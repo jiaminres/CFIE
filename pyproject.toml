@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfie"
+version = "0.1.0"
+description = "Capacity-First Inference Engine (CFIE)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+cfie = "cfie.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["cfie*"]
