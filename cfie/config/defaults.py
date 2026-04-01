@@ -15,6 +15,13 @@ DEFAULT_MAX_NUM_SEQS = 1
 # 允许引擎使用的 GPU 显存占比阈值，取值范围 (0, 1]。
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
 
+# 权重加载格式：
+# - auto: 优先 safetensors，再回退到 bin/pt
+# - hf: 同 auto（保留与 vLLM 语义一致的别名）
+# - safetensors: 仅加载 safetensors
+# - pt: 仅加载 pytorch bin/pt
+DEFAULT_LOAD_FORMAT = "auto"
+
 # 默认关闭权重量化。
 DEFAULT_QUANTIZATION = "none"
 
@@ -30,6 +37,12 @@ DEFAULT_KV_OFFLOAD_BACKEND = "cpu"
 # CPU offload 预算（单位：GB）；0.0 表示不预留 CPU offload 容量。
 DEFAULT_CPU_OFFLOAD_GB = 0.0
 
+# MoE tiered cache CPU 预算上限（单位：GB）；0.0 表示交给自动规划器。
+DEFAULT_MOE_CPU_BUDGET_GB = 0.0
+
+# MoE tiered cache 最小预留空闲内存（单位：GB）；0.0 表示使用规划器默认值。
+DEFAULT_MOE_CPU_MIN_FREE_GB = 0.0
+
 # NVMe offload 数据目录（仅在 nvme 后端启用时使用）。
 DEFAULT_NVME_OFFLOAD_PATH = "/tmp/cfie_offload"
 
@@ -41,6 +54,9 @@ DEFAULT_SCHEDULER_POLICY = "fcfs"
 
 # 允许的计算 dtype 集合。
 SUPPORTED_DTYPES = ("auto", "fp16", "bf16")
+
+# 允许的权重加载格式集合。
+SUPPORTED_LOAD_FORMATS = ("auto", "hf", "safetensors", "pt")
 
 # 允许的权重量化后端：
 # - none: 不量化

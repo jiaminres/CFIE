@@ -12,6 +12,12 @@ dependencies = []
 
 [project.scripts]
 cfie = "cfie.cli.main:main"
+cfie-train = "cfie_training.cli.main:main"
 
 [tool.setuptools.packages.find]
-include = ["cfie*"]
+include = ["cfie*", "cfie_training*", "vllm*"]
+
+[tool.setuptools.package-data]
+"cfie" = ["*.so", "*.abi3.so"]
+"cfie.cfie_flash_attn" = ["*.so", "*.abi3.so"]
+"cfie.vllm_flash_attn" = ["*.so", "*.abi3.so"]

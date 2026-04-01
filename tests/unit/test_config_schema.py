@@ -14,6 +14,8 @@ def test_engine_config_from_flat_kwargs_defaults() -> None:
     assert cfg.model.dtype == "auto"
     assert cfg.scheduler.max_num_seqs == 1
     assert cfg.runtime.gpu_memory_utilization == pytest.approx(0.9)
+    assert cfg.offload.moe_cpu_budget_gb == pytest.approx(0.0)
+    assert cfg.offload.moe_cpu_min_free_gb == pytest.approx(0.0)
 
 
 def test_engine_config_from_nested_dict() -> None:
@@ -46,6 +48,11 @@ def test_invalid_gpu_memory_ratio_raises_value_error() -> None:
         EngineConfig.from_flat_kwargs(model="m", gpu_memory_utilization=1.5)
 
 
+def test_invalid_load_format_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="load_format"):
+        EngineConfig.from_flat_kwargs(model="m", load_format="unknown")
+
+
 def test_nvme_backend_disallows_cpu_budget() -> None:
     with pytest.raises(ValueError, match="cpu_offload_gb"):
         EngineConfig.from_flat_kwargs(
@@ -63,3 +70,13 @@ def test_cpu_plus_nvme_backend_is_accepted() -> None:
     )
     assert cfg.offload.weight_offload_backend == "cpu+nvme"
     assert cfg.offload.kv_offload_backend == "cpu+nvme"
+
+
+def test_negative_moe_cpu_budget_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="moe_cpu_budget_gb"):
+        EngineConfig.from_flat_kwargs(model="m", moe_cpu_budget_gb=-1.0)
+
+
+def test_negative_moe_cpu_min_free_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="moe_cpu_min_free_gb"):
+        EngineConfig.from_flat_kwargs(model="m", moe_cpu_min_free_gb=-1.0)

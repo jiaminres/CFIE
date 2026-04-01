@@ -28,10 +28,21 @@ class LoadConfig:
     revision: str | None = None
     trust_remote_code: bool = False
     local_files_only: bool = False
+    load_format: str = defaults.DEFAULT_LOAD_FORMAT
+    download_dir: str | None = None
+    ignore_patterns: tuple[str, ...] = ()
 
     def validate(self) -> "LoadConfig":
         if self.revision is not None and not self.revision.strip():
             raise ValueError("revision must be None or a non-empty string")
+        validators.validate_choice("load_format", self.load_format,
+                                   defaults.SUPPORTED_LOAD_FORMATS)
+        if self.download_dir is not None and not self.download_dir.strip():
+            raise ValueError("download_dir must be None or a non-empty string")
+        if not isinstance(self.ignore_patterns, tuple):
+            raise ValueError("ignore_patterns must be a tuple of strings")
+        for pattern in self.ignore_patterns:
+            validators.validate_non_empty_string("ignore_patterns item", pattern)
         return self
 
 
@@ -60,6 +71,8 @@ class OffloadConfig:
     weight_offload_backend: str = defaults.DEFAULT_WEIGHT_OFFLOAD_BACKEND
     kv_offload_backend: str = defaults.DEFAULT_KV_OFFLOAD_BACKEND
     cpu_offload_gb: float = defaults.DEFAULT_CPU_OFFLOAD_GB
+    moe_cpu_budget_gb: float = defaults.DEFAULT_MOE_CPU_BUDGET_GB
+    moe_cpu_min_free_gb: float = defaults.DEFAULT_MOE_CPU_MIN_FREE_GB
     nvme_offload_path: str = defaults.DEFAULT_NVME_OFFLOAD_PATH
     offload_prefetch_window: int = defaults.DEFAULT_OFFLOAD_PREFETCH_WINDOW
 
@@ -72,6 +85,10 @@ class OffloadConfig:
                                    defaults.SUPPORTED_KV_OFFLOAD_BACKENDS)
         validators.validate_non_negative_float("cpu_offload_gb",
                                                self.cpu_offload_gb)
+        validators.validate_non_negative_float("moe_cpu_budget_gb",
+                                               self.moe_cpu_budget_gb)
+        validators.validate_non_negative_float("moe_cpu_min_free_gb",
+                                               self.moe_cpu_min_free_gb)
         validators.validate_positive_int("offload_prefetch_window",
                                          self.offload_prefetch_window,
                                          allow_zero=True)
@@ -141,6 +158,12 @@ class EngineConfig:
         cls,
         *,
         model: str,
+        revision: str | None = None,
+        trust_remote_code: bool = False,
+        local_files_only: bool = False,
+        load_format: str = defaults.DEFAULT_LOAD_FORMAT,
+        download_dir: str | None = None,
+        ignore_patterns: tuple[str, ...] = (),
         dtype: str = defaults.DEFAULT_DTYPE,
         max_model_len: int = defaults.DEFAULT_MAX_MODEL_LEN,
         max_num_seqs: int = defaults.DEFAULT_MAX_NUM_SEQS,
@@ -150,6 +173,8 @@ class EngineConfig:
         weight_offload_backend: str = defaults.DEFAULT_WEIGHT_OFFLOAD_BACKEND,
         kv_offload_backend: str = defaults.DEFAULT_KV_OFFLOAD_BACKEND,
         cpu_offload_gb: float = defaults.DEFAULT_CPU_OFFLOAD_GB,
+        moe_cpu_budget_gb: float = defaults.DEFAULT_MOE_CPU_BUDGET_GB,
+        moe_cpu_min_free_gb: float = defaults.DEFAULT_MOE_CPU_MIN_FREE_GB,
         nvme_offload_path: str = defaults.DEFAULT_NVME_OFFLOAD_PATH,
         offload_prefetch_window: int = defaults.DEFAULT_OFFLOAD_PREFETCH_WINDOW,
     ) -> "EngineConfig":
@@ -158,12 +183,22 @@ class EngineConfig:
             model=ModelConfig(model=model,
                               dtype=dtype,
                               max_model_len=max_model_len),
+            load=LoadConfig(
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                local_files_only=local_files_only,
+                load_format=load_format,
+                download_dir=download_dir,
+                ignore_patterns=ignore_patterns,
+            ),
             quant=QuantConfig(quantization=quantization),
             cache=CacheConfig(kv_cache_dtype=kv_cache_dtype),
             offload=OffloadConfig(
                 weight_offload_backend=weight_offload_backend,
                 kv_offload_backend=kv_offload_backend,
                 cpu_offload_gb=cpu_offload_gb,
+                moe_cpu_budget_gb=moe_cpu_budget_gb,
+                moe_cpu_min_free_gb=moe_cpu_min_free_gb,
                 nvme_offload_path=nvme_offload_path,
                 offload_prefetch_window=offload_prefetch_window,
             ),
@@ -179,6 +214,12 @@ class EngineConfig:
         if isinstance(raw.get("model"), str):
             return cls.from_flat_kwargs(
                 model=raw["model"],
+                revision=raw.get("revision"),
+                trust_remote_code=raw.get("trust_remote_code", False),
+                local_files_only=raw.get("local_files_only", False),
+                load_format=raw.get("load_format", defaults.DEFAULT_LOAD_FORMAT),
+                download_dir=raw.get("download_dir"),
+                ignore_patterns=tuple(raw.get("ignore_patterns", ())),
                 dtype=raw.get("dtype", defaults.DEFAULT_DTYPE),
                 max_model_len=raw.get("max_model_len",
                                       defaults.DEFAULT_MAX_MODEL_LEN),
@@ -200,6 +241,14 @@ class EngineConfig:
                                            defaults.DEFAULT_KV_OFFLOAD_BACKEND),
                 cpu_offload_gb=raw.get("cpu_offload_gb",
                                        defaults.DEFAULT_CPU_OFFLOAD_GB),
+                moe_cpu_budget_gb=raw.get(
+                    "moe_cpu_budget_gb",
+                    defaults.DEFAULT_MOE_CPU_BUDGET_GB,
+                ),
+                moe_cpu_min_free_gb=raw.get(
+                    "moe_cpu_min_free_gb",
+                    defaults.DEFAULT_MOE_CPU_MIN_FREE_GB,
+                ),
                 nvme_offload_path=raw.get("nvme_offload_path",
                                           defaults.DEFAULT_NVME_OFFLOAD_PATH),
                 offload_prefetch_window=raw.get(
