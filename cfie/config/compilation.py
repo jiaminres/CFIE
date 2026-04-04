@@ -680,9 +680,11 @@ class CompilationConfig:
     """time taken for compilation"""
 
     static_forward_context: dict[str, Any] = field(default_factory=dict, init=False)
-    """Per-model forward context
-    Map from layer name to layer objects that need to be accessed outside
-    model code, e.g., Attention, FusedMOE when dp_size>1."""
+    """每个模型实例对应的静态 forward 上下文。
+
+    该字典把“层名”映射到“层对象本身”，用于在模型定义代码之外
+    访问这些层。例如在 dp_size > 1 等场景下，外部运行时可能需要
+    直接拿到 Attention、FusedMoE 等层对象。"""
 
     static_all_moe_layers: list[str] = field(default_factory=list, init=False)
     """The names of all the MOE layers in the model

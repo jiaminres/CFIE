@@ -78,6 +78,7 @@ class OptimizationLevel(IntEnum):
 
 PerformanceMode = Literal["balanced", "interactivity", "throughput"]
 
+# 这些占位变量原本打算依赖 model_config 动态决定，目前统一关闭。
 IS_QUANTIZED = False
 IS_DENSE = False
 
@@ -93,6 +94,7 @@ def enable_norm_fusion(cfg: "CfieConfig") -> bool:
     """当 RMSNorm 或 quant FP8 自定义算子启用时开启；
     否则交由 Inductor 处理融合。"""
 
+    # 只要 RMSNorm 或 quant_fp8 任一自定义算子打开，就启用该融合。
     return cfg.compilation_config.is_custom_op_enabled(
         "rms_norm"
     ) or cfg.compilation_config.is_custom_op_enabled("quant_fp8")
@@ -104,6 +106,7 @@ def enable_act_fusion(cfg: "CfieConfig") -> bool:
     否则交由 Inductor 处理融合。
     对 FP4 模型也会启用，因为 FP4 量化总是走自定义算子，Inductor 无法融合。
     """
+    # SiLU+Mul / quant_fp8 / NVFP4 任一条件满足时，都需要走激活融合路径。
     return (
             cfg.compilation_config.is_custom_op_enabled("silu_and_mul")
             or cfg.compilation_config.is_custom_op_enabled("quant_fp8")
@@ -116,6 +119,7 @@ def enable_allreduce_rms_fusion(cfg: "CfieConfig") -> bool:
     from cfie.platforms import current_platform
     from cfie.utils.flashinfer import has_flashinfer
 
+    # 仅在 TP>1、CUDA Hopper/Blackwell 且 flashinfer 可用时打开该融合。
     return (
             cfg.parallel_config.tensor_parallel_size > 1
             and current_platform.is_cuda()
@@ -139,6 +143,7 @@ def enable_rope_kvcache_fusion(cfg: "CfieConfig") -> bool:
     """
     from cfie._aiter_ops import rocm_aiter_ops
 
+    # 当前只在 ROCm AITER + rotary_embedding custom op + graph partition 场景下启用。
     return (
             rocm_aiter_ops.is_enabled()
             and cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
@@ -151,6 +156,7 @@ def enable_norm_pad_fusion(cfg: "CfieConfig") -> bool:
     hidden size 为 2880（即 gpt-oss）时启用；否则交由 Inductor 处理融合。"""
     from cfie._aiter_ops import rocm_aiter_ops
 
+    # 目前这个融合只针对 gpt-oss 的 hidden_size=2880 特判。
     return (
             rocm_aiter_ops.is_rmsnorm_enabled()
             and not rocm_aiter_ops.is_triton_gemm_enabled()
@@ -159,6 +165,7 @@ def enable_norm_pad_fusion(cfg: "CfieConfig") -> bool:
     )
 
 
+    # O0：全部保守关闭，优先启动速度与稳定性。
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -178,6 +185,7 @@ OPTIMIZATION_LEVEL_00 = {
         "enable_flashinfer_autotune": False,
     },
 }
+# O1：开启基础编译与分段 cudagraph。
 OPTIMIZATION_LEVEL_01 = {
     "compilation_config": {
         "pass_config": {
@@ -197,6 +205,7 @@ OPTIMIZATION_LEVEL_01 = {
         "enable_flashinfer_autotune": True,
     },
 }
+# O2：在 O1 基础上进一步开启更多融合与完整/分段 cudagraph。
 OPTIMIZATION_LEVEL_02 = {
     "compilation_config": {
         "pass_config": {
@@ -216,6 +225,7 @@ OPTIMIZATION_LEVEL_02 = {
         "enable_flashinfer_autotune": True,
     },
 }
+# O3：当前实现与 O2 等价，作为未来更激进优化预留档位。
 OPTIMIZATION_LEVEL_03 = {
     "compilation_config": {
         "pass_config": {
@@ -236,6 +246,7 @@ OPTIMIZATION_LEVEL_03 = {
     },
 }
 
+# 优化级别到默认配置模板的映射表。
 OPTIMIZATION_LEVEL_TO_CONFIG = {
     OptimizationLevel.O0: OPTIMIZATION_LEVEL_00,
     OptimizationLevel.O1: OPTIMIZATION_LEVEL_01,
@@ -250,41 +261,56 @@ class CfieConfig:
     这可以简化在代码库中传递各类配置对象的过程。
     """
 
+    # ----------------- 顶层子配置对象 -----------------
     # TODO：当 ModelConfig 的默认构造不再尝试下载模型时，改用 default_factory
     model_config: ModelConfig = Field(default=None)
     """模型配置。"""
+    # cache_config 负责 KV cache / prefix cache / mamba cache 等运行期缓存设置。
     cache_config: CacheConfig = Field(default_factory=CacheConfig)
     """缓存配置。"""
+    # parallel_config 负责 TP/DP/EP/EPLB/DCP 等并行拓扑。
     parallel_config: ParallelConfig = Field(default_factory=ParallelConfig)
     """并行配置。"""
+    # scheduler_config 负责请求调度与 token budget。
     scheduler_config: SchedulerConfig = Field(
         default_factory=SchedulerConfig.default_factory,
     )
     """调度器配置。"""
+    # device_config 负责设备类型与平台推断。
     device_config: DeviceConfig = Field(default_factory=DeviceConfig)
     """设备配置。"""
+    # load_config 负责 checkpoint 加载方式。
     load_config: LoadConfig = Field(default_factory=LoadConfig)
     """加载配置。"""
+    # offload_config 负责通用权重 offload 与 MoE tiered cache 预算上限。
     offload_config: OffloadConfig = Field(default_factory=OffloadConfig)
     """模型权重卸载配置。"""
+    # attention_config 负责 attention backend 相关选项。
     attention_config: AttentionConfig = Field(default_factory=AttentionConfig)
     """注意力配置。"""
+    # kernel_config 负责底层 kernel 与 autotune 选择。
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
     """内核配置。"""
+    # LoRA 子配置；未启用时为 None。
     lora_config: LoRAConfig | None = None
     """LoRA 配置。"""
+    # speculative decoding 子配置；未启用时为 None。
     speculative_config: SpeculativeConfig | None = None
     """投机解码配置。"""
+    # 结构化输出配置。
     structured_outputs_config: StructuredOutputsConfig = Field(
         default_factory=StructuredOutputsConfig
     )
     """结构化输出配置。"""
+    # tracing / metrics / OTEL 等可观测性配置。
     observability_config: ObservabilityConfig = Field(
         default_factory=ObservabilityConfig
     )
     """可观测性配置。"""
+    # 已解析好的量化配置对象；通常在 __post_init__ 中补出。
     quant_config: QuantizationConfig | None = None
     """量化配置。"""
+    # compile / cudagraph / pass 开关的总配置。
     compilation_config: CompilationConfig = Field(default_factory=CompilationConfig)
     """模型的 `torch.compile` 与 cudagraph 捕获配置。
 
@@ -294,26 +320,34 @@ class CfieConfig:
     也可以像下面这样指定完整编译配置：
     `{"mode": 3, "cudagraph_capture_sizes": [1, 2, 4, 8]}`
     """
+    # profiler 配置。
     profiler_config: ProfilerConfig = Field(default_factory=ProfilerConfig)
     """性能分析配置。"""
+    # KV transfer 配置。
     kv_transfer_config: KVTransferConfig | None = None
     """分布式 KV 缓存传输配置。"""
+    # KV 事件配置。
     kv_events_config: KVEventsConfig | None = None
     """事件发布配置。"""
+    # EC transfer 配置。
     ec_transfer_config: ECTransferConfig | None = None
     """分布式 EC 缓存传输配置。"""
+    # 用于挂接树外扩展信息的附加配置容器。
     # 一些不透明配置，仅用于为哈希计算提供附加信息，
     # 主要用于测试、调试或树外配置注册。
     additional_config: dict | SupportsHash = Field(default_factory=dict)
     """特定平台的附加配置。不同平台支持的配置可能不同。
     请确保配置对你使用的平台有效。内容必须可哈希。"""
+    # 当前实例的唯一 ID。
     instance_id: str = ""
     """vLLM 实例 ID。"""
+    # 用于统一控制 compile / cudagraph 默认档位的优化级别。
     optimization_level: OptimizationLevel = OptimizationLevel.O2
     """优化级别。这些级别在启动耗时与性能之间做权衡：
     -O0 启动最快，-O3 性能最佳。默认使用 -O2。
     完整说明见 OptimizationLevel。"""
 
+    # 运行时偏交互还是偏吞吐的性能模式。
     performance_mode: PerformanceMode = "balanced"
     """运行时性能模式，默认是 'balanced'。
     'interactivity' 在小 batch 下更偏向更低的端到端单请求时延
@@ -321,9 +355,11 @@ class CfieConfig:
     'throughput' 在高并发下更偏向更高总体 tokens/sec
     （更大的 CUDA 图、更激进的批处理、偏吞吐的内核）。"""
 
+    # RL 训练期间使用的权重传输配置。
     weight_transfer_config: WeightTransferConfig | None = None
     """RL 训练期间的权重传输配置。"""
 
+    # 优雅关闭等待时间。
     shutdown_timeout: int = Field(default=0, ge=0)
     """在途请求的优雅关闭宽限期。关闭会最多延迟这么久，
     以便已在运行的请求完成。超时后剩余请求会被中止。
@@ -338,20 +374,25 @@ class CfieConfig:
         范围为从输入 ids/embeddings 到最终 hidden states 的计算图，
         不包括输入 ids/embeddings 之前及最终 hidden states 之后的部分。
         """
+        # factors 最外层仍保持列表，便于延续历史哈希结构。
         factors: list[Any] = []
 
+        # ----------------- 逐个汇总所有会影响计算图与执行形态的子配置哈希 -----------------
         # 汇总 cfie 配置
         cfie_factors: list[Any] = []
         from cfie import __version__
 
+        # 把 cfie 自身版本号纳入哈希，避免跨版本误复用缓存。
         cfie_factors.append(__version__)
         if self.model_config:
+            # model_config 是最核心的图结构因子。
             cfie_factors.append(self.model_config.compute_hash())
             if (
                     self.compilation_config
                     and getattr(self.compilation_config, "compile_mm_encoder", False)
                     and self.model_config.multimodal_config
             ):
+                # 若编译多模态 encoder，也把 multimodal_config 的哈希一并纳入。
                 cfie_factors.append(self.model_config.multimodal_config.compute_hash())
         else:
             cfie_factors.append("None")
@@ -414,17 +455,20 @@ class CfieConfig:
             cfie_factors.append("None")
         if self.additional_config:
             if isinstance(additional_config := self.additional_config, dict):
+                # dict 形态的 additional_config 直接按 JSON 排序序列化后求哈希。
                 additional_config_hash = safe_hash(
                     json.dumps(additional_config, sort_keys=True).encode(),
                     usedforsecurity=False,
                 ).hexdigest()
             else:
+                # 否则要求该对象自己实现 SupportsHash。
                 additional_config_hash = additional_config.compute_hash()
             cfie_factors.append(additional_config_hash)
         else:
             cfie_factors.append("None")
         factors.append(cfie_factors)
 
+        # 最终仍沿用 safe_hash，并截断成 10 位短哈希。
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()[
             :10
         ]
@@ -433,11 +477,13 @@ class CfieConfig:
     @property
     def num_speculative_tokens(self) -> int:
         """返回投机解码 token 数；若未配置则返回 0。"""
+        # 仅当 speculative_config 存在且显式设置了 token 数时返回该值。
         if (
                 self.speculative_config is not None
                 and self.speculative_config.num_speculative_tokens is not None
         ):
             return self.speculative_config.num_speculative_tokens
+        # 未启用投机解码时返回 0。
         return 0
 
     @property
@@ -467,10 +513,12 @@ class CfieConfig:
         若通过环境变量 `VLLM_TRACE_FUNCTION` 启用，
         则为当前线程开启函数调用追踪。
         """
+        # 只有开启环境变量时，才为当前线程生成 trace 文件。
         if envs.VLLM_TRACE_FUNCTION:
             tmp_dir = tempfile.gettempdir()
             # 在 tmp_dir 中加入用户名，避免权限问题
             tmp_dir = os.path.join(tmp_dir, getpass.getuser())
+            # 文件名里带上进程、线程和时间戳，方便区分多线程 trace。
             filename = (
                 f"VLLM_TRACE_FUNCTION_for_process_{os.getpid()}"
                 f"_thread_{threading.get_ident()}_at_{datetime.now()}.log"
@@ -481,6 +529,7 @@ class CfieConfig:
                 f"cfie-instance-{self.instance_id}",
                 filename,
             )
+            # 提前创建目录，再真正打开 trace。
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             enable_trace_function_call(log_path)
 
@@ -492,6 +541,7 @@ class CfieConfig:
         # 延迟导入当前平台对象，用于读取 GPU 能力信息。
         from cfie.platforms import current_platform
 
+        # ----------------- 仅当模型显式声明了 quantization 时才解析量化配置 -----------------
         # 只有在模型显式声明 quantization 方法时，才需要构建量化配置。
         if model_config.quantization is not None:
             # 延迟导入量化配置解析函数，避免模块级循环依赖与不必要开销。
@@ -502,6 +552,7 @@ class CfieConfig:
             # 读取当前设备的计算能力（compute capability）。
             capability_tuple = current_platform.get_device_capability()
 
+            # ----------------- 校验当前设备是否支持该量化方法 -----------------
             # 若当前平台能返回设备能力，则继续做“量化方法是否支持该 GPU”的校验。
             if capability_tuple is not None:
                 # 把 capability 从平台对象转换成整数形式，便于比较。
@@ -514,6 +565,7 @@ class CfieConfig:
                         f"capability: {quant_config.get_min_capability()}. "
                         f"Current capability: {capability}."
                     )
+            # ----------------- 再校验当前模型 dtype 是否被该量化方法支持 -----------------
             # 读取该量化方法允许使用的激活 dtype 集合。
             supported_dtypes = quant_config.get_supported_act_dtypes()
             # 若当前模型 dtype 不在支持集合里，则直接报错。
@@ -523,6 +575,7 @@ class CfieConfig:
                     f"method {model_config.quantization}. Supported dtypes: "
                     f"{supported_dtypes}"
                 )
+            # ----------------- 最后让量化配置根据模型目录补全细节 -----------------
             # 某些量化配置还需要基于模型目录内容进一步修正自身参数，这里执行一次补全。
             quant_config.maybe_update_config(model_config.model)
             # 返回最终可用的量化配置对象。
@@ -536,6 +589,7 @@ class CfieConfig:
     ) -> QuantizationConfig | None:
         import copy
 
+        # _get_quantization_config 内部会修改 model_config，因此这里先 deepcopy 一份。
         # 出于某些原因，带下划线的版本会修改 model_config 对象，
         # 因此这里用 deepcopy 避免该问题。
         return CfieConfig._get_quantization_config(
@@ -548,10 +602,12 @@ class CfieConfig:
             architectures: list[str] | None = None,
     ) -> "CfieConfig":
         """返回一个替换了 hf_config（可选替换 architectures）的新配置对象。"""
+        # 若调用方传了新的 architectures，则先复制 hf_config 再覆写。
         if architectures is not None:
             hf_config = copy.deepcopy(hf_config)
             hf_config.architectures = architectures
 
+        # 复制一份 model_config，避免直接污染原配置对象。
         model_config = copy.deepcopy(self.model_config)
 
         if (
@@ -559,6 +615,7 @@ class CfieConfig:
                 and hasattr(model_config.hf_config, "tie_word_embeddings")
                 and not hasattr(hf_config.get_text_config(), "tie_word_embeddings")
         ):
+            # ----------------- 多模态模型下，手工把 tie_word_embeddings 从顶层 config 透传到 text_config -----------------
             # 在 Transformers v5 中，tie_word_embeddings 属于能同时看到
             # 两个待绑定层的那个类的配置。例如：
             #
@@ -577,9 +634,11 @@ class CfieConfig:
             tie_word_embeddings = model_config.hf_config.tie_word_embeddings
             hf_config.get_text_config().tie_word_embeddings = tie_word_embeddings
 
+        # 用新的 hf_config 刷新 model_config 及其派生的 model_arch_config。
         model_config.hf_config = hf_config
         model_config.model_arch_config = model_config.get_model_arch_config()
 
+        # 返回一个仅替换了 model_config 的新 CfieConfig。
         return replace(self, model_config=model_config)
 
     def _set_config_default(self, config_obj: Any, key: str, value: Any) -> None:
@@ -590,6 +649,7 @@ class CfieConfig:
             key：属性名。
             value：默认值（静态值或可调用对象）。
         """
+        # 只有在字段仍为 None 时，才把优化级别/模式推导出的默认值写进去。
         if getattr(config_obj, key) is None:
             # 有些配置值在初始化前就已确定，属于硬编码默认值。
             # 其他值依赖用户配置，故使用 lambda 在运行时决定。
@@ -612,10 +672,12 @@ class CfieConfig:
         def apply_recursive(config_obj: Any, config_defaults: dict[str, Any]) -> None:
             """以 self 为根对象，递归地向 config_obj 应用默认值。"""
             for key, value in config_defaults.items():
+                # defaults 中不存在于目标配置对象上的字段直接跳过。
                 if not hasattr(config_obj, key):
                     continue
 
                 current = getattr(config_obj, key)
+                # 若当前字段还是 dataclass 且默认值也是嵌套字典，则递归下钻。
                 if isinstance(value, dict) and is_dataclass(current):
                     apply_recursive(current, value)
                 else:
@@ -629,25 +691,31 @@ class CfieConfig:
         当前该函数会读取 CacheConfig 中的 offloading 设置，
         并据此配置 KVTransferConfig。
         """
+        # 只有设置了 kv_offloading_size，才需要自动补 KV transfer 配置。
         # 仅在设置了 kv_offloading_size 时启用 KV offloading。
         if (kv_offloading_size := self.cache_config.kv_offloading_size) is None:
             return
 
+        # 读取当前选用的 KV offloading backend。
         kv_offloading_backend = self.cache_config.kv_offloading_backend
 
+        # 若用户没有单独提供 KVTransferConfig，则先创建一个默认实例。
         # 若未提供 KVTransferConfig，则创建一个默认实例。
         if self.kv_transfer_config is None:
             self.kv_transfer_config = KVTransferConfig()
+        # KV rank 总数按 TP * PP 计算。
         num_kv_ranks = (
                 self.parallel_config.tensor_parallel_size
                 * self.parallel_config.pipeline_parallel_size
         )
 
+        # native backend 直接走 OffloadingConnector，并把总 CPU 字节预算写进去。
         if kv_offloading_backend == "native":
             self.kv_transfer_config.kv_connector = "OffloadingConnector"
             self.kv_transfer_config.kv_connector_extra_config.update(
                 {"cpu_bytes_to_use": kv_offloading_size * (1 << 30)}
             )
+        # lmcache backend 则按 KV ranks 均分总预算。
         elif kv_offloading_backend == "lmcache":
             self.kv_transfer_config.kv_connector = "LMCacheConnectorV1"
             kv_gb_per_rank = kv_offloading_size / num_kv_ranks
@@ -656,12 +724,14 @@ class CfieConfig:
                 "lmcache.max_local_cpu_size": kv_gb_per_rank,
             }
 
+        # 当前所有 backend 最终都把本实例视为既可发送又可接收 KV 的节点。
         # 所有后端该设置一致
         self.kv_transfer_config.kv_role = "kv_both"
 
     def __post_init__(self):
         """校验各配置是否合法且彼此一致。"""
 
+        # ----------------- 基础实例初始化与预校验 -----------------
         # --------------- 基础实例初始化与预校验 ---------------
         # 为当前这份配置生成一个唯一实例 ID。
         # 这个 ID 常用于 profile / debug / 日志关联。
@@ -693,6 +763,7 @@ class CfieConfig:
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 
+        # ----------------- target / draft 最大长度对齐 -----------------
         # --------------- target / draft 最大长度对齐 ---------------
         # 当存在 speculative decoding 且带 draft model 时，
         # 需要保证 draft 的最大长度不超过 target model。
@@ -742,6 +813,7 @@ class CfieConfig:
                     target_max_model_len,
                 )
 
+        # ----------------- 量化配置补全与 MoE offload plan 注入 -----------------
         # --------------- 量化配置补全与 MoE offload plan 注入 ---------------
         # 若尚未显式生成 quant_config，则基于 model/load 配置自动推导。
         if self.quant_config is None and self.model_config is not None:
@@ -756,6 +828,7 @@ class CfieConfig:
 
             maybe_inject_moe_tiered_cache_plan(self)
 
+        # ----------------- 异步调度能力判定 -----------------
         # --------------- 异步调度能力判定 ---------------
         # 读取当前分布式执行后端。
         executor_backend = self.parallel_config.distributed_executor_backend
@@ -841,6 +914,7 @@ class CfieConfig:
             "enabled" if self.scheduler_config.async_scheduling else "disabled",
         )
 
+        # ----------------- DP 同步后端的默认策略 -----------------
         # --------------- DP 同步后端的默认策略 ---------------
         # 若用户没有显式指定 DP 同步是否禁用 NCCL，则根据 async scheduling 自动决定。
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
@@ -860,6 +934,7 @@ class CfieConfig:
                 # 非异步调度下，默认保留 NCCL 做 DP 同步。
                 self.parallel_config.disable_nccl_for_dp_synchronization = False
 
+        # ----------------- 平台相关特殊兼容处理 -----------------
         # --------------- 平台相关特殊兼容处理 ---------------
         # 延迟导入当前平台对象，避免模块级循环依赖。
         from cfie.platforms import current_platform
@@ -920,9 +995,11 @@ class CfieConfig:
             if "-quant_fp8" not in custom_ops:
                 custom_ops.append("+quant_fp8")
 
+        # 让平台按自身能力补齐默认值或修正某些配置开关。
         # 根据平台特性补齐平台默认配置。
         current_platform.apply_config_platform_defaults(self)
 
+        # ----------------- 编译模式与优化等级默认值补全 -----------------
         # --------------- 编译模式与优化等级默认值补全 ---------------
         # 若 compilation mode 还未定下来，则按 optimization_level 补默认值。
         if self.compilation_config.mode is None:
@@ -966,8 +1043,10 @@ class CfieConfig:
                 self.compilation_config.cudagraph_mode,
                 self.compilation_config.mode,
             )
+            # 不兼容时把 cudagraph mode 直接回退为 NONE。
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+        # ----------------- 序列并行 / 通信融合相关设置 -----------------
         # --------------- 序列并行 / 通信融合相关设置 ---------------
         # async TP 构建在序列并行之上，
         # 因此需要启用序列并行。
@@ -1009,6 +1088,7 @@ class CfieConfig:
                     self.compilation_config.pass_config.enable_sp = False
                     self.compilation_config.pass_config.fuse_gemm_comms = False
 
+        # ----------------- fast_moe_cold_start 默认值决议 -----------------
         # --------------- fast_moe_cold_start 默认值决议 ---------------
         # 延迟导入 torch 能力标记。
         from cfie.utils.torch_utils import HAS_OPAQUE_TYPE
@@ -1030,6 +1110,7 @@ class CfieConfig:
         # 按 speculative decoding 额外占位情况，修正调度器可调度 token 上限。
         self._set_max_num_scheduled_tokens()
 
+        # ----------------- CUDA Graph / Static Graph 最终裁决 -----------------
         # --------------- CUDA Graph / Static Graph 最终裁决 ---------------
         # 若当前平台支持 static graph，再继续做 cudagraph 相关检查。
         if current_platform.support_static_graph_mode():
@@ -1108,6 +1189,7 @@ class CfieConfig:
             # 平台不支持 static graph，则彻底关闭 cudagraph。
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+        # ----------------- KV sharing fast prefill 与编译范围设置 -----------------
         # --------------- KV sharing fast prefill 与编译范围设置 ---------------
         # 若启用了 KV sharing fast prefill，则先检查和 EAGLE 的兼容性。
         if self.cache_config.kv_sharing_fast_prefill:
@@ -1169,6 +1251,7 @@ class CfieConfig:
         # 让平台执行最后一轮 platform-specific config 修正。
         current_platform.check_and_update_config(self)
 
+        # ----------------- V1 splitting ops 与 SP 特殊处理 -----------------
         # --------------- V1 splitting ops 与 SP 特殊处理 ---------------
         # 这一步需放在 compilation_config.mode 完成所有更新之后
         # dense 模型在 DP 场景下不需要按真实 data_parallel_size 参与这里的切分决策。
@@ -1221,6 +1304,7 @@ class CfieConfig:
                         regime,
                     )
 
+        # ----------------- CUDA 平台下的最终 cudagraph 断言与告警 -----------------
         # --------------- CUDA 平台下的最终 cudagraph 断言与告警 ---------------
         # 在所有可能更新完成后，对 cudagraph mode 做最终检查
         if current_platform.is_cuda_alike():
@@ -1259,6 +1343,7 @@ class CfieConfig:
                 scope="local",
             )
 
+        # ----------------- UBatching / DBO 兼容性处理 -----------------
         # --------------- UBatching / DBO 兼容性处理 ---------------
         # 若启用了 ubatching，则 all2all backend 必须落在 DeepEP 支持集合中。
         if self.parallel_config.use_ubatching:
@@ -1283,6 +1368,7 @@ class CfieConfig:
         if not self.instance_id:
             self.instance_id = random_uuid()[:5]
 
+        # ----------------- Hybrid KV Cache Manager(HMA) 开关决议 -----------------
         # --------------- Hybrid KV Cache Manager(HMA) 开关决议 ---------------
         # Hybrid KV cache manager（HMA）运行时规则：
         # - 显式启用（--no-disable-kv-cache-manager）：若运行时要禁用则报错
@@ -1413,12 +1499,17 @@ class CfieConfig:
 
     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
         """按序列并行约束过滤 batch size，仅保留可被 TP 大小整除的值。"""
+        # ----------------- 先找出所有不满足 TP 整除约束的候选值 -----------------
         # 启用序列并行时，移除不能被 tp_size 整除的 size
         removed_sizes = [
+            # 遍历每个候选 batch size。
             size
+            # 候选列表来自上游预设的 cudagraph capture sizes。
             for size in possible_sizes
+            # 不能被 TP 大小整除的 size 在 SP 下无效。
             if size % self.parallel_config.tensor_parallel_size != 0
         ]
+        # 若确实移除了某些值，则打印一条告警帮助排查性能差异。
         if removed_sizes:
             logger.warning(
                 "Batch sizes %s are removed because they are not "
@@ -1428,9 +1519,13 @@ class CfieConfig:
                 self.parallel_config.tensor_parallel_size,
             )
 
+        # 返回过滤后的合法 size 列表。
         return [
+            # 再次遍历候选列表。
             size
+            # 保留所有满足 TP 整除约束的 size。
             for size in possible_sizes
+            # 这些 size 才能用于序列并行场景下的编译/捕获。
             if size % self.parallel_config.tensor_parallel_size == 0
         ]
 
@@ -1441,18 +1536,25 @@ class CfieConfig:
         因此需要把 max_num_scheduled_tokens 下调一个上界，
         以覆盖可能新增的槽位数量。
         """
+        # ----------------- 针对 speculative decoding 预留 drafting 槽位 -----------------
+        # 仅在启用 speculative decoding 时才需要调整该上限。
         if self.speculative_config is not None:
+            # 额外槽位数 = 每条序列可能新增的 drafting slots * 最大序列数。
             scheduled_token_delta = (
                     self.speculative_config.max_num_new_slots_for_drafting
                     * self.scheduler_config.max_num_seqs
             )
+            # 读取调度器允许的总 batch token 上限。
             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
+            # 若用户未显式给出 max_num_scheduled_tokens，则自动留出 drafting 余量。
             if self.scheduler_config.max_num_scheduled_tokens is None:
                 self.scheduler_config.max_num_scheduled_tokens = (
                         max_num_batched_tokens - scheduled_token_delta
                 )
 
+            # 读取最终生效的 max_num_scheduled_tokens。
             max_num_scheduled_tokens = self.scheduler_config.max_num_scheduled_tokens
+            # 若总槽位不够容纳“已调度 token + drafting 预留”，则直接报错。
             if max_num_batched_tokens < max_num_scheduled_tokens + (
                     self.speculative_config.max_num_new_slots_for_drafting
                     * self.scheduler_config.max_num_seqs
@@ -1500,6 +1602,7 @@ class CfieConfig:
             则不使用 cudagraph。
         """
 
+        # ----------------- 仅在真正使用 cudagraph 时才计算捕获 size -----------------
         if (
                 self.model_config is not None
                 and not self.model_config.enforce_eager
@@ -1509,44 +1612,55 @@ class CfieConfig:
             max_cudagraph_capture_size = (
                 self.compilation_config.max_cudagraph_capture_size
             )
+            # 若用户没有显式给出上限，则按 max_num_seqs 和 speculative query 长度推导。
             if max_cudagraph_capture_size is None:
+                # 普通 decode query_len 默认为 1。
                 decode_query_len = 1
+                # speculative decoding 会把一次 decode 的 query_len 拉长。
                 if (
                         self.speculative_config
                         and self.speculative_config.num_speculative_tokens
                 ):
                     decode_query_len += self.speculative_config.num_speculative_tokens
+                # 默认上限仍保守截断在 512。
                 max_cudagraph_capture_size = min(
                     self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
                 )
+            # 再用 max_num_batched_tokens 对捕获上限做最终裁剪。
             max_num_tokens = self.scheduler_config.max_num_batched_tokens
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
 
+            # 使用 cudagraph 时，最终 capture size 上限至少要 >= 1。
             assert max_cudagraph_capture_size >= 1, (
                 "Maximum cudagraph size should be greater than or equal to 1 "
                 "when using cuda graph."
             )
 
+            # ----------------- 生成最终的 cudagraph_capture_sizes 列表 -----------------
             # 确定 cudagraph_capture_sizes
             if self.compilation_config.cudagraph_capture_sizes is not None:
+                # 用户手工指定列表时，要求列表非空。
                 assert len(self.compilation_config.cudagraph_capture_sizes) > 0, (
                     "cudagraph_capture_sizes should contain at least one element "
                     "when using cuda graph."
                 )
                 # 对配置中给出的 size 去重
                 dedup_sizes = list(set(self.compilation_config.cudagraph_capture_sizes))
+                # 过滤掉超过 max_num_tokens 的非法 size。
                 cudagraph_capture_sizes = [
                     i for i in dedup_sizes if i <= max_num_tokens
                 ]
                 # 排序，确保 size 按升序
                 cudagraph_capture_sizes.sort()
             else:
+                # interactivity 模式优先生成更细粒度的小 batch 捕获列表。
                 if self.performance_mode == "interactivity":
                     # 小 batch 下使用细粒度 CUDA graph，
                     # 以最小化 padding 开销
                     interactivity_max = min(max_cudagraph_capture_size, 32)
                     cudagraph_capture_sizes = list(range(1, interactivity_max + 1))
                 else:
+                    # balanced/throughput 模式先保留几个最常见的小 batch 点。
                     cudagraph_capture_sizes = [
                         i for i in [1, 2, 4] if i <= max_cudagraph_capture_size
                     ]
@@ -1563,6 +1677,7 @@ class CfieConfig:
                 # 去重并排序
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
 
+            # 若开启了序列并行，则继续删掉无法被 TP 整除的 capture size。
             if (
                     self.parallel_config.tensor_parallel_size > 1
                     and self.compilation_config.pass_config.enable_sp
@@ -1576,6 +1691,7 @@ class CfieConfig:
             valid_max_size = (
                 cudagraph_capture_sizes[-1] if cudagraph_capture_sizes else 0
             )
+            # 若用户显式给出的 max 值与最终列表最大值不一致，则要么报错要么截断。
             if (
                     self.compilation_config.max_cudagraph_capture_size is not None
                     and self.compilation_config.max_cudagraph_capture_size != valid_max_size
@@ -1596,6 +1712,7 @@ class CfieConfig:
             # 始终写回最终的 max_cudagraph_capture_size
             self.compilation_config.max_cudagraph_capture_size = valid_max_size
 
+            # 若用户显式指定过 capture sizes，但经过过滤后变短，则打印覆盖告警。
             if self.compilation_config.cudagraph_capture_sizes is not None and len(
                     cudagraph_capture_sizes
             ) < len(self.compilation_config.cudagraph_capture_sizes):
@@ -1624,23 +1741,32 @@ class CfieConfig:
         """
         为 compilation config 设置编译区间。
         """
+        # ----------------- 汇总所有会改变图优化策略的 compile range 端点 -----------------
+        # 取局部别名，便于后续多次访问 compilation_config。
         compilation_config = self.compilation_config
+        # 用列表收集所有候选端点，最后再统一排序。
         computed_compile_ranges_endpoints = []
 
         # 编译区间上界是 max_num_batched_tokens。
         compile_range_end = self.scheduler_config.max_num_batched_tokens
+        # max_num_batched_tokens 若存在，一定是最外层的终止端点。
         if compile_range_end is not None:
             computed_compile_ranges_endpoints.append(compile_range_end)
 
+        # ----------------- 按 allreduce-rms 融合阈值补充端点 -----------------
         # 添加 flashinfer 的编译区间
         if compilation_config.pass_config.fuse_allreduce_rms:
+            # TP 大小会影响 flashinfer 融合的阈值。
             tp_size = self.parallel_config.tensor_parallel_size
+            # 读取 flashinfer allreduce-rms 对应的最大启用 size。
             max_size = compilation_config.pass_config.flashinfer_max_size(tp_size)
             if max_size is not None:
+                # 把字节阈值换算成 token 数阈值。
                 max_token_num = max_size // (
                         self.model_config.get_hidden_size()
                         * self.model_config.dtype.itemsize
                 )
+                # 只有阈值落在编译上界内时才需要新增一个分段端点。
                 if compile_range_end is not None and max_token_num < compile_range_end:
                     computed_compile_ranges_endpoints.append(max_token_num)
                 else:
@@ -1649,8 +1775,10 @@ class CfieConfig:
                         "allreduce-rms fusion will be enabled for all num_tokens."
                     )
 
+        # ----------------- 按序列并行阈值补充端点 -----------------
         # 添加序列并行的编译区间
         if compilation_config.pass_config.enable_sp:
+            # 取局部别名，避免多次深层属性访问。
             pass_config = compilation_config.pass_config
 
             # 若未显式提供，则计算 min_token_num
@@ -1663,11 +1791,14 @@ class CfieConfig:
                 tp_size = self.parallel_config.tensor_parallel_size
                 hidden_size = self.model_config.get_hidden_size()
                 element_size = self.model_config.dtype.itemsize
+                # 根据模型隐藏维、TP 和 dtype 估算 SP 何时值得打开。
                 pass_config.sp_min_token_num = get_sequence_parallelism_threshold(
                     hidden_size, tp_size, element_size
                 )
 
+            # 读取最终 SP 启用阈值。
             min_token_num = pass_config.sp_min_token_num
+            # 读取 batch token 总上限。
             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
             if min_token_num is not None and (
                     max_num_batched_tokens is not None
@@ -1678,11 +1809,14 @@ class CfieConfig:
                 # 由此形成区间：[1, min-1]（无 SP），[min, max]（启用 SP）
                 computed_compile_ranges_endpoints.append(min_token_num - 1)
 
+        # ----------------- 按 rope+kvcache 融合阈值补充端点 -----------------
         if compilation_config.pass_config.fuse_rope_kvcache:
+            # 读取 rope+kvcache 融合可用的最大 token 数阈值。
             max_token_num = (
                 compilation_config.pass_config.rope_kvcache_fusion_max_token_num
             )
             if max_token_num is not None:
+                # 阈值落在总上界内时才追加一段新的编译范围。
                 if compile_range_end is not None and max_token_num < compile_range_end:
                     computed_compile_ranges_endpoints.append(max_token_num)
                 else:
@@ -1692,26 +1826,34 @@ class CfieConfig:
                         compile_range_end,
                     )
 
+        # ----------------- 合并用户自定义的 compile_ranges_endpoints -----------------
         if compilation_config.compile_ranges_endpoints is not None:
+            # 用户提供的每个端点都要先经过合法性检查。
             for x in compilation_config.compile_ranges_endpoints:
+                # 端点必须是正整数。
                 assert isinstance(x, int)
                 assert x > 0, f"Invalid compile range endpoint: {x}"
+                # 只保留落在总上界内部且有分段意义的端点。
                 if compile_range_end is not None and x < compile_range_end and x > 1:
                     computed_compile_ranges_endpoints.append(x)
+        # 最终将所有端点排序后写回 compilation_config。
         compilation_config.compile_ranges_endpoints = sorted(
             computed_compile_ranges_endpoints
         )
 
     def try_verify_and_update_config(self):
         """按模型架构尝试校验并更新配置，仅执行一次。"""
+        # ----------------- 无 model_config 时直接跳过 -----------------
         if self.model_config is None:
             return
 
         # 避免重复执行 try_verify_and_update_config
         if getattr(self.model_config, "config_updated", False):
             return
+        # 标记本轮已经执行过 verify/update。
         self.model_config.config_updated = True
 
+        # 读取当前模型架构名。
         architecture = self.model_config.architecture
         if architecture is None:
             return
@@ -1721,19 +1863,24 @@ class CfieConfig:
             HybridAttentionMambaModelConfig,
         )
 
+        # 先按 architecture 找到专用的配置修正类。
         cls = MODELS_CONFIG_MAP.get(architecture, None)
         if cls is not None:
+            # 让具体模型类按自身规则修正 CfieConfig。
             cls.verify_and_update_config(self)
 
+        # hybrid 模型还需要额外走一轮 HybridAttentionMambaModelConfig 校验。
         if self.model_config.is_hybrid:
             HybridAttentionMambaModelConfig.verify_and_update_config(self)
 
+        # classify 转换路径需要额外把 CausalLM 配置修正为分类模型配置。
         if self.model_config.convert_type == "classify":
             # 可能将 ForCausalLM 转换为 ForSequenceClassification 模型。
             from cfie.model_executor.models.adapters import SequenceClassificationConfig
 
             SequenceClassificationConfig.verify_and_update_config(self)
 
+        # 若检测到 Run:ai 对象存储 URI，则自动调整 load_format。
         if hasattr(self.model_config, "model_weights") and is_runai_obj_uri(
                 self.model_config.model_weights
         ):
@@ -1758,16 +1905,23 @@ class CfieConfig:
         """返回带 rank 信息的路径，
         用于导出 torch.compile 调试信息。
         """
+        # 未启用 debug dump 时返回 None。
         if self.compilation_config.debug_dump_path is None:
             return None
+        # 读取当前 TP rank。
         tp_rank = self.parallel_config.rank
+        # 读取当前 DP rank。
         dp_rank = self.parallel_config.data_parallel_index
+        # 为每个 rank 构造独立子目录。
         append_path = f"rank_{tp_rank}_dp_{dp_rank}"
+        # 把 rank 信息拼到基础 debug_dump_path 后面。
         path = self.compilation_config.debug_dump_path / append_path
+        # 返回最终导出目录。
         return path
 
     def __str__(self):
         """返回用于日志展示的关键配置摘要字符串。"""
+        # 拼出一条单行摘要字符串，方便在日志中快速查看主配置。
         return (
             f"model={self.model_config.model!r}, "
             f"speculative_config={self.speculative_config!r}, "
@@ -1808,10 +1962,13 @@ class CfieConfig:
         在 Platform.update_block_size_for_backend()
         完成 block_size 最终化后调用。
         """
+        # 读取当前最终 block_size。
         block_size = self.cache_config.block_size
 
+        # ----------------- 校验 DCP / PCP 的 interleave 约束 -----------------
         # DCP 的 interleave-size 兼容性校验
         if self.parallel_config.decode_context_parallel_size > 1:
+            # 当 dcp_kv_cache_interleave_size 显式生效时，同步覆盖 cp 配置。
             if self.parallel_config.dcp_kv_cache_interleave_size > 1 and (
                     self.parallel_config.cp_kv_cache_interleave_size
                     != self.parallel_config.dcp_kv_cache_interleave_size
@@ -1824,6 +1981,7 @@ class CfieConfig:
                     "_interleave_size. And dcp-kv-cache-interleave-size will be "
                     "deprecated when PCP is fully supported."
                 )
+            # interleave size 既不能超过 block_size，也必须整除 block_size。
             assert (
                     self.parallel_config.cp_kv_cache_interleave_size <= block_size
                     and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0
@@ -1833,16 +1991,20 @@ class CfieConfig:
                 f"({self.parallel_config.cp_kv_cache_interleave_size})."
             )
 
+        # ----------------- 校验 mamba align 模式的 block_size 约束 -----------------
         # Mamba cache 的 align 模式约束
         if self.cache_config.mamba_cache_mode == "align":
+            # align 模式下 block_size 不能超过单批 token 上限。
             assert block_size <= self.scheduler_config.max_num_batched_tokens, (
                 "In Mamba cache align mode, block_size "
                 f"({block_size}) must be <= "
                 "max_num_batched_tokens "
                 f"({self.scheduler_config.max_num_batched_tokens})."
             )
+            # 若 long_prefill_token_threshold 启用，则也必须不小于 block_size。
             if self.scheduler_config.long_prefill_token_threshold > 0:
                 assert self.scheduler_config.long_prefill_token_threshold >= block_size
+            # align 模式要求多模态输入支持 chunked 调度。
             assert not self.scheduler_config.disable_chunked_mm_input, (
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "
@@ -1852,16 +2014,20 @@ class CfieConfig:
     @model_validator(mode="after")
     def validate_mamba_block_size(self) -> "CfieConfig":
         """校验 mamba_block_size 与前缀缓存设置的组合是否合法。"""
+        # 没有 model_config 时无需校验，直接返回当前对象。
         if self.model_config is None:
             return self
+        # 仅当用户显式设置了 mamba_block_size 且它不同于 max_model_len 时才算“启用”。
         mamba_block_size_is_set = (
                 self.cache_config.mamba_block_size is not None
                 and self.cache_config.mamba_block_size != self.model_config.max_model_len
         )
+        # 自定义 mamba_block_size 依赖 prefix caching，因此两者必须一起开启。
         if mamba_block_size_is_set and not self.cache_config.enable_prefix_caching:
             raise ValueError(
                 "--mamba-block-size can only be set with --enable-prefix-caching"
             )
+        # 通过校验后返回当前对象，符合 pydantic model_validator 约定。
         return self
 
 
@@ -1880,26 +2046,37 @@ def set_current_cfie_config(
     以便所有模块都能访问，例如 custom op
     可据此决定分发逻辑。
     """
+    # 需要修改模块级全局状态，因此显式声明 global。
     global _current_cfie_config, _current_prefix
+    # 先保存旧的配置上下文，方便 finally 恢复。
     old_cfie_config = _current_cfie_config
+    # 同时保存旧的层名前缀上下文。
     old_prefix = _current_prefix
+    # 延迟导入 compilation_counter，避免常规路径的额外开销。
     from cfie.compilation.counter import compilation_counter
 
+    # 记录进入上下文前，已经注册过多少个可编译模型。
     num_models_seen = compilation_counter.num_models_seen
     try:
         # 上下文变化时清理 compilation config 缓存。
         # 因为旧配置可能在新配置设置前已被访问并缓存。
         get_cached_compilation_config.cache_clear()
 
+        # 写入当前上下文的 CfieConfig。
         _current_cfie_config = cfie_config
+        # 写入当前层名前缀。
         _current_prefix = prefix
+        # 把控制权交给 with 语句块内部代码。
         yield
     except Exception:
+        # 异常路径不做吞掉处理，原样向上抛出。
         raise
     else:
+        # 若要求检查 compile/custom op 日志，则在正常退出后执行。
         if check_compile:
             cfie_config.compilation_config.custom_op_log_check()
 
+        # 若启用了 compile 但模型计数未增加，说明模型未真正支持 torch.compile。
         if (
                 check_compile
                 and cfie_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
@@ -1916,7 +2093,9 @@ def set_current_cfie_config(
                 cfie_config.model_config.model,
             )
     finally:
+        # 恢复进入上下文前的 CfieConfig。
         _current_cfie_config = old_cfie_config
+        # 恢复进入上下文前的前缀。
         _current_prefix = old_prefix
         # 上下文变化时清理 compilation config 缓存
         get_cached_compilation_config.cache_clear()
@@ -1925,11 +2104,13 @@ def set_current_cfie_config(
 @lru_cache(maxsize=1)
 def get_cached_compilation_config():
     """缓存配置，避免重复调用 get_current_cfie_config()。"""
+    # 当前上下文不变时，直接复用同一份 compilation_config。
     return get_current_cfie_config().compilation_config
 
 
 def get_current_cfie_config() -> CfieConfig:
     """获取当前上下文中的 vLLM 配置；若未设置则抛出异常。"""
+    # 未进入 set_current_cfie_config 上下文时，这里视为编程错误。
     if _current_cfie_config is None:
         raise AssertionError(
             "Current vLLM config is not set. This typically means "
@@ -1939,11 +2120,13 @@ def get_current_cfie_config() -> CfieConfig:
             "For tests that directly test custom ops/modules, use the "
             "'default_cfie_config' pytest fixture from tests/conftest.py."
         )
+    # 返回当前线程共享的全局 CfieConfig。
     return _current_cfie_config
 
 
 def get_current_cfie_config_or_none() -> CfieConfig | None:
     """获取当前 vLLM 配置；若不存在则返回 None。"""
+    # 允许调用方显式处理“当前没有配置上下文”的情况。
     return _current_cfie_config
 
 
@@ -1964,14 +2147,20 @@ def get_layers_from_cfie_config(
         layer_names：要获取的层名列表。若为 None，则返回所有层。
     """
 
+    # 未指定 layer_names 时，默认遍历 static_forward_context 中的所有层名。
     if layer_names is None:
         layer_names = list(cfie_config.compilation_config.static_forward_context.keys())
 
+    # 取出静态 forward 上下文，里面缓存了层名到层对象的映射。
     forward_context = cfie_config.compilation_config.static_forward_context
 
+    # 返回“名字存在且类型匹配”的层对象字典。
     return {
+        # 用层名作为返回字典的 key。
         layer_name: forward_context[layer_name]
+        # 遍历调用方指定或默认展开得到的层名列表。
         for layer_name in layer_names
+        # 同时要求该层已存在于上下文，且实例类型满足 layer_type。
         if layer_name in forward_context
            and isinstance(forward_context[layer_name], layer_type)
     }

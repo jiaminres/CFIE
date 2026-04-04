@@ -11,6 +11,7 @@ from cfie.logger import init_logger
 
 logger = init_logger(__name__)
 
+# KV cache 可选存储 dtype。
 CacheDType = Literal[
     "auto",
     "bfloat16",
@@ -20,9 +21,13 @@ CacheDType = Literal[
     "fp8_inc",
     "fp8_ds_mla",
 ]
+# Mamba cache 可选 dtype。
 MambaDType = Literal["auto", "float32", "float16"]
+# Mamba cache 策略。
 MambaCacheMode = Literal["all", "align", "none"]
+# prefix caching 使用的哈希算法。
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
+# KV offloading backend 类型。
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -30,13 +35,17 @@ KVOffloadingBackend = Literal["native", "lmcache"]
 class CacheConfig:
     """Configuration for the KV cache."""
 
+    # 未显式指定 block_size 时使用的默认块大小。
     DEFAULT_BLOCK_SIZE: ClassVar[int] = 16
 
+    # KV block 大小；允许先传 None，构造后会在 validator 中补默认值。
     block_size: SkipValidation[int] = None  # type: ignore[assignment]
     """Size of a contiguous cache block in number of tokens.
     Accepts None (meaning "use default"). After construction, always int."""
+    # 记录 block_size 是否由用户显式指定。
     user_specified_block_size: bool = field(default=False, init=False)
     """Whether block_size was explicitly provided. Derived automatically."""
+    # 当前实例最多允许使用的 GPU 显存比例。
     gpu_memory_utilization: float = Field(default=0.9, gt=0, le=1)
     """The fraction of GPU memory to be used for the model executor, which can
     range from 0 to 1. For example, a value of 0.5 would imply 50% GPU memory
@@ -45,6 +54,7 @@ class CacheConfig:
     not matter if you have another vLLM instance running on the same GPU. For
     example, if you have two vLLM instances running on the same GPU, you can
     set the GPU memory utilization to 0.5 for each instance."""
+    # KV cache 的存储 dtype。
     cache_dtype: CacheDType = "auto"
     """Data type for kv cache storage. If "auto", will use model data type.
     CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
@@ -53,17 +63,22 @@ class CacheConfig:
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
     """
+    # 是否是 attention-free 模型。
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
+    # 测试场景下手工覆盖 GPU block 数。
     num_gpu_blocks_override: int | None = None
     """Number of GPU blocks to use. This overrides the profiled `num_gpu_blocks`
     if specified. Does nothing if `None`. Used for testing preemption."""
+    # sliding window 大小。
     sliding_window: int | None = None
     """Sliding window size for the KV cache. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
+    # 是否启用 prefix caching。
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    # prefix caching 的哈希算法。
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:\n
     - "sha256" uses Pickle for object serialization before hashing. This is the
@@ -81,27 +96,34 @@ class CacheConfig:
     benefits before turning this on.\n
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
     reproducible hashing. Requires the optional ``xxhash`` package."""
+    # fp8 KV cache 时是否动态计算 k/v scale。
     calculate_kv_scales: bool = False
     """This enables dynamic calculation of `k_scale` and `v_scale` when
     kv_cache_dtype is fp8. If `False`, the scales will be loaded from the model
     checkpoint if available. Otherwise, the scales will default to 1.0."""
+    # CPU backend 使用的 CPU KV cache 总空间。
     cpu_kvcache_space_bytes: int | None = None
     """(CPU backend only) CPU key-value cache space."""
+    # hybrid mamba/attention 模型下的 mamba page size 覆写值。
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
+    # Mamba cache block 大小。
     mamba_block_size: int | None = Field(default=None, gt=0)
     """Size of a contiguous cache block in number of tokens for mamba cache.
     Can be set only when prefix caching is enabled.
     Value must be a multiple of 8 to align with causal_conv1d kernel."""
+    # conv + ssm 共享的 Mamba cache dtype。
     mamba_cache_dtype: MambaDType = "auto"
     """The data type to use for the Mamba cache (both the conv as well as the
     ssm state). If set to 'auto', the data type will be inferred from the model
     config."""
+    # 仅 ssm state 的 Mamba cache dtype。
     mamba_ssm_cache_dtype: MambaDType = "auto"
     """The data type to use for the Mamba cache (ssm state only, conv state will
     still be controlled by mamba_cache_dtype). If set to 'auto', the data type
     for the ssm state will be determined by mamba_cache_dtype."""
+    # Mamba cache 策略。
     mamba_cache_mode: MambaCacheMode = "none"
     """The cache strategy for Mamba layers.
     - "none": set when prefix caching is disabled.
@@ -113,11 +135,14 @@ class CacheConfig:
     """
 
     # Will be set after profiling.
+    # profile 完成后得到的 GPU block 数。
     num_gpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for GPU memory."""
+    # profile 完成后得到的 CPU block 数。
     num_cpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for CPU memory."""
 
+    # 当前仍在开发中的 fast prefill 共享 KV 开关。
     kv_sharing_fast_prefill: bool = False
     """This feature is work in progress and no prefill optimization takes place
     with this flag enabled currently.
@@ -128,6 +153,7 @@ class CacheConfig:
     necessary for implementing this optimization in some models (e.g. Gemma3n)
     """
 
+    # 手工指定每张 GPU 上 KV cache 总字节数。
     kv_cache_memory_bytes: int | None = None
     """Size of KV Cache per GPU in bytes. By default, this is set to None
     and cfie can automatically infer the kv cache size based on
@@ -137,12 +163,14 @@ class CacheConfig:
     gpu_memory_utilization. Note that kv_cache_memory_bytes
     (when not-None) ignores gpu_memory_utilization"""
 
+    # KV offloading buffer 大小，单位 GiB。
     kv_offloading_size: float | None = None
     """Size of the KV cache offloading buffer in GiB. When TP > 1, this is
     the total buffer size summed across all TP ranks. By default, this is set
     to None, which means no KV offloading is enabled. When set, vLLM will
     enable KV cache offloading to CPU using the kv_offloading_backend."""
 
+    # KV cache offloading 的底层后端。
     kv_offloading_backend: KVOffloadingBackend = "native"
     """The backend to use for KV cache offloading. Supported backends include
     'native' (vLLM native CPU offloading), 'lmcache'.
@@ -160,6 +188,7 @@ class CacheConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
+        # 这些字段只影响运行时预算或派生值，不影响编译图结构。
         ignored_factors = {
             # Runtime/derived knobs that don't affect compiled graph shape
             "gpu_memory_utilization",
@@ -180,33 +209,40 @@ class CacheConfig:
 
         from cfie.config.utils import get_hash_factors, hash_factors
 
+        # 对其余字段做哈希，供 compilation cache 区分不同 KV/cache 配置。
         factors = get_hash_factors(self, ignored_factors)
         return hash_factors(factors)
 
     def metrics_info(self):
+        # 把 cache_config 全部字段转成字符串字典，供 Prometheus 指标导出。
         # convert cache_config to dict(key: str, value: str) for prometheus
         # metrics info
         return {key: str(value) for key, value in self.__dict__.items()}
 
+    # 防止嵌套 pydantic 场景下重复执行 block_size 默认值逻辑。
     _block_size_resolved: bool = field(default=False, init=False)
     """Guard against pydantic re-running _apply_block_size_default."""
 
     @model_validator(mode="after")
     def _apply_block_size_default(self) -> "CacheConfig":
+        # ----------------- 统一处理 block_size 的默认值与“是否用户指定”标记 -----------------
         # Pydantic re-runs validators when CacheConfig is nested inside
         # another pydantic model (e.g. CfieConfig). Guard against that.
         if self._block_size_resolved:
             return self
         object.__setattr__(self, "_block_size_resolved", True)
+        # 未指定时补 DEFAULT_BLOCK_SIZE。
         if self.block_size is None:
             object.__setattr__(self, "block_size", self.DEFAULT_BLOCK_SIZE)
         else:
+            # 否则记下这是用户显式指定的 block_size。
             object.__setattr__(self, "user_specified_block_size", True)
         return self
 
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+        # fp8 KV cache 会降低显存占用，但可能引入精度损失，因此这里主动打提示日志。
         if cache_dtype.startswith("fp8"):
             logger.info(
                 "Using fp8 data type to store kv cache. It reduces the GPU "
@@ -214,4 +250,5 @@ class CacheConfig:
                 "Meanwhile, it may cause accuracy drop without a proper "
                 "scaling factor."
             )
+        # 返回归一化后的 cache_dtype。
         return cache_dtype

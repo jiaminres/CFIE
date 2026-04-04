@@ -9,6 +9,7 @@ from pydantic import Field, field_validator
 from cfie.config.utils import config
 from cfie.utils.hashing import safe_hash
 
+# MoE kernel backend 的可选枚举。
 MoEBackend = Literal[
     "auto",
     "triton",
@@ -26,9 +27,11 @@ MoEBackend = Literal[
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
+    # 是否在 warmup 阶段执行 FlashInfer autotune。
     enable_flashinfer_autotune: bool = Field(default=None)
     """If True, run FlashInfer autotuning during kernel warmup."""
 
+    # 选择 routed experts 计算所使用的 MoE kernel backend。
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
 
@@ -45,8 +48,10 @@ class KernelConfig:
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
+        # 字符串形式统一转成小写并把短横线替换成下划线。
         if isinstance(value, str):
             return value.lower().replace("-", "_")
+        # 非字符串值保持原样，交给 pydantic 后续处理。
         return value
 
     def compute_hash(self) -> str:
@@ -63,14 +68,19 @@ class KernelConfig:
         """
         # no factors to consider.
         # this config will not affect the computation graph.
+        # 当前 kernel config 不参与图结构哈希，只保留空 factors。
         factors: list[Any] = []
+        # 基于空 factors 计算稳定哈希。
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
+        # 返回最终哈希字符串。
         return hash_str
 
     @field_validator("enable_flashinfer_autotune", mode="wrap")
     @classmethod
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
         """Skip validation if the value is `None` when initialization is delayed."""
+        # 延迟初始化阶段允许字段暂时保持 None。
         if value is None:
             return value
+        # 否则继续走 pydantic 原有校验逻辑。
         return handler(value)

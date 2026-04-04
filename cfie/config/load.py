@@ -23,6 +23,7 @@ logger = init_logger(__name__)
 class LoadConfig:
     """Configuration for loading the model weights."""
 
+    # 权重加载格式。
     load_format: str | LoadFormats = "auto"
     """The format of the model weights to load:\n
     - "auto" will try to load the weights in the safetensors format and fall
@@ -51,9 +52,11 @@ class LoadConfig:
     - "mistral" will load weights from consolidated safetensors files used by
     Mistral models.\n
     - Other custom values can be supported via plugins."""
+    # 本地下载目录；为空时使用 Hugging Face 默认缓存目录。
     download_dir: str | None = None
     """Directory to download and load the weights, default to the default
     cache directory of Hugging Face."""
+    # safetensors 的读取策略。
     safetensors_load_strategy: str = "lazy"
     """Specifies the loading strategy for safetensors weights.
     - "lazy" (default): Weights are memory-mapped from the file. This enables
@@ -67,18 +70,23 @@ class LoadConfig:
       was quantized using torchao and saved using safetensors.
       Needs torchao >= 0.14.0
     """
+    # 传给具体 loader 的附加参数。
     model_loader_extra_config: dict | TensorizerConfig = Field(default_factory=dict)
     """Extra config for model loader. This will be passed to the model loader
     corresponding to the chosen load_format."""
+    # 权重首先加载到哪个 device；为空则继承 device_config.device。
     device: str | None = None
     """Device to which model weights will be loaded, default to
     device_config.device"""
+    # 下载/加载时需要忽略的文件模式。
     ignore_patterns: list[str] | str = Field(default_factory=lambda: ["original/**/*"])
     """The list of patterns to ignore when loading the model. Default to
     "original/**/*" to avoid repeated loading of llama's checkpoints."""
+    # 加载权重时是否显示 tqdm 进度条。
     use_tqdm_on_load: bool = True
     """Whether to enable tqdm for showing progress bar when loading model
     weights."""
+    # PyTorch checkpoint 的 map_location 配置。
     pt_load_map_location: str | dict[str, str] = "cpu"
     """
     pt_load_map_location: the map location for loading pytorch checkpoint, to
@@ -105,21 +113,25 @@ class LoadConfig:
         # no factors to consider.
         # this config will not affect the computation graph.
         factors: list[Any] = []
+        # load_config 只影响加载路径，不影响计算图，因此哈希固定由空 factors 推导。
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
     @field_validator("load_format", mode="after")
     def _lowercase_load_format(cls, load_format: str) -> str:
+        # 统一把 load_format 归一化成小写，减少大小写歧义。
         return load_format.lower()
 
     @field_validator("ignore_patterns", mode="after")
     def _validate_ignore_patterns(
         cls, ignore_patterns: list[str] | str
     ) -> list[str] | str:
+        # 若用户自定义了 ignore_patterns，则在启动日志中打印出来。
         if ignore_patterns != ["original/**/*"] and len(ignore_patterns) > 0:
             logger.info(
                 "Ignoring the following patterns when downloading weights: %s",
                 ignore_patterns,
             )
 
+        # 返回校验后的 ignore_patterns。
         return ignore_patterns
