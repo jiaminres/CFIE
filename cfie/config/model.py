@@ -1675,11 +1675,11 @@ class ModelConfig:
 
     @property
     def is_chunked_prefill_supported(self) -> bool:
-        # 先根据当前模型推导出的注意力类型做判断。
+        # 根据模型的注意力类型与任务形态，给 EngineArgs 提供默认 chunked prefill 能力。
         attn_type = self.attn_type
 
         if pooler_config := self.pooler_config:
-            # for pooling models
+            # ----------------- pooling 模型能力判定 -----------------
             if attn_type == "encoder_only":
                 logger.debug(
                     "Pooling models with bidirectional attn "
@@ -1688,7 +1688,7 @@ class ModelConfig:
                 return False
 
             if attn_type == "decoder":
-                # 对 causal pooling 模型，部分池化策略不支持 chunked prefill。
+                # causal pooling 里只有部分池化策略允许按 chunk 推进 prompt。
                 if (
                         pooler_config.seq_pooling_type in ("MEAN", "CLS")
                         or pooler_config.tok_pooling_type == "STEP"
@@ -1710,12 +1710,10 @@ class ModelConfig:
                     )
                     return True
 
-            # cfie currently does not have pooling models using hybrid,
-            # attention_free or encoder_decoder attn types.
-            # 目前除 encoder_decoder 外，其余 pooling 注意力类型都放行。
+            # 当前除 encoder-decoder 外，其余 pooling 注意力类型默认都放行。
             return attn_type != "encoder_decoder"
         else:
-            # for generative models
+            # ----------------- 生成模型能力判定 -----------------
             if attn_type == "encoder_decoder":
                 # 生成式 encoder-decoder 模型不支持 chunked prefill。
                 logger.debug("Encoder decoder models do not support chunked prefill.")

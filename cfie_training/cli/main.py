@@ -220,12 +220,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional predictor trace dataset JSON used instead of recapturing traces.",
     )
-    predictor_train_parser.add_argument(
+    predictor_train_checkpoint_group = (
+        predictor_train_parser.add_mutually_exclusive_group()
+    )
+    predictor_train_checkpoint_group.add_argument(
         "--init-from-checkpoint",
-        "--resume-checkpoint",
-        dest="init_from_checkpoint",
         type=Path,
-        help="Optional predictor checkpoint used to initialize model weights before training.",
+        help="Optional predictor checkpoint used only to initialize model weights before training.",
+    )
+    predictor_train_checkpoint_group.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        help="Optional predictor checkpoint used to resume model and optimizer state for continued training.",
     )
     predictor_train_parser.add_argument(
         "--checkpoint-output",
@@ -812,18 +818,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "predictor-train":
         # 先构造 predictor 训练器。
         trainer = PredictorTrainer(config)
-        # 预留可选的 checkpoint 初始化模型。
+        # 预留可选的 checkpoint 初始化 / 续训状态。
         model = None
+        optimizer_state_dict = None
+        initial_run_trace = None
         if args.init_from_checkpoint is not None:
             # 若显式提供 checkpoint，则先加载其模型权重。
             model, _ = trainer.load_checkpoint(args.init_from_checkpoint)
+        if args.resume_checkpoint is not None:
+            # 若显式要求续训，则恢复模型、optimizer 与历史 run_trace。
+            model, _, initial_run_trace, optimizer_state_dict = (
+                trainer.load_training_checkpoint(args.resume_checkpoint)
+            )
         if args.trace_input is not None:
             # 有现成 trace 输入时直接读取并训练。
             dataset = PredictorTraceDataset.from_json_file(args.trace_input)
-            model, run_trace = trainer.fit_dataset(
+            model, run_trace, optimizer_state_dict = trainer.fit_dataset(
                 dataset,
                 epochs=args.epochs,
                 model=model,
+                optimizer_state_dict=optimizer_state_dict,
+                initial_run_trace=initial_run_trace,
             )
         else:
             # 否则先现场构造 trace dataset，再执行训练。
@@ -837,10 +852,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dataset_format=args.dataset_format,
                 dataset_text_key=args.dataset_text_key,
             )
-            model, run_trace = trainer.fit_dataset(
+            model, run_trace, optimizer_state_dict = trainer.fit_dataset(
                 dataset,
                 epochs=args.epochs,
                 model=model,
+                optimizer_state_dict=optimizer_state_dict,
+                initial_run_trace=initial_run_trace,
             )
         # 如有要求，则保存训练后的 checkpoint。
         if args.checkpoint_output is not None:
@@ -848,6 +865,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=model,
                 run_trace=run_trace,
                 path=args.checkpoint_output,
+                optimizer_state_dict=optimizer_state_dict,
             )
         # 如有要求，则同步导出 runtime schema。
         if args.schema_output is not None:

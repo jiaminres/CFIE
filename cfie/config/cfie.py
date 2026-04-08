@@ -822,7 +822,11 @@ class CfieConfig:
                 self.load_config
             )
 
-        # 当模型配置与量化配置都齐备后，尝试为 MoE 模型注入 tiered cache plan。
+        # 当模型配置与量化配置都齐备后，尝试为当前这份 CfieConfig 注入 MoE tiered cache plan。
+        # 对 target 来说，这里就是主入口：
+        # 1. 先构建 target 自己的 plan
+        # 2. 若 spec_method=mtp，会在 plan 内部递归预估一份 reserve-only 的 draft plan
+        # 3. 真正加载 draft/MTP 模型时，再由 draft 自己那份 CfieConfig 单独重建 actual plan
         if self.model_config is not None and self.quant_config is not None:
             from cfie.offload.policy import maybe_inject_moe_tiered_cache_plan
 

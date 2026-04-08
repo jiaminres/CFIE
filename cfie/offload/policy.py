@@ -12,10 +12,13 @@ import torch
 
 from cfie.logger import init_logger
 from cfie.transformers_utils.config import get_safetensors_params_metadata
+from cfie.utils.mem_utils import split_gpu_memory_budget
 
 logger = init_logger(__name__)
 
 PLAN_KEY = "moe_tiered_cache"
+TARGET_OCCUPIED_GPU_BYTES_KEY = "moe_tiered_cache_target_occupied_gpu_bytes"
+MTP_RESERVE_MODE_KEY = "moe_tiered_cache_mtp_reserve_mode"
 GiB = 1 << 30
 DEFAULT_STAGE_BYTES = 1 * GiB
 DEFAULT_DYNAMIC_RESERVE_BYTES = 3 * GiB
@@ -74,6 +77,7 @@ class MoeTieredCachePlan:
     resident_bytes: int = 0
     shared_gpu_reserve_bytes: int = 0
     gpu_budget_bytes: int = 0
+    gpu_runtime_headroom_bytes: int = 0
     gpu_expert_budget_bytes: int = 0
     gpu_slots_per_layer: int = 0
     prefill_burst_slots: int = 0
@@ -104,6 +108,9 @@ def get_moe_tiered_cache_plan(cfie_config: Any) -> dict[str, Any] | None:
 
 
 def maybe_inject_moe_tiered_cache_plan(cfie_config: Any) -> None:
+    # ----------------- plan 注入入口 -----------------
+    # 这一步发生在 CfieConfig.__post_init__ 阶段。
+    # 对 target 来说，它既负责产出 target 自身 plan，也可能触发一轮 reserve-only 的 MTP 递归预估。
     # 从总配置对象上读取 additional_config 容器。
     additional_config = getattr(cfie_config, "additional_config", None)
     # 若 additional_config 不是字典，则没有可写入 plan 的位置，直接返回。
@@ -112,8 +119,16 @@ def maybe_inject_moe_tiered_cache_plan(cfie_config: Any) -> None:
     # 若当前配置里已经带有 plan，则不重复构建。
     if PLAN_KEY in additional_config:
         return
-    # 构建 MoE 分层缓存计划，并以字典形式注入到 additional_config 中。
-    additional_config[PLAN_KEY] = build_moe_tiered_cache_plan(cfie_config).to_dict()
+    # 构建当前配置视角下的 plan，并以字典形式注入到 additional_config 中。
+    plan = build_moe_tiered_cache_plan(cfie_config)
+    additional_config[PLAN_KEY] = plan.to_dict()
+    # target 规划完成后，额外记录其已经占据的 GPU 预算。
+    # 真正创建 draft/MTP 配置时，会把这个数字带过去，按“总预算 - target 已占”重新规划。
+    _maybe_record_target_occupied_gpu_bytes(
+        cfie_config=cfie_config,
+        additional_config=additional_config,
+        plan=plan,
+    )
 
 
 def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
@@ -162,6 +177,12 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     # 若不是当前 planner 支持的模型类型，则直接禁用。
     if planning_mode is None:
         return MoeTieredCachePlan(enabled=False, reason="model_type_not_supported")
+
+    # mtp reserve 模式只用于 target 递归预估 draft 侧 GPU 预留，不代表最终 draft 计划。
+    mtp_reserve_mode = _is_mtp_reserve_mode(cfie_config)
+
+    # 真实 draft 计划会读取 target 已占据的 GPU 预算，再按剩余空间重新分配 resident slots。
+    target_occupied_gpu_bytes = _get_target_occupied_gpu_bytes(cfie_config)
 
     # 读取模型本地目录路径；planner 只支持本地目录，不支持纯 repo id。
     model_path = getattr(model_config, "model", "")
@@ -245,9 +266,10 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
 
     # ------------------ 先做 GPU 侧预算规划，决定常驻 experts 与 prefill burst 空间 ------------------
 
-    # 估算本机在当前配置下，真正可供专家常驻使用的 GPU 预算。
-    # 已经折价"gpu_memory_utilization"
+    # 估算本机在当前配置下，静态规划部分可用的 GPU 预算。
     gpu_budget_bytes = _get_gpu_budget_bytes(cfie_config)
+    # 估算 ratio 外保留给运行时峰值的 GPU headroom。
+    gpu_runtime_headroom_bytes = _get_gpu_runtime_headroom_bytes(cfie_config)
 
     # 若算出来没有 GPU 预算，通常意味着非 CUDA 设备，直接禁用。
     if gpu_budget_bytes <= 0:
@@ -256,21 +278,32 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     # 估算 KV cache 与线性状态缓存的预算。
     kv_bytes, linear_state_bytes = _estimate_hybrid_cache_bytes(cfie_config)
 
-    # 为调度抖动、临时张量、运行时开销预留一个 dynamic 区域。
-    # dynamic_bytes = max(
-    #     DEFAULT_DYNAMIC_RESERVE_BYTES,
-    #     int(gpu_budget_bytes * 0.10),
-    # )
-    dynamic_bytes = 0
+    # 估算运行时峰值需要的动态 headroom。
+    # 这部分只做记录与日志，不再占用静态规划预算。
+    dynamic_bytes = _estimate_dynamic_reserve_bytes(
+        planning_mode=planning_mode,
+        gpu_budget_bytes=gpu_budget_bytes,
+    )
+    if dynamic_bytes > gpu_runtime_headroom_bytes:
+        logger.warning(
+            "Estimated runtime peak exceeds configured runtime headroom: "
+            "model=%s estimated_runtime_peak=%.2f GiB runtime_headroom=%.2f GiB. "
+            "Actual runtime profiling may require lowering gpu_memory_utilization.",
+            model_path,
+            dynamic_bytes / GiB,
+            gpu_runtime_headroom_bytes / GiB,
+        )
 
-    # resident_bytes 只表示“当前规划视角自身的非专家常驻内容”总共会占掉多少 GPU 内存。
-    resident_bytes = dense_bytes + kv_bytes + linear_state_bytes + dynamic_bytes
+    # resident_bytes 只表示“当前规划视角自身的静态非专家常驻内容”。
+    resident_bytes = dense_bytes + kv_bytes + linear_state_bytes
 
-    # target 线路若会同时加载 MTP draft，还需要额外为 draft 自身的 GPU 常驻占用预留空间。
-    shared_gpu_reserve_bytes = _estimate_target_shared_gpu_reserve_bytes(
+    # target 侧会为 draft reserve 预留预算；真实 draft 侧则会反向扣减 target 已占预算。
+    shared_gpu_reserve_bytes = _estimate_shared_gpu_reserve_bytes(
         cfie_config=cfie_config,
         planning_mode=planning_mode,
-    )  # 0.54G
+        mtp_reserve_mode=mtp_reserve_mode,
+        target_occupied_gpu_bytes=target_occupied_gpu_bytes,
+    )
 
     # 用总 GPU 预算减去 target 自身常驻量和共享/draft 预留量，得到理论上的专家显存预算。
     raw_gpu_expert_budget_bytes = max(
@@ -301,12 +334,13 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             f"top_k={top_k} raw_gpu_slots_per_layer={raw_gpu_slots_per_layer}. "
             "Current GPU memory allocation cannot satisfy the minimum MoE "
             "residency requirement for this model. "
-            f"gpu_budget={gpu_budget_bytes / GiB:.2f} GiB "
+            f"static_budget={gpu_budget_bytes / GiB:.2f} GiB "
+            f"runtime_headroom={gpu_runtime_headroom_bytes / GiB:.2f} GiB "
             f"resident={resident_bytes / GiB:.2f} GiB "
             f"(dense={dense_bytes / GiB:.2f} GiB "
             f"kv={kv_bytes / GiB:.2f} GiB "
-            f"linear_state={linear_state_bytes / GiB:.2f} GiB "
-            f"dynamic={dynamic_bytes / GiB:.2f} GiB) "
+            f"linear_state={linear_state_bytes / GiB:.2f} GiB) "
+            f"estimated_runtime_peak={dynamic_bytes / GiB:.2f} GiB "
             f"shared_gpu_reserve={shared_gpu_reserve_bytes / GiB:.2f} GiB "
             f"gpu_expert_budget={raw_gpu_expert_budget_bytes / GiB:.2f} GiB "
             f"required_expert_budget={required_gpu_expert_budget_bytes / GiB:.2f} GiB "
@@ -314,11 +348,9 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             f"expert_bytes_per_slot_all_layers={expert_bytes_per_slot_all_layers / GiB:.2f} GiB."
         )
 
-    # 若非固定模式下，当前原始 GPU 专家预算已能覆盖全部专家权重，则无需启用 tiered cache。
-    if (
-            planning_mode != "mtp"
-            and raw_gpu_expert_budget_bytes >= expert_bytes_total
-    ):
+    # reserve-only 的 mtp 临时计划必须保留 base_8 语义，不能在递归预估阶段直接扩成全量常驻。
+    # 除此之外，target 和真正的 draft 计划只要预算足够，都可以直接走 full residency。
+    if raw_gpu_expert_budget_bytes >= expert_bytes_total and not mtp_reserve_mode:
         return MoeTieredCachePlan(
             enabled=False,
             reason="full_gpu_residency_already_possible",
@@ -339,6 +371,7 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             resident_bytes=resident_bytes,
             shared_gpu_reserve_bytes=shared_gpu_reserve_bytes,
             gpu_budget_bytes=gpu_budget_bytes,
+            gpu_runtime_headroom_bytes=gpu_runtime_headroom_bytes,
             gpu_expert_budget_bytes=expert_bytes_total,
             gpu_slots_per_layer=num_experts,
         )
@@ -352,15 +385,30 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         raw_gpu_expert_budget_bytes,
     )
 
-    # MTP 基线固定为 8。
+    # MTP reserve-only 与 standalone mtp 仍沿用固定 base_8 resident 逻辑。
     fixed_gpu_slots_per_layer = _resolve_fixed_gpu_slots_per_layer(
         planning_mode=planning_mode,
         top_k=top_k,
         num_experts=num_experts,
+        mtp_reserve_mode=mtp_reserve_mode,
+        target_occupied_gpu_bytes=target_occupied_gpu_bytes,
     )
 
+    # 真正的 draft 计划如果拿到了 target 已占预算，就只按剩余 GPU 空间重算 resident slots，
+    # 不再沿用 reserve 阶段的 base_8，也不额外启用 burst 池。
+    if planning_mode == "mtp" and target_occupied_gpu_bytes > 0 and not mtp_reserve_mode:
+        gpu_slots_per_layer = min(
+            num_experts,
+            raw_gpu_slots_per_layer,
+        )
+        gpu_slots_per_layer = max(top_k, gpu_slots_per_layer)
+        prefill_burst_slots = 0
+        prefill_burst_bytes = 0
+        gpu_expert_budget_bytes = (
+            gpu_slots_per_layer * expert_bytes_per_slot_all_layers
+        )
     # 若当前模式要求固定 GPU slot 数，则不再额外规划 burst 池。
-    if fixed_gpu_slots_per_layer is not None:
+    elif fixed_gpu_slots_per_layer is not None:
         # 取“总专家数 / raw 能放下的数 / 固定目标值”三者最小值作为最终常驻 slot 数。
         gpu_slots_per_layer = min(
             num_experts,
@@ -563,8 +611,10 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         resident_bytes=resident_bytes,
         # 记录 target 线路为 MTP/shared draft 额外让出的 GPU 预算。
         shared_gpu_reserve_bytes=shared_gpu_reserve_bytes,
-        # 记录总 GPU 预算。
+        # 记录静态规划可用的总 GPU 预算。
         gpu_budget_bytes=gpu_budget_bytes,
+        # 记录 ratio 外留给运行时峰值的 GPU 余量。
+        gpu_runtime_headroom_bytes=gpu_runtime_headroom_bytes,
         # 记录实际分配给专家相关内容的 GPU 预算。
         gpu_expert_budget_bytes=gpu_expert_budget_bytes,
         # 记录每层最终 GPU 常驻 slot 数。
@@ -599,7 +649,9 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         "prefill_burst_slots=%d cpu_slots/layer=%d cpu_static=%.2f GiB "
         "cpu_stage=%.2f GiB "
         "cpu_total=%.2f GiB min_free=%.2f GiB shared_reserve=%.2f GiB "
-        "resident=%.2f GiB shared_gpu_reserve=%.2f GiB "
+        "static_budget=%.2f GiB runtime_headroom=%.2f GiB "
+        "resident=%.2f GiB estimated_runtime_peak=%.2f GiB "
+        "shared_gpu_reserve=%.2f GiB "
         "gpu_expert_budget=%.2f GiB nvme=%.2f GiB",
         model_path,
         plan.gpu_slots_per_layer,
@@ -610,7 +662,10 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         plan.cpu_budget_bytes / GiB,
         cpu_min_free_bytes / GiB,
         cpu_shared_reserve_bytes / GiB,
+        plan.gpu_budget_bytes / GiB,
+        plan.gpu_runtime_headroom_bytes / GiB,
         plan.resident_bytes / GiB,
+        plan.dynamic_bytes / GiB,
         plan.shared_gpu_reserve_bytes / GiB,
         plan.gpu_expert_budget_bytes / GiB,
         plan.nvme_expert_bytes / GiB,
@@ -661,9 +716,17 @@ def _resolve_fixed_gpu_slots_per_layer(
         planning_mode: str,
         top_k: int,
         num_experts: int,
+        mtp_reserve_mode: bool,
+        target_occupied_gpu_bytes: int,
 ) -> int | None:
     # 只有 MTP 路径要求固定常驻 slot 数；target 路径交给自动规划。
     if planning_mode != "mtp":
+        return None
+    # reserve-only 的临时 draft 预算必须固定在 base_8 语义上，供 target 预留共享显存。
+    if mtp_reserve_mode:
+        return min(num_experts, max(top_k, DEFAULT_MTP_BASE_GPU_SLOTS))
+    # 真正的 draft 计划若已拿到 target 占用 hint，就改为按剩余预算动态重算 resident slots。
+    if target_occupied_gpu_bytes > 0:
         return None
     # MTP 固定基线是 8，但绝不会小于 top-k，也不会超过总专家数。
     return min(num_experts, max(top_k, DEFAULT_MTP_BASE_GPU_SLOTS))
@@ -831,17 +894,52 @@ def _get_gpu_budget_bytes(cfie_config: Any) -> int:
     if not torch.cuda.is_available():
         return 0
 
-    # 获取当前使用的 GPU 设备索引
-    device_index = torch.cuda.current_device()
-
-    # 获取当前 GPU 的总显存大小（单位：字节）
-    total_memory = torch.cuda.get_device_properties(device_index).total_memory
-
-    # 从配置中读取 GPU 显存使用比例，默认值为 0.9
+    total_memory = _get_total_gpu_memory_bytes()
     gpu_util = float(getattr(cfie_config.cache_config, "gpu_memory_utilization", 0.9))
+    static_budget, _ = split_gpu_memory_budget(total_memory, gpu_util)
+    return static_budget
 
-    # 返回可用于预算的 GPU 显存大小
-    return int(total_memory * gpu_util)
+
+def _get_gpu_runtime_headroom_bytes(cfie_config: Any) -> int:
+    # 如果 CUDA 不可用，则返回 0
+    if not torch.cuda.is_available():
+        return 0
+
+    total_memory = _get_total_gpu_memory_bytes()
+    gpu_util = float(getattr(cfie_config.cache_config, "gpu_memory_utilization", 0.9))
+    _, runtime_headroom = split_gpu_memory_budget(total_memory, gpu_util)
+    return runtime_headroom
+
+
+def _get_total_gpu_memory_bytes() -> int:
+    # 获取当前使用的 GPU 设备索引。
+    device_index = torch.cuda.current_device()
+    # 获取当前 GPU 的总显存大小（单位：字节）。
+    return int(torch.cuda.get_device_properties(device_index).total_memory)
+
+
+def _estimate_dynamic_reserve_bytes(
+        *,
+        planning_mode: str,
+        gpu_budget_bytes: int,
+) -> int:
+    # ----------------- GPU runtime headroom 预留 -----------------
+    # target 视角需要给运行时额外开销留出安全余量：
+    # - CUDA allocator / workspace 抖动
+    # - GPTQ/Marlin 与 MoE 路径的运行时附加张量
+    # - profile 阶段统计到的非 KV 峰值波动
+    #
+    # 若完全不预留，这类“理论上刚好塞满”的配置很容易在真正初始化 KV cache 时
+    # 把 available_kv_cache_memory 顶成负数。
+    #
+    # 这份余量只在 target 规划视角扣一次，避免 target 与 actual draft 双重保守。
+    if planning_mode != "target" or gpu_budget_bytes <= 0:
+        return 0
+
+    return max(
+        DEFAULT_DYNAMIC_RESERVE_BYTES,
+        int(gpu_budget_bytes * 0.10),
+    )
 
 
 def _get_total_system_ram_bytes() -> int:
@@ -905,16 +1003,29 @@ def _estimate_cpu_shared_reserve_bytes(cfie_config: Any) -> int:
     return DEFAULT_CPU_SHARED_RESERVE_BYTES + configured_cpu_offload_bytes
 
 
-def _estimate_target_shared_gpu_reserve_bytes(
+def _estimate_shared_gpu_reserve_bytes(
         *,
         cfie_config: Any,
         planning_mode: str,
+        mtp_reserve_mode: bool,
+        target_occupied_gpu_bytes: int,
 ) -> int:
-    # 只有主干 target 规划才需要为同进程并存的 draft/MTP 模型让出 GPU 预算。
-    if planning_mode != "target":
-        return 0
+    # target 侧需要为 draft 预留共享显存；draft 侧则需要扣减 target 已占据的预算。
+    if planning_mode == "target":
+        return _estimate_target_shared_gpu_reserve_bytes(cfie_config=cfie_config)
+    if planning_mode == "mtp" and not mtp_reserve_mode:
+        return max(0, target_occupied_gpu_bytes)
+    return 0
 
-    # speculative_config 不存在时，说明没有额外的 draft 模型需要计入。
+
+def _estimate_target_shared_gpu_reserve_bytes(
+        *,
+        cfie_config: Any,
+) -> int:
+    # ----------------- target 侧递归预估 draft reserve -----------------
+    # 这里不是在真正加载 MTP 模型，而是在构建 target plan 时，先估算 draft/MTP 至少会吃掉多少 GPU。
+    # 该预估必须保持 reserve-only 语义，不能直接等同于最终 actual draft plan。
+    # 只有主干 target 规划才需要为同进程并存的 draft/MTP 模型让出 GPU 预算。
     speculative_config = getattr(cfie_config, "speculative_config", None)
     if speculative_config is None:
         return 0
@@ -930,10 +1041,17 @@ def _estimate_target_shared_gpu_reserve_bytes(
     # 延迟导入，避免在模块导入期引入 spec-decode 方向的循环依赖。
     from cfie.v1.spec_decode.utils import create_vllm_config_for_draft_model
 
-    # 基于 target 配置派生出一份独立的 draft CfieConfig；其 __post_init__ 会重新注入 draft plan。
-    draft_cfie_config = create_vllm_config_for_draft_model(cfie_config)
+    # reserve 预估阶段会单独派生一份 draft CfieConfig。
+    # 这份配置只负责回答“若按 base_8 估算，draft 至少会占多少 GPU”，不会被直接拿去跑模型。
+    draft_cfie_config = create_vllm_config_for_draft_model(
+        cfie_config,
+        additional_config_updates={
+            MTP_RESERVE_MODE_KEY: True,
+            TARGET_OCCUPIED_GPU_BYTES_KEY: 0,
+        },
+    )
 
-    # 优先复用 draft 配置里已经注入好的 plan，避免重复计算。
+    # draft reserve 配置在 __post_init__ 时同样会尝试注入 plan；这里优先复用它。
     draft_plan = get_moe_tiered_cache_plan(draft_cfie_config)
 
     # 若 draft 配置里还没有 plan，则立即补算一次，保证拿到真实的 GPU 占用预算。
@@ -949,6 +1067,47 @@ def _estimate_target_shared_gpu_reserve_bytes(
     )
     # 返回 target 必须让出的总 GPU 预算。
     return max(0, draft_resident_bytes + draft_gpu_expert_budget_bytes)
+
+
+def _get_target_occupied_gpu_bytes(cfie_config: Any) -> int:
+    # actual draft 计划会从 additional_config 里读取 target 已经占据的 GPU 预算。
+    # 这个值由 target plan 构建完成后回写进去，供 draft 重新规划 resident slots。
+    additional_config = getattr(cfie_config, "additional_config", None)
+    if not isinstance(additional_config, dict):
+        return 0
+    return int(additional_config.get(TARGET_OCCUPIED_GPU_BYTES_KEY, 0) or 0)
+
+
+def _is_mtp_reserve_mode(cfie_config: Any) -> bool:
+    # reserve-only 标记只在 target 递归预估 draft budget 时存在。
+    # 真正要加载 MTP 模型的 draft 配置不会带这个标记。
+    additional_config = getattr(cfie_config, "additional_config", None)
+    if not isinstance(additional_config, dict):
+        return False
+    return bool(additional_config.get(MTP_RESERVE_MODE_KEY, False))
+
+
+def _get_plan_gpu_occupied_bytes(plan: MoeTieredCachePlan) -> int:
+    # 当前计划真正占据的 GPU 预算 = 非专家常驻内容 + 专家相关 GPU 预算。
+    # 这个数字不会区分 target/draft；写回 additional_config 时由调用方决定是否采用。
+    return max(0, int(plan.resident_bytes) + int(plan.gpu_expert_budget_bytes))
+
+
+def _maybe_record_target_occupied_gpu_bytes(
+        *,
+        cfie_config: Any,
+        additional_config: dict[str, Any],
+        plan: MoeTieredCachePlan,
+) -> None:
+    # 只有 target 计划才需要把“已占 GPU 预算”回写给后续真正创建的 draft 配置。
+    # reserve-only 的临时 draft 配置不会走这条分支。
+    model_config = getattr(cfie_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if _resolve_qwen35_moe_planning_mode(hf_config) != "target":
+        return
+    additional_config[TARGET_OCCUPIED_GPU_BYTES_KEY] = _get_plan_gpu_occupied_bytes(
+        plan
+    )
 
 
 def _estimate_cpu_cache_budget_bytes(

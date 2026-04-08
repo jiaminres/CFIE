@@ -156,6 +156,21 @@ class PredictorEpochSummary:
             "recall_at_executed_budget": self.recall_at_executed_budget,
         }
 
+    @classmethod
+    # 从字典恢复单个 epoch 汇总。
+    def from_dict(cls, payload: dict[str, Any]) -> "PredictorEpochSummary":
+        # 逐字段恢复 epoch 编号、loss 与两档 recall。
+        return cls(
+            epoch_index=int(payload["epoch_index"]),
+            mean_loss=float(payload["mean_loss"]),
+            recall_at_candidate_budget=float(
+                payload["recall_at_candidate_budget"]
+            ),
+            recall_at_executed_budget=float(
+                payload["recall_at_executed_budget"]
+            ),
+        )
+
 
 @dataclass(slots=True, frozen=True)
 class PredictorTrainingRunTrace:
@@ -219,6 +234,30 @@ class PredictorTrainingRunTrace:
     def to_json(self, *, indent: int = 2) -> str:
         # 使用稳定排序键和指定缩进导出 JSON 文本。
         return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
+
+    @classmethod
+    # 从字典恢复 predictor 训练 run。
+    def from_dict(cls, payload: dict[str, Any]) -> "PredictorTrainingRunTrace":
+        # 先恢复逐 epoch 汇总列表。
+        epoch_summaries = tuple(
+            PredictorEpochSummary.from_dict(summary)
+            for summary in payload.get("epoch_summaries", [])
+        )
+        # 再恢复训练来源、预算和总 epoch 数。
+        return cls(
+            profile_name=str(payload["profile_name"]),
+            teacher_source=str(payload["teacher_source"]),
+            summary_source=str(payload["summary_source"]),
+            example_count=int(payload["example_count"]),
+            epochs=int(payload["epochs"]),
+            candidate_experts_per_layer=int(
+                payload["candidate_experts_per_layer"]
+            ),
+            executed_experts_per_layer=int(
+                payload["executed_experts_per_layer"]
+            ),
+            epoch_summaries=epoch_summaries,
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -1164,6 +1203,25 @@ class PredictorTrainer:
         # 继续恢复为 PredictorCheckpointMetadata。
         return PredictorCheckpointMetadata.from_dict(metadata_payload)
 
+    @classmethod
+    # 只读取 predictor checkpoint 的 run_trace 部分。
+    def read_checkpoint_run_trace(
+        cls,
+        path: str | Path,
+    ) -> PredictorTrainingRunTrace | None:
+        # 先读取 checkpoint 原始载荷。
+        payload = cls._read_checkpoint_payload(path)
+        # 取出可选的 run_trace 部分。
+        run_trace_payload = payload.get("run_trace")
+        # 旧 checkpoint 没有 run_trace 时直接返回空。
+        if run_trace_payload is None:
+            return None
+        # run_trace 若存在，则必须是字典。
+        if not isinstance(run_trace_payload, dict):
+            raise ValueError("predictor checkpoint run_trace must be a dictionary")
+        # 继续恢复为 PredictorTrainingRunTrace。
+        return PredictorTrainingRunTrace.from_dict(run_trace_payload)
+
     def _checkpoint_metadata(
         self,
         run_trace: PredictorTrainingRunTrace,
@@ -1234,12 +1292,66 @@ class PredictorTrainer:
                 + ", ".join(mismatches)
             )
 
+    def _validate_resume_run_trace(
+        self,
+        run_trace: PredictorTrainingRunTrace,
+    ) -> None:
+        # 先校验 profile/source 与当前训练器一致。
+        mismatches = []
+        if run_trace.profile_name != self.config.profile_name:
+            mismatches.append("profile_name")
+        if run_trace.candidate_experts_per_layer != (
+            self.config.predictor_routing.candidate_experts_per_layer
+        ):
+            mismatches.append("candidate_experts_per_layer")
+        if run_trace.executed_experts_per_layer != (
+            self.config.predictor_routing.executed_experts_per_layer
+        ):
+            mismatches.append("executed_experts_per_layer")
+        # 若 run_trace 自身与当前配置不兼容，则拒绝作为续训起点。
+        if mismatches:
+            raise ValueError(
+                "predictor checkpoint run_trace is incompatible with current config: "
+                + ", ".join(mismatches)
+            )
+
+    def _validate_resume_dataset(
+        self,
+        dataset: PredictorTraceDataset,
+        run_trace: PredictorTrainingRunTrace,
+    ) -> None:
+        # 续训时要求数据集来源与历史 run_trace 一致。
+        mismatches = []
+        if dataset.profile_name != run_trace.profile_name:
+            mismatches.append("profile_name")
+        if dataset.teacher_source != run_trace.teacher_source:
+            mismatches.append("teacher_source")
+        if dataset.summary_source != run_trace.summary_source:
+            mismatches.append("summary_source")
+        if dataset.example_count != run_trace.example_count:
+            mismatches.append("example_count")
+        if dataset.candidate_experts_per_layer != (
+            run_trace.candidate_experts_per_layer
+        ):
+            mismatches.append("candidate_experts_per_layer")
+        if dataset.executed_experts_per_layer != (
+            run_trace.executed_experts_per_layer
+        ):
+            mismatches.append("executed_experts_per_layer")
+        # 数据集与续训起点不一致时直接报错。
+        if mismatches:
+            raise ValueError(
+                "predictor resume dataset is incompatible with checkpoint run_trace: "
+                + ", ".join(mismatches)
+            )
+
     def save_checkpoint(
         self,
         *,
         model: FutureExpertPredictor,
         run_trace: PredictorTrainingRunTrace,
         path: str | Path,
+        optimizer_state_dict: dict[str, Any] | None = None,
     ) -> PredictorCheckpointMetadata:
         # 规范化 checkpoint 路径。
         checkpoint_path = Path(path)
@@ -1248,14 +1360,16 @@ class PredictorTrainer:
         # 基于 run_trace 生成 metadata。
         metadata = self._checkpoint_metadata(run_trace)
         # 以 torch.save 写入 metadata 和 model_state_dict。
-        torch.save(
-            {
-                "checkpoint_kind": metadata.checkpoint_kind,
-                "metadata": metadata.to_dict(),
-                "model_state_dict": model.state_dict(),
-            },
-            checkpoint_path,
-        )
+        payload = {
+            "checkpoint_kind": metadata.checkpoint_kind,
+            "metadata": metadata.to_dict(),
+            "model_state_dict": model.state_dict(),
+            "run_trace": run_trace.to_dict(),
+        }
+        # 若调用方提供了优化器状态，则一并写入 checkpoint。
+        if optimizer_state_dict is not None:
+            payload["optimizer_state_dict"] = optimizer_state_dict
+        torch.save(payload, checkpoint_path)
         # 返回写入的 metadata。
         return metadata
 
@@ -1279,6 +1393,36 @@ class PredictorTrainer:
         model.load_state_dict(state_dict)
         # 返回模型和 metadata。
         return model, metadata
+
+    def load_training_checkpoint(
+        self,
+        path: str | Path,
+    ) -> tuple[
+        FutureExpertPredictor,
+        PredictorCheckpointMetadata,
+        PredictorTrainingRunTrace | None,
+        dict[str, Any] | None,
+    ]:
+        # 先读取 checkpoint 原始载荷。
+        payload = self._read_checkpoint_payload(path)
+        # 复用现有模型权重与 metadata 加载逻辑。
+        model, metadata = self.load_checkpoint(path)
+        # 再读取可选的 run_trace。
+        run_trace = self.read_checkpoint_run_trace(path)
+        if run_trace is not None:
+            # 若存在 run_trace，则校验它与当前配置兼容。
+            self._validate_resume_run_trace(run_trace)
+        # 读取可选的 optimizer 状态。
+        optimizer_state_dict = payload.get("optimizer_state_dict")
+        if optimizer_state_dict is not None and not isinstance(
+            optimizer_state_dict,
+            dict,
+        ):
+            raise ValueError(
+                "predictor checkpoint optimizer_state_dict must be a dictionary"
+            )
+        # 返回完整训练续训所需的全部状态。
+        return model, metadata, run_trace, optimizer_state_dict
 
     @classmethod
     def export_checkpoint_bundle(
@@ -1527,7 +1671,7 @@ class PredictorTrainer:
         epochs: int | None = None,
     ) -> PredictorTrainingRunTrace:
         # 复用 fit_dataset 训练，并只返回 run_trace。
-        _, run_trace = self.fit_dataset(
+        _, run_trace, _ = self.fit_dataset(
             dataset,
             epochs=epochs,
         )
@@ -1539,9 +1683,18 @@ class PredictorTrainer:
         *,
         epochs: int | None = None,
         model: FutureExpertPredictor | None = None,
-    ) -> tuple[FutureExpertPredictor, PredictorTrainingRunTrace]:
+        optimizer_state_dict: dict[str, Any] | None = None,
+        initial_run_trace: PredictorTrainingRunTrace | None = None,
+    ) -> tuple[
+        FutureExpertPredictor,
+        PredictorTrainingRunTrace,
+        dict[str, Any],
+    ]:
         # 先校验数据集兼容性。
         self._validate_dataset_compatibility(dataset)
+        # 若提供了历史 run_trace，则校验其与当前数据集可续接。
+        if initial_run_trace is not None:
+            self._validate_resume_dataset(dataset, initial_run_trace)
         # 读取 trainer 与 routing 配置。
         trainer_cfg = self.config.predictor_trainer
         routing_cfg = self.config.predictor_routing
@@ -1562,12 +1715,23 @@ class PredictorTrainer:
             lr=trainer_cfg.learning_rate,
             weight_decay=trainer_cfg.weight_decay,
         )
+        # 若 checkpoint 里带有优化器状态，则在这里恢复。
+        if optimizer_state_dict is not None:
+            optimizer.load_state_dict(optimizer_state_dict)
         # batch_size 不能超过样本总数。
         batch_size = min(trainer_cfg.batch_size, dataset.example_count)
-        # 用列表累积逐 epoch 汇总。
-        epoch_summaries: list[PredictorEpochSummary] = []
+        # 用列表累积逐 epoch 汇总，并接上历史 run_trace。
+        epoch_summaries: list[PredictorEpochSummary] = (
+            []
+            if initial_run_trace is None
+            else list(initial_run_trace.epoch_summaries)
+        )
+        # 续训时从历史已完成 epoch 数继续编号。
+        completed_epochs = 0 if initial_run_trace is None else initial_run_trace.epochs
 
-        for epoch_index in range(epochs):
+        for epoch_offset in range(epochs):
+            # 当前 epoch 编号需要接在历史 run_trace 之后。
+            epoch_index = completed_epochs + epoch_offset
             # 每个 epoch 用独立 generator 构造确定性的打乱顺序。
             generator = torch.Generator(device="cpu")
             generator.manual_seed(trainer_cfg.seed + epoch_index)
@@ -1622,15 +1786,23 @@ class PredictorTrainer:
             )
 
         # 返回训练后的模型和完整训练 run_trace。
-        return model, PredictorTrainingRunTrace(
-            profile_name=self.config.profile_name,
-            teacher_source=dataset.teacher_source,
-            summary_source=dataset.summary_source,
-            example_count=dataset.example_count,
-            epochs=epochs,
-            candidate_experts_per_layer=routing_cfg.candidate_experts_per_layer,
-            executed_experts_per_layer=routing_cfg.executed_experts_per_layer,
-            epoch_summaries=tuple(epoch_summaries),
+        return (
+            model,
+            PredictorTrainingRunTrace(
+                profile_name=self.config.profile_name,
+                teacher_source=dataset.teacher_source,
+                summary_source=dataset.summary_source,
+                example_count=dataset.example_count,
+                epochs=completed_epochs + epochs,
+                candidate_experts_per_layer=(
+                    routing_cfg.candidate_experts_per_layer
+                ),
+                executed_experts_per_layer=(
+                    routing_cfg.executed_experts_per_layer
+                ),
+                epoch_summaries=tuple(epoch_summaries),
+            ),
+            optimizer.state_dict(),
         )
 
     def train_synthetic(

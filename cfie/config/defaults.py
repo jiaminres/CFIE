@@ -12,7 +12,8 @@ DEFAULT_MAX_MODEL_LEN = 4096
 # 调度器同时运行的最大序列数；Phase 0/1 默认单序列。
 DEFAULT_MAX_NUM_SEQS = 1
 
-# 允许引擎使用的 GPU 显存占比阈值，取值范围 (0, 1]。
+# 允许静态规划部分使用的 GPU 显存占比阈值，取值范围 (0, 1]。
+# 比例外的空间保留给运行时峰值，而不是静态 KV / 权重规划。
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
 
 # 权重加载格式：

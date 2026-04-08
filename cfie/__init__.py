@@ -3,8 +3,20 @@
 from __future__ import annotations
 
 import typing
+import warnings
 
 from .version import __version__, __version_tuple__
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r"The cuda\.cudart module is deprecated.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r"The cuda\.nvrtc module is deprecated.*",
+)
 
 MODULE_ATTRS = {
     "PoolingParams": ".pooling_params:PoolingParams",
