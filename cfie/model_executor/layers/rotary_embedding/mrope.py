@@ -5,10 +5,13 @@
 import numpy as np
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 from .base import RotaryEmbeddingBase
 from .yarn_scaling_rope import YaRNScalingRotaryEmbedding, yarn_get_mscale
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -339,6 +342,12 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         key_shape = key.shape
         if positions.ndim == 2:
             assert self.mrope_section
+            if not HAS_TRITON:
+                logger.warning_once(
+                    "MRoPE Triton kernel is unavailable in the current runtime; "
+                    "falling back to the native MRoPE path."
+                )
+                return self.forward_native(positions, query, key, offsets)
 
             q, k = triton_mrope(
                 query,

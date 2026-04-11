@@ -11,11 +11,13 @@ import os
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
+logger = init_logger(__name__)
 
 
 @triton.autotune(
@@ -97,6 +99,18 @@ def l2norm_fwd(
 ):
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
+    if not HAS_TRITON:
+        logger.warning_once(
+            "FLA l2norm is falling back to the PyTorch reference path "
+            "because Triton runtime is unavailable."
+        )
+        compute_x = x.float()
+        ref_out = compute_x * torch.rsqrt(
+            compute_x.square().sum(dim=-1, keepdim=True) + eps
+        )
+        if output_dtype is None:
+            output_dtype = x.dtype
+        return ref_out.to(output_dtype).view(x_shape_og)
     # allocate output
     if output_dtype is None:
         y = torch.empty_like(x)

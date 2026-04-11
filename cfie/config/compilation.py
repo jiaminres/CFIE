@@ -5,6 +5,7 @@ import enum
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import field, fields
+from importlib.util import find_spec
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -30,6 +31,10 @@ else:
     CfieConfig = object
 
 logger = init_logger(__name__)
+
+
+def _has_triton_runtime() -> bool:
+    return find_spec("triton") is not None
 
 
 class CompilationMode(enum.IntEnum):
@@ -923,6 +928,18 @@ class CompilationConfig:
 
         if self.backend == "":
             self.backend = current_platform.get_compile_backend()
+
+        if (
+                self.mode != CompilationMode.NONE
+                and self.backend == "inductor"
+                and current_platform.is_cuda()
+                and not _has_triton_runtime()
+        ):
+            logger.warning_once(
+                "Triton is not available in the current CUDA runtime. "
+                "Falling back from the inductor compilation backend to eager."
+            )
+            self.backend = "eager"
 
     def init_backend(self, cfie_config: "CfieConfig") -> str | Callable:
         """

@@ -1767,10 +1767,18 @@ class ModelConfig:
         else:
             # for generative models
             if attn_type == "hybrid":
-                # hybrid 生成模型的 prefix caching 仍属实验状态，先禁用。
+                # hybrid 生成模型里，MoE 路径已经具备 prefix caching 所需的
+                # hybrid KV / mamba align 支持，因此默认允许开启。
+                if self.is_moe:
+                    logger.debug(
+                        "Hybrid MoE generative models support prefix caching."
+                    )
+                    return True
+
+                # 非 MoE 的 hybrid 生成模型仍维持保守默认值。
                 logger.debug(
-                    "Hybrid models do not support prefix caching since the feature "
-                    "is still experimental."
+                    "Hybrid non-MoE models do not support prefix caching since "
+                    "the feature is still experimental."
                 )
                 return False
             elif attn_type == "attention_free":

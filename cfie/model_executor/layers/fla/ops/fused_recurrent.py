@@ -10,9 +10,73 @@
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 from .op import exp
+
+logger = init_logger(__name__)
+
+
+def _fused_recurrent_gated_delta_rule_packed_decode_ref(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    HV, V, K = initial_state.shape[-3:]
+    qkv_dim = mixed_qkv.shape[1]
+    q_dim = (qkv_dim - HV * V) // 2
+    H = q_dim // K
+    hv_per_h = HV // H
+    safe_indices = ssm_state_indices.to(device=mixed_qkv.device, dtype=torch.long)
+    valid_mask = safe_indices >= 0
+    gather_indices = safe_indices.clamp_min(0)
+
+    packed_q = mixed_qkv[:, :q_dim].view(mixed_qkv.shape[0], H, K).to(torch.float32)
+    packed_k = mixed_qkv[:, q_dim: 2 * q_dim].view(mixed_qkv.shape[0], H, K).to(
+        torch.float32
+    )
+    packed_v = mixed_qkv[:, 2 * q_dim:].view(mixed_qkv.shape[0], HV, V).to(torch.float32)
+    h_indices = (
+        torch.arange(HV, device=mixed_qkv.device, dtype=torch.long) // hv_per_h
+    )
+    q = packed_q[:, h_indices, :]
+    k = packed_k[:, h_indices, :]
+    if use_qk_l2norm_in_kernel:
+        q = q / torch.sqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)
+        k = k / torch.sqrt((k * k).sum(dim=-1, keepdim=True) + 1e-6)
+    q = q * scale
+
+    h = initial_state.index_select(0, gather_indices).to(torch.float32)
+    g = -torch.exp(A_log.to(torch.float32)).view(1, HV, 1, 1) * torch.nn.functional.softplus(
+        (a.to(torch.float32) + dt_bias.to(torch.float32).view(1, HV)).view(
+            mixed_qkv.shape[0], HV, 1, 1
+        )
+    )
+    beta = torch.sigmoid(b.to(torch.float32)).view(mixed_qkv.shape[0], HV, 1)
+    h = h * torch.exp(g)
+    v = (packed_v - (h * k[:, :, None, :]).sum(dim=-1)) * beta
+    updated_h = h + v[:, :, :, None] * k[:, :, None, :]
+    out_values = (updated_h * q[:, :, None, :]).sum(dim=-1)
+
+    out[:, 0] = torch.where(
+        valid_mask.view(mixed_qkv.shape[0], 1, 1),
+        out_values.to(out.dtype),
+        torch.zeros_like(out[:, 0]),
+    )
+    initial_state.index_copy_(
+        0,
+        gather_indices,
+        updated_h.to(initial_state.dtype),
+    )
+    return out, initial_state
 
 
 @triton.heuristics(
@@ -426,6 +490,24 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     if H <= 0 or HV % H != 0:
         raise ValueError(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
+        )
+
+    if not HAS_TRITON:
+        logger.warning_once(
+            "FLA packed recurrent decode is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _fused_recurrent_gated_delta_rule_packed_decode_ref(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            out=out,
+            ssm_state_indices=ssm_state_indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
 
     BK = triton.next_power_of_2(K)

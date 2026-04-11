@@ -82,7 +82,7 @@ from cfie.triton_utils.allocation import set_triton_allocator
 from cfie.platforms import current_platform
 from cfie.sequence import IntermediateTensors
 from cfie.transformers_utils.configs import Qwen3NextConfig
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.torch_utils import direct_register_custom_op
 from cfie.v1.attention.backend import AttentionMetadata
 from cfie.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -238,14 +238,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         # 读取当前 tensor parallel world size，用于校验 TP 与 expert 数的兼容性。
         self.tp_size = get_tensor_model_parallel_world_size()
 
-        # 取出 expert parallel 的设备侧通信组，后续本地 expert 切分依赖它。
-        self.ep_group = get_ep_group().device_group
+        # Windows 单卡本地执行会走一个不初始化 torch.distributed 的
+        # GroupCoordinator 快捷路径，此时 device_group 为空，但组内 rank/world size
+        # 仍然可以从 coordinator 本身读取。
+        ep_coordinator = get_ep_group()
+        self.ep_group = ep_coordinator.device_group
 
         # 当前 rank 在 EP 组内的组内 rank。
-        self.ep_rank = get_ep_group().rank_in_group
+        self.ep_rank = ep_coordinator.rank_in_group
 
         # 当前 EP 组的 world size，也就是 expert 并行的 rank 数。
-        self.ep_size = self.ep_group.size()
+        self.ep_size = ep_coordinator.world_size
 
         # 记录模型定义的 routed experts 总数，即逻辑专家数的基础值。
         self.n_routed_experts = config.num_experts
@@ -2220,6 +2223,19 @@ def fused_gdn_gating(
     """
     batch, num_heads = a.shape
     seq_len = 1
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Qwen3Next fused GDN gating is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        x = a.to(torch.float32) + dt_bias.to(torch.float32)
+        g = (-torch.exp(A_log.to(torch.float32)) * torch.nn.functional.softplus(
+            x,
+            beta=beta,
+            threshold=threshold,
+        )).unsqueeze(0)
+        beta_output = torch.sigmoid(b.to(torch.float32)).to(b.dtype).unsqueeze(0)
+        return g, beta_output
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)

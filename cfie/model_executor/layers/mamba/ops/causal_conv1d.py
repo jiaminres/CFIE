@@ -8,8 +8,279 @@
 import numpy as np
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.attention.backends.utils import PAD_SLOT_ID
+
+logger = init_logger(__name__)
+
+
+def _apply_activation_ref(x: torch.Tensor, activation: str | None) -> torch.Tensor:
+    if activation in ["silu", "swish"]:
+        return x * torch.sigmoid(x)
+    return x
+
+
+def _resolve_cache_line(
+        cache_indices: torch.Tensor | None,
+        seq_idx: int,
+        *,
+        block_offset: int = 0,
+) -> int:
+    if cache_indices is None:
+        return seq_idx
+
+    if cache_indices.dim() == 1:
+        return int(cache_indices[seq_idx].item())
+
+    return int(cache_indices[seq_idx, block_offset].item())
+
+
+def _load_initial_history(
+        state: torch.Tensor | None,
+        history_len: int,
+        *,
+        load_initial_state: bool,
+        start_offset: int = 0,
+) -> torch.Tensor:
+    if state is None or history_len <= 0 or not load_initial_state:
+        dim = 0 if state is None else state.shape[0]
+        dtype = torch.float32 if state is None else state.dtype
+        device = None if state is None else state.device
+        return torch.zeros((dim, history_len), dtype=dtype, device=device)
+
+    history = state[:, start_offset: start_offset + history_len]
+    if history.shape[-1] == history_len:
+        return history
+
+    padded = torch.zeros(
+        (state.shape[0], history_len),
+        dtype=state.dtype,
+        device=state.device,
+    )
+    if history.numel() > 0:
+        padded[:, : history.shape[-1]] = history
+    return padded
+
+
+def _update_conv_state_ref(
+        state: torch.Tensor,
+        seq_tokens: torch.Tensor,
+        *,
+        shift_tokens: int,
+) -> torch.Tensor:
+    state_len = state.shape[-1]
+    if state_len == 0:
+        return state
+
+    shift_tokens = max(shift_tokens, 0)
+    retained_state = state[:, min(shift_tokens, state_len):]
+    updated = torch.cat([retained_state, seq_tokens], dim=-1)
+
+    if updated.shape[-1] >= state_len:
+        return updated[:, -state_len:]
+
+    padded = torch.zeros_like(state)
+    padded[:, -updated.shape[-1]:] = updated
+    return padded
+
+
+def _causal_conv1d_sequence_ref(
+        seq_tokens: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        history: torch.Tensor,
+        *,
+        activation: str | None,
+) -> torch.Tensor:
+    _, width = weight.shape
+    combined = torch.cat([history, seq_tokens], dim=-1)
+    windows = combined.unfold(dimension=-1, size=width, step=1)
+    output = (windows * weight[:, None, :]).sum(dim=-1)
+    if bias is not None:
+        output = output + bias[:, None]
+    return _apply_activation_ref(output, activation)
+
+
+def _causal_conv1d_fn_ref(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        conv_states: torch.Tensor | None,
+        query_start_loc: torch.Tensor,
+        *,
+        cache_indices: torch.Tensor | None = None,
+        has_initial_state: torch.Tensor | None = None,
+        activation: str | None = "silu",
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    _, width = weight.shape
+    history_len = width - 1
+    batch = query_start_loc.numel() - 1
+
+    for seq_idx in range(batch):
+        seq_start = int(query_start_loc[seq_idx].item())
+        seq_end = int(query_start_loc[seq_idx + 1].item())
+        if seq_end <= seq_start:
+            continue
+
+        cache_line = _resolve_cache_line(cache_indices, seq_idx)
+        if cache_line == PAD_SLOT_ID:
+            continue
+
+        state = None if conv_states is None else conv_states[cache_line]
+        load_initial_state = (
+            has_initial_state is None or bool(has_initial_state[seq_idx].item())
+        )
+        history = _load_initial_history(
+            state,
+            history_len,
+            load_initial_state=load_initial_state,
+        )
+        seq_tokens = x[:, seq_start:seq_end]
+        out[:, seq_start:seq_end] = _causal_conv1d_sequence_ref(
+            seq_tokens,
+            weight,
+            bias,
+            history,
+            activation=activation,
+        )
+
+        if conv_states is not None:
+            conv_states[cache_line] = _update_conv_state_ref(
+                conv_states[cache_line],
+                seq_tokens,
+                shift_tokens=seq_tokens.shape[-1],
+            )
+
+    return out
+
+
+def _causal_conv1d_update_ref(
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        *,
+        activation: str | None,
+        conv_state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        pad_slot_id: int = PAD_SLOT_ID,
+        block_idx_last_scheduled_token: torch.Tensor | None = None,
+        initial_state_idx: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if (
+            query_start_loc is None
+            and num_accepted_tokens is None
+            and block_idx_last_scheduled_token is None
+            and initial_state_idx is None
+            and (conv_state_indices is None or conv_state_indices.ndim == 1)
+    ):
+        if x.dim() == 2:
+            x = x.unsqueeze(-1)
+        batch, dim, seqlen = x.shape
+        history_len = weight.shape[1] - 1
+        safe_indices = (
+            torch.arange(batch, device=x.device, dtype=torch.long)
+            if conv_state_indices is None
+            else conv_state_indices.to(device=x.device, dtype=torch.long)
+        )
+        valid_mask = safe_indices >= 0
+        gather_indices = safe_indices.clamp_min(0)
+        state = conv_state.index_select(0, gather_indices)
+        history = state[:, :, :history_len]
+        combined = torch.cat([history, x], dim=-1)
+        windows = combined.unfold(dimension=-1, size=weight.shape[1], step=1)
+        out = (windows * weight.view(1, dim, 1, weight.shape[1])).sum(dim=-1)
+        if bias is not None:
+            out = out + bias.view(1, dim, 1)
+        out = _apply_activation_ref(out, activation)
+        out = out * valid_mask.view(batch, 1, 1)
+
+        updated_state = _update_conv_state_ref(
+            state.reshape(batch * dim, state.shape[-1]),
+            x.reshape(batch * dim, seqlen),
+            shift_tokens=seqlen,
+        ).reshape(batch, dim, state.shape[-1])
+        conv_state.index_copy_(0, gather_indices, updated_state)
+        return out
+
+    out = x.clone()
+    _, width = weight.shape
+    history_len = width - 1
+
+    if query_start_loc is None:
+        batch, _, _ = x.shape
+    else:
+        batch = query_start_loc.numel() - 1
+
+    for seq_idx in range(batch):
+        if query_start_loc is None:
+            seq_tokens = x[seq_idx]
+            seq_len = seq_tokens.shape[-1]
+        else:
+            seq_start = int(query_start_loc[seq_idx].item())
+            seq_end = int(query_start_loc[seq_idx + 1].item())
+            if seq_end <= seq_start:
+                continue
+            seq_tokens = x[seq_start:seq_end].transpose(0, 1).contiguous()
+            seq_len = seq_end - seq_start
+
+        input_block_offset = 0
+        if initial_state_idx is not None:
+            input_block_offset = int(initial_state_idx[seq_idx].item())
+        input_cache_line = _resolve_cache_line(
+            conv_state_indices,
+            seq_idx,
+            block_offset=input_block_offset,
+        )
+        if input_cache_line == pad_slot_id:
+            continue
+
+        output_block_offset = 0
+        if block_idx_last_scheduled_token is not None:
+            output_block_offset = int(block_idx_last_scheduled_token[seq_idx].item())
+        output_cache_line = _resolve_cache_line(
+            conv_state_indices,
+            seq_idx,
+            block_offset=output_block_offset,
+        )
+
+        state = conv_state[input_cache_line]
+        history_offset = 0
+        shift_tokens = seq_len
+        if num_accepted_tokens is not None:
+            history_offset = max(int(num_accepted_tokens[seq_idx].item()) - 1, 0)
+            shift_tokens = 1
+
+        history = _load_initial_history(
+            state,
+            history_len,
+            load_initial_state=True,
+            start_offset=history_offset,
+        )
+        seq_output = _causal_conv1d_sequence_ref(
+            seq_tokens,
+            weight,
+            bias,
+            history,
+            activation=activation,
+        )
+
+        if query_start_loc is None:
+            out[seq_idx, :, :seq_len] = seq_output
+        else:
+            out[seq_start:seq_end] = seq_output.transpose(0, 1)
+
+        if output_cache_line != pad_slot_id:
+            conv_state[output_cache_line] = _update_conv_state_ref(
+                conv_state[input_cache_line],
+                seq_tokens,
+                shift_tokens=shift_tokens,
+            )
+
+    return out
 
 
 @triton.jit()
@@ -541,6 +812,21 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Mamba causal_conv1d prefill is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _causal_conv1d_fn_ref(
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+        ).to(original_x_dtype)
     out = torch.empty_like(x)
     if metadata is not None:
         nums_dict = metadata.nums_dict
@@ -1275,6 +1561,28 @@ def causal_conv1d_update(
 
         # weight 在 width 维上要求连续
         assert weight.stride(1) == 1
+
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Mamba causal_conv1d decode is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        out = _causal_conv1d_update_ref(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation=activation,
+            conv_state_indices=conv_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=query_start_loc,
+            pad_slot_id=pad_slot_id,
+            block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+            initial_state_idx=initial_state_idx,
+        )
+        if unsqueeze:
+            out = out.squeeze(-1)
+        return out.to(original_x_dtype)
 
     # -------------------------
     # 6. 输出直接复用 x

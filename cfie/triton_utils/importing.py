@@ -80,6 +80,7 @@ class TritonPlaceholder(types.ModuleType):
         self.heuristics = self._dummy_decorator("heuristics")
         self.Config = self._dummy_decorator("Config")
         self.language = TritonLanguagePlaceholder()
+        self._allocator = None
 
     def _dummy_decorator(self, name):
         def decorator(*args, **kwargs):
@@ -88,6 +89,20 @@ class TritonPlaceholder(types.ModuleType):
             return lambda f: f
 
         return decorator
+
+    def cdiv(self, x, y):
+        return (x + y - 1) // y
+
+    def next_power_of_2(self, x):
+        if x <= 1:
+            return 1
+        return 1 << (x - 1).bit_length()
+
+    def reinterpret(self, tensor, dtype=None):
+        return tensor
+
+    def set_allocator(self, allocator):
+        self._allocator = allocator
 
 
 class TritonLanguagePlaceholder(types.ModuleType):

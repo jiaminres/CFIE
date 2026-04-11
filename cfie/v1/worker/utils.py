@@ -14,7 +14,7 @@ from cfie.model_executor.layers.attention import Attention
 from cfie.model_executor.models.interfaces import MultiModalEmbeddings
 from cfie.model_executor.models.utils import extract_layer_index
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.math_utils import largest_power_of_2_divisor
 from cfie.utils.mem_utils import (
     MemorySnapshot,
@@ -95,6 +95,7 @@ class KVBlockZeroer:
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
+        self._fallback_blocks: list[tuple[torch.Tensor, int, int]] | None = None
 
     def init_meta(
         self,
@@ -119,6 +120,7 @@ class KVBlockZeroer:
         """
         seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
+        fallback_blocks: list[tuple[torch.Tensor, int, int]] = []
         page_size_el: int | None = None
 
         for group in attn_groups_iter:
@@ -146,6 +148,7 @@ class KVBlockZeroer:
                 if dp in seen_ptrs:
                     continue
                 seen_ptrs.add(dp)
+                fallback_blocks.append((kv, block_dim, ratio))
 
                 el = kv.element_size()
                 cur_bytes = kv.stride(block_dim) * el
@@ -168,10 +171,12 @@ class KVBlockZeroer:
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
+                    assert off_bytes % 4 == 0
                     seg_addrs.append(dp + off_bytes)
 
         if not seg_addrs or page_size_el is None:
             self._meta = None
+            self._fallback_blocks = None
             return
 
         blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
@@ -188,12 +193,23 @@ class KVBlockZeroer:
             blk_size,
             len(seg_addrs),
         )
+        self._fallback_blocks = fallback_blocks
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
         seg_addrs, page_size_el, blk_size, n_segs = self._meta
+        if not HAS_TRITON:
+            logger.warning_once(
+                "KV block zeroing is falling back to the PyTorch reference "
+                "path because Triton runtime is unavailable."
+            )
+            assert self._fallback_blocks is not None
+            for kv, block_dim, ratio in self._fallback_blocks:
+                for block_id in block_ids:
+                    kv.narrow(block_dim, block_id * ratio, ratio).zero_()
+            return
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2

@@ -18,11 +18,62 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.math_utils import cdiv, next_power_of_2
 from cfie.utils.platform_utils import num_compute_units
 
 from .utils import input_guard
+
+logger = init_logger(__name__)
+
+
+def _apply_gate_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
+    if activation in ("swish", "silu"):
+        return F.silu(x)
+    if activation == "sigmoid":
+        return torch.sigmoid(x)
+    raise ValueError(f"Unsupported gating activation: {activation}")
+
+
+def layer_norm_ref(
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    upcast=True,
+    activation: str = "swish",
+):
+    dtype = x.dtype
+    weight = weight.float()
+    bias = bias.float() if bias is not None else None
+    if upcast:
+        x = x.float()
+        z = z.float() if z is not None else z
+    if z is not None and not norm_before_gate:
+        x = x * _apply_gate_activation(z, activation)
+    if group_size is None:
+        mean = x.mean(dim=-1, keepdim=True)
+        var = (x - mean).square().mean(dim=-1, keepdim=True)
+        out = (x - mean) * torch.rsqrt(var + eps) * weight
+        if bias is not None:
+            out = out + bias
+    else:
+        x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
+        mean = x_group.mean(dim=-1, keepdim=True)
+        var = (x_group - mean).square().mean(dim=-1, keepdim=True)
+        out = rearrange(
+            (x_group - mean) * torch.rsqrt(var + eps),
+            "... g d -> ... (g d)",
+        ) * weight
+        if bias is not None:
+            out = out + bias
+    if z is not None and norm_before_gate:
+        out = out * _apply_gate_activation(z, activation)
+    return out.to(dtype)
 
 
 def rms_norm_ref(
@@ -34,6 +85,7 @@ def rms_norm_ref(
     group_size=None,
     norm_before_gate=True,
     upcast=True,
+    activation: str = "swish",
 ):
     dtype = x.dtype
     weight = weight.float()
@@ -42,7 +94,7 @@ def rms_norm_ref(
         x = x.float()
         z = z.float() if z is not None else z
     if z is not None and not norm_before_gate:
-        x = x * F.silu(z)
+        x = x * _apply_gate_activation(z, activation)
     if group_size is None:
         rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
         out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
@@ -53,7 +105,7 @@ def rms_norm_ref(
         if bias is not None:
             out = out + bias
     if z is not None and norm_before_gate:
-        out *= F.silu(z)
+        out *= _apply_gate_activation(z, activation)
     return out.to(dtype)
 
 
@@ -192,6 +244,27 @@ def layer_norm_fwd(
         group_size = N
     assert N % group_size == 0
     ngroups = N // group_size
+    if not HAS_TRITON:
+        logger.warning_once(
+            "FLA layer norm is falling back to the PyTorch reference path "
+            "because Triton runtime is unavailable."
+        )
+        ref_impl = rms_norm_ref if is_rms_norm else layer_norm_ref
+        ref_out = ref_impl(
+            x,
+            weight,
+            bias,
+            z=z,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            activation=activation,
+        )
+        if out is not None:
+            out.copy_(ref_out)
+        else:
+            out = ref_out
+        return out, None, None
     assert x.stride(-1) == 1
     if z is not None:
         assert z.stride(-1) == 1

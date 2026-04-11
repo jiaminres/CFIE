@@ -1001,6 +1001,12 @@ def cfie_is_batch_invariant() -> bool:
     return VLLM_BATCH_INVARIANT
 
 
+def vllm_is_batch_invariant() -> bool:
+    # Backward-compatible alias for upstream attention backends that still
+    # import the old helper name.
+    return cfie_is_batch_invariant()
+
+
 def override_envs_for_invariance(
     attention_backend: AttentionBackendEnum | None,
 ):

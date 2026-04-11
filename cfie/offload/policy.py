@@ -32,6 +32,8 @@ DEFAULT_CPU_CACHE_BUDGET_FRACTION = 0.50
 # to consume more of the post-watermark headroom before giving up on CPU.
 DEFAULT_CPU_CACHE_BOOST_FRACTION = 0.75
 DEFAULT_MTP_BASE_GPU_SLOTS = 8
+DEFAULT_PREFILL_BURST_MIN_TOKENS = 8
+DEFAULT_PREFILL_BURST_TOKENS_PER_GPU_SLOT = 4
 
 QWEN35_MOE_MODEL_TYPE = "qwen3_5_moe"
 QWEN35_MTP_MODEL_TYPE = "qwen3_5_mtp"
@@ -305,10 +307,11 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         target_occupied_gpu_bytes=target_occupied_gpu_bytes,
     )
 
-    # 用总 GPU 预算减去 target 自身常驻量和共享/draft 预留量，得到理论上的专家显存预算。
+    # 用总 GPU 预算减去 target 自身常驻量、运行时动态峰值预留和共享/draft 预留量，
+    # 得到理论上的专家显存预算。
     raw_gpu_expert_budget_bytes = max(
         0,
-        gpu_budget_bytes - resident_bytes - shared_gpu_reserve_bytes,
+        gpu_budget_bytes - resident_bytes - dynamic_bytes - shared_gpu_reserve_bytes,
     )
 
     # 进一步把专家显存预算换算成“每层最多能常驻多少个专家 slot”。
@@ -443,6 +446,25 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         gpu_expert_budget_bytes = (
                 gpu_slots_per_layer * expert_bytes_per_slot_all_layers + prefill_burst_bytes
         )
+
+    max_num_batched_tokens = _get_max_num_batched_tokens(cfie_config)
+    if prefill_burst_slots > 0:
+        burst_min_tokens = max(
+            DEFAULT_PREFILL_BURST_MIN_TOKENS,
+            int(gpu_slots_per_layer) * DEFAULT_PREFILL_BURST_TOKENS_PER_GPU_SLOT,
+        )
+        if 0 < max_num_batched_tokens < burst_min_tokens:
+            logger.info(
+                "Disabling prefill burst pool because max_num_batched_tokens=%d "
+                "is below burst_min_tokens=%d for the current resident-slot plan.",
+                max_num_batched_tokens,
+                burst_min_tokens,
+            )
+            prefill_burst_slots = 0
+            prefill_burst_bytes = 0
+            gpu_expert_budget_bytes = (
+                int(gpu_slots_per_layer) * expert_bytes_per_slot_all_layers
+            )
 
     # ------------------ 再做 CPU 侧预算规划，决定 static experts、staging 与 NVMe spill ------------------
 
@@ -792,6 +814,13 @@ def _plan_prefill_burst_slots(
 
     # 返回“最终常驻 resident slot 数 + 最终 burst slot 数”。
     return int(resident_slots), int(burst_slots)
+
+
+def _get_max_num_batched_tokens(cfie_config: Any) -> int:
+    scheduler_config = getattr(cfie_config, "scheduler_config", None)
+    if scheduler_config is None:
+        return 0
+    return int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
 
 
 def _extract_expert_layer_prefix(param_name: str) -> str | None:

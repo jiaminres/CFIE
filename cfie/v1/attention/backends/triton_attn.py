@@ -17,6 +17,7 @@ from cfie.model_executor.layers.quantization.utils.quant_utils import (
 )
 from cfie.platforms import current_platform
 from cfie.platforms.interface import DeviceCapability
+from cfie.triton_utils import HAS_TRITON
 from cfie.utils.math_utils import next_power_of_2
 from cfie.v1.attention.backend import (
     AttentionBackend,
@@ -351,6 +352,22 @@ class TritonAttentionBackend(AttentionBackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return True
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if not HAS_TRITON:
+            return "Triton runtime not available"
+        return None
 
 
 class TritonAttentionImpl(AttentionImpl):

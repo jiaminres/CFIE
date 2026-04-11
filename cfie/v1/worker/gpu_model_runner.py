@@ -5614,6 +5614,21 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
+        if self._has_capture_unsafe_tiered_moe_cache():
+            logger.warning_once(
+                "Skipping CUDA graph memory profiling because CFIE tiered "
+                "MoE cache performs dynamic expert remapping and host-backed "
+                "expert loads that are not capture-safe yet."
+            )
+            return 0
+        if self.offload_config.uva.cpu_offload_gb > 0:
+            logger.warning_once(
+                "Skipping CUDA graph memory profiling because CPU weight "
+                "offloading requires a stable InputBatch layout during "
+                "minimal KV-cache initialization."
+            )
+            return 0
+
         with set_current_cfie_config(self.cfie_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -5713,8 +5728,27 @@ class GPUModelRunner(
 
         return int(total_estimate)
 
+    def _has_capture_unsafe_tiered_moe_cache(self) -> bool:
+        cached = getattr(self, "_capture_unsafe_tiered_moe_cache", None)
+        if cached is not None:
+            return cached
+
+        has_tiered_cache = any(
+            getattr(module, "_cfie_tiered_cache_controller", None) is not None
+            for module in self.model.modules()
+        )
+        self._capture_unsafe_tiered_moe_cache = has_tiered_cache
+        return has_tiered_cache
+
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        if self._has_capture_unsafe_tiered_moe_cache():
+            logger.warning_once(
+                "Skipping CUDA graph capture because CFIE tiered MoE cache "
+                "currently runs in eager mode while expert remapping and "
+                "host-backed loads remain capture-unsafe."
+            )
+            return 0
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "

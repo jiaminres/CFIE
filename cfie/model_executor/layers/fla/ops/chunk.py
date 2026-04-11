@@ -11,6 +11,9 @@ import warnings
 
 import torch
 
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -19,6 +22,85 @@ from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard, should_warn_on_format_mismatch
 from .wy_fast import recompute_w_u_fwd
+
+logger = init_logger(__name__)
+
+
+def _expand_qk_heads(x: torch.Tensor, target_heads: int) -> torch.Tensor:
+    if x.shape[2] == target_heads:
+        return x
+    if target_heads % x.shape[2] != 0:
+        raise ValueError(
+            f"Cannot expand {x.shape[2]} query/key heads to {target_heads} value heads."
+        )
+    return x.repeat_interleave(target_heads // x.shape[2], dim=2)
+
+
+def _chunk_gated_delta_rule_ref(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.LongTensor | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    B, T, _, K = q.shape
+    H = v.shape[2]
+    V = v.shape[-1]
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
+
+    q_work = _expand_qk_heads(q.float(), H)
+    k_work = _expand_qk_heads(k.float(), H)
+    if use_qk_l2norm_in_kernel:
+        q_work = q_work * torch.rsqrt(q_work.square().sum(dim=-1, keepdim=True) + 1e-6)
+        k_work = k_work * torch.rsqrt(k_work.square().sum(dim=-1, keepdim=True) + 1e-6)
+    v_work = v.float()
+    g_work = g.float() if g is not None else None
+    beta_work = beta.float()
+
+    output = v_work.new_empty((B, T, H, V))
+    final_state = (
+        v_work.new_empty((N, H, V, K), dtype=torch.float32)
+        if output_final_state
+        else None
+    )
+
+    if cu_seqlens is None:
+        sequence_ranges = [(seq_idx, seq_idx, 0, T) for seq_idx in range(B)]
+    else:
+        sequence_ranges = [
+            (seq_idx, 0, int(cu_seqlens[seq_idx].item()), int(cu_seqlens[seq_idx + 1].item()))
+            for seq_idx in range(N)
+        ]
+
+    for seq_idx, batch_idx, start, end in sequence_ranges:
+        state = initial_state[seq_idx].float().clone()
+        for tok_idx in range(start, end):
+            q_tok = q_work[batch_idx, tok_idx]
+            k_tok = k_work[batch_idx, tok_idx]
+            v_tok = v_work[batch_idx, tok_idx]
+            beta_tok = beta_work[batch_idx, tok_idx].unsqueeze(-1)
+
+            if g_work is not None:
+                decay = torch.exp(g_work[batch_idx, tok_idx]).unsqueeze(-1).unsqueeze(-1)
+                state = state * decay
+
+            delta_v = v_tok - torch.matmul(state, k_tok.unsqueeze(-1)).squeeze(-1)
+            delta_v = delta_v * beta_tok
+            state = state + delta_v.unsqueeze(-1) * k_tok.unsqueeze(-2)
+
+            output[batch_idx, tok_idx] = torch.matmul(
+                state, q_tok.unsqueeze(-1)
+            ).squeeze(-1) * scale
+
+        if final_state is not None:
+            final_state[seq_idx] = state
+
+    return output.to(q.dtype), final_state
 
 
 def chunk_gated_delta_rule_fwd(
@@ -204,6 +286,23 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if not HAS_TRITON:
+        logger.warning_once(
+            "FLA chunk gated delta rule is falling back to the PyTorch "
+            "recurrent reference path because Triton runtime is unavailable."
+        )
+        return _chunk_gated_delta_rule_ref(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,

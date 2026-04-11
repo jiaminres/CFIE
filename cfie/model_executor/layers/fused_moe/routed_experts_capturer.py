@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import tempfile
@@ -13,6 +12,11 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from multiprocessing import shared_memory
 from unittest.mock import patch
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 import numpy as np
 import torch
@@ -38,11 +42,22 @@ _global_experts_reader: RoutedExpertsReader | None = None
 def _file_lock(lock_file: str, mode: str = "wb+") -> Generator[None, None, None]:
     """Context manager for file-based locking."""
     with open(lock_file, mode) as fp:
-        fcntl.flock(fp, fcntl.LOCK_EX)
+        fp.seek(0)
+        fp.write(b"\0")
+        fp.flush()
+        fp.seek(0)
+        if os.name == "nt":
+            msvcrt.locking(fp.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(fp, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(fp, fcntl.LOCK_UN)
+            fp.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fp, fcntl.LOCK_UN)
 
 
 def _create_or_attach_shared_memory(

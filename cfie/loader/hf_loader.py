@@ -115,8 +115,31 @@ class HFModelLoader(BaseModelLoader):
                 "please provide an explicit architecture override")
         return str(architectures[0])
 
-    def _resolve_native_model_cls(self, architecture: str) -> type[nn.Module] | None:
-        model_cls, _ = ModelRegistry.resolve_model_cls([architecture])
+    def _resolve_native_model_cls(
+        self,
+        architecture: str,
+        model_config: ModelConfig,
+    ) -> type[nn.Module] | None:
+        if not hasattr(model_config, "model_impl"):
+            logger.info(
+                "model_config type %s does not expose vLLM model registry "
+                "fields; using HF loader path for arch=%s",
+                type(model_config).__name__,
+                architecture,
+            )
+            return None
+        try:
+            model_cls, _ = ModelRegistry.resolve_model_cls(
+                [architecture],
+                model_config,
+            )
+        except (RuntimeError, ValueError):
+            logger.info(
+                "no built-in model implementation resolved for arch=%s; "
+                "falling back to HF loader path",
+                architecture,
+            )
+            return None
         return model_cls
 
     def _copy_weights_into_model(self, model: nn.Module,
@@ -230,7 +253,7 @@ class HFModelLoader(BaseModelLoader):
         hf_config = self._load_hf_config(model_dir, load_config)
         arch = self._resolve_primary_arch(hf_config)
 
-        native_cls = self._resolve_native_model_cls(arch)
+        native_cls = self._resolve_native_model_cls(arch, model_config)
         backend = "hf_fallback_missing_native"
         model: nn.Module
 

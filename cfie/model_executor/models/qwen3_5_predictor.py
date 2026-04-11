@@ -23,6 +23,7 @@ from cfie.predictor import (
     PredictorCandidatePlan,
     PredictorCandidatePlanner,
     PredictorOnlineExpertState,
+    PredictorObservedRoutingTracker,
     PredictorParameterBucket,
     PredictorRuntimeSchema,
     bucketize_module_parameters,
@@ -65,6 +66,12 @@ class PredictorRuntimeState:
     parameter_bucket: PredictorParameterBucket | None = None
     online_expert_states: dict[int, PredictorOnlineExpertState] = field(
         default_factory=dict
+    )
+    observed_online_expert_states: dict[int, PredictorOnlineExpertState] = field(
+        default_factory=dict
+    )
+    observed_routing_tracker: PredictorObservedRoutingTracker = field(
+        default_factory=PredictorObservedRoutingTracker
     )
 
     @property
@@ -118,10 +125,48 @@ class PredictorRuntimeState:
             self,
             layer_index: int,
     ) -> PredictorOnlineExpertState | None:
+        return self.online_expert_states.get(
+            int(layer_index)
+        ) or self.observed_online_expert_states.get(int(layer_index))
+
+    def get_explicit_online_expert_state(
+            self,
+            layer_index: int,
+    ) -> PredictorOnlineExpertState | None:
         return self.online_expert_states.get(int(layer_index))
+
+    def get_observed_online_expert_state(
+            self,
+            layer_index: int,
+    ) -> PredictorOnlineExpertState | None:
+        return self.observed_online_expert_states.get(int(layer_index))
 
     def clear_online_expert_states(self) -> None:
         self.online_expert_states.clear()
+
+    def clear_observed_online_expert_states(self) -> None:
+        self.observed_online_expert_states.clear()
+
+    def reset_observed_online_expert_step(self) -> None:
+        self.observed_routing_tracker.start_step()
+
+    def observe_routed_experts(
+            self,
+            *,
+            layer_index: int,
+            expert_ids: torch.Tensor,
+    ) -> None:
+        self.observed_routing_tracker.observe(
+            layer_index=layer_index,
+            expert_ids=expert_ids,
+        )
+
+    def commit_observed_online_expert_states(self) -> None:
+        self.observed_online_expert_states = (
+            self.observed_routing_tracker.finalize_step(
+                hot_budget=self.schema.candidate_experts_per_layer,
+            )
+        )
 
 
 @dataclass(slots=True)
@@ -232,6 +277,19 @@ class Qwen3_5PredictorSparseMoeBlock(Qwen3NextSparseMoeBlock):
         self.experts.routing_method_type = self.experts.router.routing_method_type
         self.experts.runner = self.experts._init_runner()
 
+    def _record_observed_routing(
+            self,
+            *,
+            routed_expert_ids: torch.Tensor,
+    ) -> None:
+        runtime_state = self.predictor_runtime
+        if runtime_state is None:
+            return
+        runtime_state.observe_routed_experts(
+            layer_index=self.layer_id,
+            expert_ids=routed_expert_ids,
+        )
+
     def _predictor_custom_routing_function(
             self,
             hidden_states: torch.Tensor,
@@ -244,11 +302,13 @@ class Qwen3_5PredictorSparseMoeBlock(Qwen3NextSparseMoeBlock):
         active_state = self.active_layer_plan
         runtime_state = self.predictor_runtime
         if active_state is None or runtime_state is None:
-            return self._default_topk_routing(
+            topk_weights, topk_ids = self._default_topk_routing(
                 gating_output,
                 topk=topk,
                 renormalize=renormalize,
             )
+            self._record_observed_routing(routed_expert_ids=topk_ids)
+            return topk_weights, topk_ids
 
         candidate_ids = tuple(
             expert_id
@@ -276,11 +336,13 @@ class Qwen3_5PredictorSparseMoeBlock(Qwen3NextSparseMoeBlock):
 
         if candidate_index.numel() < topk:
             if runtime_state.schema.allow_candidate_mismatch:
-                return self._default_topk_routing(
+                topk_weights, topk_ids = self._default_topk_routing(
                     gating_output,
                     topk=topk,
                     renormalize=renormalize,
                 )
+                self._record_observed_routing(routed_expert_ids=topk_ids)
+                return topk_weights, topk_ids
             raise RuntimeError(
                 "predictor candidate pool is smaller than model top-k "
                 f"for layer {active_state.layer_plan.future_layer_index}: "
@@ -290,11 +352,13 @@ class Qwen3_5PredictorSparseMoeBlock(Qwen3NextSparseMoeBlock):
         masked_logits = torch.full_like(gating_output, float("-inf"))
         masked_logits[:, candidate_index] = gating_output[:, candidate_index]
 
-        return self._default_topk_routing(
+        topk_weights, topk_ids = self._default_topk_routing(
             masked_logits,
             topk=topk,
             renormalize=renormalize,
         )
+        self._record_observed_routing(routed_expert_ids=topk_ids)
+        return topk_weights, topk_ids
 
     def bind_predictor_runtime(
             self,
@@ -491,25 +555,30 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
             self,
             *,
             insertion_layer_index: int,
-    ) -> tuple[PredictorOnlineExpertState | None, bool]:
+    ) -> tuple[PredictorOnlineExpertState | None, str | None]:
         runtime_state = self.predictor_runtime
         if runtime_state is not None:
-            bound_online_state = runtime_state.get_online_expert_state(
+            bound_online_state = runtime_state.get_explicit_online_expert_state(
                 insertion_layer_index
             )
             if bound_online_state is not None:
-                return bound_online_state, True
+                return bound_online_state, "explicit_runtime_state"
+            observed_online_state = runtime_state.get_observed_online_expert_state(
+                insertion_layer_index
+            )
+            if observed_online_state is not None:
+                return observed_online_state, "observed_runtime_state"
         layer = self._predictor_decoder_layer(layer_index=insertion_layer_index)
         if layer is None:
-            return None, False
+            return None, None
         logical_replica_count = layer.mlp.experts.eplb_state.logical_replica_count
         if logical_replica_count is None:
-            return None, False
+            return None, None
         return (
             PredictorOnlineExpertState.from_logical_replica_count(
                 logical_replica_count,
             ),
-            False,
+            "eplb_logical_replica_count",
         )
 
     def _current_layer_online_expert_summary(
@@ -517,16 +586,17 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
             *,
             insertion_layer_index: int,
     ) -> tuple[float, ...]:
-        online_expert_state, is_explicit_runtime_state = (
+        online_expert_state, online_state_source = (
             self._resolve_online_expert_state(
                 insertion_layer_index=insertion_layer_index
             )
         )
         if online_expert_state is None:
-            return (0.0,) * 22
+            return (0.0,) * 23
         return (
-            float(is_explicit_runtime_state),
-            float(not is_explicit_runtime_state),
+            float(online_state_source == "explicit_runtime_state"),
+            float(online_state_source == "observed_runtime_state"),
+            float(online_state_source == "eplb_logical_replica_count"),
             *online_expert_state.summary_stats(),
         )
 
@@ -678,6 +748,8 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
 
     def reset_predictor_forward_state(self) -> None:
         self.predictor_forward_state.reset()
+        if self.predictor_runtime is not None:
+            self.predictor_runtime.reset_observed_online_expert_step()
         for layer in self.layers:
             if isinstance(layer, Qwen3_5PredictorDecoderLayer):
                 layer.bind_active_layer_plan(None)
@@ -792,6 +864,8 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
                 layer.bind_active_online_expert_state(None)
 
         if not get_pp_group().is_last_rank:
+            if self.predictor_runtime is not None:
+                self.predictor_runtime.commit_observed_online_expert_states()
             output_tensors: dict[str, torch.Tensor | object] = {
                 "hidden_states": hidden_states,
                 "residual": residual,
@@ -806,6 +880,8 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
             return IntermediateTensors(
                 output_tensors
             )
+        if self.predictor_runtime is not None:
+            self.predictor_runtime.commit_observed_online_expert_states()
         hidden_states, _ = self.norm(hidden_states, residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
@@ -873,6 +949,10 @@ class Qwen3_5MoePredictorForCausalLM(Qwen3_5MoeForCausalLM):
         if self.predictor_runtime is not None:
             self.predictor_runtime.clear_online_expert_states()
 
+    def clear_observed_predictor_online_expert_states(self) -> None:
+        if self.predictor_runtime is not None:
+            self.predictor_runtime.clear_observed_online_expert_states()
+
     def load_predictor_runtime(
             self,
             *,
@@ -923,3 +1003,28 @@ class Qwen3_5MoePredictorForConditionalGeneration(
             cfie_config=cfie_config,
             prefix=prefix,
         )
+
+    def bind_predictor_online_expert_state(
+            self,
+            *,
+            layer_index: int,
+            online_expert_state: PredictorOnlineExpertState | None,
+    ) -> None:
+        self.language_model.bind_predictor_online_expert_state(
+            layer_index=layer_index,
+            online_expert_state=online_expert_state,
+        )
+
+    def bind_predictor_online_expert_states(
+            self,
+            online_expert_states: dict[int, PredictorOnlineExpertState | None],
+    ) -> None:
+        self.language_model.bind_predictor_online_expert_states(
+            online_expert_states
+        )
+
+    def clear_predictor_online_expert_states(self) -> None:
+        self.language_model.clear_predictor_online_expert_states()
+
+    def clear_observed_predictor_online_expert_states(self) -> None:
+        self.language_model.clear_observed_predictor_online_expert_states()

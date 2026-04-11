@@ -3,6 +3,7 @@
 
 import math
 from importlib.util import find_spec
+from typing import Callable
 
 import torch
 
@@ -11,6 +12,55 @@ from cfie.model_executor.custom_op import CustomOp
 from cfie.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+_cfie_flash_attn_apply_rotary_emb: Callable | None = None
+_cfie_flash_attn_rotary_unavailable = False
+
+
+def _is_optional_cfie_flash_attn_import_error(exc: BaseException) -> bool:
+    module_name = getattr(exc, "name", None)
+    if isinstance(module_name, str) and module_name.startswith("triton"):
+        return True
+
+    return (
+        "cfie.cfie_flash_attn requires the CUDA flash attention extensions"
+        in str(exc)
+    )
+
+
+def _get_cfie_flash_attn_apply_rotary_emb() -> Callable | None:
+    global _cfie_flash_attn_apply_rotary_emb
+    global _cfie_flash_attn_rotary_unavailable
+
+    if _cfie_flash_attn_apply_rotary_emb is not None:
+        return _cfie_flash_attn_apply_rotary_emb
+
+    if _cfie_flash_attn_rotary_unavailable:
+        return None
+
+    if find_spec("triton") is None:
+        _cfie_flash_attn_rotary_unavailable = True
+        logger.warning_once(
+            "cfie_flash_attn rotary is unavailable because Triton is not "
+            "installed; falling back to the native rotary embedding path."
+        )
+        return None
+
+    try:
+        from cfie.cfie_flash_attn.layers.rotary import apply_rotary_emb
+    except (ImportError, ModuleNotFoundError) as exc:
+        if not _is_optional_cfie_flash_attn_import_error(exc):
+            raise
+
+        _cfie_flash_attn_rotary_unavailable = True
+        logger.warning_once(
+            "cfie_flash_attn rotary is unavailable in the current runtime; "
+            "falling back to the native rotary embedding path."
+        )
+        return None
+
+    _cfie_flash_attn_apply_rotary_emb = apply_rotary_emb
+    return _cfie_flash_attn_apply_rotary_emb
 
 
 # common functions
@@ -297,8 +347,11 @@ class ApplyRotaryEmb(CustomOp):
         cos: torch.Tensor, # [seq_len_rotary, rotary_dim / 2]
         sin: torch.Tensor, # [seq_len_rotary, rotary_dim / 2]
     ) -> torch.Tensor:
-        # CUDA 路径使用 cfie_flash_attn 中的 rotary 实现
-        from cfie.cfie_flash_attn.layers.rotary import apply_rotary_emb
+        # CUDA 路径优先使用 cfie_flash_attn rotary；
+        # 若当前运行时没有 Triton 或 flash attention 扩展，则回退到共享的原生实现。
+        apply_rotary_emb = _get_cfie_flash_attn_apply_rotary_emb()
+        if apply_rotary_emb is None:
+            return self.forward_native(x, cos, sin)
 
         # 统一输入形状与 dtype
         x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)

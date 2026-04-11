@@ -145,6 +145,9 @@ def _maybe_force_spawn():
     elif xpu_is_initialized():
         reasons.append("XPU is initialized")
 
+    if os.name == "nt":
+        reasons.append("Windows does not support fork")
+
     if in_wsl():
         reasons.append("WSL is detected and NVML is not compatible with fork")
 

@@ -15,6 +15,7 @@ from cfie.predictor.parameter_bucket import (
     bucketize_module_parameters,
 )
 from cfie.predictor.online_state import PredictorOnlineExpertState
+from cfie.predictor.online_state import PredictorObservedRoutingTracker
 from cfie.predictor.planner import (
     CandidateLayerPlan,
     PredictorCandidatePlan,
@@ -32,6 +33,7 @@ __all__ = [
     "PredictorParameterViewSpec",
     "PredictorMetricsSummary",
     "PredictorOnlineExpertState",
+    "PredictorObservedRoutingTracker",
     "PredictorRuntimeSchema",
     "bucketize_module_parameters",
     "load_predictor_bundle",

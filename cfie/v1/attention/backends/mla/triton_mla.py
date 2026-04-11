@@ -16,6 +16,7 @@ from cfie.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
 )
 from cfie.platforms.interface import DeviceCapability
+from cfie.triton_utils import HAS_TRITON
 from cfie.v1.attention.backend import (
     AttentionLayer,
     AttentionType,
@@ -61,6 +62,22 @@ class TritonMLABackend(MLACommonBackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return True
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if not HAS_TRITON:
+            return "Triton runtime not available"
+        return None
 
 
 class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):

@@ -1,5 +1,13 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = [
+    "cmake>=3.26.1",
+    "ninja",
+    "packaging>=24.2",
+    "setuptools>=77.0.3,<81.0.0",
+    "torch == 2.10.0",
+    "wheel",
+    "jinja2>=3.1.6",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +15,7 @@ name = "cfie"
 version = "0.1.0"
 description = "Capacity-First Inference Engine (CFIE)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = []
 
 [project.scripts]
@@ -18,6 +26,6 @@ cfie-train = "cfie_training.cli.main:main"
 include = ["cfie*", "cfie_training*", "vllm*"]
 
 [tool.setuptools.package-data]
-"cfie" = ["*.so", "*.abi3.so"]
-"cfie.cfie_flash_attn" = ["*.so", "*.abi3.so"]
-"cfie.vllm_flash_attn" = ["*.so", "*.abi3.so"]
+"cfie" = ["*.so", "*.abi3.so", "*.pyd", "*.dll"]
+"cfie.cfie_flash_attn" = ["*.so", "*.abi3.so", "*.pyd", "*.dll"]
+"cfie.vllm_flash_attn" = ["*.so", "*.abi3.so", "*.pyd", "*.dll"]

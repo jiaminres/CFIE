@@ -45,6 +45,20 @@ logger = init_logger(__name__)
 _R = TypeVar("_R", default=Any)
 
 
+def _should_enable_v1_multiprocessing(
+        cfie_config: CfieConfig,
+        *,
+        requested: bool,
+) -> bool:
+    parallel_config = cfie_config.parallel_config
+    # 多 rank 场景必须保留 multiprocessing 路径；单 rank 再允许走本地直通。
+    requires_multiprocessing = (
+        parallel_config.world_size > 1
+        or parallel_config.data_parallel_size > 1
+    )
+    return requested or requires_multiprocessing
+
+
 class LLMEngine:
     """Legacy LLMEngine for backwards compatibility."""
 
@@ -180,7 +194,10 @@ class LLMEngine:
             log_stats=(not disable_log_stats),
             usage_context=usage_context,
             stat_loggers=stat_loggers,
-            multiprocess_mode=envs.VLLM_ENABLE_V1_MULTIPROCESSING,
+            multiprocess_mode=_should_enable_v1_multiprocessing(
+                cfie_config,
+                requested=envs.VLLM_ENABLE_V1_MULTIPROCESSING,
+            ),
         )
 
     @classmethod
@@ -203,6 +220,10 @@ class LLMEngine:
         if envs.VLLM_ENABLE_V1_MULTIPROCESSING:
             logger.debug("Enabling multiprocessing for LLMEngine.")
             enable_multiprocessing = True
+        enable_multiprocessing = _should_enable_v1_multiprocessing(
+            cfie_config,
+            requested=enable_multiprocessing,
+        )
 
         # 用最终配置实例化高层引擎对象。
         return cls(
