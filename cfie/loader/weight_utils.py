@@ -52,20 +52,34 @@ def filter_files_not_needed_for_inference(weight_files: list[str]) -> list[str]:
     ]
 
 
+import os
+from pathlib import Path
+
 def filter_duplicate_safetensors_files(
     weight_files: list[str],
     model_dir: str,
     index_filename: str = "model.safetensors.index.json",
 ) -> list[str]:
-    """按 index 文件过滤重复或无关 safetensors 分片。"""
+    """根据 safetensors 索引文件过滤重复或无关的分片文件。"""
 
     del index_filename
     weight_map = load_safetensor_index(model_dir)
     if not weight_map:
         return sorted(weight_files)
 
-    allowed = {str(Path(model_dir) / shard_name) for shard_name in weight_map.values()}
-    filtered = [path for path in weight_files if path in allowed]
+    def normalize_path(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path))
+
+    allowed = {
+        normalize_path(str(Path(model_dir) / shard_name))
+        for shard_name in weight_map.values()
+    }
+
+    filtered = [
+        path
+        for path in weight_files
+        if normalize_path(path) in allowed
+    ]
     return sorted(filtered)
 
 

@@ -195,12 +195,23 @@ class ApplyRotaryEmb(CustomOp):
         # 先默认没有 flash_attn 的 rotary 实现
         self.apply_rotary_emb_flash_attn = None
 
-        # 如果当前环境安装了 flash_attn，就导入其中的 Triton rotary 实现
+        # 如果当前环境安装了可用的 flash_attn，就导入其中的 Triton rotary 实现。
+        # 这里必须真的尝试 import，而不能只看 find_spec：
+        # 某些源码树（例如 .deps/vllm-flash-attn-src）会让 find_spec 命中，
+        # 但其底层 CUDA 扩展并未真正编译好，继续导入反而会在启动期崩溃。
         if find_spec("flash_attn") is not None:
-            from flash_attn.ops.triton.rotary import apply_rotary
-
-            # 保存 flash_attn 提供的 apply_rotary 函数
-            self.apply_rotary_emb_flash_attn = apply_rotary
+            try:
+                from flash_attn.ops.triton.rotary import apply_rotary
+            except (ImportError, ModuleNotFoundError, OSError) as exc:
+                logger.info_once(
+                    "flash_attn rotary backend is unavailable, falling back to "
+                    "the CFIE rotary path: %s",
+                    exc,
+                    scope="local",
+                )
+            else:
+                # 保存 flash_attn 提供的 apply_rotary 函数
+                self.apply_rotary_emb_flash_attn = apply_rotary
 
     @staticmethod
     def forward_static(

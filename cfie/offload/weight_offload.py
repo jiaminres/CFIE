@@ -47,6 +47,10 @@ class _RawExpertWeights:
     w13_qzeros: torch.Tensor
     # 量化专家在 CPU staging/raw buffer 中重新拼装后的 w2 qzeros。
     w2_qzeros: torch.Tensor
+    # desc_act=True 时，gate/up 路径还需要保留排序前的 g_idx。
+    w13_g_idx: torch.Tensor | None = None
+    # desc_act=True 时，down_proj 路径还需要保留排序前的 g_idx。
+    w2_g_idx: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -68,171 +72,246 @@ class _PrefillBurstExecutionStats:
 
 
 class _PrefillBurstExecutionLayer:
-    """Lightweight layer proxy bound to the shared prefill burst tensors."""
+    """绑定到共享 prefill burst 临时张量上的轻量代理层。"""
 
     def __init__(
-        self,
-        base_layer: FusedMoE,
-        target: Any,
-        expert_map: torch.Tensor,
-        num_slots: int,
+            self,
+            base_layer: FusedMoE,
+            target: Any,
+            expert_map: torch.Tensor,
+            num_slots: int,
     ) -> None:
-        # target 是共享 burst pool 本身，里面持有真正的临时执行张量。
+        # ------------------------------- 保存共享 burst pool 对象并完成首次绑定 -------------------------------
+        # 记录共享 burst pool 本体，后续执行时会直接从这里读取临时执行张量。
         self._target = target
-        # 初始化时立即把 proxy 绑定到当前 layer 和专家映射上。
+
+        # 使用当前基础层、专家映射表和槽位数完成代理层的首次绑定。
         self.bind(base_layer, expert_map, num_slots)
 
     def bind(
-        self,
-        base_layer: FusedMoE,
-        expert_map: torch.Tensor,
-        num_slots: int,
+            self,
+            base_layer: FusedMoE,
+            expert_map: torch.Tensor,
+            num_slots: int,
     ) -> None:
-        # 保存真实的基础层，用于把其它属性透传回原始 FusedMoE。
+        # ------------------------------- 绑定基础层与当前 burst expert 映射关系 -------------------------------
+        # 保存真实的基础 FusedMoE 层，后续未显式覆盖的属性会统一透传给它。
         self._base_layer = base_layer
-        # 用 burst pool 自己的 expert_map 覆盖原层的 resident expert_map。
+
+        # 使用当前 burst pool 的 expert 映射表覆盖原始层上的 resident expert 映射。
         self._expert_map = expert_map
-        # local_num_experts 改成 burst pool 的临时 slot 数。
+
+        # 将当前代理层的本地专家数量改写为 burst pool 的临时槽位数。
         self.local_num_experts = num_slots
-        # global_num_experts 保持和原始层一致，方便 router/topk_ids 继续工作。
+
+        # 保持全局专家数量与原始层一致，确保 router 和 top-k expert id 的语义不变。
         self.global_num_experts = base_layer.global_num_experts
-        # 量化路径下，把执行时读取的权重张量全部改绑到 burst pool 的临时张量。
+
+        # ------------------------------- 在量化路径下把执行权重张量重定向到 burst pool -------------------------------
+        # 当共享目标对象上存在量化权重张量时，说明当前工作在量化执行路径下。
         if hasattr(self._target, "w13_qweight"):
+            # 将 w13 量化权重重定向到 burst pool 的临时张量。
             self.w13_qweight = self._target.w13_qweight
+
+            # 将 w2 量化权重重定向到 burst pool 的临时张量。
             self.w2_qweight = self._target.w2_qweight
+
+            # 将 w13 的 scale 张量重定向到 burst pool 的临时张量。
             self.w13_scales = self._target.w13_scales
+
+            # 将 w2 的 scale 张量重定向到 burst pool 的临时张量。
             self.w2_scales = self._target.w2_scales
+
+            # 将 w13 的 qzeros 张量重定向到 burst pool 的临时张量。
             self.w13_qzeros = self._target.w13_qzeros
+
+            # 将 w2 的 qzeros 张量重定向到 burst pool 的临时张量。
             self.w2_qzeros = self._target.w2_qzeros
+
+            # 将 w13 的 g_idx 张量重定向到 burst pool 的临时张量。
             self.w13_g_idx = self._target.w13_g_idx
+
+            # 将 w2 的 g_idx 张量重定向到 burst pool 的临时张量。
             self.w2_g_idx = self._target.w2_g_idx
+
+            # 将 w13 的 g_idx_sort_indices 张量重定向到 burst pool 的临时张量。
             self.w13_g_idx_sort_indices = self._target.w13_g_idx_sort_indices
+
+            # 将 w2 的 g_idx_sort_indices 张量重定向到 burst pool 的临时张量。
             self.w2_g_idx_sort_indices = self._target.w2_g_idx_sort_indices
-            # 某些通用路径通过 w13_weight/w2_weight 访问权重，这里也别名到量化张量上。
+
+            # 某些通用执行路径会通过 w13_weight 访问权重，这里把它别名到量化权重张量上。
             self.w13_weight = self._target.w13_qweight
+
+            # 某些通用执行路径会通过 w2_weight 访问权重，这里把它别名到量化权重张量上。
             self.w2_weight = self._target.w2_qweight
         else:
-            # 非量化路径则直接改绑到 burst pool 的 dense 权重张量。
+            # ------------------------------- 在非量化路径下把执行权重张量重定向到 burst pool -------------------------------
+            # 将 w13 dense 权重重定向到 burst pool 的临时张量。
             self.w13_weight = self._target.w13_weight
+
+            # 将 w2 dense 权重重定向到 burst pool 的临时张量。
             self.w2_weight = self._target.w2_weight
 
     @property
     def expert_map(self) -> torch.Tensor:
-        # 运行时执行 kernel 时读取的是 burst pool 的临时专家映射。
+        # ------------------------------- 返回当前 burst pool 使用的临时 expert 映射表 -------------------------------
+        # 运行时 kernel 读取的 expert_map 应当来自当前 burst pool 的临时映射表。
         return self._expert_map
 
     def __getattr__(self, name: str) -> Any:
-        # 其余配置/超参统一回退到原始 FusedMoE 层上。
+        # ------------------------------- 将未显式覆盖的属性统一透传给原始 FusedMoE 层 -------------------------------
+        # 当代理层自身没有该属性时，回退到原始基础层上继续查找。
         return getattr(self._base_layer, name)
 
 
 class SharedPrefillBurstPool:
-    """Shared single-layer execution buffer for large prefill MoE batches."""
+    """用于大 prefill MoE batch 的共享单层临时执行缓冲池。"""
 
     def __init__(self, template_layer: FusedMoE, num_slots: int) -> None:
-        # burst pool 至少要有 1 个临时 slot，否则没有意义。
+        # ------------------------------- 校验 burst pool 槽位数并初始化基础元数据 -------------------------------
+        # 共享 prefill burst pool 至少需要 1 个临时槽位，否则没有实际意义。
         if num_slots <= 0:
             raise ValueError("Shared prefill burst pool requires a positive slot count")
 
-        # 记录 burst pool 的临时 slot 容量。
+        # 记录当前 burst pool 可容纳的临时槽位数量。
         self.num_slots = int(num_slots)
-        # 全局专家数要与模板层一致，便于沿用相同的 topk expert id。
+
+        # 记录模板层对应的全局专家总数，后续复用同一套全局 expert id 语义。
         self.global_num_experts = template_layer.global_num_experts
-        # 记录模板层名，仅用于日志输出。
+
+        # 记录模板层名称，主要用于日志输出与调试定位。
         self.layer_name = template_layer.layer_name
-        # 共享池一次只允许一个 layer/request 使用，避免被并发覆盖。
+
+        # 共享池同一时刻只允许一个 layer 或 request 使用，防止临时张量被并发覆盖。
         self._busy = False
 
-        # ----------------- 按量化模式分配临时执行张量 -----------------
-        # GPTQ Marlin 路径需要为所有量化权重与辅助索引都分配一份 burst 张量。
+        # ------------------------------- 按模板层的量化模式分配临时执行张量 -------------------------------
+        # 当模板层采用 GPTQ Marlin 量化路径时，需要为量化权重、scale 与辅助索引都准备 burst 张量。
         if isinstance(template_layer.quant_method, GPTQMarlinMoEMethod):
+            # 记录当前 burst pool 工作在 GPTQ Marlin 模式下。
             self._mode = "gptq_marlin"
+
+            # 为 w13 量化权重分配按 slot 组织的临时张量。
             self.w13_qweight = torch.empty(
                 (self.num_slots, *template_layer.w13_qweight.shape[1:]),
                 dtype=template_layer.w13_qweight.dtype,
                 device=template_layer.w13_qweight.device,
             )
+
+            # 为 w2 量化权重分配按 slot 组织的临时张量。
             self.w2_qweight = torch.empty(
                 (self.num_slots, *template_layer.w2_qweight.shape[1:]),
                 dtype=template_layer.w2_qweight.dtype,
                 device=template_layer.w2_qweight.device,
             )
+
+            # 为 w13 的 scale 张量分配按 slot 组织的临时张量。
             self.w13_scales = torch.empty(
                 (self.num_slots, *template_layer.w13_scales.shape[1:]),
                 dtype=template_layer.w13_scales.dtype,
                 device=template_layer.w13_scales.device,
             )
+
+            # 为 w2 的 scale 张量分配按 slot 组织的临时张量。
             self.w2_scales = torch.empty(
                 (self.num_slots, *template_layer.w2_scales.shape[1:]),
                 dtype=template_layer.w2_scales.dtype,
                 device=template_layer.w2_scales.device,
             )
+
+            # 为 w13 的 qzeros 张量分配按 slot 组织的临时张量。
             self.w13_qzeros = torch.empty(
                 (self.num_slots, *template_layer.w13_qzeros.shape[1:]),
                 dtype=template_layer.w13_qzeros.dtype,
                 device=template_layer.w13_qzeros.device,
             )
+
+            # 为 w2 的 qzeros 张量分配按 slot 组织的临时张量。
             self.w2_qzeros = torch.empty(
                 (self.num_slots, *template_layer.w2_qzeros.shape[1:]),
                 dtype=template_layer.w2_qzeros.dtype,
                 device=template_layer.w2_qzeros.device,
             )
+
+            # 为 w13 的 g_idx 张量分配按 slot 组织的临时张量。
             self.w13_g_idx = torch.empty(
                 (self.num_slots, *template_layer.w13_g_idx.shape[1:]),
                 dtype=template_layer.w13_g_idx.dtype,
                 device=template_layer.w13_g_idx.device,
             )
+
+            # 为 w2 的 g_idx 张量分配按 slot 组织的临时张量。
             self.w2_g_idx = torch.empty(
                 (self.num_slots, *template_layer.w2_g_idx.shape[1:]),
                 dtype=template_layer.w2_g_idx.dtype,
                 device=template_layer.w2_g_idx.device,
             )
+
+            # 为 w13 的 g_idx_sort_indices 张量分配按 slot 组织的临时张量。
             self.w13_g_idx_sort_indices = torch.empty(
                 (self.num_slots, *template_layer.w13_g_idx_sort_indices.shape[1:]),
                 dtype=template_layer.w13_g_idx_sort_indices.dtype,
                 device=template_layer.w13_g_idx_sort_indices.device,
             )
+
+            # 为 w2 的 g_idx_sort_indices 张量分配按 slot 组织的临时张量。
             self.w2_g_idx_sort_indices = torch.empty(
                 (self.num_slots, *template_layer.w2_g_idx_sort_indices.shape[1:]),
                 dtype=template_layer.w2_g_idx_sort_indices.dtype,
                 device=template_layer.w2_g_idx_sort_indices.device,
             )
+
+            # 记录 expert 映射表应放置的设备，沿用量化权重所在设备。
             expert_map_device = template_layer.w13_qweight.device
-        # 非量化路径只需要准备 runtime 直接消费的 w13/w2 权重。
+
+        # 当模板层采用非量化路径时，只需要准备运行时直接消费的 w13 和 w2 权重张量。
         elif isinstance(template_layer.quant_method, UnquantizedFusedMoEMethod):
+            # 记录当前 burst pool 工作在非量化模式下。
             self._mode = "unquantized"
+
+            # 为 w13 权重分配按 slot 组织的临时张量。
             self.w13_weight = torch.empty(
                 (self.num_slots, *template_layer.w13_weight.shape[1:]),
                 dtype=template_layer.w13_weight.dtype,
                 device=template_layer.w13_weight.device,
             )
+
+            # 为 w2 权重分配按 slot 组织的临时张量。
             self.w2_weight = torch.empty(
                 (self.num_slots, *template_layer.w2_weight.shape[1:]),
                 dtype=template_layer.w2_weight.dtype,
                 device=template_layer.w2_weight.device,
             )
+
+            # 记录 expert 映射表应放置的设备，沿用非量化权重所在设备。
             expert_map_device = template_layer.w13_weight.device
         else:
+            # 当前共享 burst pool 仅支持 GPTQ Marlin 和非量化两类 FusedMoE 路径。
             raise TypeError(
                 "Shared prefill burst pool only supports GPTQMarlinMoEMethod "
                 "and UnquantizedFusedMoEMethod"
             )
 
-        # 为 burst pool 单独准备一张“全局 expert -> burst slot”的映射表。
+        # ------------------------------- 构造全局 expert 到 burst slot 的映射表与执行代理层 -------------------------------
+        # 为当前共享 burst pool 准备一张“全局 expert id -> burst slot id”的映射表。
         self._expert_map = torch.full(
             (self.global_num_experts,),
             -1,
             dtype=torch.int32,
             device=expert_map_device,
         )
-        # 再构造一个轻量代理层，把 kernel 入口重定向到 burst pool 上。
+
+        # 基于模板层构造一个轻量级执行代理层，把 kernel 入口重定向到 burst pool 上。
         self._execution_layer = _PrefillBurstExecutionLayer(
             base_layer=template_layer,
             target=self,
             expert_map=self._expert_map,
             num_slots=self.num_slots,
         )
-        # 记录 burst pool 初始化完成后的占用情况。
+
+        # ------------------------------- 打印 burst pool 初始化完成日志 -------------------------------
+        # 输出当前共享 burst pool 的层名、模式、槽位数与显存占用大小。
         logger.info(
             "Initialized shared prefill burst pool: layer=%s mode=%s slots=%d bytes=%.2f MiB",
             template_layer.layer_name,
@@ -243,7 +322,8 @@ class SharedPrefillBurstPool:
 
     @property
     def nbytes(self) -> int:
-        # 量化路径需要把所有临时量化张量都纳入统计。
+        # ------------------------------- 统计当前 burst pool 的总字节占用 -------------------------------
+        # 当工作在 GPTQ Marlin 模式时，需要把所有临时量化张量都纳入统计。
         if self._mode == "gptq_marlin":
             tensors = (
                 self.w13_qweight,
@@ -258,73 +338,85 @@ class SharedPrefillBurstPool:
                 self.w2_g_idx_sort_indices,
             )
         else:
-            # 非量化路径只统计 w13/w2 两块权重张量。
+            # 当工作在非量化模式时，只统计 w13 和 w2 两块临时权重张量。
             tensors = (self.w13_weight, self.w2_weight)
-        # 逐张量按元素数 * 单元素字节数求和。
+
+        # 对所有临时张量逐个按“元素数 * 单元素字节数”求和，得到总占用字节数。
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
     def supports_layer(self, layer: FusedMoE) -> bool:
-        # 专家总数不一致时，topk expert id 语义不同，不能复用同一个 burst pool。
+        # ------------------------------- 判断当前共享 burst pool 是否可被指定层复用 -------------------------------
+        # 当目标层的全局专家总数与当前 burst pool 不一致时，说明 top-k expert id 语义不同，不能复用。
         if layer.global_num_experts != self.global_num_experts:
             return False
-        # 量化路径下，还要确保所有核心张量形状都兼容。
+
+        # 当工作在 GPTQ Marlin 模式时，需要额外校验所有核心量化张量的形状兼容性。
         if self._mode == "gptq_marlin":
             return (
-                isinstance(layer.quant_method, GPTQMarlinMoEMethod)
-                and layer.w13_qweight.shape[1:] == self.w13_qweight.shape[1:]
-                and layer.w2_qweight.shape[1:] == self.w2_qweight.shape[1:]
-                and layer.w13_scales.shape[1:] == self.w13_scales.shape[1:]
-                and layer.w2_scales.shape[1:] == self.w2_scales.shape[1:]
-                and layer.w13_qzeros.shape[1:] == self.w13_qzeros.shape[1:]
-                and layer.w2_qzeros.shape[1:] == self.w2_qzeros.shape[1:]
+                    isinstance(layer.quant_method, GPTQMarlinMoEMethod)
+                    and layer.w13_qweight.shape[1:] == self.w13_qweight.shape[1:]
+                    and layer.w2_qweight.shape[1:] == self.w2_qweight.shape[1:]
+                    and layer.w13_scales.shape[1:] == self.w13_scales.shape[1:]
+                    and layer.w2_scales.shape[1:] == self.w2_scales.shape[1:]
+                    and layer.w13_qzeros.shape[1:] == self.w13_qzeros.shape[1:]
+                    and layer.w2_qzeros.shape[1:] == self.w2_qzeros.shape[1:]
             )
-        # 非量化路径则校验 w13/w2 形状即可。
+
+        # 当工作在非量化模式时，仅需校验 w13 和 w2 权重张量的形状兼容性。
         return (
-            isinstance(layer.quant_method, UnquantizedFusedMoEMethod)
-            and layer.w13_weight.shape[1:] == self.w13_weight.shape[1:]
-            and layer.w2_weight.shape[1:] == self.w2_weight.shape[1:]
+                isinstance(layer.quant_method, UnquantizedFusedMoEMethod)
+                and layer.w13_weight.shape[1:] == self.w13_weight.shape[1:]
+                and layer.w2_weight.shape[1:] == self.w2_weight.shape[1:]
         )
 
     def execute(
-        self,
-        controller: LayerTieredExpertCacheController,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        shared_experts_input: torch.Tensor | None,
+            self,
+            controller: LayerTieredExpertCacheController,
+            x: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # 共享 burst pool 设计成串行使用，防止两个请求同时覆盖临时张量。
+        # ------------------------------- 校验共享 burst pool 当前未被占用 -------------------------------
+        # 共享 burst pool 被设计为串行使用，若当前已被占用则直接报错，防止临时张量被并发覆盖。
         if self._busy:
             raise RuntimeError(
                 f"{controller.layer_key}: shared prefill burst pool is already in use"
             )
 
-        # 先把本次请求真正涉及到的唯一 expert 集合提取出来。
+        # ------------------------------- 提取本次请求涉及的唯一 expert 集合并校验槽位容量 -------------------------------
+        # 从当前 top-k expert id 中提取去重后的唯一 expert 集合。
         requested = controller._unique_experts(topk_ids)
-        # 若本次唯一 experts 超过 burst pool 容量，则不能走 burst 路径。
+
+        # 当本次请求的唯一 expert 数超过 burst pool 槽位容量时，无法走 burst 执行路径。
         if len(requested) > self.num_slots:
             raise RuntimeError(
                 f"{controller.layer_key}: requested {len(requested)} experts but only "
                 f"{self.num_slots} burst slots are available"
             )
 
-        # ----------------- 装填 burst pool 并临时执行 -----------------
+        # ------------------------------- 装填 burst pool 并执行当前 prefill 请求 -------------------------------
+        # 标记当前共享池进入占用状态。
         self._busy = True
         try:
-            # 每次执行前先清空上一轮残留的 burst expert 映射。
+            # 每次执行前先清空上一轮残留的“全局 expert -> burst slot”映射。
             self._expert_map.fill_(-1)
-            # 按 requested experts 把 resident/CPU/NVMe 来源的数据写入 burst pool。
+
+            # 按当前请求的 expert 集合，把 resident、CPU 或 NVMe 中的数据填充到 burst pool。
             stats = controller._populate_prefill_burst_pool(self, requested)
-            # 依次登记“全局 expert -> burst slot”关系，供 quant_method.apply 使用。
+
+            # 依次登记当前请求中每个全局 expert 对应的 burst slot 编号。
             for slot, expert_id in enumerate(requested):
                 self._expert_map[expert_id] = slot
-            # 把轻量执行层重新绑定到当前控制器对应的 layer 上。
+
+            # 将轻量代理执行层重新绑定到当前控制器对应的真实 layer 上。
             self._execution_layer.bind(
                 base_layer=controller.layer,
                 expert_map=self._expert_map,
                 num_slots=self.num_slots,
             )
-            # 记录 burst 执行的数据来源命中情况。
+
+            # 打印当前 burst 执行的数据来源命中情况，包括 resident 命中、CPU 命中与 NVMe 加载次数。
             logger.info(
                 "Tiered MoE prefill burst execution: layer=%s unique=%d slots=%d "
                 "resident_hits=%d cpu_hits=%d nvme_loads=%d",
@@ -335,7 +427,8 @@ class SharedPrefillBurstPool:
                 stats.cpu_hits,
                 stats.nvme_loads,
             )
-            # 真正执行时直接把 burst proxy layer 交给量化方法。
+
+            # 通过当前控制器的量化方法，把执行入口直接重定向到 burst proxy layer 上完成实际计算。
             return controller.quant_method.apply(
                 layer=self._execution_layer,
                 x=x,
@@ -344,71 +437,103 @@ class SharedPrefillBurstPool:
                 shared_experts_input=shared_experts_input,
             )
         finally:
-            # 无论成功还是失败，都要释放共享池占用标记。
+            # ------------------------------- 释放共享 burst pool 的占用标记 -------------------------------
+            # 无论本次执行成功还是失败，都必须清除 busy 标记，允许后续请求继续复用该共享池。
             self._busy = False
 
 
 class LayerTieredExpertCacheController:
-    """Per-layer GPU/CPU/NVMe cache controller for routed experts."""
+    """Per-layer GPU/CPU tiered cache controller for routed experts."""
 
     def __init__(
-        self,
-        layer: FusedMoE,
-        plan: dict[str, Any],
-        expert_store: SafetensorExpertStore,
-        prefill_burst_pool: SharedPrefillBurstPool | None = None,
+            self,
+            layer: FusedMoE,
+            plan: dict[str, Any],
+            expert_store: SafetensorExpertStore,
+            prefill_burst_pool: SharedPrefillBurstPool | None = None,
     ) -> None:
-        # CFIE tiered cache 依赖 FusedMoE 预先建立好的全局 expert -> 本地 slot 映射表。
+        # ------------------------------- 校验当前层是否已建立全局 expert 到本地 slot 的映射 -------------------------------
+        # Tiered MoE cache 依赖 FusedMoE 预先构造好的全局 expert 到本地 slot 映射表。
         if layer._expert_map is None:
             raise ValueError("Tiered MoE cache requires a global-to-local expert map")
 
-        # ----------------- 保存控制器核心依赖 -----------------
-        # 记录当前控制器绑定的 FusedMoE 层。
+        # ------------------------------- 保存控制器绑定的核心对象与基础元数据 -------------------------------
+        # 保存当前控制器绑定的 FusedMoE 层对象。
         self.layer = layer
-        # 保存启动期规划器生成的 plan 字典。
+
+        # 保存启动期规划器生成的计划字典。
         self.plan = plan
-        # expert_store 负责从 safetensors/NVMe 读取冷专家权重。
+
+        # 保存专家存储对象，后续冷专家权重都通过它按需读取。
         self.expert_store = expert_store
-        # 共享 burst pool 用于 prefill 大批量时的临时执行路径。
+
+        # 保存共享 prefill burst pool；若存在，则可用于大 prefill batch 的临时执行路径。
         self.prefill_burst_pool = prefill_burst_pool
-        # layer_key 作为 expert_store 与日志的层级主键。
+
+        # 保存当前层的层级主键，供本地存储查询与日志输出使用。
         self.layer_key = layer.layer_name
-        # quant_method 决定写回 GPU slot 时需要的转换逻辑。
+
+        # 保存当前层对应的量化方法对象，后续用于决定权重写回与执行路径。
         self.quant_method = layer.quant_method
-        # resident GPU slot 数等于当前 FusedMoE 在 CFIE 路径下实际创建的 local experts 数。
+
+        # resident GPU slot 数等于当前 FusedMoE 层在 CFIE 路径下实际创建的本地 expert 数。
         self.num_slots = layer.local_num_experts
-        # step 用于给近似 LRU 驱逐打时间戳。
+
+        # 初始化逻辑时间步计数器，后续用于近似 LRU 驱逐时间戳。
         self._step = 0
-        # access_count 统计每个 expert 被请求的次数。
+
+        # 初始化每个全局 expert 的访问计数器。
         self._access_count = [0] * layer.global_num_experts
-        # last_used_step 记录每个 expert 最近一次命中的逻辑时间。
+
+        # 初始化每个全局 expert 最近一次命中的逻辑时间记录。
         self._last_used_step = [0] * layer.global_num_experts
-        # slot_to_global 是 resident GPU slots 的反向索引表。
+
+        # 初始化 resident GPU slot 到全局 expert 的反向映射表。
         self._slot_to_global = [-1] * self.num_slots
-        # 以下指标仅用于日志和调试统计。
+
+        # ------------------------------- 初始化运行期统计指标 -------------------------------
+        # 记录控制器累计执行过的专家加载次数。
         self._total_loads = 0
+
+        # 记录命中 CPU 常驻缓存的次数。
         self._cpu_hits = 0
+
+        # 记录实际从冷存储加载专家的次数。
         self._nvme_loads = 0
+
+        # 记录发生 expert 驱逐的次数。
         self._evictions = 0
-        # _mode 标识当前层走量化专家还是非量化专家加载链路。
+
+        # 当前控制器使用的权重模式标识，稍后会根据 quant_method 进行赋值。
         self._mode: str
-        # 若平台允许，则优先用 pinned CPU memory 作为 staging/static cache，以加快 H2D。
+
+        # ------------------------------- 初始化 CPU 侧缓存与缓冲区状态 -------------------------------
+        # 若平台支持 pinned memory，则优先使用 pinned CPU memory 以加快 H2D 传输。
         self._use_pinned_cpu = is_pin_memory_available()
-        # _cpu_static_bundles 保存已物化到 CPU 内存中的静态专家 bundle。
+
+        # 保存已物化到 CPU 常驻内存中的静态 expert bundle。
         self._cpu_static_bundles: dict[int, ExpertBundle] = {}
-        # _cpu_stage_bundle 是一块可复用的 staging 区，用于从 NVMe 读入冷专家。
+
+        # 保留旧版计划兼容字段；当前主线一般不再依赖单独的 staging bundle。
         self._cpu_stage_bundle: ExpertBundle | None = None
-        # _cpu_static_experts 记录 plan 指定的 CPU 常驻专家集合。
+
+        # 保存计划中指定的 CPU 常驻 expert 集合。
         self._cpu_static_experts: frozenset[int] = frozenset()
-        # 统计 controller 持有的所有 CPU buffer 大小，便于日志观察。
+
+        # 统计当前控制器持有的全部 CPU buffer 总字节数。
         self._cpu_buffer_bytes = 0
-        # 量化路径在 CPU 侧还需要一块 raw buffer，用于把 gate/up/down 重组回 kernel 需要的格式。
+
+        # 量化路径下用于在 CPU 侧暂存并重组原始专家权重的 raw buffer。
         self._cpu_quantized_raw_buffer: _RawExpertWeights | None = None
-        # 非量化路径也需要一块 raw buffer，用于把 gate/up/down 合成 runtime w13/w2。
+
+        # 非量化路径下用于在 CPU 侧暂存并重组原始专家权重的 raw buffer。
         self._cpu_unquantized_raw_buffer: _RawUnquantizedExpertWeights | None = None
-        # 允许通过 plan 显式覆盖 burst 的最小 token 阈值。
+
+        # ------------------------------- 计算 prefill burst 的最小 token 触发阈值 -------------------------------
+        # 优先读取计划中显式配置的 burst 最小 token 阈值。
         configured_burst_min_tokens = int(self.plan.get("prefill_burst_min_tokens", 0))
-        # 否则按“至少 8 个 token，且每个 resident slot 对应 4 个 token”的经验值计算。
+
+        # 当计划未显式配置时，按默认经验公式计算 burst 最小 token 阈值。
         self._prefill_burst_min_tokens = (
             configured_burst_min_tokens
             if configured_burst_min_tokens > 0
@@ -418,52 +543,78 @@ class LayerTieredExpertCacheController:
             )
         )
 
-        # ----------------- 识别当前层的权重模式并校验约束 -----------------
+        # ------------------------------- 根据量化方法识别当前层的权重模式并校验约束 -------------------------------
+        # 当当前层采用 GPTQ Marlin 量化方法时，进入量化 expert 动态加载路径。
         if isinstance(layer.quant_method, GPTQMarlinMoEMethod):
-            # desc_act=True 会改变 runtime 行为，当前动态加载链路未适配。
-            if layer.quant_method.quant_config.desc_act:
-                raise ValueError(
-                    "Tiered MoE cache does not support GPTQ desc_act=True"
-                )
-            # 当前实现假设激活输入仍是标准 bf16/fp16，不支持额外 input_dtype 改写。
+            # 当前实现假设输入激活仍为标准 bf16 或 fp16，不支持额外 input_dtype 改写。
             if layer.quant_method.input_dtype is not None:
                 raise ValueError(
                     "Tiered MoE cache currently expects standard bf16/fp16 activations"
                 )
-            # GPTQ Marlin 路径下，后续需要 repack/permute，所以记录相关量化超参。
+
+            # 记录当前控制器工作在 GPTQ Marlin 模式下。
             self._mode = "gptq_marlin"
+
+            # 记录 GPTQ 是否启用了 desc_act 配置，后续执行路径可按该标志决定处理分支。
+            self._gptq_desc_act = bool(layer.quant_method.quant_config.desc_act)
+
+            # 记录当前层量化权重所在的目标 GPU 设备。
             self.device = layer.w13_qweight.device
+
+            # 保存量化权重的 pack_factor 参数。
             self.pack_factor = layer.quant_method.quant_config.pack_factor
+
+            # 保存量化类型对应的 bit 数。
             self.num_bits = layer.quant_method.quant_config.quant_type.size_bits
+
+            # 保存量化 group size 参数。
             self.group_size = layer.quant_method.quant_config.group_size
+
+            # 标记当前路径不是 8bit 激活路径。
             self.is_a_8bit = False
+
+        # 当当前层采用非量化 FusedMoE 方法时，进入非量化动态加载路径。
         elif isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
-            # 当前非量化动态加载路径未实现 bias 分支。
+            # 当前非量化动态加载路径不支持带 bias 的 MoE。
             if layer.quant_method.moe.has_bias:
                 raise ValueError(
                     "Tiered MoE cache currently does not support biased unquantized MoE"
                 )
-            # 非量化路径目前只支持 Triton backend。
+
+            # 当前非量化路径仅支持 Triton backend。
             if layer.quant_method.unquantized_backend != UnquantizedMoeBackend.TRITON:
                 raise TypeError(
                     "Tiered MoE cache currently only supports TRITON unquantized MoE"
                 )
-            # 记录非量化模式与 GPU 目标设备。
+
+            # 记录当前控制器工作在非量化模式下。
             self._mode = "unquantized"
+
+            # 非量化路径下不涉及 GPTQ desc_act，显式记录为 False。
+            self._gptq_desc_act = False
+
+            # 记录当前层非量化权重所在的目标 GPU 设备。
             self.device = layer.w13_weight.device
         else:
+            # 当前控制器仅支持 GPTQ Marlin 和非量化 FusedMoE 两类路径。
             raise TypeError(
                 "Tiered MoE cache currently supports GPTQMarlinMoEMethod "
                 "and UnquantizedFusedMoEMethod only"
             )
 
-        # 根据 layer._expert_map 反推当前 resident GPU slots 里分别装着哪个全局 expert。
+        # ------------------------------- 根据 layer._expert_map 反推 resident GPU slot 的初始专家布局 -------------------------------
+        # 遍历所有全局 expert，通过 layer._expert_map 反推出当前 resident GPU slot 中实际驻留的是哪个 expert。
         for global_expert in range(layer.global_num_experts):
+            # 读取当前全局 expert 映射到的本地 slot 编号。
             slot = int(layer._expert_map[global_expert].item())
+
+            # 当 slot 编号落在当前 resident slot 范围内时，记录其反向映射关系。
             if 0 <= slot < self.num_slots:
+                # 本地slot --> 全局slot
                 self._slot_to_global[slot] = global_expert
 
-        # 初始化 CPU static experts、staging bundle 与 raw buffer。
+        # ------------------------------- 初始化 CPU 常驻 expert 池与原始权重缓冲区 -------------------------------
+        # 根据当前计划与权重模式初始化 CPU 侧固定 expert 池和原始权重缓冲区。
         self._init_cpu_fixed_pools()
 
     @property
@@ -490,18 +641,18 @@ class LayerTieredExpertCacheController:
     def can_run_prefill_burst(self, num_unique_experts: int, num_tokens: int) -> bool:
         # 只有 burst pool 存在、容量足够、token 数够大且层形状兼容时，才能走 burst。
         return (
-            self.prefill_burst_pool is not None
-            and num_unique_experts <= self.prefill_burst_pool.num_slots
-            and num_tokens >= self.prefill_burst_min_tokens
-            and self.prefill_burst_pool.supports_layer(self.layer)
+                self.prefill_burst_pool is not None
+                and num_unique_experts <= self.prefill_burst_pool.num_slots
+                and num_tokens >= self.prefill_burst_min_tokens
+                and self.prefill_burst_pool.supports_layer(self.layer)
         )
 
     def run_prefill_burst(
-        self,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        shared_experts_input: torch.Tensor | None,
+            self,
+            x: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # 没有共享 burst pool 时，说明该层不支持/未启用该执行路径。
         if self.prefill_burst_pool is None:
@@ -594,33 +745,51 @@ class LayerTieredExpertCacheController:
         )
 
     def _materialize_cpu_static_bundle(
-        self,
-        expert_id: int,
-        *,
-        eager: bool = False,
+            self,
+            expert_id: int,
+            *,
+            eager: bool = False,
     ) -> ExpertBundle | None:
-        # 非 CPU static expert 没有物化资格，直接返回 None。
+        # ------------------------------- 仅为计划指定的 CPU 常驻 expert 物化静态 bundle -------------------------------
+        # 当当前 expert 不属于 CPU 常驻 expert 集合时，直接返回 None。
         if expert_id not in self._cpu_static_experts:
             return None
 
-        # 已经物化过的 CPU bundle 直接复用。
+        # ------------------------------- 优先复用已经物化完成的 CPU 静态 bundle -------------------------------
+        # 先从 CPU 静态缓存字典中查找当前 expert 对应的 bundle。
         bundle = self._cpu_static_bundles.get(expert_id)
+
+        # 当当前 expert 的 CPU 静态 bundle 已经存在时，直接复用该 bundle。
         if bundle is not None:
             return bundle
 
-        # ----------------- 首次把 static expert 从 expert store 拉到 CPU 内存 -----------------
+        # ------------------------------- 首次从本地 expert store 物化 CPU 静态 bundle -------------------------------
+        # 为当前 expert 分配一份源 bundle，用于承接从本地存储中读取出的权重张量。
         bundle = self._allocate_source_bundle()
+
+        # 当 GPTQ 未启用 desc_act 时，g_idx 可由运行时重建，因此这里允许跳过该后缀字段。
+        skip_suffixes = ("g_idx",) if not self._gptq_desc_act else ()
+
+        # 将当前 expert 的权重从本地 expert store 拷贝到新分配的 CPU bundle 中。
         self.expert_store.copy_expert_into(
             self.layer_key,
             expert_id,
             bundle.tensors,
-            skip_suffixes=("g_idx",),
+            skip_suffixes=skip_suffixes,
         )
-        # 放入静态缓存字典，并累计 CPU 占用。
+
+        # ------------------------------- 将新物化的 bundle 注册到 CPU 静态缓存并更新占用统计 -------------------------------
+        # 将当前 expert 对应的 CPU 静态 bundle 写入缓存字典。
         self._cpu_static_bundles[expert_id] = bundle
+
+        # 将当前 bundle 的字节占用累计到 CPU buffer 总大小中。
         self._cpu_buffer_bytes += bundle.nbytes
+
+        # 统计当前已经完成物化的 CPU 静态 expert 数量。
         materialized = len(self._cpu_static_bundles)
-        # 仅在前几次或每 32 个静态专家时打日志，避免刷屏。
+
+        # ------------------------------- 在关键物化节点输出日志 -------------------------------
+        # 仅在前几个 expert 或每累计 32 个静态 expert 时输出日志，避免日志过于频繁。
         if materialized <= 8 or materialized % 32 == 0:
             logger.info(
                 "Materialized CPU static expert bundle: layer=%s expert=%d "
@@ -632,33 +801,26 @@ class LayerTieredExpertCacheController:
                 len(self._cpu_static_experts),
                 self._cpu_buffer_bytes / (1 << 20),
             )
+
+        # ------------------------------- 返回当前物化完成的 CPU 静态 bundle -------------------------------
+        # 返回当前 expert 对应的 CPU 静态 bundle。
         return bundle
 
     def _get_source_bundle(self, expert_id: int) -> tuple[ExpertBundle, str]:
         # 先尝试命中 CPU static experts。
         bundle = self._materialize_cpu_static_bundle(expert_id)
         source = "cpu_static"
-        # static 未命中时，退化成“从 NVMe 读到 staging bundle”。
         if bundle is None:
-            if self._cpu_stage_bundle is None:
-                raise RuntimeError(
-                    f"{self.layer_key}: no preallocated CPU staging buffer available "
-                    f"for expert {expert_id}"
-                )
-            # 这里不会长期保存该 expert，只是把它临时读到 staging 区。
-            self.expert_store.copy_expert_into(
-                self.layer_key,
-                expert_id,
-                self._cpu_stage_bundle.tensors,
-                skip_suffixes=("g_idx",),
+            raise RuntimeError(
+                f"{self.layer_key}: expert {expert_id} is not present in the CPU "
+                "static expert pool. Current MoE tiered cache mainline requires "
+                "initial_cpu_experts to cover every expert."
             )
-            bundle = self._cpu_stage_bundle
-            source = "nvme_stage"
         # 返回 bundle 以及来源标签，供统计与日志使用。
         return bundle, source
 
     def _load_expert_into_slot(self, expert_id: int, slot: int) -> None:
-        # 先确定该 expert 当前是从 CPU static 命中，还是走 NVMe staging 读取。
+        # 当前主线里，动态换入专家只能来自 CPU static mirror。
         bundle, source = self._get_source_bundle(expert_id)
         # 统计来源命中。
         if source == "nvme_stage":
@@ -688,9 +850,9 @@ class LayerTieredExpertCacheController:
             )
 
     def _populate_prefill_burst_pool(
-        self,
-        pool: SharedPrefillBurstPool,
-        requested: list[int],
+            self,
+            pool: SharedPrefillBurstPool,
+            requested: list[int],
     ) -> _PrefillBurstExecutionStats:
         # 统计本轮 burst pool 中不同来源的命中情况。
         stats = _PrefillBurstExecutionStats()
@@ -712,10 +874,10 @@ class LayerTieredExpertCacheController:
         return stats
 
     def _copy_resident_expert_to_target(
-        self,
-        expert_id: int,
-        slot: int,
-        target: Any,
+            self,
+            expert_id: int,
+            slot: int,
+            target: Any,
     ) -> None:
         # 通过主层的 expert_map 找到该 resident expert 当前位于哪个 GPU slot。
         src_slot = int(self.layer._expert_map[expert_id].item())
@@ -754,10 +916,33 @@ class LayerTieredExpertCacheController:
             raw = self._assemble_raw_weights(bundle)
             # 再把 raw 权重异步搬到目标 GPU 设备。
             raw_gpu = self._move_raw_weights_to_device(raw)
+            if self._gptq_desc_act:
+                if raw_gpu.w13_g_idx is None or raw_gpu.w2_g_idx is None:
+                    raise RuntimeError(
+                        f"{self.layer_key}: desc_act=True requires g_idx tensors "
+                        "during dynamic expert load"
+                    )
+                w13_g_idx_sort_indices = torch.argsort(
+                    raw_gpu.w13_g_idx, dim=-1
+                ).to(torch.int32)
+                w2_g_idx_sort_indices = torch.argsort(
+                    raw_gpu.w2_g_idx, dim=-1
+                ).to(torch.int32)
+                w13_sorted_g_idx = torch.gather(
+                    raw_gpu.w13_g_idx, -1, w13_g_idx_sort_indices
+                )
+                w2_sorted_g_idx = torch.gather(
+                    raw_gpu.w2_g_idx, -1, w2_g_idx_sort_indices
+                )
+            else:
+                w13_g_idx_sort_indices = self._empty_perm(raw_gpu.w13_qweight.device)
+                w2_g_idx_sort_indices = self._empty_perm(raw_gpu.w2_qweight.device)
+                w13_sorted_g_idx = None
+                w2_sorted_g_idx = None
             # qweight 需要重新 repack 成 Marlin MoE kernel 可直接消费的布局。
             repacked_w13 = ops.gptq_marlin_moe_repack(
                 raw_gpu.w13_qweight,
-                self._empty_perm(raw_gpu.w13_qweight.device),
+                w13_g_idx_sort_indices,
                 raw_gpu.w13_qweight.shape[1] * self.pack_factor,
                 raw_gpu.w13_qweight.shape[2],
                 self.num_bits,
@@ -766,7 +951,7 @@ class LayerTieredExpertCacheController:
             # w2 也要独立做一遍 repack。
             repacked_w2 = ops.gptq_marlin_moe_repack(
                 raw_gpu.w2_qweight,
-                self._empty_perm(raw_gpu.w2_qweight.device),
+                w2_g_idx_sort_indices,
                 raw_gpu.w2_qweight.shape[1] * self.pack_factor,
                 raw_gpu.w2_qweight.shape[2],
                 self.num_bits,
@@ -784,7 +969,7 @@ class LayerTieredExpertCacheController:
             permuted_w2_scales = marlin_moe_permute_scales(
                 s=raw_gpu.w2_scales,
                 size_k=raw_gpu.w2_scales.shape[1]
-                * (self.group_size if self.group_size != -1 else self.pack_factor),
+                       * (self.group_size if self.group_size != -1 else self.pack_factor),
                 size_n=raw_gpu.w2_scales.shape[2],
                 group_size=self.group_size,
                 is_a_8bit=self.is_a_8bit,
@@ -798,6 +983,18 @@ class LayerTieredExpertCacheController:
                 permuted_w13_scales=permuted_w13_scales[0],
                 permuted_w2_scales=permuted_w2_scales[0],
                 raw_gpu=raw_gpu,
+                w13_g_idx=w13_sorted_g_idx[0] if w13_sorted_g_idx is not None else None,
+                w2_g_idx=w2_sorted_g_idx[0] if w2_sorted_g_idx is not None else None,
+                w13_g_idx_sort_indices=(
+                    w13_g_idx_sort_indices[0]
+                    if self._gptq_desc_act
+                    else None
+                ),
+                w2_g_idx_sort_indices=(
+                    w2_g_idx_sort_indices[0]
+                    if self._gptq_desc_act
+                    else None
+                ),
             )
             return
 
@@ -822,15 +1019,19 @@ class LayerTieredExpertCacheController:
         )
 
     def _write_quantized_target_slot(
-        self,
-        *,
-        target: Any,
-        slot: int,
-        repacked_w13: torch.Tensor,
-        repacked_w2: torch.Tensor,
-        permuted_w13_scales: torch.Tensor,
-        permuted_w2_scales: torch.Tensor,
-        raw_gpu: _RawExpertWeights,
+            self,
+            *,
+            target: Any,
+            slot: int,
+            repacked_w13: torch.Tensor,
+            repacked_w2: torch.Tensor,
+            permuted_w13_scales: torch.Tensor,
+            permuted_w2_scales: torch.Tensor,
+            raw_gpu: _RawExpertWeights,
+            w13_g_idx: torch.Tensor | None = None,
+            w2_g_idx: torch.Tensor | None = None,
+            w13_g_idx_sort_indices: torch.Tensor | None = None,
+            w2_g_idx_sort_indices: torch.Tensor | None = None,
     ) -> None:
         with torch.no_grad():
             # 依次覆盖目标 slot 中的 runtime 量化权重与 scale。
@@ -841,14 +1042,25 @@ class LayerTieredExpertCacheController:
             # qzeros 不参与 repack/permute，直接沿用 raw 格式写入即可。
             target.w13_qzeros[slot].copy_(raw_gpu.w13_qzeros[0])
             target.w2_qzeros[slot].copy_(raw_gpu.w2_qzeros[0])
+            if (
+                    w13_g_idx is not None
+                    and w2_g_idx is not None
+                    and w13_g_idx_sort_indices is not None
+                    and w2_g_idx_sort_indices is not None
+                    and hasattr(target, "w13_g_idx")
+            ):
+                target.w13_g_idx[slot].copy_(w13_g_idx)
+                target.w2_g_idx[slot].copy_(w2_g_idx)
+                target.w13_g_idx_sort_indices[slot].copy_(w13_g_idx_sort_indices)
+                target.w2_g_idx_sort_indices[slot].copy_(w2_g_idx_sort_indices)
 
     def _write_unquantized_target_slot(
-        self,
-        *,
-        target: Any,
-        slot: int,
-        runtime_w13: torch.Tensor,
-        runtime_w2: torch.Tensor,
+            self,
+            *,
+            target: Any,
+            slot: int,
+            runtime_w13: torch.Tensor,
+            runtime_w2: torch.Tensor,
     ) -> None:
         with torch.no_grad():
             # 非量化路径直接覆盖目标 slot 对应的 w13/w2 runtime 权重。
@@ -869,6 +1081,8 @@ class LayerTieredExpertCacheController:
         raw = self._cpu_quantized_raw_buffer
         # seen_fields 用于确保 gate/up/down 的关键张量都被正确拼齐。
         seen_fields: set[tuple[str, str]] = set()
+        seen_w13_g_idx = False
+        seen_w2_g_idx = False
 
         # ----------------- 逐张量把 bundle 中的 gate/up/down 权重拼进 raw buffer -----------------
         for relative_name, tensor in tensors.items():
@@ -900,6 +1114,11 @@ class LayerTieredExpertCacheController:
             elif proj_name == "down_proj":
                 self._copy_direct(field_name, cpu_tensor, raw)
                 seen_fields.add((proj_name, field_name))
+            if field_name == "g_idx":
+                if proj_name in ("gate_proj", "up_proj"):
+                    seen_w13_g_idx = True
+                elif proj_name == "down_proj":
+                    seen_w2_g_idx = True
 
         # ----------------- 校验动态加载所需字段是否齐全 -----------------
         required_fields = {
@@ -919,31 +1138,39 @@ class LayerTieredExpertCacheController:
                 f"{self.layer_key}: missing expert tensors for dynamic load: "
                 f"{sorted(missing_fields)}"
             )
+        if self._gptq_desc_act and (not seen_w13_g_idx or not seen_w2_g_idx):
+            raise KeyError(
+                f"{self.layer_key}: missing expert g_idx tensors for dynamic load"
+            )
 
         return raw
 
     def _copy_merged_half(
-        self,
-        field_name: str,
-        tensor: torch.Tensor,
-        raw: _RawExpertWeights,
-        *,
-        offset: int,
-        qzeros_offset: int,
+            self,
+            field_name: str,
+            tensor: torch.Tensor,
+            raw: _RawExpertWeights,
+            *,
+            offset: int,
+            qzeros_offset: int,
     ) -> None:
         # qweight/scales 按列偏移写入 w13 的对应半边。
         if field_name == "qweight":
-            raw.w13_qweight[0, :, offset : offset + tensor.shape[-1]].copy_(tensor)
+            raw.w13_qweight[0, :, offset: offset + tensor.shape[-1]].copy_(tensor)
         elif field_name == "scales":
-            raw.w13_scales[0, :, offset : offset + tensor.shape[-1]].copy_(tensor)
+            raw.w13_scales[0, :, offset: offset + tensor.shape[-1]].copy_(tensor)
         # qzeros 的列数按 pack_factor 压缩，因此使用单独的 qzeros_offset。
         elif field_name == "qzeros":
-            raw.w13_qzeros[0, :, qzeros_offset : qzeros_offset + tensor.shape[-1]].copy_(
+            raw.w13_qzeros[0, :, qzeros_offset: qzeros_offset + tensor.shape[-1]].copy_(
                 tensor
             )
+        elif field_name == "g_idx":
+            if raw.w13_g_idx is None:
+                raise RuntimeError(f"{self.layer_key}: w13_g_idx raw buffer is missing")
+            raw.w13_g_idx[0].copy_(tensor)
 
     def _copy_direct(
-        self, field_name: str, tensor: torch.Tensor, raw: _RawExpertWeights
+            self, field_name: str, tensor: torch.Tensor, raw: _RawExpertWeights
     ) -> None:
         # down_proj 不需要合并偏移，直接整块写入 w2 对应字段。
         if field_name == "qweight":
@@ -952,6 +1179,10 @@ class LayerTieredExpertCacheController:
             raw.w2_scales[0].copy_(tensor)
         elif field_name == "qzeros":
             raw.w2_qzeros[0].copy_(tensor)
+        elif field_name == "g_idx":
+            if raw.w2_g_idx is None:
+                raise RuntimeError(f"{self.layer_key}: w2_g_idx raw buffer is missing")
+            raw.w2_g_idx[0].copy_(tensor)
 
     def _move_raw_weights_to_device(self, raw: _RawExpertWeights) -> _RawExpertWeights:
         # 把 CPU raw buffer 异步搬到目标 GPU，后续 repack/permute 在设备侧完成。
@@ -962,10 +1193,20 @@ class LayerTieredExpertCacheController:
             w2_scales=raw.w2_scales.to(device=self.device, non_blocking=True),
             w13_qzeros=raw.w13_qzeros.to(device=self.device, non_blocking=True),
             w2_qzeros=raw.w2_qzeros.to(device=self.device, non_blocking=True),
+            w13_g_idx=(
+                raw.w13_g_idx.to(device=self.device, non_blocking=True)
+                if raw.w13_g_idx is not None
+                else None
+            ),
+            w2_g_idx=(
+                raw.w2_g_idx.to(device=self.device, non_blocking=True)
+                if raw.w2_g_idx is not None
+                else None
+            ),
         )
 
     def _assemble_unquantized_weights(
-        self, bundle: ExpertBundle
+            self, bundle: ExpertBundle
     ) -> _RawUnquantizedExpertWeights:
         # ----------------- 计算非量化 w13 的拼接尺寸 -----------------
         tensors = bundle.tensors
@@ -998,7 +1239,7 @@ class LayerTieredExpertCacheController:
                 seen_fields.add((proj_name, field_name))
             # up_proj 写入 w13 后半部分。
             elif proj_name == "up_proj":
-                raw.w13_weight[0, half_dim : half_dim + cpu_tensor.shape[0]].copy_(
+                raw.w13_weight[0, half_dim: half_dim + cpu_tensor.shape[0]].copy_(
                     cpu_tensor
                 )
                 seen_fields.add((proj_name, field_name))
@@ -1023,7 +1264,7 @@ class LayerTieredExpertCacheController:
         return raw
 
     def _move_unquantized_weights_to_device(
-        self, raw: _RawUnquantizedExpertWeights
+            self, raw: _RawUnquantizedExpertWeights
     ) -> _RawUnquantizedExpertWeights:
         # 把非量化 raw buffer 异步搬到目标 GPU。
         return _RawUnquantizedExpertWeights(
@@ -1036,36 +1277,48 @@ class LayerTieredExpertCacheController:
         return torch.empty((1, 0), dtype=torch.int32, device=device)
 
     def _init_cpu_fixed_pools(self) -> None:
-        # ----------------- 根据 plan 确认 CPU static experts 集合 -----------------
+        # ------------------------------- 根据计划解析 CPU 常驻 expert 集合 -------------------------------
+        # 从计划中的 initial_cpu_experts 读取需要在 CPU 侧常驻的 expert 编号，并过滤掉越界的 expert。
         cpu_static_experts = tuple(
             int(expert_id)
             for expert_id in self.plan.get("initial_cpu_experts", ())
             if int(expert_id) < self.layer.global_num_experts
         )
+
+        # 将 CPU 常驻 expert 集合冻结为 frozenset，便于后续快速判断与避免误修改。
         self._cpu_static_experts = frozenset(cpu_static_experts)
 
-        # ----------------- 先初始化 staging bundle -----------------
-        if int(self.plan.get("staging_bytes", 0)) > 0:
-            self._cpu_stage_bundle = self._allocate_source_bundle()
-            self._cpu_buffer_bytes += self._cpu_stage_bundle.nbytes
+        # ------------------------------- 初始化 CPU 侧 staging bundle 状态 -------------------------------
+        # 当前主线路径不再单独维护 staging bundle，因此这里显式置为 None。
+        self._cpu_stage_bundle = None
 
-        # ----------------- 再初始化 raw buffer -----------------
+        # ------------------------------- 按当前权重模式初始化 CPU 侧原始权重缓冲区 -------------------------------
+        # 当当前控制器工作在 GPTQ Marlin 模式下时，分配量化原始权重缓冲区。
         if self._mode == "gptq_marlin":
+            # 分配 CPU 侧量化原始权重缓冲区。
             self._cpu_quantized_raw_buffer = self._allocate_quantized_raw_buffer()
+
+            # 将量化原始权重缓冲区占用的字节数累计到 CPU buffer 总大小中。
             self._cpu_buffer_bytes += self._raw_quantized_nbytes(
                 self._cpu_quantized_raw_buffer
             )
         else:
+            # 当当前控制器工作在非量化模式下时，分配非量化原始权重缓冲区。
             self._cpu_unquantized_raw_buffer = self._allocate_unquantized_raw_buffer()
+
+            # 将非量化原始权重缓冲区占用的字节数累计到 CPU buffer 总大小中。
             self._cpu_buffer_bytes += self._raw_unquantized_nbytes(
                 self._cpu_unquantized_raw_buffer
             )
 
-        # ----------------- 最后按计划把 CPU static experts 预热到内存 -----------------
+        # ------------------------------- 按计划将 CPU 常驻 expert 预热到内存中 -------------------------------
+        # 遍历计划中指定的 CPU 常驻 expert，并将其对应的静态 bundle 预先物化到 CPU 内存中。
         for expert_id in cpu_static_experts:
+            # 以 eager 模式物化当前 expert 的 CPU 静态 bundle。
             self._materialize_cpu_static_bundle(expert_id, eager=True)
 
-        # 若控制器确实持有 CPU 侧缓存/缓冲区，则打印初始化日志。
+        # ------------------------------- 在持有 CPU 缓存或缓冲区时输出初始化日志 -------------------------------
+        # 当当前控制器确实持有 CPU 静态 bundle 或 staging bundle 时，输出初始化日志。
         if self._cpu_static_bundles or self._cpu_stage_bundle is not None:
             logger.info(
                 "Initialized fixed CPU expert pool: layer=%s static=%d/%d staging=%s "
@@ -1073,18 +1326,24 @@ class LayerTieredExpertCacheController:
                 self.layer_key,
                 len(self._cpu_static_bundles),
                 len(self._cpu_static_experts),
-                self._cpu_stage_bundle is not None,
+                False,
                 self._cpu_buffer_bytes / (1 << 20),
                 self.prefill_burst_min_tokens,
             )
 
     def _allocate_source_bundle(self) -> ExpertBundle:
-        # CPU source bundle 既可作为 static expert 存储，也可作为 NVMe staging 区复用。
+        # ------------------------------- 为 CPU 侧 expert 镜像分配 source bundle 容器 -------------------------------
+        # 构造 CPU 侧张量分配参数；当平台支持时启用 pinned memory 以加速后续 H2D 传输。
         cpu_tensor_args = {"device": "cpu", "pin_memory": self._use_pinned_cpu}
+
+        # 预声明 source bundle 内部保存的张量字典。
         tensors: dict[str, torch.Tensor]
-        # 量化路径需要为 gate/up/down 的 qweight/scales/qzeros 分别预分配张量。
+
+        # ------------------------------- 在量化路径下分配 gate/up/down 的量化权重张量 -------------------------------
+        # 当当前控制器工作在 GPTQ Marlin 模式下时，为 gate、up、down 三路分别分配 qweight、scales 和 qzeros 张量。
         if self._mode == "gptq_marlin":
             tensors = {
+                # 为 gate 投影的量化权重分配 CPU 张量。
                 "slot.gate_proj.qweight": torch.empty(
                     (
                         self.layer.hidden_size // self.pack_factor,
@@ -1093,11 +1352,15 @@ class LayerTieredExpertCacheController:
                     dtype=torch.int32,
                     **cpu_tensor_args,
                 ),
+
+                # 为 gate 投影的 scale 张量分配 CPU 张量。
                 "slot.gate_proj.scales": torch.empty(
                     (self.layer.num_groups_w13, self.layer.intermediate_size_per_partition),
                     dtype=self.layer.w13_scales.dtype,
                     **cpu_tensor_args,
                 ),
+
+                # 为 gate 投影的 qzeros 张量分配 CPU 张量。
                 "slot.gate_proj.qzeros": torch.empty(
                     (
                         self.layer.num_groups_w13,
@@ -1106,6 +1369,8 @@ class LayerTieredExpertCacheController:
                     dtype=self.layer.w13_qzeros.dtype,
                     **cpu_tensor_args,
                 ),
+
+                # 为 up 投影的量化权重分配 CPU 张量。
                 "slot.up_proj.qweight": torch.empty(
                     (
                         self.layer.hidden_size // self.pack_factor,
@@ -1114,11 +1379,18 @@ class LayerTieredExpertCacheController:
                     dtype=torch.int32,
                     **cpu_tensor_args,
                 ),
+
+                # 为 up 投影的 scale 张量分配 CPU 张量。
                 "slot.up_proj.scales": torch.empty(
-                    (self.layer.num_groups_w13, self.layer.intermediate_size_per_partition),
+                    (
+                        self.layer.num_groups_w13,
+                        self.layer.intermediate_size_per_partition
+                    ),
                     dtype=self.layer.w13_scales.dtype,
                     **cpu_tensor_args,
                 ),
+
+                # 为 up 投影的 qzeros 张量分配 CPU 张量。
                 "slot.up_proj.qzeros": torch.empty(
                     (
                         self.layer.num_groups_w13,
@@ -1127,6 +1399,8 @@ class LayerTieredExpertCacheController:
                     dtype=self.layer.w13_qzeros.dtype,
                     **cpu_tensor_args,
                 ),
+
+                # 为 down 投影的量化权重分配 CPU 张量。
                 "slot.down_proj.qweight": torch.empty(
                     (
                         self.layer.intermediate_size_per_partition // self.pack_factor,
@@ -1135,37 +1409,78 @@ class LayerTieredExpertCacheController:
                     dtype=torch.int32,
                     **cpu_tensor_args,
                 ),
+
+                # 为 down 投影的 scale 张量分配 CPU 张量。
                 "slot.down_proj.scales": torch.empty(
                     (self.layer.num_groups_w2, self.layer.hidden_size),
                     dtype=self.layer.w2_scales.dtype,
                     **cpu_tensor_args,
                 ),
+
+                # 为 down 投影的 qzeros 张量分配 CPU 张量。
                 "slot.down_proj.qzeros": torch.empty(
                     (self.layer.num_groups_w2, self.layer.hidden_size // self.pack_factor),
                     dtype=self.layer.w2_qzeros.dtype,
                     **cpu_tensor_args,
                 ),
             }
+            if self._gptq_desc_act:
+                tensors.update(
+                    {
+                        "slot.gate_proj.g_idx": torch.empty(
+                            (self.layer.hidden_size,),
+                            dtype=self.layer.w13_g_idx.dtype,
+                            **cpu_tensor_args,
+                        ),
+                        "slot.up_proj.g_idx": torch.empty(
+                            (self.layer.hidden_size,),
+                            dtype=self.layer.w13_g_idx.dtype,
+                            **cpu_tensor_args,
+                        ),
+                        "slot.down_proj.g_idx": torch.empty(
+                            (self.layer.intermediate_size_per_partition,),
+                            dtype=self.layer.w2_g_idx.dtype,
+                            **cpu_tensor_args,
+                        ),
+                    }
+                )
         else:
-            # 非量化路径则只需要原始 weight 张量。
+            # ------------------------------- 在非量化路径下分配 gate/up/down 的原始权重张量 -------------------------------
+            # 当当前控制器工作在非量化模式下时，只需要为 gate、up、down 三路分配原始 weight 张量。
             tensors = {
+                # 为 gate 投影的原始权重分配 CPU 张量。
                 "slot.gate_proj.weight": torch.empty(
-                    (self.layer.intermediate_size_per_partition, self.layer.hidden_size),
+                    (
+                        self.layer.intermediate_size_per_partition,
+                        self.layer.hidden_size
+                    ),
                     dtype=self.layer.w13_weight.dtype,
                     **cpu_tensor_args,
                 ),
+
+                # 为 up 投影的原始权重分配 CPU 张量。
                 "slot.up_proj.weight": torch.empty(
-                    (self.layer.intermediate_size_per_partition, self.layer.hidden_size),
+                    (
+                        self.layer.intermediate_size_per_partition,
+                        self.layer.hidden_size
+                    ),
                     dtype=self.layer.w13_weight.dtype,
                     **cpu_tensor_args,
                 ),
+
+                # 为 down 投影的原始权重分配 CPU 张量。
                 "slot.down_proj.weight": torch.empty(
-                    (self.layer.hidden_size, self.layer.intermediate_size_per_partition),
+                    (
+                        self.layer.hidden_size,
+                        self.layer.intermediate_size_per_partition
+                    ),
                     dtype=self.layer.w2_weight.dtype,
                     **cpu_tensor_args,
                 ),
             }
-        # 返回一个统一的 ExpertBundle，供 static/staging 路径复用。
+
+        # ------------------------------- 将张量字典封装为统一的 ExpertBundle 返回 -------------------------------
+        # 基于当前张量字典构造统一的 ExpertBundle，供 CPU static 与动态加载路径复用。
         return ExpertBundle(
             tensors=tensors,
             nbytes=bundle_nbytes(tensors),
@@ -1173,9 +1488,13 @@ class LayerTieredExpertCacheController:
         )
 
     def _allocate_quantized_raw_buffer(self) -> _RawExpertWeights:
-        # 量化路径 raw buffer 的形状直接对齐单 expert 在运行时需要的合并格式。
+        # ------------------------------- 为量化路径分配单 expert 级 CPU 原始权重缓冲区 -------------------------------
+        # 构造 CPU 侧张量分配参数；当平台支持时启用 pinned memory 以加速后续 H2D 传输。
         cpu_tensor_args = {"device": "cpu", "pin_memory": self._use_pinned_cpu}
+
+        # 返回面向量化路径的单 expert 原始权重缓冲区对象。
         return _RawExpertWeights(
+            # 为 gate/up 合并后的 w13 量化权重分配 CPU 缓冲区。
             w13_qweight=torch.empty(
                 (
                     1,
@@ -1185,6 +1504,7 @@ class LayerTieredExpertCacheController:
                 dtype=torch.int32,
                 **cpu_tensor_args,
             ),
+            # 为 down 路径的 w2 量化权重分配 CPU 缓冲区。
             w2_qweight=torch.empty(
                 (
                     1,
@@ -1194,16 +1514,27 @@ class LayerTieredExpertCacheController:
                 dtype=torch.int32,
                 **cpu_tensor_args,
             ),
+            # 为 gate/up 合并后的 w13 scale 张量分配 CPU 缓冲区。
             w13_scales=torch.empty(
-                (1, self.layer.num_groups_w13, 2 * self.layer.intermediate_size_per_partition),
+                (
+                    1,
+                    self.layer.num_groups_w13,
+                    2 * self.layer.intermediate_size_per_partition
+                ),
                 dtype=self.layer.w13_scales.dtype,
                 **cpu_tensor_args,
             ),
+            # 为 down 路径的 w2 scale 张量分配 CPU 缓冲区。
             w2_scales=torch.empty(
-                (1, self.layer.num_groups_w2, self.layer.hidden_size),
+                (
+                    1,
+                    self.layer.num_groups_w2,
+                    self.layer.hidden_size
+                ),
                 dtype=self.layer.w2_scales.dtype,
                 **cpu_tensor_args,
             ),
+            # 为 gate/up 合并后的 w13 qzeros 张量分配 CPU 缓冲区。
             w13_qzeros=torch.empty(
                 (
                     1,
@@ -1213,28 +1544,64 @@ class LayerTieredExpertCacheController:
                 dtype=self.layer.w13_qzeros.dtype,
                 **cpu_tensor_args,
             ),
+            # 为 down 路径的 w2 qzeros 张量分配 CPU 缓冲区。
             w2_qzeros=torch.empty(
-                (1, self.layer.num_groups_w2, self.layer.hidden_size // self.pack_factor),
+                (
+                    1,
+                    self.layer.num_groups_w2,
+                    self.layer.hidden_size // self.pack_factor
+                ),
                 dtype=self.layer.w2_qzeros.dtype,
                 **cpu_tensor_args,
+            ),
+            w13_g_idx=(
+                torch.empty(
+                    (1, self.layer.hidden_size),
+                    dtype=self.layer.w13_g_idx.dtype,
+                    **cpu_tensor_args,
+                )
+                if self._gptq_desc_act
+                else None
+            ),
+            w2_g_idx=(
+                torch.empty(
+                    (1, self.layer.intermediate_size_per_partition),
+                    dtype=self.layer.w2_g_idx.dtype,
+                    **cpu_tensor_args,
+                )
+                if self._gptq_desc_act
+                else None
             ),
         )
 
     def _allocate_unquantized_raw_buffer(self) -> _RawUnquantizedExpertWeights:
-        # 非量化 raw buffer 同样只为“单个 expert 的合并形式”分配 1 个 batch 维。
+        # ------------------------------- 为非量化路径分配单 expert 级 CPU 原始权重缓冲区 -------------------------------
+        # 构造 CPU 侧张量分配参数；当平台支持时启用 pinned memory 以加速后续 H2D 传输。
         cpu_tensor_args = {"device": "cpu", "pin_memory": self._use_pinned_cpu}
+
+        # 判断当前 MoE 路径是否采用 act-and-mul 形式，从而决定 w13 的上游输出维度。
         is_act_and_mul = bool(self.layer.moe_config.is_act_and_mul)
+
+        # 根据是否启用 act-and-mul，计算 w13 合并权重的输出维度。
         w13_up_dim = (
             2 * self.layer.intermediate_size_per_partition
             if is_act_and_mul
             else self.layer.intermediate_size_per_partition
         )
+
+        # 返回面向非量化路径的单 expert 原始权重缓冲区对象。
         return _RawUnquantizedExpertWeights(
+            # 为 gate/up 合并后的 w13 权重分配 CPU 缓冲区。
             w13_weight=torch.empty(
-                (1, w13_up_dim, self.layer.hidden_size),
+                (
+                    1,
+                    w13_up_dim,
+                    self.layer.hidden_size
+                ),
                 dtype=self.layer.w13_weight.dtype,
                 **cpu_tensor_args,
             ),
+            # 为 down 路径的 w2 权重分配 CPU 缓冲区。
             w2_weight=torch.empty(
                 (
                     1,
@@ -1261,7 +1628,8 @@ class LayerTieredExpertCacheController:
 
     @staticmethod
     def _raw_quantized_nbytes(raw: _RawExpertWeights) -> int:
-        # 统计量化 raw buffer 总字节数。
+        # ------------------------------- 统计量化原始权重缓冲区的总字节数 -------------------------------
+        # 对量化原始权重缓冲区中的各个张量按“元素数乘以单元素字节数”求和，得到总字节占用。
         return sum(
             tensor.numel() * tensor.element_size()
             for tensor in (
@@ -1271,7 +1639,10 @@ class LayerTieredExpertCacheController:
                 raw.w2_scales,
                 raw.w13_qzeros,
                 raw.w2_qzeros,
+                raw.w13_g_idx,
+                raw.w2_g_idx,
             )
+            if tensor is not None
         )
 
     @staticmethod
