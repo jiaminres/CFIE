@@ -8,11 +8,78 @@
 import numpy as np
 import torch
 
+import cfie._custom_ops as ops
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.attention.backends.utils import PAD_SLOT_ID
 
 logger = init_logger(__name__)
+
+
+def _activation_to_kernel_arg(activation: str | None) -> str:
+    return "" if activation is None else activation
+
+
+def _try_precompiled_causal_conv1d_fn(
+    *,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    activation: str | None,
+    pad_slot_id: int,
+) -> torch.Tensor | None:
+    if not x.is_cuda or not conv_states.is_cuda:
+        return None
+    if not ops.has_precompiled_causal_conv1d_fn():
+        return None
+    return ops.causal_conv1d_fn_precompiled(
+        x=x,
+        weight=weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=_activation_to_kernel_arg(activation),
+        pad_slot_id=pad_slot_id,
+    )
+
+
+def _try_precompiled_causal_conv1d_update(
+    *,
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    conv_state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None,
+    pad_slot_id: int,
+    block_idx_last_scheduled_token: torch.Tensor | None,
+    initial_state_idx: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if not x.is_cuda or not conv_state.is_cuda:
+        return None
+    if not ops.has_precompiled_causal_conv1d_update():
+        return None
+    return ops.causal_conv1d_update_precompiled(
+        x=x,
+        conv_state=conv_state,
+        weight=weight,
+        bias=bias,
+        activation=_activation_to_kernel_arg(activation),
+        conv_state_indices=conv_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        query_start_loc=query_start_loc,
+        pad_slot_id=pad_slot_id,
+        block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+        initial_state_idx=initial_state_idx,
+    )
 
 
 def _apply_activation_ref(x: torch.Tensor, activation: str | None) -> torch.Tensor:
@@ -813,6 +880,19 @@ def causal_conv1d_fn(
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
     if not HAS_TRITON:
+        precompiled = _try_precompiled_causal_conv1d_fn(
+            x=x,
+            weight=weight,
+            bias=bias,
+            conv_states=conv_states,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+        )
+        if precompiled is not None:
+            return precompiled.to(original_x_dtype)
         logger.warning_once(
             "Mamba causal_conv1d prefill is falling back to the PyTorch "
             "reference path because Triton runtime is unavailable."
@@ -1563,6 +1643,24 @@ def causal_conv1d_update(
         assert weight.stride(1) == 1
 
     if not HAS_TRITON:
+        precompiled = _try_precompiled_causal_conv1d_update(
+            x=x,
+            conv_state=conv_state,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            conv_state_indices=conv_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=query_start_loc,
+            pad_slot_id=pad_slot_id,
+            block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+            initial_state_idx=initial_state_idx,
+        )
+        if precompiled is not None:
+            out = precompiled
+            if unsqueeze:
+                out = out.squeeze(-1)
+            return out.to(original_x_dtype)
         logger.warning_once(
             "Mamba causal_conv1d decode is falling back to the PyTorch "
             "reference path because Triton runtime is unavailable."

@@ -9,7 +9,7 @@
 
 #include <vector>
 
-torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
+inline torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
   // Ensure tensor is on CUDA
   if (!tensor.is_cuda()) {
     throw std::runtime_error("Tensor must be on CUDA device");
@@ -172,6 +172,24 @@ fused_sigmoid_gating_delta_rule_update_precompiled(
     const std::optional<torch::Tensor>& ssm_state_indices,
     const std::optional<torch::Tensor>& num_accepted_tokens,
     bool use_qk_l2norm_in_kernel, bool is_kda);
+
+torch::Tensor causal_conv1d_fn_precompiled(
+    const torch::Tensor& x, const torch::Tensor& weight,
+    const std::optional<torch::Tensor>& bias, torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const std::optional<torch::Tensor>& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const std::string& activation, int64_t pad_slot_id);
+
+torch::Tensor causal_conv1d_update_precompiled(
+    const torch::Tensor& x, torch::Tensor& conv_state,
+    const torch::Tensor& weight, const std::optional<torch::Tensor>& bias,
+    const std::string& activation,
+    const std::optional<torch::Tensor>& conv_state_indices,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const std::optional<torch::Tensor>& query_start_loc, int64_t pad_slot_id,
+    const std::optional<torch::Tensor>& block_idx_last_scheduled_token,
+    const std::optional<torch::Tensor>& initial_state_idx);
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 

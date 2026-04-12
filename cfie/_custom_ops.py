@@ -469,6 +469,66 @@ def fused_sigmoid_gating_delta_rule_update_precompiled(
     )
 
 
+def has_precompiled_causal_conv1d_fn() -> bool:
+    return hasattr(torch.ops._C, "causal_conv1d_fn_precompiled")
+
+
+def causal_conv1d_fn_precompiled(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    activation: str,
+    pad_slot_id: int,
+) -> torch.Tensor:
+    return torch.ops._C.causal_conv1d_fn_precompiled(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        activation,
+        pad_slot_id,
+    )
+
+
+def has_precompiled_causal_conv1d_update() -> bool:
+    return hasattr(torch.ops._C, "causal_conv1d_update_precompiled")
+
+
+def causal_conv1d_update_precompiled(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str,
+    conv_state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None,
+    pad_slot_id: int,
+    block_idx_last_scheduled_token: torch.Tensor | None,
+    initial_state_idx: torch.Tensor | None,
+) -> torch.Tensor:
+    return torch.ops._C.causal_conv1d_update_precompiled(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        conv_state_indices,
+        num_accepted_tokens,
+        query_start_loc,
+        pad_slot_id,
+        block_idx_last_scheduled_token,
+        initial_state_idx,
+    )
+
+
 def apply_repetition_penalties_torch(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,

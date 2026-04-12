@@ -262,6 +262,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fused_sigmoid_gating_delta_rule_update_precompiled", torch::kCUDA,
            &fused_sigmoid_gating_delta_rule_update_precompiled);
 
+  ops.def(
+      "causal_conv1d_fn_precompiled("
+      "    Tensor x, Tensor weight, Tensor? bias, Tensor! conv_states,"
+      "    Tensor query_start_loc, Tensor? cache_indices,"
+      "    Tensor? has_initial_state, str activation,"
+      "    int pad_slot_id) -> Tensor");
+  ops.impl("causal_conv1d_fn_precompiled", torch::kCUDA,
+           &causal_conv1d_fn_precompiled);
+
+  ops.def(
+      "causal_conv1d_update_precompiled("
+      "    Tensor x, Tensor! conv_state, Tensor weight, Tensor? bias,"
+      "    str activation, Tensor? conv_state_indices,"
+      "    Tensor? num_accepted_tokens, Tensor? query_start_loc,"
+      "    int pad_slot_id, Tensor? block_idx_last_scheduled_token,"
+      "    Tensor? initial_state_idx) -> Tensor");
+  ops.impl("causal_conv1d_update_precompiled", torch::kCUDA,
+           &causal_conv1d_update_precompiled);
+
   // Quantization ops
 #ifndef USE_ROCM
   // DeepSeek V3 fused A GEMM (SM 9.0+, bf16 only, 1-16 tokens).

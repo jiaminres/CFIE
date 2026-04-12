@@ -1,7 +1,8 @@
+#include <torch/all.h>
+
 #include "ops.h"
 
-#include <torch/extension.h>
-
+#include <algorithm>
 #include <vector>
 
 namespace {
@@ -15,6 +16,15 @@ torch::Tensor apply_gate_activation(const torch::Tensor& x,
     return torch::sigmoid(x);
   }
   TORCH_CHECK(false, "Unsupported gating activation: ", activation);
+  return x;
+}
+
+torch::Tensor apply_optional_activation(const torch::Tensor& x,
+                                        const std::string& activation) {
+  if (activation.empty()) {
+    return x;
+  }
+  return apply_gate_activation(x, activation);
 }
 
 torch::Tensor softplus_with_threshold(const torch::Tensor& x, double beta,
@@ -96,6 +106,78 @@ int64_t resolve_state_index(const std::optional<torch::Tensor>& indices,
     return idx[flat_index].item<int64_t>();
   }
   return idx.index({seq_idx, token_offset}).item<int64_t>();
+}
+
+int64_t resolve_cache_line(const std::optional<torch::Tensor>& cache_indices,
+                           int64_t seq_idx, int64_t block_offset = 0) {
+  if (!cache_indices.has_value()) {
+    return seq_idx;
+  }
+
+  const auto& idx = cache_indices.value();
+  if (idx.dim() == 1) {
+    return idx[seq_idx].item<int64_t>();
+  }
+  return idx.index({seq_idx, block_offset}).item<int64_t>();
+}
+
+torch::Tensor load_initial_history(const torch::Tensor& state,
+                                   int64_t history_len,
+                                   bool load_initial_state,
+                                   int64_t start_offset = 0) {
+  if (!state.defined() || history_len <= 0 || !load_initial_state) {
+    const int64_t dim = state.defined() ? state.size(0) : 0;
+    auto options = state.defined()
+                       ? state.options()
+                       : torch::TensorOptions().dtype(torch::kFloat32);
+    return torch::zeros({dim, history_len}, options);
+  }
+
+  auto history = state.slice(-1, start_offset, start_offset + history_len);
+  if (history.size(-1) == history_len) {
+    return history;
+  }
+
+  auto padded = torch::zeros({state.size(0), history_len}, state.options());
+  if (history.numel() > 0) {
+    padded.slice(-1, 0, history.size(-1)).copy_(history);
+  }
+  return padded;
+}
+
+torch::Tensor update_conv_state_ref(const torch::Tensor& state,
+                                    const torch::Tensor& seq_tokens,
+                                    int64_t shift_tokens) {
+  const int64_t state_len = state.size(-1);
+  if (state_len == 0) {
+    return state;
+  }
+
+  const int64_t safe_shift = std::max<int64_t>(shift_tokens, 0);
+  auto retained_state = state.slice(-1, std::min<int64_t>(safe_shift, state_len));
+  auto updated = torch::cat({retained_state, seq_tokens}, -1);
+
+  if (updated.size(-1) >= state_len) {
+    return updated.slice(-1, updated.size(-1) - state_len, updated.size(-1));
+  }
+
+  auto padded = torch::zeros_like(state);
+  padded.slice(-1, state_len - updated.size(-1), state_len).copy_(updated);
+  return padded;
+}
+
+torch::Tensor causal_conv1d_sequence_ref(
+    const torch::Tensor& seq_tokens, const torch::Tensor& weight,
+    const std::optional<torch::Tensor>& bias, const torch::Tensor& history,
+    const std::string& activation) {
+  auto combined = torch::cat({history, seq_tokens}, -1);
+  auto windows = combined.unfold(-1, weight.size(1), 1);
+  auto output =
+      (windows * weight.unsqueeze(1)).sum(-1);
+  if (bias.has_value()) {
+    output = output + bias.value().unsqueeze(1);
+  }
+  return apply_optional_activation(output, activation);
 }
 
 torch::Tensor l2norm_last_dim(const torch::Tensor& x) {
@@ -234,9 +316,6 @@ fused_sigmoid_gating_delta_rule_update_precompiled(
                          ? initial_state
                          : q.new_empty({T, HV, V, K}, initial_state.options());
 
-  auto head_index =
-      torch::arange(HV, torch::TensorOptions().dtype(torch::kLong).device(q.device())) /
-      hv_per_h;
   auto A_log_f32 = A_log.to(torch::kFloat32);
   auto dt_bias_f32 = dt_bias.to(torch::kFloat32);
 
@@ -315,9 +394,9 @@ fused_sigmoid_gating_delta_rule_update_precompiled(
       const int64_t token_idx = bos + token_offset;
 
       auto q_token =
-          q_tokens[token_idx].to(torch::kFloat32).index_select(0, head_index);
+          q_tokens[token_idx].to(torch::kFloat32).repeat_interleave(hv_per_h, 0);
       auto k_token =
-          k_tokens[token_idx].to(torch::kFloat32).index_select(0, head_index);
+          k_tokens[token_idx].to(torch::kFloat32).repeat_interleave(hv_per_h, 0);
       auto v_token = v_tokens[token_idx].to(torch::kFloat32);
       auto beta_token = torch::sigmoid(b_tokens[token_idx].to(torch::kFloat32));
 
@@ -375,4 +454,183 @@ fused_sigmoid_gating_delta_rule_update_precompiled(
   }
 
   return {output, final_state};
+}
+
+torch::Tensor causal_conv1d_fn_precompiled(
+    const torch::Tensor& x, const torch::Tensor& weight,
+    const std::optional<torch::Tensor>& bias, torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const std::optional<torch::Tensor>& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const std::string& activation, int64_t pad_slot_id) {
+  TORCH_CHECK(x.is_cuda(), "causal_conv1d_fn_precompiled expects CUDA x");
+  TORCH_CHECK(weight.is_cuda(),
+              "causal_conv1d_fn_precompiled expects CUDA weight");
+  TORCH_CHECK(conv_states.is_cuda(),
+              "causal_conv1d_fn_precompiled expects CUDA conv_states");
+  TORCH_CHECK(x.dim() == 2,
+              "causal_conv1d_fn_precompiled expects x with shape [dim, tokens]");
+
+  auto out = torch::zeros_like(x);
+  const int64_t history_len = weight.size(1) - 1;
+  const int64_t batch = query_start_loc.numel() - 1;
+
+  for (int64_t seq_idx = 0; seq_idx < batch; ++seq_idx) {
+    const int64_t seq_start = query_start_loc[seq_idx].item<int64_t>();
+    const int64_t seq_end = query_start_loc[seq_idx + 1].item<int64_t>();
+    if (seq_end <= seq_start) {
+      continue;
+    }
+
+    const int64_t cache_line = resolve_cache_line(cache_indices, seq_idx);
+    if (cache_line == pad_slot_id) {
+      continue;
+    }
+
+    const auto state = conv_states[cache_line];
+    const bool load_initial_state =
+        !has_initial_state.has_value() ||
+        has_initial_state.value()[seq_idx].item<bool>();
+    auto history = load_initial_history(state, history_len, load_initial_state);
+    auto seq_tokens = x.slice(1, seq_start, seq_end);
+    out.slice(1, seq_start, seq_end)
+        .copy_(causal_conv1d_sequence_ref(seq_tokens, weight, bias, history,
+                                          activation));
+    conv_states[cache_line].copy_(update_conv_state_ref(
+        conv_states[cache_line], seq_tokens, seq_tokens.size(-1)));
+  }
+
+  return out;
+}
+
+torch::Tensor causal_conv1d_update_precompiled(
+    const torch::Tensor& x, torch::Tensor& conv_state,
+    const torch::Tensor& weight, const std::optional<torch::Tensor>& bias,
+    const std::string& activation,
+    const std::optional<torch::Tensor>& conv_state_indices,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const std::optional<torch::Tensor>& query_start_loc, int64_t pad_slot_id,
+    const std::optional<torch::Tensor>& block_idx_last_scheduled_token,
+    const std::optional<torch::Tensor>& initial_state_idx) {
+  TORCH_CHECK(x.is_cuda(), "causal_conv1d_update_precompiled expects CUDA x");
+  TORCH_CHECK(weight.is_cuda(),
+              "causal_conv1d_update_precompiled expects CUDA weight");
+  TORCH_CHECK(conv_state.is_cuda(),
+              "causal_conv1d_update_precompiled expects CUDA conv_state");
+
+  const bool use_fast_path =
+      !query_start_loc.has_value() && !num_accepted_tokens.has_value() &&
+      !block_idx_last_scheduled_token.has_value() &&
+      !initial_state_idx.has_value() &&
+      (!conv_state_indices.has_value() || conv_state_indices.value().dim() == 1);
+
+  if (use_fast_path) {
+    TORCH_CHECK(x.dim() == 3,
+                "fast-path causal_conv1d_update_precompiled expects [B, D, T]");
+    const int64_t batch = x.size(0);
+    const int64_t dim = x.size(1);
+    const int64_t seqlen = x.size(2);
+    const int64_t history_len = weight.size(1) - 1;
+
+    auto safe_indices =
+        conv_state_indices.has_value()
+            ? conv_state_indices.value().to(torch::TensorOptions()
+                                                .dtype(torch::kLong)
+                                                .device(x.device()))
+            : torch::arange(batch, torch::TensorOptions()
+                                       .dtype(torch::kLong)
+                                       .device(x.device()));
+    auto valid_mask = safe_indices >= 0;
+    auto gather_indices = safe_indices.clamp_min(0);
+    auto state = conv_state.index_select(0, gather_indices);
+    auto history = state.slice(-1, 0, history_len);
+    auto combined = torch::cat({history, x}, -1);
+    auto windows = combined.unfold(-1, weight.size(1), 1);
+    auto out =
+        (windows * weight.view({1, dim, 1, weight.size(1)})).sum(-1);
+    if (bias.has_value()) {
+      out = out + bias.value().view({1, dim, 1});
+    }
+    out = apply_optional_activation(out, activation);
+    out = out * valid_mask.view({batch, 1, 1}).to(out.scalar_type());
+
+    auto updated_state =
+        update_conv_state_ref(state.reshape({batch * dim, state.size(-1)}),
+                              x.reshape({batch * dim, seqlen}), seqlen)
+            .reshape({batch, dim, state.size(-1)});
+    conv_state.index_copy_(0, gather_indices, updated_state);
+    return out;
+  }
+
+  auto out = x.clone();
+  const int64_t history_len = weight.size(1) - 1;
+  const int64_t batch = query_start_loc.has_value()
+                            ? query_start_loc.value().numel() - 1
+                            : x.size(0);
+
+  for (int64_t seq_idx = 0; seq_idx < batch; ++seq_idx) {
+    torch::Tensor seq_tokens;
+    int64_t seq_len = 0;
+    int64_t seq_start = 0;
+    int64_t seq_end = 0;
+    if (!query_start_loc.has_value()) {
+      seq_tokens = x[seq_idx];
+      seq_len = seq_tokens.size(-1);
+    } else {
+      seq_start = query_start_loc.value()[seq_idx].item<int64_t>();
+      seq_end = query_start_loc.value()[seq_idx + 1].item<int64_t>();
+      if (seq_end <= seq_start) {
+        continue;
+      }
+      seq_tokens =
+          x.slice(0, seq_start, seq_end).transpose(0, 1).contiguous();
+      seq_len = seq_end - seq_start;
+    }
+
+    int64_t input_block_offset = 0;
+    if (initial_state_idx.has_value()) {
+      input_block_offset = initial_state_idx.value()[seq_idx].item<int64_t>();
+    }
+    const int64_t input_cache_line =
+        resolve_cache_line(conv_state_indices, seq_idx, input_block_offset);
+    if (input_cache_line == pad_slot_id) {
+      continue;
+    }
+
+    int64_t output_block_offset = 0;
+    if (block_idx_last_scheduled_token.has_value()) {
+      output_block_offset =
+          block_idx_last_scheduled_token.value()[seq_idx].item<int64_t>();
+    }
+    const int64_t output_cache_line =
+        resolve_cache_line(conv_state_indices, seq_idx, output_block_offset);
+
+    const auto state = conv_state[input_cache_line];
+    int64_t history_offset = 0;
+    int64_t shift_tokens = seq_len;
+    if (num_accepted_tokens.has_value()) {
+      history_offset =
+          std::max<int64_t>(num_accepted_tokens.value()[seq_idx].item<int64_t>() - 1,
+                            0);
+      shift_tokens = 1;
+    }
+
+    auto history =
+        load_initial_history(state, history_len, true, history_offset);
+    auto seq_output =
+        causal_conv1d_sequence_ref(seq_tokens, weight, bias, history, activation);
+
+    if (!query_start_loc.has_value()) {
+      out[seq_idx].slice(-1, 0, seq_len).copy_(seq_output);
+    } else {
+      out.slice(0, seq_start, seq_end).copy_(seq_output.transpose(0, 1));
+    }
+
+    if (output_cache_line != pad_slot_id) {
+      conv_state[output_cache_line].copy_(update_conv_state_ref(
+          conv_state[input_cache_line], seq_tokens, shift_tokens));
+    }
+  }
+
+  return out;
 }
