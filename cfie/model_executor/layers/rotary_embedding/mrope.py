@@ -5,6 +5,7 @@
 import numpy as np
 import torch
 
+from cfie import _custom_ops as ops
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON, tl, triton
 
@@ -12,6 +13,34 @@ from .base import RotaryEmbeddingBase
 from .yarn_scaling_rope import YaRNScalingRotaryEmbedding, yarn_get_mscale
 
 logger = init_logger(__name__)
+
+
+def _try_precompiled_mrope(
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_size: int,
+    rotary_dim: int,
+    mrope_section: list[int],
+    is_neox_style: bool,
+    mrope_interleaved: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if key is None or not query.is_cuda or not key.is_cuda:
+        return None
+    if not ops.has_mrope_rotary_embedding():
+        return None
+    return ops.mrope_rotary_embedding(
+        query,
+        key,
+        cos,
+        sin,
+        head_size,
+        rotary_dim,
+        mrope_section,
+        is_neox_style,
+        mrope_interleaved,
+    )
 
 
 @triton.jit
@@ -343,6 +372,19 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         if positions.ndim == 2:
             assert self.mrope_section
             if not HAS_TRITON:
+                precompiled = _try_precompiled_mrope(
+                    query=query,
+                    key=key,
+                    cos=cos,
+                    sin=sin,
+                    head_size=self.head_size,
+                    rotary_dim=self.rotary_dim,
+                    mrope_section=self.mrope_section,
+                    is_neox_style=self.is_neox_style,
+                    mrope_interleaved=self.mrope_interleaved,
+                )
+                if precompiled is not None:
+                    return precompiled
                 logger.warning_once(
                     "MRoPE Triton kernel is unavailable in the current runtime; "
                     "falling back to the native MRoPE path."

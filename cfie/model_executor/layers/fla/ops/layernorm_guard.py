@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from cfie import _custom_ops as ops
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.math_utils import cdiv, next_power_of_2
@@ -26,6 +27,38 @@ from cfie.utils.platform_utils import num_compute_units
 from .utils import input_guard
 
 logger = init_logger(__name__)
+
+
+def _try_precompiled_layer_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    z: torch.Tensor | None,
+    eps: float,
+    group_size: int,
+    norm_before_gate: bool,
+    is_rms_norm: bool,
+    activation: str,
+) -> torch.Tensor | None:
+    if not x.is_cuda or not weight.is_cuda:
+        return None
+    if bias is not None and not bias.is_cuda:
+        return None
+    if z is not None and not z.is_cuda:
+        return None
+    if not ops.has_gated_layer_norm():
+        return None
+    return ops.gated_layer_norm(
+        x,
+        weight,
+        bias,
+        z,
+        eps,
+        group_size,
+        norm_before_gate,
+        is_rms_norm,
+        activation,
+    )
 
 
 def _apply_gate_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
@@ -245,6 +278,23 @@ def layer_norm_fwd(
     assert N % group_size == 0
     ngroups = N // group_size
     if not HAS_TRITON:
+        precompiled_out = _try_precompiled_layer_norm(
+            x=x,
+            weight=weight,
+            bias=bias,
+            z=z,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            is_rms_norm=is_rms_norm,
+            activation=activation,
+        )
+        if precompiled_out is not None:
+            if out is not None:
+                out.copy_(precompiled_out)
+            else:
+                out = precompiled_out
+            return out, None, None
         logger.warning_once(
             "FLA layer norm is falling back to the PyTorch reference path "
             "because Triton runtime is unavailable."

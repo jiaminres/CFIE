@@ -326,6 +326,34 @@ def rotary_embedding(
     )
 
 
+def has_mrope_rotary_embedding() -> bool:
+    return hasattr(torch.ops._C, "mrope_rotary_embedding")
+
+
+def mrope_rotary_embedding(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_size: int,
+    rotary_dim: int,
+    mrope_section: list[int],
+    is_neox: bool,
+    mrope_interleaved: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.mrope_rotary_embedding(
+        query,
+        key,
+        cos,
+        sin,
+        head_size,
+        rotary_dim,
+        mrope_section,
+        is_neox,
+        mrope_interleaved,
+    )
+
+
 # layer norm ops
 def rms_norm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
@@ -364,6 +392,80 @@ def fused_qk_norm_rope(
         cos_sin_cache,
         is_neox,
         position_ids,
+    )
+
+
+def has_gated_layer_norm() -> bool:
+    return hasattr(torch.ops._C, "gated_layer_norm")
+
+
+def gated_layer_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    gate: torch.Tensor | None,
+    epsilon: float,
+    group_size: int,
+    norm_before_gate: bool,
+    is_rms_norm: bool,
+    activation: str,
+) -> torch.Tensor:
+    return torch.ops._C.gated_layer_norm(
+        input,
+        weight,
+        bias,
+        gate,
+        epsilon,
+        group_size,
+        norm_before_gate,
+        is_rms_norm,
+        activation,
+    )
+
+
+def has_precompiled_fused_sigmoid_gating_delta_rule_update() -> bool:
+    return hasattr(
+        torch.ops._C, "fused_sigmoid_gating_delta_rule_update_precompiled"
+    )
+
+
+def fused_sigmoid_gating_delta_rule_update_precompiled(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: float,
+    threshold: float,
+    scale: float,
+    initial_state: torch.Tensor,
+    inplace_final_state: bool,
+    cu_seqlens: torch.Tensor | None,
+    ssm_state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+    use_qk_l2norm_in_kernel: bool,
+    is_kda: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.fused_sigmoid_gating_delta_rule_update_precompiled(
+        A_log,
+        a,
+        b,
+        dt_bias,
+        q,
+        k,
+        v,
+        beta,
+        threshold,
+        scale,
+        initial_state,
+        inplace_final_state,
+        cu_seqlens,
+        ssm_state_indices,
+        num_accepted_tokens,
+        use_qk_l2norm_in_kernel,
+        is_kda,
     )
 
 

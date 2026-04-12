@@ -9,10 +9,55 @@
 
 import torch
 
+from cfie import _custom_ops as ops
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON, tl, triton
 
 logger = init_logger(__name__)
+
+
+def _try_precompiled_fused_sigmoid_gating_delta_rule_update(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: float,
+    threshold: float,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    inplace_final_state: bool,
+    cu_seqlens: torch.LongTensor | None,
+    ssm_state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+    use_qk_l2norm_in_kernel: bool,
+    is_kda: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if initial_state is None or not q.is_cuda:
+        return None
+    if not ops.has_precompiled_fused_sigmoid_gating_delta_rule_update():
+        return None
+    return ops.fused_sigmoid_gating_delta_rule_update_precompiled(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,
+        threshold=threshold,
+        scale=scale,
+        initial_state=initial_state,
+        inplace_final_state=inplace_final_state,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        is_kda=is_kda,
+    )
 
 
 def _resolve_state_index(
@@ -403,6 +448,27 @@ def fused_sigmoid_gating_delta_rule_update(
         final_state = q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
 
     if not HAS_TRITON:
+        precompiled = _try_precompiled_fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=a,
+            b=b,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            beta=beta,
+            threshold=threshold,
+            scale=scale,
+            initial_state=initial_state,
+            inplace_final_state=inplace_final_state,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            is_kda=is_kda,
+        )
+        if precompiled is not None:
+            return precompiled
         logger.warning_once(
             "Qwen3Next fused GDN gating is falling back to the PyTorch "
             "reference path because Triton runtime is unavailable."
