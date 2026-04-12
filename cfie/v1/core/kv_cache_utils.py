@@ -837,23 +837,36 @@ def get_num_blocks(
     cfie_config: CfieConfig, num_layers: int, available_memory: int, page_size: int
 ) -> int:
     """
-    Get the number of kv cache blocks.
+    根据“可给 KV 的总预算”推导最终可分配的 block 数量。
 
-    Args:
-        cfie_config: The global CfieConfig
-        num_layers: The number of layers
-        available_memory: Memory available for KV cache in bytes.
-        page_size: The page size of the KV cache.
+    这里采用统一公式：
+
+    `num_blocks = available_memory // page_size // num_layers`
+
+    含义是：
+
+    - `available_memory` 是已经扣除了常驻非 KV 显存后的可用预算。
+    - `page_size` 是单层单 block 实际占用的物理字节数。
+    - `num_layers` 是共享这份预算的逻辑层/组数量。
+
+    也就是说，本函数回答的问题是：
+    “给定总预算后，所有层平均下来，每层最多还能拿到多少个 block。”
     """
+    # 先按“总预算 / 单 block 大小 / 共享层数”计算理论 block 数。
     num_blocks = int(available_memory // page_size // num_layers)
+    # 预算不足时至少回到 0，避免出现负值。
     num_blocks = max(num_blocks, 0)
+    # 允许测试或特殊配置通过 override 改写最终 block 数。
     num_blocks = may_override_num_blocks(cfie_config, num_blocks)
     return num_blocks
 
 
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
     """
-    Get the page size of the KV cache.
+    读取一组 KV cache 规格共享的统一 page size。
+
+    显存划分阶段如果要把多层塞进同一块共享 tensor，就必须先确认这些层的
+    单 block 物理页大小一致；否则无法直接按同一 page size 切分。
     """
     page_sizes = {layer.page_size_bytes for layer in kv_cache_specs}
     assert len(page_sizes) == 1
@@ -1081,15 +1094,21 @@ def get_kv_cache_config_from_groups(
     available_memory: int,
 ) -> KVCacheConfig:
     """
-    Generate the KV cache configuration from the KV cache groups and spec
-    of each layer.
+    把“KV cache 分组结果 + worker 可用预算”落实成单个 worker 的 KVCacheConfig。
 
-    Args:
-        cfie_config: The global CfieConfig
-        kv_cache_groups: The KV cache groups
-        available_memory: Memory available for KV cache in bytes
-    Returns:
-        The generated KVCacheConfig
+    输入里已经包含两类上游结论：
+
+    - `kv_cache_groups`:
+      哪些层共享同一类 KV cache 规格，哪些层可以共用同一块底层 tensor。
+    - `available_memory`:
+      这个 worker 在完成权重加载和启动期 profiling 后，真正还能分给 KV
+      cache 的字节预算。
+
+    本函数负责把这两个输入变成：
+
+    - `num_blocks`
+    - 每块 KV tensor 的大小
+    - 每块 tensor 由哪些层共享
     """
     if len(kv_cache_groups) == 0:
         # Attention free models do not have KV cache.
@@ -1100,7 +1119,9 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
-    # Determine how model runners should initialize the KV cache tensors.
+    # ------------------ 分支 1：统一类型但不同隐藏维度 ------------------
+    # 这类场景每层 page_size 不同，因此不能简单地按“共享 page_size”拼接。
+    # 做法是：所有层共用同一个 num_blocks，但每层单独分配自己的 tensor 大小。
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -1120,25 +1141,29 @@ def get_kv_cache_config_from_groups(
             for layer_name in kv_cache_groups[0].layer_names
         ]
     else:
-        # General case:
-        # We will have group_size memory pools, each is shared by one layer from
-        # each group. As layers of different groups have different block table,
-        # they will use different parts of the shared Tensor.
-        # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
-        # (sw.1, padding) will be: (group_size = 2)
-        # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
-        # full.1, sw.2: share another Tensor with size=available_memory//2
+        # ------------------ 分支 2：通用共享布局 ------------------
+        # 我们会生成 `group_size` 块共享 tensor。每一块 tensor 在“每个 group
+        # 的同一槽位层”之间复用。不同 group 通过各自的 block table 映射到共享
+        # tensor 的不同逻辑区段上。
+        #
+        # 例如 3 个 group:
+        #   (full.0, full.1), (sw.0, sw.2), (sw.1, padding)
+        # 若 group_size = 2，则共享布局为：
+        #   tensor 0 <- full.0 / sw.0 / sw.1
+        #   tensor 1 <- full.1 / sw.2
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
 
         page_size = get_uniform_page_size(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
         assert group_size > 0, "group_size must be greater than 0"
+        # 统一 page_size 后，再按共享槽位数量计算全局 block 数。
         num_blocks = get_num_blocks(
             cfie_config, group_size, available_memory, page_size
         )
         kv_cache_tensors = []
         for i in range(group_size):
+            # 收集“第 i 个共享槽位”上实际存在的层名。
             shared_by = []
             for j in range(len(kv_cache_groups)):
                 if i < len(kv_cache_groups[j].layer_names):
@@ -1263,7 +1288,11 @@ def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
 ) -> KVCacheConfig:
     """
-    Generate the KV cache configuration for the scheduler.
+    从各 worker 的 KVCacheConfig 汇总出 scheduler 侧使用的统一配置。
+
+    scheduler 只关心“全局上能调度多少 block / 每个 group 是什么规格”，
+    不需要保留 worker 局部的 tensor 细节，因此这里会把多 worker 配置压成
+    一份代表性配置。
     """
     assert all(
         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
@@ -1516,38 +1545,27 @@ def get_kv_cache_configs(
     available_memory: list[int],
 ) -> list[KVCacheConfig]:
     """
-    Generates the KV cache configurations for a model.
-    Since we use a shared centralized controller for all workers, we need the
-    `kv_cache_config` to be consistent across all workers to make sure
-    the KV cache allocation can be applied to all workers. However, different
-    workers may have different memory available, and different type of layers
-    (when pipeline parallel is enabled). To handle the difference between
-    workers, the current implementation is:
-    1. Merge the KV cache specs of all workers to get the KVCacheSpecs for
-       the whole model.
-    2. Generate the KV cache groups based on the layer ratio of the whole model.
-       This also handles spec unification for hybrid models.
-    3. Handle auto-fit max_model_len and memory checks using per-worker
-       projected groups to account for PP sharding.
-    4. Generate the KV cache configs for each worker based on the KV cache
-       grouping strategy. (This is reasonable because the layer ratio of
-       different PP stages are similar.)
-    5. Change the num_blocks of each worker to the smallest among all workers
-       and shrink tensor sizes proportionally to avoid allocating unused memory.
+    基于“每个 worker 的 KV 规格 + 每个 worker 的可用显存预算”，统一生成
+    整个模型的 KVCacheConfig。
 
-    Args:
-        cfie_config: The global CfieConfig
-        kv_cache_specs: List of dict[layer_name, KVCacheSpec] for each worker.
-        available_memory: Memory available for KV cache in bytes for each
-            worker.
+    这是显存划分链里真正把 `available_memory` 变成 `num_blocks` 的核心入口。
+    它要同时处理两个事实：
 
-    Returns:
-        The generated KVCacheConfigs for each worker.
+    - 不同 worker 可能因为 PP 分片而持有不同层。
+    - 不同 worker 的 `available_memory` 也可能不完全一样。
+
+    因此这里的策略是：
+
+    1. 先把所有 worker 的 layer spec 合并成全局视角。
+    2. 在全局视角上做 KV group 划分与 hybrid spec 归一。
+    3. 再把全局 group 投影回每个 worker。
+    4. 针对每个 worker 的预算各自算出一份 KVCacheConfig。
+    5. 最后把所有 worker 的 `num_blocks` 收敛到最小值，保证中央调度器看到
+       的 block 容量一致。
     """
 
-    # Merge the KV cache specs of all workers. Different PP stages may have
-    # different layer names, and different TP ranks of the same PP stage should
-    # have the same KV cache spec.
+    # ------------------ 第 1 段：合并所有 worker 的 KV 规格 ------------------
+    # 不同 PP stage 的层名不同，但同一层在不同 rank 上的 spec 必须一致。
     merged_kv_cache_specs: dict[str, KVCacheSpec] = {}
     for kv_cache_spec_one_worker in kv_cache_specs:
         for layer_name, layer_spec in kv_cache_spec_one_worker.items():
@@ -1559,25 +1577,24 @@ def get_kv_cache_configs(
                     "across workers. This is not supported yet."
                 )
 
-    # Get global KV cache groups. This also handles spec unification for
-    # hybrid models when disable_hybrid_kv_cache_manager is enabled.
-    # After this call, merged_kv_cache_specs may be modified in-place.
+    # ------------------ 第 2 段：在全局视角上做 KV group 划分 ------------------
+    # 这一步也会顺手处理 hybrid 模型的 spec 统一问题。
     global_kv_cache_groups = get_kv_cache_groups(cfie_config, merged_kv_cache_specs)
 
-    # If original_max_model_len was -1, automatically
-    # determine the maximum model length that fits in available GPU memory.
-    # We use per-worker projected groups to account for PP sharding.
+    # ------------------ 第 3 段：把全局 group 投影回各 worker ------------------
+    # 这样后续 auto-fit 与内存检查才能按每个 worker 的真实持层来做。
     projected_groups_per_worker = [
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
 
     if cfie_config.model_config.original_max_model_len == -1:
+        # max_model_len=-1 时，自动压到“所有 worker 都放得下”的长度。
         _auto_fit_max_model_len(
             cfie_config, projected_groups_per_worker, available_memory
         )
 
-    # Check if the available memory is enough per worker.
+    # ------------------ 第 4 段：逐 worker 做容量检查 ------------------
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
             continue
@@ -1588,6 +1605,7 @@ def get_kv_cache_configs(
             partial(_estimate_max_model_len_from_groups, cfie_config, groups),
         )
 
+    # ------------------ 第 5 段：逐 worker 生成局部 KVCacheConfig ------------------
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
         projected_groups_per_worker, kv_cache_specs, available_memory
@@ -1601,9 +1619,9 @@ def get_kv_cache_configs(
             )
         )
 
-    # Change the num_blocks of each rank to the smallest among all ranks.
-    # We also need to shrink the tensor size proportionally to avoid
-    # allocating unused memory.
+    # ------------------ 第 6 段：把所有 worker 的 block 容量收敛到统一下界 ------------------
+    # 中央 scheduler 需要看到一致的 block 容量，因此最终以最小 num_blocks 为准。
+    # 同时同步缩小各 tensor 大小，避免某些 worker 额外分到用不上的显存。
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )

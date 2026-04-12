@@ -29,8 +29,22 @@ def split_gpu_memory_budget(
     total_memory: int,
     gpu_memory_utilization: float,
 ) -> tuple[int, int]:
-    """Split total GPU memory into static budget and runtime headroom."""
+    """
+    按统一口径把总 GPU 显存切成“静态预算”和“运行时余量”两部分。
+
+    这里的切分规则是当前显存划分主链的基础约定，MoE planner 与 worker
+    运行时都必须复用同一套逻辑，避免两边对 `gpu_memory_utilization`
+    的理解发生漂移。
+
+    - static_budget:
+      可被权重、常驻非 KV 状态以及最终 KV cache 占用的“静态区域”。
+    - runtime_headroom:
+      必须额外留给 prefill/decode 峰值、临时 workspace、图捕获等
+      运行期抖动的余量。
+    """
+    # ratio 内的显存视为“静态预算”，后续 KV cache 只能从这部分里扣。
     static_budget = math.ceil(total_memory * gpu_memory_utilization)
+    # ratio 外的显存全部当作运行期 headroom，不再挪给静态常驻分配。
     runtime_headroom = max(0, total_memory - static_budget)
     return static_budget, runtime_headroom
 
@@ -76,79 +90,111 @@ class DeviceMemoryProfiler:
 
 @dataclass
 class MemorySnapshot:
-    """Memory snapshot."""
+    """显存快照对象。"""
 
+    # PyTorch 侧观测到的峰值显存占用，单位为字节。
     torch_peak: int = 0
+
+    # 当前时刻设备剩余空闲显存，单位为字节。
     free_memory: int = 0
+
+    # 当前设备总显存容量，单位为字节。
     total_memory: int = 0
+
+    # 当前整个设备已被占用的显存，单位为字节。
     cuda_memory: int = 0
+
+    # 当前由 PyTorch 运行时保留的显存，单位为字节。
     torch_memory: int = 0
+
+    # 当前非 PyTorch 路径占用的显存，单位为字节。
     non_torch_memory: int = 0
+
+    # 本次快照采样的时间戳。
     timestamp: float = 0.0
 
+    # 当前快照绑定的设备对象；允许外部显式传入。
     device: torch.types.Device = None
+
+    # 是否在初始化结束后自动执行一次测量。
     auto_measure: bool = True
 
     def __post_init__(self) -> None:
+        # ------------------------------- 解析当前快照绑定的设备对象 -------------------------------
+        # 当调用方没有显式传入设备时，从当前平台读取默认设备。
         if self.device is None:
+            # 获取当前平台返回默认设备的函数对象。
             device_fn = current_platform.current_device
+
+            # 校验当前平台提供了默认设备获取函数。
             assert device_fn is not None
+
+            # 使用当前平台返回的默认设备构造标准 torch.device 对象。
             self.device_ = torch.device(device_fn())
         else:
+            # 当调用方显式传入了设备时，直接将其规范化为 torch.device 对象。
             self.device_ = torch.device(self.device)
 
+        # ------------------------------- 按配置决定是否在初始化后立即采样 -------------------------------
+        # 当启用了自动测量时，在对象初始化完成后立即执行一次显存快照采样。
         if self.auto_measure:
             self.measure()
 
     def measure(self) -> None:
+        # ------------------------------- 读取当前快照绑定的目标设备 -------------------------------
+        # 取出当前快照实际绑定的设备对象，后续所有显存查询都基于它执行。
         device = self.device_
 
-        # we measure the torch peak memory usage via allocated_bytes,
-        # rather than `torch.cuda.memory_reserved()` .
-        # After `torch.cuda.reset_peak_memory_stats()`,
-        # `torch.cuda.memory_reserved()` will keep growing, and only shrink
-        # when we call `torch.accelerator.empty_cache()` or OOM happens.
+        # ------------------------------- 采样 PyTorch 侧的峰值显存占用 -------------------------------
+        # 读取当前设备在 PyTorch 统计口径下的 allocated_bytes 峰值。
         self.torch_peak = current_platform.memory_stats(device).get(
             "allocated_bytes.all.peak", 0
         )
 
+        # ------------------------------- 采样当前设备的空闲显存与总显存 -------------------------------
+        # 读取当前设备的空闲显存与总显存，作为本次快照的基础容量信息。
         self.free_memory, self.total_memory = current_platform.mem_get_info(device)
-        shared_sysmem_device_mem_sms = ((8, 7), (11, 0), (12, 1))  # Orin, Thor, Spark
+
+        # ------------------------------- 在 UMA 平台上修正 free_memory 的取值口径 -------------------------------
+        # 列出共享系统内存的集成式 GPU 设备 capability，用于识别 UMA 平台。
+        shared_sysmem_device_mem_sms = ((8, 7), (11, 0), (12, 1))
+
+        # 当当前平台为 CUDA 且设备 capability 命中 UMA 平台集合时，需要改用系统可用内存修正 free_memory。
         if (
             current_platform.is_cuda()
             and current_platform.get_device_capability(device.index)
             in shared_sysmem_device_mem_sms
         ):
-            # On UMA (Orin, Thor and Spark) platform,
-            # where both CPU and GPU rely on system memory,
-            # the cudaMemGetInfo function shows the amount of free system memory
-            # rather than what’s actually available.
-            # In the case,
-            # torch.cuda.mem_get_info() only reports "free" memory,
-            # which can be lower than what is actually
-            # available due to not including cache memory.
-            # There’s also a comprehensive reference page
-            # that explains how you can compute the proper value yourself.
-            # https://docs.nvidia.com/cuda/cuda-for-tegra-appnote/#estimating-total-allocatable-device-memory-on-an-integrated-gpu-device
+            # 在 UMA 平台上，用系统当前可用内存近似替代设备 free_memory。
             self.free_memory = psutil.virtual_memory().available
 
+        # ------------------------------- 计算当前设备总占用显存 -------------------------------
+        # 用总显存减去空闲显存，得到当前设备已被占用的总显存。
         self.cuda_memory = self.total_memory - self.free_memory
 
-        # torch.cuda.memory_reserved() is how many bytes
-        # PyTorch gets from cuda (by calling cudaMalloc, etc.)
-        # this is used to measure the non-torch memory usage
+        # ------------------------------- 采样当前由 PyTorch 保留的显存 -------------------------------
+        # 读取当前设备上由 PyTorch 运行时保留的显存字节数。
         self.torch_memory = current_platform.memory_reserved(device)
 
+        # ------------------------------- 计算非 PyTorch 路径占用的显存 -------------------------------
+        # 用设备总占用显存减去 PyTorch 保留显存，得到非 PyTorch 路径占用的显存。
         self.non_torch_memory = self.cuda_memory - self.torch_memory
+
+        # ------------------------------- 记录本次快照采样时间戳 -------------------------------
+        # 保存当前时间戳，用于后续快照差分与时序分析。
         self.timestamp = time.time()
 
     def __sub__(self, other: "MemorySnapshot") -> "MemorySnapshot":
+        # ------------------------------- 校验参与差分的两个快照来自同一设备 -------------------------------
+        # 当两个快照绑定的设备不一致时，拒绝执行差分运算。
         if self.device_ != other.device_:
             raise ValueError(
                 "The two snapshots should be from the same device! "
                 f"Found: {self.device_} vs. {other.device_}"
             )
 
+        # ------------------------------- 构造两个快照之间的差分结果 -------------------------------
+        # 返回一个新快照对象，其各字段值为当前快照减去另一个快照后的差值。
         return MemorySnapshot(
             torch_peak=self.torch_peak - other.torch_peak,
             free_memory=self.free_memory - other.free_memory,
@@ -162,6 +208,8 @@ class MemorySnapshot:
         )
 
     def __repr__(self) -> str:
+        # ------------------------------- 构造当前显存快照的人类可读字符串表示 -------------------------------
+        # 返回包含峰值显存、空闲显存、总显存、PyTorch 显存、非 PyTorch 显存与时间戳的摘要字符串。
         return (
             f"torch_peak={format_gib(self.torch_peak)}GiB, "
             f"free_memory={format_gib(self.free_memory)}GiB, "

@@ -1284,13 +1284,16 @@ class LayerTieredExpertCacheController:
 
 
 def maybe_enable_tiered_moe_cache(model: nn.Module, cfie_config: Any) -> None:
-    # 从总配置里读取启动期 planner 注入的 tiered cache plan。
+    # ------------------------------- 读取 tiered MoE cache 计划并判断是否启用 -------------------------------
+    # 从配置对象中读取启动期 planner 注入的 tiered MoE cache 计划。
     plan = get_moe_tiered_cache_plan(cfie_config)
-    # plan 不存在或 planner 判断 disabled 时，直接不挂载任何控制器。
+
+    # 当计划不存在，或计划中显式标记为未启用时，直接返回，不挂载任何控制器。
     if not plan or not bool(plan.get("enabled", False)):
         return
 
-    # 打印准备挂载 tiered cache 的总览信息。
+    # ------------------------------- 打印 tiered MoE cache 挂载前的总体计划信息 -------------------------------
+    # 输出当前 tiered MoE cache 计划的关键摘要信息，便于确认模型类型、GPU 槽位、burst 槽位和 CPU 槽位等参数。
     logger.info(
         "Preparing tiered MoE expert cache attachment: model_type=%s "
         "gpu_slots/layer=%d prefill_burst_slots=%d cpu_slots/layer=%d model=%s",
@@ -1300,60 +1303,82 @@ def maybe_enable_tiered_moe_cache(model: nn.Module, cfie_config: Any) -> None:
         int(plan.get("cpu_slots_per_layer", 0)),
         plan.get("model_path", ""),
     )
-    # SafetensorExpertStore 负责后续所有按层/按 expert 的冷数据读取。
+
+    # ------------------------------- 初始化冷数据读取存储与全局统计状态 -------------------------------
+    # 基于计划中的模型路径创建 safetensors 专家存储，用于后续按层、按专家读取冷数据。
     expert_store = SafetensorExpertStore(plan["model_path"])
-    # 读取计划中的共享 burst pool 容量。
+
+    # 读取计划中配置的共享 prefill burst pool 槽位数。
     prefill_burst_slots = int(plan.get("prefill_burst_slots", 0))
-    # enabled_layers 统计最终真正挂上控制器的层数。
+
+    # 记录最终真正挂载 tiered cache controller 的层数。
     enabled_layers = 0
-    # marked_layers 统计模型里被标记为“应该启用 tiered cache”的 FusedMoE 层数。
+
+    # 记录模型中被标记为应该启用 tiered cache 的 FusedMoE 层数。
     marked_layers = 0
-    # 同一模型里尽量复用一个共享 burst pool，减少额外显存占用。
+
+    # 尽量在同一模型内复用一个共享 prefill burst pool，以减少额外显存占用。
     shared_prefill_burst_pool: SharedPrefillBurstPool | None = None
 
-    # ----------------- 遍历模型模块，为每个目标 FusedMoE 层挂控制器 -----------------
+    # ------------------------------- 遍历模型模块并为目标 FusedMoE 层挂载控制器 -------------------------------
+    # 遍历模型中的全部子模块，逐个查找需要启用 tiered cache 的 FusedMoE 层。
     for module in model.modules():
-        # 只处理 FusedMoE 层。
+        # 仅处理 FusedMoE 类型的层。
         if not isinstance(module, FusedMoE):
             continue
-        # 只处理前面在 layer 初始化时被标记启用 CFIE tiered cache 的层。
+
+        # 仅处理前面初始化阶段已被标记启用 CFIE tiered cache 的层。
         if not getattr(module, "_cfie_tiered_cache_enabled", False):
             continue
+
+        # 统计当前模型中被标记需要启用 tiered cache 的层数。
         marked_layers += 1
+
+        # 当前层默认不绑定任何 prefill burst pool。
         layer_prefill_burst_pool: SharedPrefillBurstPool | None = None
-        # 若 plan 启用了 burst pool，则优先复用全局共享池。
+
+        # ------------------------------- 按需为当前层分配或复用共享 prefill burst pool -------------------------------
+        # 当计划中启用了 prefill burst pool 时，优先尝试为当前层复用全局共享池。
         if prefill_burst_slots > 0:
+            # 当全局共享 burst pool 尚未创建时，基于当前层构造一份模板化共享池。
             if shared_prefill_burst_pool is None:
                 shared_prefill_burst_pool = SharedPrefillBurstPool(
                     template_layer=module,
                     num_slots=prefill_burst_slots,
                 )
-            # 当前层形状与共享池兼容时，直接挂同一个 burst pool。
+
+            # 当当前层与共享 burst pool 的形状兼容时，直接复用同一个共享池。
             if shared_prefill_burst_pool.supports_layer(module):
                 layer_prefill_burst_pool = shared_prefill_burst_pool
             else:
-                # 不兼容时保留警告并让该层只走 resident prepare 路径。
+                # 当当前层与共享 burst pool 不兼容时，保留告警，并让该层仅走 resident prepare 路径。
                 logger.warning(
                     "Skipping shared prefill burst pool on incompatible MoE layer: %s",
                     module.layer_name,
                 )
-        # 为当前层挂上真正的 per-layer tiered cache controller。
+
+        # ------------------------------- 为当前 FusedMoE 层挂载 tiered cache controller -------------------------------
+        # 基于当前层、全局计划、专家存储和可选的 prefill burst pool 构造分层专家缓存控制器。
         module._cfie_tiered_cache_controller = LayerTieredExpertCacheController(
             layer=module,
             plan=plan,
             expert_store=expert_store,
             prefill_burst_pool=layer_prefill_burst_pool,
         )
+
+        # 统计当前已成功挂载控制器的层数。
         enabled_layers += 1
 
-    # 若理论应启用的层数和实际挂载数不一致，直接 fail fast。
+    # ------------------------------- 校验目标层数与实际挂载层数是否一致 -------------------------------
+    # 当存在被标记的目标层，但实际成功挂载的层数与标记层数不一致时，直接失败并报错。
     if marked_layers and enabled_layers != marked_layers:
         raise RuntimeError(
             f"Tiered MoE cache expected {marked_layers} layers, but attached only "
             f"{enabled_layers}"
         )
 
-    # 所有目标层都成功挂载后，打印最终启用日志。
+    # ------------------------------- 在全部挂载成功后打印最终启用日志 -------------------------------
+    # 当至少有一层成功启用了 tiered MoE cache 时，打印最终启用结果。
     if enabled_layers > 0:
         logger.info(
             "Enabled tiered MoE expert cache on %d layers (plan=%s)",

@@ -100,11 +100,14 @@ class MoeTieredCachePlan:
 def get_moe_tiered_cache_plan(cfie_config: Any) -> dict[str, Any] | None:
     # 从总配置对象上读取 additional_config 容器。
     additional_config = getattr(cfie_config, "additional_config", None)
+
     # additional_config 不是字典时，说明当前配置里没有可读取 plan 的位置。
     if not isinstance(additional_config, dict):
         return None
+
     # 读取约定键名对应的 plan。
     plan = additional_config.get(PLAN_KEY)
+
     # 只有字典形态的 plan 才视为有效。
     return plan if isinstance(plan, dict) else None
 
@@ -135,6 +138,11 @@ def maybe_inject_moe_tiered_cache_plan(cfie_config: Any) -> None:
 
 def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     # ------------------ 基础前置校验：模型类型、并行方式、量化后端 ------------------
+
+    # TODO 当前MOE内存卸载方案过于局限于单一的执行路径
+    #  建议不应限定是否开TP、EPLB 和 限定量化方式 和 量化方式为GPTQ时限定desc为False
+    #  考察整个系统实现，确保将MOE 卸载方案实现修改为可与任意TP、EPLB 和 量化方式兼容，然后删除以下限制
+
     # 读取模型配置对象；后续几乎所有规划都依赖它。
     model_config = getattr(cfie_config, "model_config", None)
     # 只有 MoE 模型才需要构建专家分层缓存计划；否则直接返回 disabled plan。
@@ -174,8 +182,10 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
 
     # 记录原始 model_type，供最后回填到 plan 中与日志输出。
     model_type = getattr(hf_config, "model_type", "")
+
     # 解析当前模型属于 target 规划还是 MTP 规划模式。
     planning_mode = _resolve_qwen35_moe_planning_mode(hf_config)
+
     # 若不是当前 planner 支持的模型类型，则直接禁用。
     if planning_mode is None:
         return MoeTieredCachePlan(enabled=False, reason="model_type_not_supported")
@@ -188,6 +198,9 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
 
     # 读取模型本地目录路径；planner 只支持本地目录，不支持纯 repo id。
     model_path = getattr(model_config, "model", "")
+
+    # TODO 这里是否能跟项目中创建模型，下载模型权重，加载参数的流程同步
+    #  即若此时还没有文件夹，或文件夹内没有权重文件，则将项目中后续下载权重的任务提前，而不是限制model_path的放在方式, 应该兼容目前系统支持的model_path
     # 若模型路径不是本地目录，则无法基于本地 safetensors 元数据做规划。
     if not Path(model_path).is_dir():
         return MoeTieredCachePlan(enabled=False, reason="model_path_not_local")
@@ -195,11 +208,12 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     # ------------------ 读取 safetensors 元数据，并识别当前变体的专家层结构 ------------------
     # 扫描 safetensors 元数据，用于统计 dense / expert 权重大小。
     metadata = get_safetensors_params_metadata(model_path)
+
     # 若一个有效的 safetensors 元数据映射都拿不到，则无法规划。
     if not metadata:
         return MoeTieredCachePlan(enabled=False, reason="missing_safetensors_metadata")
 
-    # 依据 planning_mode 过滤出当前变体真正参与规划的权重元数据。
+    # 过滤target模型 或 MTP模型
     variant_metadata = _filter_metadata_for_planning(
         metadata=metadata,
         planning_mode=planning_mode,
@@ -216,16 +230,20 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             if (prefix := _extract_expert_layer_prefix(name)) is not None
         }
     )
+
     # 若完全提取不到专家层前缀，则说明专家张量不存在或命名不匹配。
     if not layer_prefixes:
         return MoeTieredCachePlan(enabled=False, reason="missing_expert_tensors")
 
     # 计算模型中的 MoE 层数量。
     num_moe_layers = len(layer_prefixes)
+
     # 读取每层总专家数。
     num_experts = int(getattr(hf_text_config, "num_experts", 0))
+
     # 读取每个 token 路由到的专家数 top-k。
     top_k = int(getattr(hf_text_config, "num_experts_per_tok", 0))
+
     # 维度非法时无法继续规划。
     if num_experts <= 0 or top_k <= 0:
         return MoeTieredCachePlan(enabled=False, reason="invalid_moe_dimensions")
@@ -256,9 +274,7 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     expert_bytes_per_expert = max(layer_expert_sizes.values())
 
     # 取所有层中最大的“整层全部专家大小”，方便记录总体规模信息。
-    expert_bytes_per_layer = max(
-        expert_bytes * num_experts for expert_bytes in layer_expert_sizes.values()
-    )
+    expert_bytes_per_layer = expert_bytes_per_expert * num_experts
 
     # 把各层单专家大小求和，得到“每层常驻 1 个专家跨全模型总共要多少字节”。
     expert_bytes_per_slot_all_layers = sum(layer_expert_sizes.values())
@@ -267,11 +283,12 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     dense_bytes = total_bytes - expert_bytes_total
 
     # ------------------ 先做 GPU 侧预算规划，决定常驻 experts 与 prefill burst 空间 ------------------
+    # TODO 这里的计算方式是 显卡总显存 * gpu_memory_utilization
+    #  但按照我希望的项目总口径: 参数静态划分 + KV_cache = 可用显存 * gpu_memory_utilization， 计算峰值 + 其他部分 < （1 - gpu_memory_utilization) * 可用显存
+    #  这里应该取可用显存 而不是 总显存
 
     # 估算本机在当前配置下，静态规划部分可用的 GPU 预算。
     gpu_budget_bytes = _get_gpu_budget_bytes(cfie_config)
-    # 估算 ratio 外保留给运行时峰值的 GPU headroom。
-    gpu_runtime_headroom_bytes = _get_gpu_runtime_headroom_bytes(cfie_config)
 
     # 若算出来没有 GPU 预算，通常意味着非 CUDA 设备，直接禁用。
     if gpu_budget_bytes <= 0:
@@ -279,22 +296,6 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
 
     # 估算 KV cache 与线性状态缓存的预算。
     kv_bytes, linear_state_bytes = _estimate_hybrid_cache_bytes(cfie_config)
-
-    # 估算运行时峰值需要的动态 headroom。
-    # 这部分只做记录与日志，不再占用静态规划预算。
-    dynamic_bytes = _estimate_dynamic_reserve_bytes(
-        planning_mode=planning_mode,
-        gpu_budget_bytes=gpu_budget_bytes,
-    )
-    if dynamic_bytes > gpu_runtime_headroom_bytes:
-        logger.warning(
-            "Estimated runtime peak exceeds configured runtime headroom: "
-            "model=%s estimated_runtime_peak=%.2f GiB runtime_headroom=%.2f GiB. "
-            "Actual runtime profiling may require lowering gpu_memory_utilization.",
-            model_path,
-            dynamic_bytes / GiB,
-            gpu_runtime_headroom_bytes / GiB,
-        )
 
     # resident_bytes 只表示“当前规划视角自身的静态非专家常驻内容”。
     resident_bytes = dense_bytes + kv_bytes + linear_state_bytes
@@ -307,11 +308,11 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         target_occupied_gpu_bytes=target_occupied_gpu_bytes,
     )
 
-    # 用总 GPU 预算减去 target 自身常驻量、运行时动态峰值预留和共享/draft 预留量，
+    # 用总 GPU 预算减去 target 自身常驻量和共享/draft 预留量，
     # 得到理论上的专家显存预算。
     raw_gpu_expert_budget_bytes = max(
         0,
-        gpu_budget_bytes - resident_bytes - dynamic_bytes - shared_gpu_reserve_bytes,
+        gpu_budget_bytes - resident_bytes - shared_gpu_reserve_bytes,
     )
 
     # 进一步把专家显存预算换算成“每层最多能常驻多少个专家 slot”。
@@ -324,12 +325,14 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     if raw_gpu_slots_per_layer < top_k:
         # top-k 常驻所需的最小专家显存预算。
         required_gpu_expert_budget_bytes = expert_bytes_per_slot_all_layers * top_k
+
         # 满足该最小专家预算时，对应的总 GPU 预算下限。
         required_total_gpu_budget_bytes = (
                 resident_bytes
                 + shared_gpu_reserve_bytes
                 + required_gpu_expert_budget_bytes
         )
+
         # 直接抛出带详细预算拆分的错误，提示当前 GPU 分配无法满足该 MoE 模型。
         raise ValueError(
             "Insufficient GPU budget for MoE tiered cache: "
@@ -338,12 +341,10 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             "Current GPU memory allocation cannot satisfy the minimum MoE "
             "residency requirement for this model. "
             f"static_budget={gpu_budget_bytes / GiB:.2f} GiB "
-            f"runtime_headroom={gpu_runtime_headroom_bytes / GiB:.2f} GiB "
             f"resident={resident_bytes / GiB:.2f} GiB "
             f"(dense={dense_bytes / GiB:.2f} GiB "
             f"kv={kv_bytes / GiB:.2f} GiB "
             f"linear_state={linear_state_bytes / GiB:.2f} GiB) "
-            f"estimated_runtime_peak={dynamic_bytes / GiB:.2f} GiB "
             f"shared_gpu_reserve={shared_gpu_reserve_bytes / GiB:.2f} GiB "
             f"gpu_expert_budget={raw_gpu_expert_budget_bytes / GiB:.2f} GiB "
             f"required_expert_budget={required_gpu_expert_budget_bytes / GiB:.2f} GiB "
@@ -370,25 +371,14 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             dense_bytes=dense_bytes,
             kv_bytes=kv_bytes,
             linear_state_bytes=linear_state_bytes,
-            dynamic_bytes=dynamic_bytes,
             resident_bytes=resident_bytes,
             shared_gpu_reserve_bytes=shared_gpu_reserve_bytes,
             gpu_budget_bytes=gpu_budget_bytes,
-            gpu_runtime_headroom_bytes=gpu_runtime_headroom_bytes,
             gpu_expert_budget_bytes=expert_bytes_total,
             gpu_slots_per_layer=num_experts,
         )
 
-    # 不管 raw 预算多小，也至少要为 top-k 个常驻专家保留显存预算。
-    min_gpu_expert_budget_bytes = expert_bytes_per_slot_all_layers * top_k
-
-    # 真正参与后续规划的 GPU 专家预算取“raw 预算”和“top-k 最小预算”的较大者。
-    gpu_expert_budget_bytes = max(
-        min_gpu_expert_budget_bytes,
-        raw_gpu_expert_budget_bytes,
-    )
-
-    # MTP reserve-only 与 standalone mtp 仍沿用固定 base_8 resident 逻辑。
+    # MTP reserve-only 固定 base_8 resident 逻辑。
     fixed_gpu_slots_per_layer = _resolve_fixed_gpu_slots_per_layer(
         planning_mode=planning_mode,
         top_k=top_k,
@@ -404,11 +394,10 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             num_experts,
             raw_gpu_slots_per_layer,
         )
-        gpu_slots_per_layer = max(top_k, gpu_slots_per_layer)
         prefill_burst_slots = 0
         prefill_burst_bytes = 0
         gpu_expert_budget_bytes = (
-            gpu_slots_per_layer * expert_bytes_per_slot_all_layers
+                gpu_slots_per_layer * expert_bytes_per_slot_all_layers
         )
     # 若当前模式要求固定 GPU slot 数，则不再额外规划 burst 池。
     elif fixed_gpu_slots_per_layer is not None:
@@ -418,8 +407,6 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             raw_gpu_slots_per_layer,
             fixed_gpu_slots_per_layer,
         )
-        # 但仍需保证最终常驻数不少于 top-k。
-        gpu_slots_per_layer = max(top_k, gpu_slots_per_layer)
         # 固定常驻模式下不启用 prefill burst。
         prefill_burst_slots = 0
         # 对应的 burst 临时池显存也为 0。
@@ -434,7 +421,7 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         gpu_slots_per_layer, prefill_burst_slots = _plan_prefill_burst_slots(
             num_experts=num_experts,
             top_k=top_k,
-            total_gpu_budget_bytes=int(gpu_expert_budget_bytes),
+            total_gpu_budget_bytes=int(raw_gpu_expert_budget_bytes),
             expert_bytes_per_slot_all_layers=expert_bytes_per_slot_all_layers,
             expert_bytes_per_expert=expert_bytes_per_expert,
         )
@@ -447,31 +434,57 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
                 gpu_slots_per_layer * expert_bytes_per_slot_all_layers + prefill_burst_bytes
         )
 
+    # ------------------------------- 根据 batch token 上限决定是否关闭 prefill burst 池 -------------------------------
+    # 读取当前配置下允许的最大 batched token 数。
     max_num_batched_tokens = _get_max_num_batched_tokens(cfie_config)
+
+    # 当当前仍计划启用 prefill burst 池时，继续检查 token 上限是否足以支撑 burst。
     if prefill_burst_slots > 0:
+        # ------------------------------- 计算当前 resident-slot 方案对应的 burst 最小 token 门槛 -------------------------------
+        # 取默认下限与“每层 GPU 常驻槽位数乘以每槽位 token 配额”两者中的较大值，作为 burst 的最小 token 门槛。
         burst_min_tokens = max(
             DEFAULT_PREFILL_BURST_MIN_TOKENS,
             int(gpu_slots_per_layer) * DEFAULT_PREFILL_BURST_TOKENS_PER_GPU_SLOT,
         )
+
+        # ------------------------------- 当最大 batched token 数不足时关闭 prefill burst 池 -------------------------------
+        # 当 max_num_batched_tokens 为有效正数且低于 burst 最小门槛时，说明当前 batch 上限不足以支撑 burst 池。
         if 0 < max_num_batched_tokens < burst_min_tokens:
+            # 记录日志，说明当前因为 batched token 上限过低而关闭 prefill burst 池。
             logger.info(
                 "Disabling prefill burst pool because max_num_batched_tokens=%d "
                 "is below burst_min_tokens=%d for the current resident-slot plan.",
                 max_num_batched_tokens,
                 burst_min_tokens,
             )
+
+            # 关闭 prefill burst 槽位数。
             prefill_burst_slots = 0
+
+            # 将 prefill burst 对应的显存预算清零。
             prefill_burst_bytes = 0
+
+            # 将 GPU 专家预算回退为仅由常驻 expert 槽位占用的预算。
             gpu_expert_budget_bytes = (
-                int(gpu_slots_per_layer) * expert_bytes_per_slot_all_layers
+                    int(gpu_slots_per_layer) * expert_bytes_per_slot_all_layers
             )
 
     # ------------------ 再做 CPU 侧预算规划，决定 static experts、staging 与 NVMe spill ------------------
 
+    # TODO 从这里可以看出, 当前的逻辑是GPU + CPU内存各自负责一部分专家
+    #  在没有使用到NVME的时候，GPU专家 + CPU专家 = 总专家
+    #  但这样会加大运行时的加载负担，这样不仅需要先将GPU的专家卸载到stage, 然后再将CPU专家加载GPU
+    #  应该设计成CPU专家重合GPU专家， 即即便GPU存放了专家0, CPU内存也需要存放一份专家0, 这样，后续动态加载，只需要考虑内存到显存的方向，大大减少了运载时间
     # 计算在 GPU 常驻之后，还剩多少专家候选需要落到 CPU/NVMe。
     remaining_cpu_candidates = max(
         0,
         num_experts - gpu_slots_per_layer,
+    )
+
+    # 计算全部专家里，在 GPU 部分之外还剩多少专家字节需要找落点。
+    remaining_expert_bytes = max(
+        0,
+        expert_bytes_total - gpu_expert_budget_bytes,
     )
 
     # 读取当前系统可用物理内存。
@@ -480,121 +493,121 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     # 读取当前系统总物理内存。
     total_system_bytes = _get_total_system_ram_bytes()
 
+    # TODO 当前的CPU内存的控制参数既有控制最低剩余内存，也有控制最大使用内存的参数
+    #  太啰嗦了， 改为只用最大使用内存的控制参数决定内存卸载专家的数量，不再明确指明最低剩余内存
     # 估算主机侧最少需要保留的空闲内存水位。
-    cpu_min_free_bytes = _estimate_cpu_min_free_bytes(
-        cfie_config=cfie_config,
-        total_system_bytes=total_system_bytes,
-    )
+    # cpu_min_free_bytes = _estimate_cpu_min_free_bytes(
+    #     cfie_config=cfie_config,
+    #     total_system_bytes=total_system_bytes,
+    # )
 
-    # 估算还需要额外预留给共享用途的 CPU 内存。
+    # 估算还需要额外预留给uva用途的 CPU 内存。
     cpu_shared_reserve_bytes = _estimate_cpu_shared_reserve_bytes(cfie_config)
 
-    # 计算全部专家里，在 GPU 部分之外还剩多少专家字节需要找落点。
-    remaining_expert_bytes = max(
-        0,
-        expert_bytes_total - gpu_expert_budget_bytes,
-    )
+    # TODO 当前版本会考虑NVME作为二级缓存，但实际测试后，一旦发生NVME交互，则推理速度太慢，无法承担实际应用
+    #  项目应整体改为只有显存 和 内存作为存储系统，删除NVME管线, 且因为删除NVME, 所以无需留存stage, 供NVME做缓存
+    # 至少需要留存多少给NVME做stage
+    # minimal_staging_bytes = _estimate_minimal_cpu_staging_bytes(
+    #     cfie_config=cfie_config,
+    #     available_system_bytes=available_system_bytes,
+    #     expert_bytes_per_slot_all_layers=expert_bytes_per_slot_all_layers,
+    #     remaining_cpu_candidates=remaining_cpu_candidates,  # 剩余专家数
+    #     remaining_expert_bytes=remaining_expert_bytes,  # 剩余专家数的大小
+    # )
 
-    # 估算即使 CPU 不做静态缓存，至少也需要给 staging 预留多少内存。
-    minimal_staging_bytes = _estimate_minimal_cpu_staging_bytes(
-        cfie_config=cfie_config,
-        available_system_bytes=available_system_bytes,
-        remaining_expert_bytes=remaining_expert_bytes,
-        expert_bytes_per_slot_all_layers=expert_bytes_per_slot_all_layers,
-        remaining_cpu_candidates=remaining_cpu_candidates,
-    )
 
-    # 先把 CPU 预算上限初始化为“剩余专家总字节数”。
-    cpu_budget_cap_bytes = remaining_expert_bytes
+    # # 若当前 CPU 预算连最基本的 staging 都装不下，则至少借出 minimal staging 预算。
+    # if cpu_budget_bytes < minimal_staging_bytes < remaining_expert_bytes:
+    #     logger.info(
+    #         "Borrowing minimal CPU staging budget below min-free watermark: "
+    #         "model=%s staging=%.2f MiB available=%.2f GiB min_free=%.2f GiB",
+    #         model_path,
+    #         minimal_staging_bytes / (1 << 20),
+    #         available_system_bytes / GiB,
+    #     )
+    #     # 强行把 CPU 预算抬到 minimal staging 水平，确保仍可运行分层加载。
+    #     cpu_budget_bytes = minimal_staging_bytes
 
-    # 若除了 staging 之外，CPU 还有希望静态常驻部分专家，则把预算上限改为“静态专家 + staging”。
-    if remaining_expert_bytes > minimal_staging_bytes:
-        # remaining_resident_expert_bytes 表示所有剩余 CPU 候选若全部静态缓存，需要多少字节。
-        remaining_resident_expert_bytes = (
-                remaining_cpu_candidates * expert_bytes_per_slot_all_layers
-        )
-        # CPU 真正有意义的预算上限，就是“静态部分 + staging”。
-        cpu_budget_cap_bytes = remaining_resident_expert_bytes + minimal_staging_bytes
+    # # 先把 CPU 预算上限初始化为“剩余专家总字节数”。
+    # cpu_budget_cap_bytes = remaining_expert_bytes
+    #
+    # # 若除了 staging 之外，CPU 还有希望静态常驻部分专家，则把预算上限改为“静态专家 + staging”。
+    # if remaining_expert_bytes > minimal_staging_bytes:
+    #     # CPU 真正有意义的预算上限，就是“静态部分 + staging”。
+    #     cpu_budget_cap_bytes = remaining_expert_bytes + minimal_staging_bytes
 
     # 用主机侧预算估算器得到一个保守 CPU 预算，再与预算上限取最小值。
-    cpu_budget_bytes = min(
-        _estimate_cpu_cache_budget_bytes(
-            cfie_config=cfie_config,
-            available_system_bytes=available_system_bytes,
-            total_system_bytes=total_system_bytes,
-        ),
-        cpu_budget_cap_bytes,
-    )
+    # cpu_budget_bytes = min(
+    #     _estimate_cpu_cache_budget_bytes(
+    #         cfie_config=cfie_config,
+    #         available_system_bytes=available_system_bytes,
+    #         total_system_bytes=total_system_bytes,
+    #     ),
+    #     cpu_budget_cap_bytes,
+    # )
 
-    # 若当前 CPU 预算连最基本的 staging 都装不下，则至少借出 minimal staging 预算。
-    if cpu_budget_bytes < minimal_staging_bytes < remaining_expert_bytes:
-        logger.info(
-            "Borrowing minimal CPU staging budget below min-free watermark: "
-            "model=%s staging=%.2f MiB available=%.2f GiB min_free=%.2f GiB",
-            model_path,
-            minimal_staging_bytes / (1 << 20),
-            available_system_bytes / GiB,
-            cpu_min_free_bytes / GiB,
-        )
-        # 强行把 CPU 预算抬到 minimal staging 水平，确保仍可运行分层加载。
-        cpu_budget_bytes = minimal_staging_bytes
+    # TODO 这是简化修改后的逻辑，这里的remaining_expert_bytes后续要改为全专家数；再判断预算是否超过min(内存最大可使用空间, 参数设置的最大使用空间)
+    #  若超过，直接提示用户，然后异常退出程序
+    cpu_budget_bytes = remaining_expert_bytes
+
+
 
     # 若保守 CPU 预算只差不到 1 个跨层 expert slot 就能消除 NVMe spill，则尝试做一次温和提升。
-    if (
-            remaining_expert_bytes > minimal_staging_bytes
-            and cpu_budget_bytes < cpu_budget_cap_bytes
-            and cpu_budget_cap_bytes - cpu_budget_bytes <= expert_bytes_per_slot_all_layers
-    ):
-        # 这里用更激进的 boost fraction 重新估算一次 CPU 预算，但仍不允许超过理论预算上限。
-        boosted_cpu_budget_bytes = min(
-            _estimate_cpu_cache_budget_bytes(
-                cfie_config=cfie_config,
-                available_system_bytes=available_system_bytes,
-                total_system_bytes=total_system_bytes,
-                budget_fraction=DEFAULT_CPU_CACHE_BOOST_FRACTION,
-            ),
-            cpu_budget_cap_bytes,
-        )
+    # if (
+    #         remaining_expert_bytes > minimal_staging_bytes
+    #         and cpu_budget_bytes < cpu_budget_cap_bytes
+    #         and cpu_budget_cap_bytes - cpu_budget_bytes <= expert_bytes_per_slot_all_layers
+    # ):
+    #     # 这里用更激进的 boost fraction 重新估算一次 CPU 预算，但仍不允许超过理论预算上限。
+    #     boosted_cpu_budget_bytes = min(
+    #         _estimate_cpu_cache_budget_bytes(
+    #             cfie_config=cfie_config,
+    #             available_system_bytes=available_system_bytes,
+    #             total_system_bytes=total_system_bytes,
+    #             budget_fraction=DEFAULT_CPU_CACHE_BOOST_FRACTION,
+    #         ),
+    #         cpu_budget_cap_bytes,
+    #     )
+    #
+    #     # 只有在 boost 确实能继续抬高预算时才采用，避免无效覆盖。
+    #     if boosted_cpu_budget_bytes > cpu_budget_bytes:
+    #         logger.info(
+    #             "Boosting CPU budget to avoid small NVMe spill: model=%s "
+    #             "cpu_budget=%.2f GiB boosted=%.2f GiB cap=%.2f GiB",
+    #             model_path,
+    #             cpu_budget_bytes / GiB,
+    #             boosted_cpu_budget_bytes / GiB,
+    #             cpu_budget_cap_bytes / GiB,
+    #         )
+    #         cpu_budget_bytes = boosted_cpu_budget_bytes
 
-        # 只有在 boost 确实能继续抬高预算时才采用，避免无效覆盖。
-        if boosted_cpu_budget_bytes > cpu_budget_bytes:
-            logger.info(
-                "Boosting CPU budget to avoid small NVMe spill: model=%s "
-                "cpu_budget=%.2f GiB boosted=%.2f GiB cap=%.2f GiB",
-                model_path,
-                cpu_budget_bytes / GiB,
-                boosted_cpu_budget_bytes / GiB,
-                cpu_budget_cap_bytes / GiB,
-            )
-            cpu_budget_bytes = boosted_cpu_budget_bytes
-
-    # 若还有 CPU 候选专家且 CPU 预算非零，则默认给 staging 留 2 个 slot 的空间。
-    staging_slots_per_layer = (
-        2 if remaining_cpu_candidates > 0 and cpu_budget_bytes > 0 else 0
-    )
-
-    # staging_bytes 等于“总 CPU 预算”和“2 个 slot staging 空间”中的较小值。
-    staging_bytes = min(
-        cpu_budget_bytes,
-        staging_slots_per_layer * expert_bytes_per_slot_all_layers,
-    )
-
-    # 扣掉 staging 后，其余部分都视为 CPU 静态缓存预算。
-    cpu_static_bytes = max(0, cpu_budget_bytes - staging_bytes)
-
-    # 把静态缓存预算换算成“每层可静态缓存多少个 CPU 专家”。
-    cpu_slots_per_layer = min(
-        remaining_cpu_candidates,
-        cpu_static_bytes // max(1, expert_bytes_per_slot_all_layers),
-    )
-
-    # 还装不进 GPU 和 CPU 的那部分专家字节，最终只能落到 NVMe。
-    nvme_expert_bytes = max(
-        0,
-        expert_bytes_total
-        - gpu_slots_per_layer * expert_bytes_per_slot_all_layers
-        - cpu_slots_per_layer * expert_bytes_per_slot_all_layers,
-    )
+    # # 若还有 CPU 候选专家且 CPU 预算非零，则默认给 staging 留 2 个 slot 的空间。
+    # staging_slots_per_layer = (
+    #     2 if remaining_cpu_candidates > 0 and cpu_budget_bytes > 0 else 0
+    # )
+    #
+    # # staging_bytes 等于“总 CPU 预算”和“2 个 slot staging 空间”中的较小值。
+    # staging_bytes = min(
+    #     cpu_budget_bytes,
+    #     staging_slots_per_layer * expert_bytes_per_slot_all_layers,
+    # )
+    #
+    # # 扣掉 staging 后，其余部分都视为 CPU 静态缓存预算。
+    # cpu_static_bytes = max(0, cpu_budget_bytes - staging_bytes)
+    #
+    # # 把静态缓存预算换算成“每层可静态缓存多少个 CPU 专家”。
+    # cpu_slots_per_layer = min(
+    #     remaining_cpu_candidates,
+    #     cpu_static_bytes // max(1, expert_bytes_per_slot_all_layers),
+    # )
+    #
+    # # 还装不进 GPU 和 CPU 的那部分专家字节，最终只能落到 NVMe。
+    # nvme_expert_bytes = max(
+    #     0,
+    #     expert_bytes_total
+    #     - gpu_slots_per_layer * expert_bytes_per_slot_all_layers
+    #     - cpu_slots_per_layer * expert_bytes_per_slot_all_layers,
+    # )
 
     # ------------------ 汇总最终 plan，并把自动规划结果打到启动日志 ------------------
     # 汇总前面所有中间结果，生成最终的 enabled plan 对象。
@@ -627,16 +640,13 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         kv_bytes=kv_bytes,
         # 记录线性状态缓存预算字节量。
         linear_state_bytes=linear_state_bytes,
-        # 记录动态预留字节量。
-        dynamic_bytes=dynamic_bytes,
+
         # 记录非专家常驻内容总字节量。
         resident_bytes=resident_bytes,
         # 记录 target 线路为 MTP/shared draft 额外让出的 GPU 预算。
         shared_gpu_reserve_bytes=shared_gpu_reserve_bytes,
         # 记录静态规划可用的总 GPU 预算。
         gpu_budget_bytes=gpu_budget_bytes,
-        # 记录 ratio 外留给运行时峰值的 GPU 余量。
-        gpu_runtime_headroom_bytes=gpu_runtime_headroom_bytes,
         # 记录实际分配给专家相关内容的 GPU 预算。
         gpu_expert_budget_bytes=gpu_expert_budget_bytes,
         # 记录每层最终 GPU 常驻 slot 数。
@@ -647,23 +657,29 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         prefill_burst_bytes=int(prefill_burst_bytes),
         # 记录最终 CPU 总预算。
         cpu_budget_bytes=int(cpu_budget_bytes),
+
+        # TODO 根据上述修改要求，修改，具体如下:
+        #  cpu静态专家缓存 = 全部专家的大小
+        #  cpu静态专家数目 = 全部专家
+        #  删除stage 和 NVME的设定
+        #  initial_cpu_experts： 初始化应该在CPU初始化全部专家
         # 记录 CPU 静态专家缓存预算。
-        cpu_static_bytes=int(cpu_static_bytes),
+        # cpu_static_bytes=int(cpu_static_bytes),
         # 记录每层可静态缓存到 CPU 的专家 slot 数。
-        cpu_slots_per_layer=int(cpu_slots_per_layer),
+        # cpu_slots_per_layer=int(cpu_slots_per_layer),
         # 记录 staging buffer 总预算。
-        staging_bytes=int(staging_bytes),
+        # staging_bytes=int(staging_bytes),
         # 记录最终仍需落到 NVMe 的专家字节量。
-        nvme_expert_bytes=int(nvme_expert_bytes),
+        # nvme_expert_bytes=int(nvme_expert_bytes),
         # 默认把前 gpu_slots_per_layer 个专家放进初始 GPU 常驻集合。
         initial_gpu_experts=tuple(range(int(gpu_slots_per_layer))),
         # 默认把紧随其后的 cpu_slots_per_layer 个专家放进初始 CPU 静态集合。
-        initial_cpu_experts=tuple(
-            range(
-                int(gpu_slots_per_layer),
-                int(gpu_slots_per_layer + cpu_slots_per_layer),
-            )
-        ),
+        # initial_cpu_experts=tuple(
+        #     range(
+        #         int(gpu_slots_per_layer),
+        #         int(gpu_slots_per_layer + cpu_slots_per_layer),
+        #     )
+        # ),
     )
     # 打印最终自动规划结果，便于启动日志中快速核对 GPU/CPU/NVMe 分配。
     logger.info(
@@ -682,7 +698,6 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         plan.cpu_static_bytes / GiB,
         plan.staging_bytes / GiB,
         plan.cpu_budget_bytes / GiB,
-        cpu_min_free_bytes / GiB,
         cpu_shared_reserve_bytes / GiB,
         plan.gpu_budget_bytes / GiB,
         plan.gpu_runtime_headroom_bytes / GiB,
@@ -744,12 +759,15 @@ def _resolve_fixed_gpu_slots_per_layer(
     # 只有 MTP 路径要求固定常驻 slot 数；target 路径交给自动规划。
     if planning_mode != "mtp":
         return None
+
     # reserve-only 的临时 draft 预算必须固定在 base_8 语义上，供 target 预留共享显存。
     if mtp_reserve_mode:
         return min(num_experts, max(top_k, DEFAULT_MTP_BASE_GPU_SLOTS))
+
     # 真正的 draft 计划若已拿到 target 占用 hint，就改为按剩余预算动态重算 resident slots。
     if target_occupied_gpu_bytes > 0:
         return None
+
     # MTP 固定基线是 8，但绝不会小于 top-k，也不会超过总专家数。
     return min(num_experts, max(top_k, DEFAULT_MTP_BASE_GPU_SLOTS))
 
@@ -762,31 +780,27 @@ def _plan_prefill_burst_slots(
         expert_bytes_per_slot_all_layers: int,
         expert_bytes_per_expert: int,
 ) -> tuple[int, int]:
-    # -----------------
-    # 目标：先预留 prefill burst，再用剩余预算估算 resident slots。
-    # -----------------
-    # 若总专家数本来就不超过 top-k，则所有专家都可直接常驻 GPU，不需要 burst 池。
+    # ------------------------------- 处理无需 burst 池或输入参数无效的退化场景 -------------------------------
+    # 当总专家数不超过 top-k 时，说明所有专家都可以直接作为常驻专家处理，不需要额外的 burst 池。
     if num_experts <= top_k:
+        # 返回最终常驻专家槽位数以及 0 个 burst 槽位。
         return min(num_experts, top_k), 0
 
-    # 若预算或尺寸参数无效，则退化为“只保留 top-k 个常驻专家、不启用 burst”。
+    # 当 GPU 预算或专家尺寸参数无效时，退化为仅保留 top-k 个常驻专家且不启用 burst 池。
     if (
             total_gpu_budget_bytes <= 0
             or expert_bytes_per_slot_all_layers <= 0
             or expert_bytes_per_expert <= 0
     ):
+        # 返回最终常驻专家槽位数以及 0 个 burst 槽位。
         return min(num_experts, top_k), 0
 
-    # -----------------
-    # 第一步：预设 burst 目标容量。
-    # -----------------
-    # prefill burst 默认目标覆盖全量 experts；对真实 Qwen3.5 target 来说通常就是固定 256 slots。
+    # ------------------------------- 预设 prefill burst 池的目标容量 -------------------------------
+    # 默认将 burst 池目标容量设为全量专家数，表示优先尝试为全部专家预留 burst 槽位。
     target_burst_slots = int(num_experts)
 
-    # -----------------
-    # 第二步：先整体扣掉 burst 池预算，再看 resident 还能剩多少。
-    # -----------------
-    # 先整体扣掉“全量 burst 池”预算，再用剩余预算估算常驻 resident slots。
+    # ------------------------------- 在优先预留 burst 池后估算剩余常驻专家槽位 -------------------------------
+    # 先从总 GPU 预算中扣除全量 burst 池所需的预算，再用剩余预算估算可容纳的常驻专家槽位数。
     resident_slots = min(
         num_experts,
         max(
@@ -795,12 +809,13 @@ def _plan_prefill_burst_slots(
         ) // max(1, expert_bytes_per_slot_all_layers),
     )
 
-    # -----------------
-    # 第三步：若 burst 挤掉了 top-k 常驻下限，就收缩 burst 保住 resident。
-    # -----------------
-    # 若全量 burst 会把 resident 压到 top-k 以下，则收缩 burst，只保留满足 top-k 后还能容纳的部分。
+    # ------------------------------- 当 burst 池压缩了 top-k 常驻下限时收缩 burst 容量 -------------------------------
+    # 当按全量 burst 预留后，剩余常驻专家槽位数低于 top-k 下限时，需要收缩 burst 池容量以保住常驻下限。
     if resident_slots < top_k:
+        # 先将常驻专家槽位数恢复到至少满足 top-k 的水平。
         resident_slots = min(num_experts, top_k)
+
+        # 在保住常驻专家槽位下限后，重新用剩余预算估算还能容纳多少个 burst 槽位。
         burst_slots = min(
             num_experts,
             max(
@@ -810,9 +825,11 @@ def _plan_prefill_burst_slots(
             ) // max(1, expert_bytes_per_expert),
         )
     else:
+        # 当全量 burst 预留后仍能满足 top-k 常驻下限时，直接保留目标 burst 槽位数。
         burst_slots = target_burst_slots
 
-    # 返回“最终常驻 resident slot 数 + 最终 burst slot 数”。
+    # ------------------------------- 返回最终的常驻槽位数与 burst 槽位数 -------------------------------
+    # 返回最终计算得到的常驻专家槽位数以及 prefill burst 槽位数。
     return int(resident_slots), int(burst_slots)
 
 
@@ -843,16 +860,21 @@ def _extract_expert_layer_prefix(param_name: str) -> str | None:
 def _extract_expert_param_parts(param_name: str) -> tuple[str, int] | None:
     # 约定 routed expert 参数名里会包含 `.experts.` 这个分隔标记。
     marker = ".experts."
+
     # 如果参数名不包含该标记，说明它不是专家参数，直接返回 None。
     if marker not in param_name:
         return None
+
     # 以第一次出现 `.experts.` 为界，拆出层前缀和后半段内容。
     prefix, remainder = param_name.split(marker, 1)
+
     # 从后半段里取出第一个 `.` 之前的部分，期望它就是专家编号。
     expert_id, _, _ = remainder.partition(".")
+
     # 如果专家编号不是纯数字，说明命名不符合约定，直接返回 None。
     if not expert_id.isdigit():
         return None
+
     # 返回“专家层统一前缀 + 整数专家编号”，供后续按层、按专家聚合大小。
     return f"{prefix}{marker[:-1]}", int(expert_id)
 
@@ -871,11 +893,13 @@ def _collect_expert_bytes(
     for name, info in metadata.items():
         # 先把当前参数条目的字节数算出来。
         nbytes = _metadata_nbytes(info)
+
         # 无论是否是专家参数，都要累计进全模型总字节量。
         total_bytes += nbytes
 
         # 尝试把参数名解析成“专家层前缀 + 专家编号”。
         expert_parts = _extract_expert_param_parts(name)
+
         # 不是 routed expert 参数时，跳过 expert 统计，仅保留 total_bytes 的累计结果。
         if expert_parts is None:
             continue
@@ -914,6 +938,7 @@ def _metadata_nbytes(info: dict[str, Any]) -> int:
 
     # 根据 shape 计算参数元素总数。
     numel = math.prod(int(dim) for dim in shape)
+
     # 用元素个数乘以单元素字节数，得到该参数的估算总字节量。
     return numel * _DTYPE_BYTES.get(dtype, 0)
 
@@ -923,6 +948,8 @@ def _get_gpu_budget_bytes(cfie_config: Any) -> int:
     if not torch.cuda.is_available():
         return 0
 
+    # planner 侧必须与 worker 侧复用同一套显存切分口径，否则静态规划出来的
+    # expert resident / staging 预算会与运行时真正给 KV cache 预留的空间脱节。
     total_memory = _get_total_gpu_memory_bytes()
     gpu_util = float(getattr(cfie_config.cache_config, "gpu_memory_utilization", 0.9))
     static_budget, _ = split_gpu_memory_budget(total_memory, gpu_util)
@@ -934,6 +961,8 @@ def _get_gpu_runtime_headroom_bytes(cfie_config: Any) -> int:
     if not torch.cuda.is_available():
         return 0
 
+    # 取出 ratio 外的余量，用来约束 planner 不要把所有可见显存都当成
+    # 可静态占用空间；这部分应保留给运行时峰值与临时开销。
     total_memory = _get_total_gpu_memory_bytes()
     gpu_util = float(getattr(cfie_config.cache_config, "gpu_memory_utilization", 0.9))
     _, runtime_headroom = split_gpu_memory_budget(total_memory, gpu_util)
@@ -1021,14 +1050,23 @@ def _estimate_cpu_min_free_bytes(
 
 
 def _estimate_cpu_shared_reserve_bytes(cfie_config: Any) -> int:
-    # 读取统一 offload 配置；UVA 场景下，CPU offload 也会与 MoE cache 竞争主机内存。
+    # ------------------------------- 读取 CPU offload 配置并解析主机侧额外预留空间 -------------------------------
+    # 从配置对象中读取统一的 offload 配置；若不存在则返回 None。
     offload_config = getattr(cfie_config, "offload_config", None)
+
+    # 从 offload 配置中读取 UVA 配置；若不存在则返回 None。
     uva_config = getattr(offload_config, "uva", None)
+
+    # 读取 UVA 配置中声明的 CPU offload 容量，单位为 GiB；未配置时退化为 0。
     configured_cpu_offload_gb = float(
         getattr(uva_config, "cpu_offload_gb", 0.0) or 0.0
     )
+
+    # 将 CPU offload 容量从 GiB 转换为字节数。
     configured_cpu_offload_bytes = int(configured_cpu_offload_gb * GiB)
-    # 最终共享预留量 = 固定共享预留 + UVA 明确要求的 CPU offload 空间。
+
+    # ------------------------------- 计算最终的 CPU 共享预留字节数 -------------------------------
+    # 返回固定共享预留与 UVA 显式要求的 CPU offload 空间之和，作为最终 CPU 共享预留量。
     return DEFAULT_CPU_SHARED_RESERVE_BYTES + configured_cpu_offload_bytes
 
 
@@ -1145,32 +1183,52 @@ def _estimate_cpu_cache_budget_bytes(
         total_system_bytes: int,
         budget_fraction: float = DEFAULT_CPU_CACHE_BUDGET_FRACTION,
 ) -> int:
-    # 没有可用内存时，不给 CPU expert cache 分配预算。
+    # ------------------------------- 处理无可用系统内存时的退化场景 -------------------------------
+    # 当当前可用系统内存小于等于 0 时，不为 CPU expert cache 分配任何预算。
     if available_system_bytes <= 0:
+        # 直接返回 0，表示当前没有可分配的 CPU cache 预算。
         return 0
 
-    # 先读取用户可能配置的硬上限。
+    # ------------------------------- 读取用户配置的 CPU cache 硬上限 -------------------------------
+    # 从配置对象中读取 offload 配置；若不存在则返回 None。
     offload_config = getattr(cfie_config, "offload_config", None)
+
+    # 读取用户显式配置的 MoE CPU 预算上限，单位为 GiB；未配置时退化为 0。
     hard_cap_gb = float(getattr(offload_config, "moe_cpu_budget_gb", 0.0) or 0.0)
+
+    # 当硬上限大于 0 时，将其从 GiB 转换为字节数；否则记为 0。
     hard_cap_bytes = int(hard_cap_gb * GiB) if hard_cap_gb > 0 else 0
 
-    # 扣掉最小空闲水位和共享预留量后，得到 MoE cache 可消费的预算窗口。
+    # ------------------------------- 扣除最小空闲水位与共享预留量，计算可消费预算窗口 -------------------------------
+    # 估算系统侧必须保留的最小空闲内存字节数。
     min_free_bytes = _estimate_cpu_min_free_bytes(
         cfie_config=cfie_config,
         total_system_bytes=total_system_bytes,
     )
+
+    # 估算需要为共享用途预留的 CPU 内存字节数。
     shared_reserve_bytes = _estimate_cpu_shared_reserve_bytes(cfie_config)
+
+    # 从当前可用系统内存中扣除最小空闲水位与共享预留后，得到 MoE cache 可消费的预算窗口。
     budget_window_bytes = max(
         0,
         available_system_bytes - min_free_bytes - shared_reserve_bytes,
     )
-    # budget_fraction 会被夹在 [0, 1] 区间，避免异常值放大或变负。
+
+    # ------------------------------- 根据预算比例换算 CPU cache 预算并做范围裁剪 -------------------------------
+    # 将预算比例限制在 [0, 1] 区间内，避免异常值导致预算放大或出现负值。
     budget_fraction = min(1.0, max(0.0, float(budget_fraction)))
+
+    # 按预算比例从可消费预算窗口中换算出 CPU cache 预算。
     budget_bytes = int(budget_window_bytes * budget_fraction)
+
+    # 当用户配置了硬上限时，再将预算裁剪到不超过该硬上限。
     if hard_cap_bytes > 0:
-        # 若用户还配置了硬上限，则再做一次裁剪。
+        # 取当前预算与用户硬上限中的较小值作为最终预算。
         budget_bytes = min(budget_bytes, hard_cap_bytes)
-    # 最终返回非负预算。
+
+    # ------------------------------- 返回最终的非负 CPU cache 预算 -------------------------------
+    # 返回最终计算得到的非负 CPU cache 预算字节数。
     return max(0, budget_bytes)
 
 

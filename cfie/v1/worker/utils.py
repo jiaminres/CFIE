@@ -424,14 +424,19 @@ def get_static_memory_budget(
     cache_config: CacheConfig,
 ) -> int:
     """
-    Calculate the static GPU budget for this instance and validate that the
-    current free memory can at least hold that static portion.
+    计算当前实例允许使用的静态 GPU 显存预算，
+    并校验启动时的空闲显存是否至少能够容纳这部分静态预算。
     """
+    # ------------------------------- 基于总显存与利用率配置计算静态显存预算 -------------------------------
+    # TODO 修改此处 应该不是总显存来做分配，而是可用显存
+    # 按总显存和 gpu_memory_utilization 将显存拆分为静态预算与运行时余量，并取静态预算部分。
     static_memory_budget, _ = split_gpu_memory_budget(
         init_snapshot.total_memory,
         cache_config.gpu_memory_utilization,
     )
 
+    # ------------------------------- 校验启动时空闲显存是否满足静态预算下限 -------------------------------
+    # 当启动时空闲显存小于静态显存预算时，说明当前实例连静态部分都无法安全容纳，应直接报错。
     if init_snapshot.free_memory < static_memory_budget:
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "
@@ -443,6 +448,8 @@ def get_static_memory_budget(
             f"utilization or reduce GPU memory used by other processes."
         )
 
+    # ------------------------------- 返回静态显存预算结果 -------------------------------
+    # 返回当前实例允许使用的静态 GPU 显存预算字节数。
     return static_memory_budget
 
 

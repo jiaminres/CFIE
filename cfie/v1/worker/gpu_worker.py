@@ -222,49 +222,70 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        # ------------------------------- 校验设备类型并进入 CUDA 设备初始化路径 -------------------------------
+        # 当前 worker 仅支持在 CUDA 设备上完成初始化；若设备类型不是 CUDA，则直接报错。
         if self.device_config.device_type == "cuda":
-            # This env var set by Ray causes exceptions with graph building.
+            # ------------------------------- 清理会干扰图构建的环境变量并读取并行配置 -------------------------------
+            # 移除由 Ray 注入的 NCCL_ASYNC_ERROR_HANDLING，避免其影响后续图构建流程。
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+
+            # 读取当前 worker 的并行配置对象，后续会用于本地 rank 修正与设备合法性检查。
             parallel_config = self.parallel_config
+
+            # ------------------------------- 在单节点本地 DP 场景下修正 local_rank -------------------------------
+            # 当不是 ray 或 external_launcher 驱动，且 DP 后端也不是 ray，同时每个 DP 仅位于单节点内时，
+            # 需要把 DP rank 对本地设备编号的偏移量合并进 local_rank。
             if (
-                parallel_config.distributed_executor_backend
-                not in ("ray", "external_launcher")
-                and parallel_config.data_parallel_backend != "ray"
-                and parallel_config.nnodes_within_dp == 1
+                    parallel_config.distributed_executor_backend
+                    not in ("ray", "external_launcher")
+                    and parallel_config.data_parallel_backend != "ray"
+                    and parallel_config.nnodes_within_dp == 1
             ):
-                # Use local DP rank if available, otherwise use global DP rank.
+                # 优先读取本地 DP rank；若未提供，则退回到全局 DP index。
                 dp_local_rank = self.parallel_config.data_parallel_rank_local
                 if dp_local_rank is None:
+                    # 使用全局 DP index 作为本地 DP rank 的退化值。
                     dp_local_rank = self.parallel_config.data_parallel_index
 
+                # 计算当前 TP 与 PP 组合后的局部并行世界大小。
                 tp_pp_world_size = (
-                    self.parallel_config.pipeline_parallel_size
-                    * self.parallel_config.tensor_parallel_size
+                        self.parallel_config.pipeline_parallel_size
+                        * self.parallel_config.tensor_parallel_size
                 )
 
-                # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
+                # ------------------------------- 将 DP rank 的设备偏移量并入 local_rank -------------------------------
+                # 按 DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK 的方式修正本地设备编号。
                 self.local_rank += dp_local_rank * tp_pp_world_size
+
+                # 校验修正后的 local_rank 没有越过当前可见设备数量上界。
                 assert self.local_rank < torch.accelerator.device_count(), (
                     f"DP adjusted local rank {self.local_rank} is out of bounds. "
                 )
+
+                # 读取当前进程可见的 CUDA 设备数量；若 CUDA 不可用则记为 0。
                 visible_device_count = (
                     torch.accelerator.device_count() if torch.cuda.is_available() else 0
                 )
+
+                # 校验当前 local_world_size 不超过可见设备总数。
                 assert self.parallel_config.local_world_size <= visible_device_count, (
                     f"local_world_size ({self.parallel_config.local_world_size}) must "
                     f"be less than or equal to the number of visible devices "
                     f"({visible_device_count})."
                 )
 
+            # ------------------------------- 绑定当前 worker 对应的 CUDA 设备 -------------------------------
+            # 根据修正后的 local_rank 构造当前 worker 绑定的 CUDA 设备对象。
             self.device = torch.device(f"cuda:{self.local_rank}")
+
+            # 将当前线程的默认设备切换到该 CUDA 设备。
             torch.accelerator.set_device_index(self.device)
 
+            # 校验当前平台是否支持模型配置要求的数据类型。
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
-            # Initialize the distributed environment BEFORE taking
-            # memory snapshot
-            # This ensures NCCL buffers are allocated before we measure
-            # available memory
+            # ------------------------------- 在采集显存快照前初始化分布式环境 -------------------------------
+            # 必须先初始化分布式环境，使 NCCL 相关缓冲区先分配完成，再去测量后续可用显存。
             init_worker_distributed_environment(
                 self.cfie_config,
                 self.rank,
@@ -273,56 +294,77 @@ class Worker(WorkerBase):
                 current_platform.dist_backend,
             )
 
+            # ------------------------------- 记录 model runner 版本并设置随机种子 -------------------------------
+            # 当启用了 V2 model runner 时，仅在本地打印一次日志提示。
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner", scope="local")
 
-            # Set random seed.
+            # 设置模型随机种子，保证后续初始化与 profiling 过程可复现。
             set_random_seed(self.model_config.seed)
 
-            # Now take memory snapshot after NCCL is initialized
+            # ------------------------------- 在 NCCL 初始化完成后采集显存快照并拆分预算 -------------------------------
+            # 在采集显存快照前先执行垃圾回收，尽量减少无关对象残留。
             gc.collect()
+
+            # 清空 PyTorch 缓存分配器中的可释放缓存。
             torch.accelerator.empty_cache()
 
-            # take current memory snapshot
+            # 采集当前设备的初始化显存快照。
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+
+            # 基于初始化显存快照与 cache 配置计算静态显存预算。
             self.static_memory_budget = get_static_memory_budget(
                 init_snapshot, self.cache_config
             )
+
+            # 按 gpu_memory_utilization 把总显存拆成静态预算与运行时余量，并保存运行时余量部分。
             _, self.runtime_memory_headroom = split_gpu_memory_budget(
                 init_snapshot.total_memory,
                 self.cache_config.gpu_memory_utilization,
             )
+
+            # 输出初始化显存快照调试信息。
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+
+            # 输出静态显存预算调试信息。
             logger.debug(
                 "worker static memory budget: %sGiB",
                 format_gib(self.static_memory_budget),
             )
         else:
+            # 当前设备类型不受支持时，直接抛出异常。
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
-        # Initialize workspace manager
+        # ------------------------------- 初始化 workspace manager -------------------------------
+        # 当启用 DBO 时使用 2 个 ubatch，否则使用 1 个 ubatch。
         num_ubatches = 2 if self.cfie_config.parallel_config.enable_dbo else 1
+
+        # 基于当前设备与 ubatch 数量初始化 workspace manager。
         init_workspace_manager(self.device, num_ubatches)
 
-        # Construct the model runner
+        # ------------------------------- 构造模型运行器实例 -------------------------------
+        # 当启用 V2 model runner 时，导入并构造 V2 版本的 GPUModelRunner。
         if self.use_v2_model_runner:
             from cfie.v1.worker.gpu.model_runner import (
                 GPUModelRunner as GPUModelRunnerV2,
             )
 
-            # HACK(woosuk): This is a temporary fix to avoid type errors.
+            # 构造 V2 版本 model runner，并显式标注类型忽略以规避当前临时类型问题。
             self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
                 self.cfie_config, self.device
             )
         else:
+            # 否则导入并构造 V1 版本的 GPUModelRunner。
             from cfie.v1.worker.gpu_model_runner import (
                 GPUModelRunner as GPUModelRunnerV1,
             )
 
+            # 构造 V1 版本 model runner。
             self.model_runner = GPUModelRunnerV1(self.cfie_config, self.device)
 
+        # ------------------------------- 在 rank 0 上报使用统计信息 -------------------------------
+        # 仅由 rank 0 收集并上报当前配置相关的使用统计信息。
         if self.rank == 0:
-            # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.cfie_config)
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
@@ -369,16 +411,26 @@ class Worker(WorkerBase):
     @torch.inference_mode()
     # 通过一次 profiling 估算出还能留给 KV cache 的显存预算。
     def determine_available_memory(self) -> int:
-        """Profiles the peak memory usage of the model to determine how much
-        memory can be used for KV cache without OOMs.
+        """
+        通过一次启动期 profiling，推导“真正可分给 KV cache 的显存预算”。
 
-        The engine will first conduct a profiling of the existing memory usage.
-        Then, it calculates the free memory that can be used for KV cache in
-        bytes.
+        这里不是简单地看一次 `free_memory`，而是把显存拆成两类：
 
-        Tip:
-            You may limit the usage of GPU memory
-            by adjusting the `gpu_memory_utilization` parameter.
+        - steady_non_kv_cache_memory:
+          profile 结束后仍会常驻的非 KV 显存，例如权重、常驻 workspace、
+          backend 元数据等。
+        - runtime_peak_memory:
+          只会在 prefill/decode 或图捕获时冲高的动态峰值，需要额外留在
+          `runtime_headroom` 里，不能拿去分配 KV cache。
+
+        最终公式是：
+
+        `available_kv_cache_memory_bytes = static_memory_budget - steady_non_kv_cache_memory`
+
+        同时还要校验：
+
+        - `runtime_peak_memory <= runtime_memory_headroom`
+        - `static_memory_budget + runtime_peak_memory <= startup_free_memory`
         """
         # 若用户直接指定了 KV cache 大小，则跳过自动估算。
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
@@ -403,9 +455,9 @@ class Worker(WorkerBase):
             # 直接返回用户手工指定的 KV cache 大小。
             return kv_cache_memory_bytes
 
-        # Execute a forward pass with dummy inputs to profile the memory usage
-        # of the model.
-        # 通过 profiling 估算非 KV cache 部分的显存占用。
+        # ------------------ 第 1 段：测出“非 KV”显存真实占用 ------------------
+        # 通过 dummy forward + memory_profiling，得到权重、激活峰值、非 torch
+        # 显存等信息，为后续把静态预算与运行时峰值拆开做准备。
         with memory_profiling(
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
@@ -424,6 +476,7 @@ class Worker(WorkerBase):
             if not self.model_config.enforce_eager:
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
+        # ------------------ 第 2 段：把 profile 结果折叠成 steady / peak 两类口径 ------------------
         # Use the pre-cudagraph torch peak to avoid double-counting.
         # 计算 profiling 带来的 torch 峰值增量。
         profile_result.torch_peak_increase = (
@@ -481,6 +534,7 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
+        # ------------------ 第 3 段：校验“静态预算 + 运行时余量”是否站得住 ------------------
         # ratio 外的空间现在只保留给运行时峰值，不再拿来承接静态预算。
         if self.runtime_peak_memory > self.runtime_memory_headroom:
             raise ValueError(
@@ -510,6 +564,7 @@ class Worker(WorkerBase):
                 "other processes."
             )
 
+        # ------------------ 第 4 段：导出最终可给 KV cache 的预算 ------------------
         # 用“静态预算 - 常驻非 KV 显存”得到可用于 KV cache 的空间。
         self.available_kv_cache_memory_bytes = (
             self.static_memory_budget - self.steady_non_kv_cache_memory
@@ -626,7 +681,17 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     # 按 engine core 给出的最终配置分配 KV cache，并完成缓存相关初始化。
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        """Allocate GPU KV cache with the specified kv_cache_config."""
+        """
+        按已经规划好的 `KVCacheConfig` 真正分配并绑定 GPU KV cache。
+
+        这一步不再重新做预算决策，而是把上游已经算好的：
+
+        - `num_blocks`
+        - `kv_cache_groups`
+        - 每个 tensor 的共享关系与大小
+
+        materialize 成实际的 KV tensor、metadata builder 和 transfer 侧注册项。
+        """
 
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.

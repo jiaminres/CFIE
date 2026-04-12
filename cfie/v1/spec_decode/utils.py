@@ -262,52 +262,71 @@ def create_vllm_config_for_draft_model(
     target_model_vllm_config: CfieConfig,
     additional_config_updates: dict[str, object] | None = None,
 ) -> CfieConfig:
-    """The cfie_config is configured for the target model, e.g.
-    its quant_config and parallel_config. But the draft model is potentially
-    quantized differently, and has potentially different tensor_parallel_size.
-    This function creates a new cfie_config configured for the drafter.
-    The cfie_config is useful when loading the draft model with get_model().
     """
-    # ----------------- 由 target 配置派生 draft 配置 -----------------
-    # 这个函数既会被 target plan 的 reserve 递归调用，也会被真正加载 draft/MTP 模型时调用。
-    # 两种场景都会新建一份独立的 CfieConfig，而不是直接复用 target 那份对象。
-    # 把当前传入的 target 配置先记为 old，后续基于它派生 draft 配置。
+    当前传入的 cfie_config 是面向 target 模型构造的，
+    其中已经包含 target 模型对应的量化配置和并行配置等信息。
+
+    但 draft 模型可能采用不同的量化方式，
+    也可能具有不同的张量并行规模。
+
+    因此，这个函数会基于 target 模型配置派生出一份新的 cfie_config，
+    并将其调整为适用于 draft 模型的配置。
+
+    这份新的 cfie_config 主要用于后续通过 get_model() 加载 draft 模型。
+    """
+    # ------------------------------- 基于 target 配置派生 draft 模型配置 -------------------------------
+    # 将当前传入的 target 模型配置保存为旧配置对象，后续所有 draft 配置都从它派生。
     old = target_model_vllm_config
-    # draft 配置只能在 speculative_config 已经构造完成后派生，否则直接报错。
+
+    # 断言当前 target 配置已经构造出 speculative_config，否则无法继续派生 draft 配置。
     assert old.speculative_config is not None, "speculative_config is not set"
-    # 取出 target 上挂着的 speculative_config，里面带有 draft 模型和并行配置。
+
+    # 读取 target 配置上挂载的 speculative_config，其中包含 draft 模型与并行相关配置。
     old_spec_config = old.speculative_config
-    # 复制一份 draft 并行配置，但强制沿用 target 当前进程的 rank，保证本地 rank 对齐。
+
+    # ------------------------------- 派生 draft 专属的并行配置 -------------------------------
+    # 基于 speculative_config 中的 draft 并行配置复制出一份新配置，并强制沿用 target 当前进程的 rank。
     new_parallel_config = replace(
-        old_spec_config.draft_parallel_config, rank=old.parallel_config.rank
+        old_spec_config.draft_parallel_config,
+        rank=old.parallel_config.rank,
     )
-    # 先取出 target 的 additional_config，后面会按需复制并清理其中不该继承到 draft 的字段。
+
+    # ------------------------------- 复制并清理 additional_config -------------------------------
+    # 先读取旧配置中的 additional_config，后续按需复制并清理其中不应继承到 draft 的字段。
     new_additional_config = getattr(old, "additional_config", None)
-    # 只有 additional_config 是字典时，才做浅拷贝并移除 target 专属的 plan。
+
+    # 仅当 additional_config 实际为字典时，才执行浅拷贝与字段清理。
     if isinstance(new_additional_config, dict):
         # 复制一份字典，避免后续修改 draft 配置时反向污染 target 配置。
         new_additional_config = dict(new_additional_config)
-        # Target and draft models must plan their MoE residency independently.
-        # target 和 draft 的 MoE 驻留计划必须独立生成，因此要删掉继承下来的旧 plan。
+
+        # 删除 target 配置中已有的计划字段，避免 draft 误继承 target 的 MoE 驻留计划。
         new_additional_config.pop(PLAN_KEY, None)
-        # 调用方可额外注入 planning hint，例如：
-        # - reserve-only 的 mtp 预算估算模式
-        # - target 已占 GPU 预算这类要传递给 actual draft plan 的辅助信息
+
+        # 当调用方额外提供配置更新项时，将这些更新项写入新的 additional_config。
         if additional_config_updates:
+            # 将调用方提供的附加配置更新合并到新的 additional_config 中。
             new_additional_config.update(additional_config_updates)
-    # 基于旧配置构造一份新的 CfieConfig，并替换成 draft 自己需要的关键子配置。
+
+    # ------------------------------- 构造 draft 专属的 CfieConfig -------------------------------
+    # 基于旧配置复制出一份新的 CfieConfig，并替换成 draft 模型所需的关键子配置。
     new: CfieConfig = replace(
         old,
-        # 清空 target 已解析过的 quant_config，让 draft 在 __post_init__ 里按自身权重重新解析。
+        # 清空旧的 quant_config，使 draft 配置在后续初始化过程中按自身模型重新解析量化配置。
         quant_config=None,
-        # 使用上面为 draft 派生出的并行配置。
+
+        # 使用为 draft 模型派生出的并行配置。
         parallel_config=new_parallel_config,
-        # 把 model_config 切换成 speculative_config 里准备好的 draft_model_config。
+
+        # 将 model_config 切换为 speculative_config 中保存的 draft 模型配置。
         model_config=old_spec_config.draft_model_config,
-        # 把清理过的 additional_config 传入新配置，避免 target 的 plan 被 draft 误用。
+
+        # 使用清理后的 additional_config，避免 target 的旧计划污染 draft 配置。
         additional_config=new_additional_config,
     )
-    # 返回面向 draft 模型的新 CfieConfig。
+
+    # ------------------------------- 返回 draft 模型配置对象 -------------------------------
+    # 返回面向 draft 模型构造完成的新 CfieConfig。
     return new
 
 

@@ -257,6 +257,17 @@ class EngineCore:
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, cfie_config: CfieConfig) -> KVCacheConfig:
+        """
+        把各 worker 的显存 profile 结果转换成最终 KV cache 配置并完成落地。
+
+        这一步是“显存划分链”的总装配点，整体顺序是：
+
+        1. 收集每个 worker 暴露出来的 KV cache 规格。
+        2. 触发 worker 做显存 profiling，拿到每个 worker 可给 KV 的预算。
+        3. 基于 `get_kv_cache_configs()` 生成每个 worker 的 KVCacheConfig。
+        4. 汇总成 scheduler 可用的统一配置。
+        5. 下发给 worker 真正分配 KV cache 并做 warmup/capture。
+        """
         # 记录 KV cache 初始化起始时间。
         start = time.time()
 

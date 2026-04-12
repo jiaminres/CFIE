@@ -615,27 +615,31 @@ class CudaPlatformBase(Platform):
         return True
 
 
-# ---------------- NVML 工具路径 ----------------
-# 注意：
-# NVML 不受 `CUDA_VISIBLE_DEVICES` 影响，
-# 相关函数都是基于真实物理设备 id 工作。
-#
-# 使用 NVML 的一个主要好处是：
-# 它可以在“不初始化 CUDA context”的前提下查询 GPU 信息。
+# ------------------------------- 基于 NVML 的 CUDA 设备查询平台实现 -------------------------------
+# 该实现通过 NVML 查询 GPU 信息，而不是依赖 CUDA runtime 初始化后的上下文状态。
 class NvmlCudaPlatform(CudaPlatformBase):
     @classmethod
     @cache
     @with_nvml_context
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         """
-        用 NVML 查询 GPU 的 compute capability。
+        使用 NVML 查询指定设备的 compute capability。
         """
+        # ------------------------------- 将逻辑设备编号映射为物理设备编号并查询 capability -------------------------------
         try:
+            # 将当前逻辑设备编号转换为真实物理设备编号。
             physical_device_id = cls.device_id_to_physical_device_id(device_id)
+
+            # 基于物理设备编号获取 NVML 设备句柄。
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+
+            # 读取设备的 CUDA compute capability 主版本号与次版本号。
             major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+
+            # 返回包装后的设备 capability 对象。
             return DeviceCapability(major=major, minor=minor)
         except RuntimeError:
+            # 当 NVML 查询失败时，返回 None 表示 capability 不可用。
             return None
 
     @classmethod
@@ -646,85 +650,128 @@ class NvmlCudaPlatform(CudaPlatformBase):
         device_id: int = 0,
     ) -> bool:
         """
-        判断设备是否满足指定 compute capability。
+        判断指定设备是否满足给定的 compute capability 要求。
         """
+        # ------------------------------- 调用父类逻辑判断设备 capability 是否满足要求 -------------------------------
         try:
+            # 复用父类的 capability 判断逻辑。
             return super().has_device_capability(capability, device_id)
         except RuntimeError:
+            # 当查询过程中发生异常时，按不满足 capability 处理。
             return False
 
     @classmethod
     @with_nvml_context
     def get_device_name(cls, device_id: int = 0) -> str:
         """
-        用 NVML 查询设备名称。
+        使用 NVML 查询指定设备的名称。
         """
+        # ------------------------------- 将逻辑设备编号映射为物理设备编号并查询设备名称 -------------------------------
+        # 将当前逻辑设备编号转换为真实物理设备编号。
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
+
+        # 基于物理设备编号返回设备名称。
         return cls._get_physical_device_name(physical_device_id)
 
     @classmethod
     @with_nvml_context
     def get_device_uuid(cls, device_id: int = 0) -> str:
         """
-        用 NVML 查询设备 UUID。
+        使用 NVML 查询指定设备的 UUID。
         """
+        # ------------------------------- 将逻辑设备编号映射为物理设备编号并查询设备 UUID -------------------------------
+        # 将当前逻辑设备编号转换为真实物理设备编号。
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
+
+        # 基于物理设备编号获取 NVML 设备句柄。
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+
+        # 返回该设备对应的 UUID 字符串。
         return pynvml.nvmlDeviceGetUUID(handle)
 
     @classmethod
     @with_nvml_context
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """
-        用 NVML 查询设备总显存。
+        使用 NVML 查询指定设备的总显存大小。
         """
+        # ------------------------------- 将逻辑设备编号映射为物理设备编号并查询总显存 -------------------------------
+        # 将当前逻辑设备编号转换为真实物理设备编号。
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
+
+        # 基于物理设备编号获取 NVML 设备句柄。
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+
+        # 读取并返回设备总显存字节数。
         return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
 
     @classmethod
     @with_nvml_context
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
         """
-        查询一组 GPU 是否通过 NVLink 完全互联（单跳可达）。
+        判断一组物理 GPU 是否通过 NVLink 形成完全互联。
         """
+        # ------------------------------- 为待检查的物理设备列表构造 NVML 句柄 -------------------------------
+        # 为每个物理设备编号获取对应的 NVML 设备句柄。
         handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+
+        # ------------------------------- 逐对检查 GPU 之间的 NVLink 连通性 -------------------------------
+        # 枚举设备句柄列表中的每一对 GPU 组合。
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
+                # 仅检查上三角组合，避免重复检查同一对设备。
                 if i < j:
                     try:
+                        # 读取当前两张 GPU 在 NVLINK 能力维度上的 P2P 状态。
                         p2p_status = pynvml.nvmlDeviceGetP2PStatus(
                             handle,
                             peer_handle,
                             pynvml.NVML_P2P_CAPS_INDEX_NVLINK,
                         )
+
+                        # 当任意一对 GPU 之间的 NVLink 状态不正常时，说明整体不完全互联。
                         if p2p_status != pynvml.NVML_P2P_STATUS_OK:
                             return False
                     except pynvml.NVMLError:
+                        # 当查询 NVLink 状态失败时，记录日志并按“不完全互联”处理。
                         logger.exception(
                             "NVLink detection failed. This is normal if"
                             " your machine has no NVLink equipped."
                         )
                         return False
+
+        # 全部 GPU 两两之间都满足 NVLink 单跳可达时，返回完全互联。
         return True
 
     @classmethod
     def _get_physical_device_name(cls, device_id: int = 0) -> str:
         """
-        用物理设备 id 查询设备名。
+        使用物理设备编号查询设备名称。
         """
+        # ------------------------------- 基于物理设备编号直接查询设备名称 -------------------------------
+        # 根据物理设备编号获取 NVML 设备句柄。
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+
+        # 返回该物理设备的名称。
         return pynvml.nvmlDeviceGetName(handle)
 
     @classmethod
     @with_nvml_context
     def log_warnings(cls):
         """
-        检查系统中的 GPU 名称是否混杂，并打印告警。
+        检查系统中的 GPU 是否存在混卡情况，并在需要时打印告警。
         """
+        # ------------------------------- 读取系统中可见物理 GPU 数量 -------------------------------
+        # 通过 NVML 读取当前系统中的物理 GPU 数量。
         device_ids: int = pynvml.nvmlDeviceGetCount()
+
+        # ------------------------------- 在多 GPU 场景下检查设备名称是否混杂 -------------------------------
+        # 仅当系统中 GPU 数量大于 1 时，才有必要检查是否存在混卡情况。
         if device_ids > 1:
+            # 读取所有物理 GPU 的设备名称列表。
             device_names = [cls._get_physical_device_name(i) for i in range(device_ids)]
+
+            # 当系统中存在不同型号 GPU，且 CUDA_DEVICE_ORDER 不是 PCI_BUS_ID 时，打印告警。
             if (
                 len(set(device_names)) > 1
                 and os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID"
@@ -735,7 +782,6 @@ class NvmlCudaPlatform(CudaPlatformBase):
                     "avoid unexpected behavior.",
                     ", ".join(device_names),
                 )
-
 
 class NonNvmlCudaPlatform(CudaPlatformBase):
     """

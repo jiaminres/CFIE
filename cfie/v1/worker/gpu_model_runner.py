@@ -5614,6 +5614,13 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
+        """
+        估算当前 runner 若执行 CUDA graph capture，会额外吃掉多少显存。
+
+        这一步只服务于“运行时峰值预留”，不会直接决定 KV cache 大小。
+        真正的作用是给 `GPUWorker.determine_available_memory()` 一个更完整的
+        `runtime_peak_memory` 估计值。
+        """
         if self._has_capture_unsafe_tiered_moe_cache():
             logger.warning_once(
                 "Skipping CUDA graph memory profiling because CFIE tiered "
@@ -5629,6 +5636,7 @@ class GPUModelRunner(
             )
             return 0
 
+        # 为了只估图捕获本身的额外开销，这里先构造一个最小可运行 KV cache。
         with set_current_cfie_config(self.cfie_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -5651,7 +5659,7 @@ class GPUModelRunner(
             ),
         )
 
-        # Use a temporary pool for profiling to avoid fragmentation in the main pool.
+        # 使用临时 graph pool 做 profiling，避免把主 graph pool 提前打碎。
         profiling_pool = current_platform.graph_pool_handle()
         original_pools: dict[int, Any] = {}
         for instance in list(CUDAGraphWrapper._all_instances):
@@ -5666,6 +5674,8 @@ class GPUModelRunner(
             torch.accelerator.empty_cache()
 
             for mode, descs in capture_descs:
+                # 只采样前两个 capture：第一次看“共享基底成本”，第二次看
+                # “每多一个 graph 的增量成本”，就足够外推整体大小。
                 profile_descs = descs[:2]
                 mem_samples: list[int] = []
 
@@ -5688,7 +5698,7 @@ class GPUModelRunner(
                     mem_samples.append(mem_before - free_after)
 
                 first_capture = mem_samples[0]
-                # Use at least 1 MiB per graph for driver overhead
+                # 每个 graph 至少按 1 MiB 驱动开销计，避免小样本估算为 0。
                 per_graph = max(mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20)
 
                 shared_memory_estimate[mode] = first_capture
@@ -5715,9 +5725,8 @@ class GPUModelRunner(
         self._cleanup_profiling_kv_cache()
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
 
-        # FULL and PIECEWISE graphs share the global pool at runtime and are
-        # never replayed concurrently, so the pool overlays their memory.
-        # Take the max to avoid double-counting the overlap.
+        # FULL 和 PIECEWISE 在运行时共享同一套 global pool，且不会并发 replay，
+        # 因此共享部分按最大值计即可，避免把可重叠显存重复计算。
         total_estimate = max(shared_memory_estimate.values()) + sum(
             per_graph_estimate.values()
         )
@@ -5729,10 +5738,19 @@ class GPUModelRunner(
         return int(total_estimate)
 
     def _has_capture_unsafe_tiered_moe_cache(self) -> bool:
+        """
+        判断当前模型是否挂载了“暂不适合做 CUDA graph capture”的 tiered MoE cache。
+
+        当前 CFIE 的 tiered MoE cache 仍包含动态专家 remap 和 host-backed
+        expert load，这些路径还不是 capture-safe，因此一旦检测到相关 controller，
+        就应回退到 eager 路径。
+        """
         cached = getattr(self, "_capture_unsafe_tiered_moe_cache", None)
+        # 结果会被缓存，避免每次都遍历整棵 module 树。
         if cached is not None:
             return cached
 
+        # 只要任一模块挂有 tiered cache controller，就认为整条执行链不适合 capture。
         has_tiered_cache = any(
             getattr(module, "_cfie_tiered_cache_controller", None) is not None
             for module in self.model.modules()
@@ -5742,6 +5760,12 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        """
+        在 warmup 之后真正执行 CUDA graph capture，并返回 graph pool 占用。
+
+        对当前 Windows + tiered MoE 主线而言，这一步不是强制前提；若检测到
+        capture-unsafe 路径，应直接跳过，让主线保持 eager 可运行。
+        """
         if self._has_capture_unsafe_tiered_moe_cache():
             logger.warning_once(
                 "Skipping CUDA graph capture because CFIE tiered MoE cache "
@@ -6551,10 +6575,14 @@ class GPUModelRunner(
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
-        Initialize KV cache based on `kv_cache_config`.
-        Args:
-            kv_cache_config: Configuration for the KV cache, including the KV
-            cache size of each layer
+        按 `kv_cache_config` 真正初始化本 runner 使用的 KV cache。
+
+        这里的职责不是“算能分多少 KV”，而是把上游已经做好的规划落实到本地：
+
+        1. 补齐 encoder-only / KV sharing 等特殊层。
+        2. 初始化 attention backend 与 metadata builder。
+        3. 根据 backend 能力把管理层 block size 映射成 kernel block size。
+        4. 分配 KV tensor，并把它们注册给 transfer / drafter 等依赖方。
         """
         # 深拷贝配置，避免后续修改污染上游对象。
         kv_cache_config = deepcopy(kv_cache_config)
@@ -6696,13 +6724,16 @@ class GPUModelRunner(
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
-        Generates the KVCacheSpec by parsing the kv cache format from each
-        Attention module in the static forward context.
-        Returns:
-            KVCacheSpec: A dictionary mapping layer names to their KV cache
-            format. Layers that do not need KV cache are not included.
+        从当前模型的 attention 层中提取“每层需要什么样的 KV cache”。
+
+        返回值描述的是“规格”，不是“最终大小”：
+
+        - 这里决定每层 block_size / head 数 / dtype / page_size 等格式信息。
+        - 真正能分到多少 blocks，要等 worker 完成显存 profiling 后，再交给
+          `get_kv_cache_configs()` 结合 `available_memory` 计算。
         """
         if has_ec_transfer() and not get_ec_transfer().is_consumer:
+            # producer 侧不持有本地 KV cache，因此直接返回空规格。
             return {}
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         layer_type = cast(type[Any], AttentionLayerBase)
@@ -6722,6 +6753,7 @@ class GPUModelRunner(
                 continue
             # Skip modules that don't need KV cache (eg encoder-only attention)
             if spec := attn_module.get_kv_cache_spec(self.cfie_config):
+                # 只有真正需要 KV cache 的层才进入后续统一规划。
                 kv_cache_spec[layer_name] = spec
 
         return kv_cache_spec
