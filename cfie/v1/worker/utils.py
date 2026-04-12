@@ -7,6 +7,7 @@ from itertools import product as iprod
 from typing import Any
 
 import torch
+import cfie._custom_ops as ops
 
 from cfie.config import CacheConfig, CfieConfig
 from cfie.logger import init_logger
@@ -38,6 +39,37 @@ from cfie.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+def _try_precompiled_zero_kv_blocks(
+    zeroer: "KVBlockZeroer",
+    block_ids: list[int],
+) -> bool:
+    if not block_ids or zeroer._fallback_blocks is None:
+        return False
+    if not ops.has_precompiled_zero_kv_blocks():
+        return False
+
+    kv_tensors: list[torch.Tensor] = []
+    block_dims: list[int] = []
+    ratios: list[int] = []
+    for kv, block_dim, ratio in zeroer._fallback_blocks:
+        if not kv.is_cuda:
+            return False
+        kv_tensors.append(kv)
+        block_dims.append(block_dim)
+        ratios.append(ratio)
+
+    block_ids_tensor = torch.tensor(
+        block_ids, dtype=torch.int64, device=zeroer.device
+    )
+    ops.zero_kv_blocks_precompiled(
+        block_ids=block_ids_tensor,
+        kv_tensors=kv_tensors,
+        block_dims=block_dims,
+        ratios=ratios,
+    )
+    return True
 
 
 @triton.jit
@@ -201,6 +233,8 @@ class KVBlockZeroer:
             return
         seg_addrs, page_size_el, blk_size, n_segs = self._meta
         if not HAS_TRITON:
+            if _try_precompiled_zero_kv_blocks(self, block_ids):
+                return
             logger.warning_once(
                 "KV block zeroing is falling back to the PyTorch reference "
                 "path because Triton runtime is unavailable."

@@ -581,14 +581,15 @@ class LayerTieredExpertCacheController:
                     "Tiered MoE cache currently does not support biased unquantized MoE"
                 )
 
-            # 当前非量化路径支持 Triton 与 PyTorch 回退 backend。
+            # 当前非量化路径支持 Triton、CUDA ATen 与 PyTorch 回退 backend。
             if layer.quant_method.unquantized_backend not in (
                 UnquantizedMoeBackend.TRITON,
+                UnquantizedMoeBackend.CUDA_ATEN,
                 UnquantizedMoeBackend.TORCH,
             ):
                 raise TypeError(
-                    "Tiered MoE cache currently only supports TRITON and "
-                    "TORCH fallback unquantized MoE"
+                    "Tiered MoE cache currently only supports TRITON, "
+                    "CUDA_ATEN, and TORCH fallback unquantized MoE"
                 )
 
             # 记录当前控制器工作在非量化模式下。
@@ -772,7 +773,7 @@ class LayerTieredExpertCacheController:
         bundle = self._allocate_source_bundle()
 
         # 当 GPTQ 未启用 desc_act 时，g_idx 可由运行时重建，因此这里允许跳过该后缀字段。
-        skip_suffixes = ("g_idx",) if not self._gptq_desc_act else ()
+        skip_suffixes = ("g_idx",) if not getattr(self, "_gptq_desc_act", False) else ()
 
         # 将当前 expert 的权重从本地 expert store 拷贝到新分配的 CPU bundle 中。
         self.expert_store.copy_expert_into(
@@ -1337,8 +1338,13 @@ class LayerTieredExpertCacheController:
 
     def _allocate_source_bundle(self) -> ExpertBundle:
         # ------------------------------- 为 CPU 侧 expert 镜像分配 source bundle 容器 -------------------------------
-        # 构造 CPU 侧张量分配参数；当平台支持时启用 pinned memory 以加速后续 H2D 传输。
-        cpu_tensor_args = {"device": "cpu", "pin_memory": self._use_pinned_cpu}
+        # source bundle 是长期驻留的 CPU static mirror。它的规模会随“层数 × experts”线性增长，
+        # 不能使用 pinned memory，否则 Windows / CUDA 会把大量长期页锁定内存计入加速器分配压力，
+        # 在 122B + MTP drafter 这类场景下容易在初始化 CPU 静态专家池时触发 CUDA OOM。
+        #
+        # 当前高效 H2D 通道由单 expert raw staging buffer 承担：动态加载时先把 pageable source bundle
+        # 拼装进可复用 raw buffer，再从 raw buffer 搬到 GPU。因此 source bundle 保持普通 CPU 内存即可。
+        cpu_tensor_args = {"device": "cpu"}
 
         # 预声明 source bundle 内部保存的张量字典。
         tensors: dict[str, torch.Tensor]
@@ -1488,7 +1494,7 @@ class LayerTieredExpertCacheController:
         return ExpertBundle(
             tensors=tensors,
             nbytes=bundle_nbytes(tensors),
-            pinned=self._use_pinned_cpu,
+            pinned=False,
         )
 
     def _allocate_quantized_raw_buffer(self) -> _RawExpertWeights:

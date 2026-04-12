@@ -10,6 +10,7 @@
 import warnings
 
 import torch
+import cfie._custom_ops as ops
 
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON
@@ -101,6 +102,40 @@ def _chunk_gated_delta_rule_ref(
             final_state[seq_idx] = state
 
     return output.to(q.dtype), final_state
+
+
+def _try_precompiled_chunk_gated_delta_rule(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.LongTensor | None,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    if initial_state is None or not q.is_cuda:
+        return None
+    if not ops.has_precompiled_chunk_gated_delta_rule():
+        return None
+    output, final_state = ops.chunk_gated_delta_rule_precompiled(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    if not output_final_state:
+        return output, None
+    return output, final_state
 
 
 def chunk_gated_delta_rule_fwd(
@@ -287,6 +322,20 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if not HAS_TRITON:
+        precompiled = _try_precompiled_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if precompiled is not None:
+            return precompiled
         logger.warning_once(
             "FLA chunk gated delta rule is falling back to the PyTorch "
             "recurrent reference path because Triton runtime is unavailable."

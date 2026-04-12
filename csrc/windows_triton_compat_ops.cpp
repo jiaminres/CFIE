@@ -184,6 +184,15 @@ torch::Tensor l2norm_last_dim(const torch::Tensor& x) {
   return x / torch::sqrt((x * x).sum(-1, true) + 1e-6);
 }
 
+torch::Tensor expand_qk_heads(const torch::Tensor& x, int64_t target_heads) {
+  if (x.size(2) == target_heads) {
+    return x;
+  }
+  TORCH_CHECK(target_heads % x.size(2) == 0, "Cannot expand ", x.size(2),
+              " query/key heads to ", target_heads, " value heads.");
+  return x.repeat_interleave(target_heads / x.size(2), 2);
+}
+
 }  // namespace
 
 std::tuple<torch::Tensor, torch::Tensor> mrope_rotary_embedding(
@@ -456,6 +465,141 @@ fused_sigmoid_gating_delta_rule_update_precompiled(
   return {output, final_state};
 }
 
+torch::Tensor apply_rotary_emb_precompiled(const torch::Tensor& x,
+                                           const torch::Tensor& cos,
+                                           const torch::Tensor& sin,
+                                           bool is_neox_style,
+                                           bool enable_fp32_compute) {
+  TORCH_CHECK(x.is_cuda(), "apply_rotary_emb_precompiled expects CUDA x");
+  TORCH_CHECK(cos.is_cuda(), "apply_rotary_emb_precompiled expects CUDA cos");
+  TORCH_CHECK(sin.is_cuda(), "apply_rotary_emb_precompiled expects CUDA sin");
+  TORCH_CHECK(x.dim() == 3 || x.dim() == 4,
+              "apply_rotary_emb_precompiled expects x with rank 3 or 4");
+
+  auto working_x = enable_fp32_compute ? x.to(torch::kFloat32) : x;
+  auto working_cos = enable_fp32_compute ? cos.to(torch::kFloat32) : cos;
+  auto working_sin = enable_fp32_compute ? sin.to(torch::kFloat32) : sin;
+  const bool added_batch = working_x.dim() == 3;
+  if (added_batch) {
+    working_x = working_x.unsqueeze(0);
+  }
+
+  auto cos_expanded = working_cos.unsqueeze(-2).to(working_x.scalar_type());
+  auto sin_expanded = working_sin.unsqueeze(-2).to(working_x.scalar_type());
+
+  torch::Tensor output;
+  if (is_neox_style) {
+    auto parts = working_x.split(working_x.size(-1) / 2, -1);
+    auto x1 = parts[0];
+    auto x2 = parts[1];
+    auto o1 = x1 * cos_expanded - x2 * sin_expanded;
+    auto o2 = x2 * cos_expanded + x1 * sin_expanded;
+    output = torch::cat({o1, o2}, -1);
+  } else {
+    auto x1 = working_x.slice(-1, 0, working_x.size(-1), 2);
+    auto x2 = working_x.slice(-1, 1, working_x.size(-1), 2);
+    auto o1 = x1 * cos_expanded - x2 * sin_expanded;
+    auto o2 = x2 * cos_expanded + x1 * sin_expanded;
+    output = torch::stack({o1, o2}, -1).flatten(-2);
+  }
+
+  if (added_batch) {
+    output = output.squeeze(0);
+  }
+  if (enable_fp32_compute) {
+    output = output.to(x.scalar_type());
+  }
+  return output;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_precompiled(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& g, const torch::Tensor& beta, double scale,
+    const torch::Tensor& initial_state, bool output_final_state,
+    const std::optional<torch::Tensor>& cu_seqlens,
+    bool use_qk_l2norm_in_kernel) {
+  TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() &&
+                  beta.is_cuda() && initial_state.is_cuda(),
+              "chunk_gated_delta_rule_precompiled expects CUDA tensors");
+
+  const int64_t B = q.size(0);
+  const int64_t T = q.size(1);
+  const int64_t H = v.size(2);
+  const int64_t K = q.size(3);
+  const int64_t V = v.size(3);
+  const int64_t N = cu_seqlens.has_value() ? cu_seqlens.value().size(0) - 1 : B;
+
+  auto q_work = expand_qk_heads(q.to(torch::kFloat32), H);
+  auto k_work = expand_qk_heads(k.to(torch::kFloat32), H);
+  if (use_qk_l2norm_in_kernel) {
+    q_work = l2norm_last_dim(q_work);
+    k_work = l2norm_last_dim(k_work);
+  }
+  auto v_work = v.to(torch::kFloat32);
+  auto g_work = g.to(torch::kFloat32);
+  auto beta_work = beta.to(torch::kFloat32);
+
+  auto output = torch::empty({B, T, H, V}, q.options());
+  auto final_state = output_final_state
+                         ? torch::empty(
+                               {N, H, V, K},
+                               torch::TensorOptions().dtype(torch::kFloat32).device(q.device()))
+                         : torch::empty(
+                               {0},
+                               torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+
+  for (int64_t seq_idx = 0; seq_idx < N; ++seq_idx) {
+    int64_t batch_idx = seq_idx;
+    int64_t start = 0;
+    int64_t end = T;
+    if (cu_seqlens.has_value()) {
+      batch_idx = 0;
+      start = cu_seqlens.value()[seq_idx].item<int64_t>();
+      end = cu_seqlens.value()[seq_idx + 1].item<int64_t>();
+    }
+
+    auto state = initial_state[seq_idx].to(torch::kFloat32).clone();
+    for (int64_t tok_idx = start; tok_idx < end; ++tok_idx) {
+      auto q_tok = q_work.index({batch_idx, tok_idx});
+      auto k_tok = k_work.index({batch_idx, tok_idx});
+      auto v_tok = v_work.index({batch_idx, tok_idx});
+      auto beta_tok = beta_work.index({batch_idx, tok_idx}).unsqueeze(-1);
+      auto decay =
+          torch::exp(g_work.index({batch_idx, tok_idx})).unsqueeze(-1).unsqueeze(-1);
+      state = state * decay;
+      auto delta_v =
+          v_tok - torch::matmul(state, k_tok.unsqueeze(-1)).squeeze(-1);
+      delta_v = delta_v * beta_tok;
+      state = state + delta_v.unsqueeze(-1) * k_tok.unsqueeze(-2);
+      output.index_put_({batch_idx, tok_idx},
+                        (torch::matmul(state, q_tok.unsqueeze(-1)).squeeze(-1) * scale)
+                            .to(output.scalar_type()));
+    }
+
+    if (output_final_state) {
+      final_state.index_put_({seq_idx}, state);
+    }
+  }
+
+  return {output, final_state};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_gdn_gating_precompiled(
+    const torch::Tensor& A_log, const torch::Tensor& a,
+    const torch::Tensor& b, const torch::Tensor& dt_bias, double beta,
+    double threshold) {
+  TORCH_CHECK(A_log.is_cuda() && a.is_cuda() && b.is_cuda() && dt_bias.is_cuda(),
+              "fused_gdn_gating_precompiled expects CUDA tensors");
+  auto x = a.to(torch::kFloat32) + dt_bias.to(torch::kFloat32);
+  auto g =
+      (-torch::exp(A_log.to(torch::kFloat32)) *
+       softplus_with_threshold(x, beta, threshold))
+          .unsqueeze(0);
+  auto beta_output =
+      torch::sigmoid(b.to(torch::kFloat32)).to(b.scalar_type()).unsqueeze(0);
+  return {g, beta_output};
+}
+
 torch::Tensor causal_conv1d_fn_precompiled(
     const torch::Tensor& x, const torch::Tensor& weight,
     const std::optional<torch::Tensor>& bias, torch::Tensor& conv_states,
@@ -501,6 +645,30 @@ torch::Tensor causal_conv1d_fn_precompiled(
   }
 
   return out;
+}
+
+void zero_kv_blocks_precompiled(const torch::Tensor& block_ids,
+                                c10::List<torch::Tensor> kv_tensors,
+                                c10::List<int64_t> block_dims,
+                                c10::List<int64_t> ratios) {
+  TORCH_CHECK(block_ids.is_cuda(),
+              "zero_kv_blocks_precompiled expects CUDA block_ids");
+  TORCH_CHECK(kv_tensors.size() == block_dims.size() &&
+                  kv_tensors.size() == ratios.size(),
+              "kv_tensors, block_dims, and ratios must have the same length");
+
+  auto block_ids_cpu = block_ids.to(torch::kCPU);
+  for (size_t tensor_idx = 0; tensor_idx < kv_tensors.size(); ++tensor_idx) {
+    auto kv = kv_tensors.get(tensor_idx);
+    TORCH_CHECK(kv.is_cuda(),
+                "zero_kv_blocks_precompiled expects CUDA kv tensors");
+    const int64_t block_dim = block_dims.get(tensor_idx);
+    const int64_t ratio = ratios.get(tensor_idx);
+    for (int64_t idx = 0; idx < block_ids_cpu.numel(); ++idx) {
+      const int64_t block_id = block_ids_cpu[idx].item<int64_t>();
+      kv.narrow(block_dim, block_id * ratio, ratio).zero_();
+    }
+  }
 }
 
 torch::Tensor causal_conv1d_update_precompiled(

@@ -6,6 +6,7 @@ from importlib.util import find_spec
 from typing import Callable
 
 import torch
+import cfie._custom_ops as ops
 
 from cfie.logger import init_logger
 from cfie.model_executor.custom_op import CustomOp
@@ -61,6 +62,27 @@ def _get_cfie_flash_attn_apply_rotary_emb() -> Callable | None:
 
     _cfie_flash_attn_apply_rotary_emb = apply_rotary_emb
     return _cfie_flash_attn_apply_rotary_emb
+
+
+def _try_precompiled_apply_rotary_emb(
+    *,
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool,
+    enable_fp32_compute: bool,
+) -> torch.Tensor | None:
+    if not x.is_cuda:
+        return None
+    if not ops.has_precompiled_apply_rotary_emb():
+        return None
+    return ops.apply_rotary_emb_precompiled(
+        x=x,
+        cos=cos,
+        sin=sin,
+        is_neox_style=is_neox_style,
+        enable_fp32_compute=enable_fp32_compute,
+    )
 
 
 # common functions
@@ -358,6 +380,16 @@ class ApplyRotaryEmb(CustomOp):
         cos: torch.Tensor, # [seq_len_rotary, rotary_dim / 2]
         sin: torch.Tensor, # [seq_len_rotary, rotary_dim / 2]
     ) -> torch.Tensor:
+        precompiled = _try_precompiled_apply_rotary_emb(
+            x=x,
+            cos=cos,
+            sin=sin,
+            is_neox_style=self.is_neox_style,
+            enable_fp32_compute=self.enable_fp32_compute,
+        )
+        if precompiled is not None:
+            return precompiled
+
         # CUDA 路径优先使用 cfie_flash_attn rotary；
         # 若当前运行时没有 Triton 或 flash attention 扩展，则回退到共享的原生实现。
         apply_rotary_emb = _get_cfie_flash_attn_apply_rotary_emb()

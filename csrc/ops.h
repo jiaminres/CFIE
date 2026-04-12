@@ -173,6 +173,24 @@ fused_sigmoid_gating_delta_rule_update_precompiled(
     const std::optional<torch::Tensor>& num_accepted_tokens,
     bool use_qk_l2norm_in_kernel, bool is_kda);
 
+torch::Tensor apply_rotary_emb_precompiled(const torch::Tensor& x,
+                                           const torch::Tensor& cos,
+                                           const torch::Tensor& sin,
+                                           bool is_neox_style,
+                                           bool enable_fp32_compute);
+
+std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_precompiled(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& g, const torch::Tensor& beta, double scale,
+    const torch::Tensor& initial_state, bool output_final_state,
+    const std::optional<torch::Tensor>& cu_seqlens,
+    bool use_qk_l2norm_in_kernel);
+
+std::tuple<torch::Tensor, torch::Tensor> fused_gdn_gating_precompiled(
+    const torch::Tensor& A_log, const torch::Tensor& a,
+    const torch::Tensor& b, const torch::Tensor& dt_bias, double beta,
+    double threshold);
+
 torch::Tensor causal_conv1d_fn_precompiled(
     const torch::Tensor& x, const torch::Tensor& weight,
     const std::optional<torch::Tensor>& bias, torch::Tensor& conv_states,
@@ -190,6 +208,11 @@ torch::Tensor causal_conv1d_update_precompiled(
     const std::optional<torch::Tensor>& query_start_loc, int64_t pad_slot_id,
     const std::optional<torch::Tensor>& block_idx_last_scheduled_token,
     const std::optional<torch::Tensor>& initial_state_idx);
+
+void zero_kv_blocks_precompiled(const torch::Tensor& block_ids,
+                                c10::List<torch::Tensor> kv_tensors,
+                                c10::List<int64_t> block_dims,
+                                c10::List<int64_t> ratios);
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 

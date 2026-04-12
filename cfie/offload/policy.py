@@ -397,20 +397,8 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         target_occupied_gpu_bytes=target_occupied_gpu_bytes,
     )
 
-    # 真正的 draft 计划如果拿到了 target 已占预算，就只按剩余 GPU 空间重算 resident slots，
-    # 不再沿用 reserve 阶段的 base_8，也不额外启用 burst 池。
-    if planning_mode == "mtp" and target_occupied_gpu_bytes > 0 and not mtp_reserve_mode:
-        gpu_slots_per_layer = min(
-            num_experts,
-            raw_gpu_slots_per_layer,
-        )
-        prefill_burst_slots = 0
-        prefill_burst_bytes = 0
-        gpu_expert_budget_bytes = (
-                gpu_slots_per_layer * expert_bytes_per_slot_all_layers
-        )
     # 若当前模式要求固定 GPU slot 数，则不再额外规划 burst 池。
-    elif fixed_gpu_slots_per_layer is not None:
+    if fixed_gpu_slots_per_layer is not None:
         # 取“总专家数 / raw 能放下的数 / 固定目标值”三者最小值作为最终常驻 slot 数。
         gpu_slots_per_layer = min(
             num_experts,
@@ -650,9 +638,11 @@ def _resolve_fixed_gpu_slots_per_layer(
     if mtp_reserve_mode:
         return min(num_experts, max(top_k, DEFAULT_MTP_BASE_GPU_SLOTS))
 
-    # 真正的 draft 计划若已拿到 target 占用 hint，就改为按剩余预算动态重算 resident slots。
-    if target_occupied_gpu_bytes > 0:
-        return None
+    # MTP 是 target 的辅助 drafter，GPU/KV 预算应优先留给 target 主模型。
+    # 即使真实 draft 计划已经拿到 target 占用 hint，也不能把剩余显存贪心扩成大量
+    # drafter resident experts；否则 122B + MTP 会在 drafter 初始化后把 KV cache 挤到
+    # 负预算。这里统一固定在 base_8/top-k 下限，剩余 expert 通过 CPU static mirror 换入。
+    del target_occupied_gpu_bytes
 
     # MTP 固定基线是 8，但绝不会小于 top-k，也不会超过总专家数。
     return min(num_experts, max(top_k, DEFAULT_MTP_BASE_GPU_SLOTS))

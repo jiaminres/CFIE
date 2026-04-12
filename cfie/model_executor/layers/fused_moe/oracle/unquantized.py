@@ -21,6 +21,9 @@ from cfie.model_executor.layers.fused_moe.flashinfer_trtllm_moe import (
 from cfie.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
+from cfie.model_executor.layers.fused_moe.moe_permute_unpermute import (
+    moe_permute_unpermute_supported,
+)
 from cfie.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
 )
@@ -35,6 +38,7 @@ class UnquantizedMoeBackend(Enum):
     FLASHINFER_TRTLLM = "FlashInfer TRTLLM"
     FLASHINFER_CUTLASS = "FlashInfer CUTLASS"
     AITER = "ROCm AITER"
+    CUDA_ATEN = "CUDA ATen"
     TRITON = "TRITON"
     TORCH = "PyTorch"
     CPU = "CPU"
@@ -53,6 +57,13 @@ UNSUPPORTED_BACKEND = [
     UnquantizedMoeBackend.TPU,
     UnquantizedMoeBackend.OOT,
 ]
+
+
+def _has_cuda_aten_moe_backend() -> bool:
+    try:
+        return moe_permute_unpermute_supported()
+    except (AttributeError, RuntimeError):
+        return False
 
 
 def map_unquantized_backend(runner_backend: MoEBackend) -> UnquantizedMoeBackend:
@@ -179,6 +190,13 @@ def select_unquantized_moe_backend(
                 )
             if HAS_TRITON:
                 backend = UnquantizedMoeBackend.TRITON
+            elif _has_cuda_aten_moe_backend():
+                logger.info_once(
+                    "Triton is unavailable on the current CUDA runtime; "
+                    "falling back to the CUDA ATen Unquantized MoE backend.",
+                    scope="local",
+                )
+                backend = UnquantizedMoeBackend.CUDA_ATEN
             else:
                 logger.info_once(
                     "Triton is unavailable on the current CUDA runtime; "
@@ -258,6 +276,19 @@ def make_unquantized_moe_kernel(
         kernel = mk.FusedMoEKernel(
             MoEPrepareAndFinalizeNoDPEPModular(),
             TritonExperts(
+                moe_config=moe_config,
+                quant_config=quant_config,
+            ),
+            inplace=not moe_config.disable_inplace,
+        )
+    elif backend == UnquantizedMoeBackend.CUDA_ATEN:
+        from cfie.model_executor.layers.fused_moe.cuda_aten_moe import (
+            CudaAtenExperts,
+        )
+
+        kernel = mk.FusedMoEKernel(
+            MoEPrepareAndFinalizeNoDPEPModular(),
+            CudaAtenExperts(
                 moe_config=moe_config,
                 quant_config=quant_config,
             ),

@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from itertools import islice
 
 import torch
+import cfie._custom_ops as ops
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
@@ -107,6 +108,28 @@ from .utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+
+def _try_precompiled_fused_gdn_gating(
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        dt_bias: torch.Tensor,
+        beta: float = 1.0,
+        threshold: float = 20.0,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not a.is_cuda:
+        return None
+    if not ops.has_precompiled_fused_gdn_gating():
+        return None
+    return ops.fused_gdn_gating_precompiled(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        beta=beta,
+        threshold=threshold,
+    )
 
 
 def fi_chunk_gated_delta_rule(
@@ -2224,6 +2247,16 @@ def fused_gdn_gating(
     batch, num_heads = a.shape
     seq_len = 1
     if not HAS_TRITON:
+        precompiled = _try_precompiled_fused_gdn_gating(
+            A_log=A_log,
+            a=a,
+            b=b,
+            dt_bias=dt_bias,
+            beta=beta,
+            threshold=threshold,
+        )
+        if precompiled is not None:
+            return precompiled
         logger.warning_once(
             "Qwen3Next fused GDN gating is falling back to the PyTorch "
             "reference path because Triton runtime is unavailable."

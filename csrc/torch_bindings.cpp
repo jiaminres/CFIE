@@ -263,6 +263,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &fused_sigmoid_gating_delta_rule_update_precompiled);
 
   ops.def(
+      "apply_rotary_emb_precompiled("
+      "    Tensor x, Tensor cos, Tensor sin, bool is_neox_style,"
+      "    bool enable_fp32_compute) -> Tensor");
+  ops.impl("apply_rotary_emb_precompiled", torch::kCUDA,
+           &apply_rotary_emb_precompiled);
+
+  ops.def(
+      "chunk_gated_delta_rule_precompiled("
+      "    Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, float scale,"
+      "    Tensor initial_state, bool output_final_state, Tensor? cu_seqlens,"
+      "    bool use_qk_l2norm_in_kernel) -> (Tensor, Tensor)");
+  ops.impl("chunk_gated_delta_rule_precompiled", torch::kCUDA,
+           &chunk_gated_delta_rule_precompiled);
+
+  ops.def(
+      "fused_gdn_gating_precompiled("
+      "    Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, float beta,"
+      "    float threshold) -> (Tensor, Tensor)");
+  ops.impl("fused_gdn_gating_precompiled", torch::kCUDA,
+           &fused_gdn_gating_precompiled);
+
+  ops.def(
       "causal_conv1d_fn_precompiled("
       "    Tensor x, Tensor weight, Tensor? bias, Tensor! conv_states,"
       "    Tensor query_start_loc, Tensor? cache_indices,"
@@ -280,6 +302,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor? initial_state_idx) -> Tensor");
   ops.impl("causal_conv1d_update_precompiled", torch::kCUDA,
            &causal_conv1d_update_precompiled);
+
+  ops.def(
+      "zero_kv_blocks_precompiled("
+      "    Tensor block_ids, Tensor[] kv_tensors, int[] block_dims,"
+      "    int[] ratios) -> ()");
+  ops.impl("zero_kv_blocks_precompiled", torch::kCUDA,
+           &zero_kv_blocks_precompiled);
 
   // Quantization ops
 #ifndef USE_ROCM

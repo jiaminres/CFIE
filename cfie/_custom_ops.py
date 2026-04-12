@@ -469,6 +469,78 @@ def fused_sigmoid_gating_delta_rule_update_precompiled(
     )
 
 
+def has_precompiled_apply_rotary_emb() -> bool:
+    return hasattr(torch.ops._C, "apply_rotary_emb_precompiled")
+
+
+def apply_rotary_emb_precompiled(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool,
+    enable_fp32_compute: bool,
+) -> torch.Tensor:
+    return torch.ops._C.apply_rotary_emb_precompiled(
+        x,
+        cos,
+        sin,
+        is_neox_style,
+        enable_fp32_compute,
+    )
+
+
+def has_precompiled_chunk_gated_delta_rule() -> bool:
+    return hasattr(torch.ops._C, "chunk_gated_delta_rule_precompiled")
+
+
+def chunk_gated_delta_rule_precompiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.chunk_gated_delta_rule_precompiled(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        use_qk_l2norm_in_kernel,
+    )
+
+
+def has_precompiled_fused_gdn_gating() -> bool:
+    return hasattr(torch.ops._C, "fused_gdn_gating_precompiled")
+
+
+def fused_gdn_gating_precompiled(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    beta: float,
+    threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.fused_gdn_gating_precompiled(
+        A_log,
+        a,
+        b,
+        dt_bias,
+        beta,
+        threshold,
+    )
+
+
 def has_precompiled_causal_conv1d_fn() -> bool:
     return hasattr(torch.ops._C, "causal_conv1d_fn_precompiled")
 
@@ -526,6 +598,24 @@ def causal_conv1d_update_precompiled(
         pad_slot_id,
         block_idx_last_scheduled_token,
         initial_state_idx,
+    )
+
+
+def has_precompiled_zero_kv_blocks() -> bool:
+    return hasattr(torch.ops._C, "zero_kv_blocks_precompiled")
+
+
+def zero_kv_blocks_precompiled(
+    block_ids: torch.Tensor,
+    kv_tensors: list[torch.Tensor],
+    block_dims: list[int],
+    ratios: list[int],
+) -> None:
+    torch.ops._C.zero_kv_blocks_precompiled(
+        block_ids,
+        kv_tensors,
+        block_dims,
+        ratios,
     )
 
 
