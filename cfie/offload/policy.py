@@ -853,7 +853,7 @@ def _get_gpu_budget_bytes(cfie_config: Any) -> int:
 
     # ------------------------------- 读取当前可用显存并按利用率切分静态预算 -------------------------------
     # 读取当前时刻 GPU 的可用显存字节数，作为预算切分的基准。
-    available_memory = _get_available_gpu_memory_bytes()
+    available_memory, _ = _get_available_gpu_memory_snapshot()
 
     # 读取配置中的 gpu_memory_utilization；未显式配置时默认使用 0.9。
     gpu_util = float(getattr(cfie_config.cache_config, "gpu_memory_utilization", 0.9))
@@ -874,7 +874,7 @@ def _get_gpu_runtime_headroom_bytes(cfie_config: Any) -> int:
 
     # ------------------------------- 读取当前可用显存并按利用率切分运行时余量 -------------------------------
     # 读取当前时刻 GPU 的可用显存字节数，作为预算切分的基准。
-    available_memory = _get_available_gpu_memory_bytes()
+    available_memory, _ = _get_available_gpu_memory_snapshot()
 
     # 读取配置中的 gpu_memory_utilization；未显式配置时默认使用 0.9。
     gpu_util = float(getattr(cfie_config.cache_config, "gpu_memory_utilization", 0.9))
@@ -894,15 +894,17 @@ def _get_total_gpu_memory_bytes() -> int:
     return int(torch.cuda.get_device_properties(device_index).total_memory)
 
 
-def _get_available_gpu_memory_bytes() -> int:
+def _get_available_gpu_memory_snapshot() -> tuple[int, bool]:
     # 优先读取 CUDA 运行时报告的当前 free memory。
-    # 若环境不支持该查询，则退回总显存，保证单测和最小环境仍能继续规划。
+    # 返回值中的布尔位用于区分：
+    # - True: 预算基于“当前剩余可用显存”，适合 actual draft 视角
+    # - False: 预算退回到“总显存”，此时仍需要 target_occupied 作为补偿
     device_index = torch.cuda.current_device()
     try:
         free_memory, _ = torch.cuda.mem_get_info(device_index)
-        return int(free_memory)
+        return int(free_memory), True
     except Exception:
-        return _get_total_gpu_memory_bytes()
+        return _get_total_gpu_memory_bytes(), False
 
 
 def _estimate_dynamic_reserve_bytes(
@@ -1021,6 +1023,13 @@ def _estimate_shared_gpu_reserve_bytes(
     if planning_mode == "target":
         return _estimate_target_shared_gpu_reserve_bytes(cfie_config=cfie_config)
     if planning_mode == "mtp" and not mtp_reserve_mode:
+        # actual draft 规划如果已经建立在“当前 free GPU memory”口径上，
+        # 则 target 已占显存天然已经从预算里扣掉，不能再重复减一次。
+        # 只有当预算不得不退回到 total GPU memory 估算时，才继续使用
+        # target_occupied_gpu_bytes 作为补偿项。
+        _, budget_uses_current_free_memory = _get_available_gpu_memory_snapshot()
+        if budget_uses_current_free_memory:
+            return 0
         return max(0, target_occupied_gpu_bytes)
     return 0
 

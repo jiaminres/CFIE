@@ -4,7 +4,7 @@ import torch
 
 from cfie.config import CfieConfig, replace
 from cfie.offload.policy import PLAN_KEY
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
@@ -104,6 +104,34 @@ def eagle_step_update_slot_mapping_and_metadata(
     if input_batch_size is None:
         input_batch_size = batch_size
     n_blocks_per_req = block_table_tensor.shape[1]
+
+    if not HAS_TRITON:
+        new_position = positions_1d + 1
+        exceeds_max = new_position >= max_model_len
+        clamped_position = torch.where(
+            exceeds_max,
+            torch.zeros_like(new_position),
+            new_position,
+        )
+        block_number = clamped_position.div(block_size, rounding_mode="floor")
+        block_number = torch.clamp(block_number, max=n_blocks_per_req - 1)
+        req_idx = torch.arange(batch_size, device=positions_1d.device)
+        block_id = block_table_tensor[req_idx, block_number]
+        slot_id = block_id * block_size + torch.remainder(
+            clamped_position, block_size
+        )
+        padding_slot_ids = torch.full_like(slot_id, PADDING_SLOT_ID)
+        slot_id = torch.where(exceeds_max, padding_slot_ids, slot_id)
+
+        new_seq_len = torch.where(exceeds_max, torch.ones_like(seq_lens), seq_lens + 1)
+        new_seq_len.clamp_(max=max_model_len)
+
+        out_clamped_positions[:batch_size].copy_(clamped_position)
+        out_slot_mapping[:batch_size].copy_(slot_id)
+        if input_batch_size > batch_size:
+            out_slot_mapping[batch_size:input_batch_size].fill_(PADDING_SLOT_ID)
+        seq_lens.copy_(new_seq_len)
+        return
 
     eagle_step_slot_mapping_metadata_kernel[(input_batch_size,)](
         positions_1d,
@@ -224,6 +252,108 @@ def eagle_prepare_next_token_padded_kernel(
             tl.store(next_token_ids_ptr + req_idx, backup_token)
 
         tl.store(valid_sampled_tokens_count_ptr + req_idx, valid_count)
+
+
+def eagle_prepare_inputs_padded(
+    cu_num_draft_tokens: torch.Tensor,
+    valid_sampled_tokens_count: torch.Tensor,
+    query_start_loc_gpu: torch.Tensor,
+    token_indices_to_sample: torch.Tensor,
+    num_rejected_tokens_gpu: torch.Tensor,
+) -> None:
+    num_reqs = valid_sampled_tokens_count.shape[0]
+
+    if not HAS_TRITON:
+        num_draft_tokens = torch.empty_like(valid_sampled_tokens_count)
+        if num_reqs > 0:
+            num_draft_tokens[0] = cu_num_draft_tokens[0]
+        if num_reqs > 1:
+            num_draft_tokens[1:] = cu_num_draft_tokens[1:] - cu_num_draft_tokens[:-1]
+
+        num_rejected_tokens = (
+            num_draft_tokens + 1 - valid_sampled_tokens_count
+        ).to(num_rejected_tokens_gpu.dtype)
+        num_rejected_tokens = torch.where(
+            num_draft_tokens > 0,
+            num_rejected_tokens,
+            torch.zeros_like(num_rejected_tokens),
+        )
+        index_to_sample = (query_start_loc_gpu[1:] - 1 - num_rejected_tokens).to(
+            token_indices_to_sample.dtype
+        )
+
+        token_indices_to_sample.copy_(index_to_sample)
+        num_rejected_tokens_gpu.copy_(num_rejected_tokens)
+        return
+
+    grid = (num_reqs,)
+    eagle_prepare_inputs_padded_kernel[grid](
+        cu_num_draft_tokens,
+        valid_sampled_tokens_count,
+        query_start_loc_gpu,
+        token_indices_to_sample,
+        num_rejected_tokens_gpu,
+        num_reqs,
+    )
+
+
+def eagle_prepare_next_token_padded(
+    sampled_token_ids: torch.Tensor,
+    discard_request_mask: torch.Tensor,
+    backup_next_token_ids: torch.Tensor,
+    next_token_ids: torch.Tensor,
+    valid_sampled_tokens_count: torch.Tensor,
+    vocab_size: int,
+) -> None:
+    batch_size, num_sampled_tokens_per_req = sampled_token_ids.shape
+
+    if not HAS_TRITON:
+        valid_mask = (sampled_token_ids != -1) & (sampled_token_ids < vocab_size)
+        valid_count = valid_mask.sum(dim=1).to(valid_sampled_tokens_count.dtype)
+
+        token_offsets = torch.arange(
+            num_sampled_tokens_per_req,
+            device=sampled_token_ids.device,
+            dtype=torch.int64,
+        ).expand(batch_size, -1)
+        last_valid_index = torch.where(
+            valid_mask,
+            token_offsets,
+            token_offsets.new_full(token_offsets.shape, -1),
+        ).amax(dim=1)
+        gather_index = last_valid_index.clamp_min(0).unsqueeze(1)
+        last_valid_token = sampled_token_ids.gather(1, gather_index).squeeze(1)
+        next_token = torch.where(
+            valid_count > 0,
+            last_valid_token.to(backup_next_token_ids.dtype),
+            backup_next_token_ids,
+        )
+
+        next_token = torch.where(discard_request_mask, backup_next_token_ids, next_token)
+        valid_count = torch.where(
+            discard_request_mask,
+            torch.zeros_like(valid_count),
+            valid_count,
+        )
+
+        next_token_ids.copy_(next_token.to(next_token_ids.dtype))
+        valid_sampled_tokens_count.copy_(valid_count)
+        return
+
+    grid = (batch_size,)
+    block_size_tokens = triton.next_power_of_2(num_sampled_tokens_per_req)
+    eagle_prepare_next_token_padded_kernel[grid](
+        sampled_token_ids,
+        discard_request_mask,
+        backup_next_token_ids,
+        next_token_ids,
+        valid_sampled_tokens_count,
+        vocab_size,
+        num_sampled_tokens_per_req,
+        batch_size,
+        sampled_token_ids.stride(0),
+        BLOCK_SIZE_TOKENS=block_size_tokens,
+    )
 
 
 def compute_new_slot_mapping(
@@ -361,6 +491,168 @@ def extend_all_queries_by_N(
         slot_mapping=new_slot_mapping,
     )
     return new_cad
+
+
+def copy_and_expand_eagle_inputs(
+    target_token_ids_ptr: torch.Tensor,
+    target_positions_ptr: torch.Tensor,
+    next_token_ids_ptr: torch.Tensor,
+    out_input_ids_ptr: torch.Tensor,
+    out_positions_ptr: torch.Tensor,
+    out_is_rejected_token_mask_ptr: torch.Tensor,
+    out_is_masked_token_mask_ptr: torch.Tensor,
+    out_new_token_indices_ptr: torch.Tensor,
+    out_hidden_state_mapping_ptr: torch.Tensor,
+    query_start_loc_ptr: torch.Tensor,
+    query_end_loc_ptr: torch.Tensor,
+    padding_token_id: int,
+    parallel_drafting_token_id: int,
+    total_input_tokens: int,
+    num_padding_slots_per_request: int,
+    shift_input_ids: bool,
+) -> None:
+    batch_size = query_end_loc_ptr.shape[0]
+
+    if not HAS_TRITON:
+        last_input_index = total_input_tokens - 1
+        for request_idx in range(batch_size):
+            query_start_loc = int(query_start_loc_ptr[request_idx].item())
+            next_query_start_loc = int(query_start_loc_ptr[request_idx + 1].item())
+            query_end_loc = int(query_end_loc_ptr[request_idx].item())
+
+            if shift_input_ids:
+                num_valid_tokens = query_end_loc - query_start_loc
+                input_offset = 1
+                output_start = query_start_loc + request_idx * (
+                    num_padding_slots_per_request - 1
+                )
+            else:
+                num_valid_tokens = query_end_loc - query_start_loc + 1
+                input_offset = 0
+                output_start = query_start_loc + request_idx * (
+                    num_padding_slots_per_request
+                )
+
+            num_rejected = next_query_start_loc - query_end_loc - 1
+            total_output_tokens = (
+                num_valid_tokens + num_padding_slots_per_request + num_rejected
+            )
+            j = torch.arange(
+                total_output_tokens,
+                device=target_token_ids_ptr.device,
+                dtype=torch.int64,
+            )
+            out_idx = output_start + j
+
+            is_valid_region = j < num_valid_tokens
+            is_bonus_region = j == num_valid_tokens
+            is_parallel_draft_region = (j > num_valid_tokens) & (
+                j < num_valid_tokens + num_padding_slots_per_request
+            )
+            is_rejected_region = j >= (
+                num_valid_tokens + num_padding_slots_per_request
+            )
+
+            in_idx = query_start_loc + input_offset + j
+            in_idx_clamped = torch.clamp(in_idx, max=last_input_index)
+            token_ids = torch.where(
+                is_valid_region,
+                target_token_ids_ptr[in_idx_clamped],
+                torch.zeros_like(in_idx_clamped, dtype=target_token_ids_ptr.dtype),
+            )
+
+            if target_positions_ptr.ndim == 1:
+                start_pos = target_positions_ptr[query_start_loc]
+            else:
+                start_pos = target_positions_ptr[0, query_start_loc]
+            positions = start_pos + j.to(out_positions_ptr.dtype)
+
+            bonus_token = next_token_ids_ptr[request_idx]
+            token_ids = torch.where(
+                is_bonus_region,
+                torch.full_like(token_ids, bonus_token),
+                token_ids,
+            )
+            token_ids = torch.where(
+                is_parallel_draft_region,
+                torch.full_like(token_ids, parallel_drafting_token_id),
+                token_ids,
+            )
+            token_ids = torch.where(
+                is_rejected_region,
+                torch.full_like(token_ids, padding_token_id),
+                token_ids,
+            )
+            positions = torch.where(
+                is_rejected_region,
+                torch.zeros_like(positions),
+                positions,
+            )
+
+            out_input_ids_ptr[out_idx] = token_ids.to(out_input_ids_ptr.dtype)
+            out_positions_ptr[out_idx] = positions.to(out_positions_ptr.dtype)
+            out_is_rejected_token_mask_ptr[out_idx] = is_rejected_region.to(
+                out_is_rejected_token_mask_ptr.dtype
+            )
+            out_is_masked_token_mask_ptr[out_idx] = is_parallel_draft_region.to(
+                out_is_masked_token_mask_ptr.dtype
+            )
+
+            is_new_token_region = (j >= num_valid_tokens) & (
+                j < num_valid_tokens + num_padding_slots_per_request
+            )
+            if is_new_token_region.any():
+                new_token_local_idx = j[is_new_token_region] - num_valid_tokens
+                new_token_out_idx = (
+                    request_idx * num_padding_slots_per_request + new_token_local_idx
+                )
+                out_new_token_indices_ptr[new_token_out_idx] = out_idx[
+                    is_new_token_region
+                ].to(out_new_token_indices_ptr.dtype)
+
+            if shift_input_ids:
+                num_input_tokens_this_request = next_query_start_loc - query_start_loc
+                src_idx = torch.arange(
+                    query_start_loc,
+                    next_query_start_loc,
+                    device=target_token_ids_ptr.device,
+                    dtype=torch.int64,
+                )
+                mapped_out_idx = out_idx[:num_input_tokens_this_request]
+                out_hidden_state_mapping_ptr[src_idx] = mapped_out_idx.to(
+                    out_hidden_state_mapping_ptr.dtype
+                )
+        return
+
+    max_num_tokens_per_request = 0
+    if batch_size > 0:
+        max_num_tokens_per_request = int(
+            (query_start_loc_ptr[1:] - query_start_loc_ptr[:-1]).max().item()
+        ) + num_padding_slots_per_request
+    block_size_tokens = min(256, triton.next_power_of_2(max_num_tokens_per_request))
+    num_blocks = (
+        max_num_tokens_per_request + block_size_tokens - 1
+    ) // block_size_tokens
+    grid = (batch_size, num_blocks)
+    copy_and_expand_eagle_inputs_kernel[grid](
+        target_token_ids_ptr=target_token_ids_ptr,
+        target_positions_ptr=target_positions_ptr,
+        next_token_ids_ptr=next_token_ids_ptr,
+        out_input_ids_ptr=out_input_ids_ptr,
+        out_positions_ptr=out_positions_ptr,
+        out_is_rejected_token_mask_ptr=out_is_rejected_token_mask_ptr,
+        out_is_masked_token_mask_ptr=out_is_masked_token_mask_ptr,
+        out_new_token_indices_ptr=out_new_token_indices_ptr,
+        out_hidden_state_mapping_ptr=out_hidden_state_mapping_ptr,
+        query_start_loc_ptr=query_start_loc_ptr,
+        query_end_loc_ptr=query_end_loc_ptr,
+        padding_token_id=padding_token_id,
+        parallel_drafting_token_id=parallel_drafting_token_id,
+        total_input_tokens=total_input_tokens,
+        num_padding_slots_per_request=num_padding_slots_per_request,
+        shift_input_ids=shift_input_ids,
+        BLOCK_SIZE_TOKENS=block_size_tokens,
+    )
 
 
 # Unified copy/expand kernel

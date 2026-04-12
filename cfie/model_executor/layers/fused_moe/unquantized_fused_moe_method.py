@@ -73,7 +73,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.kernel: mk.FusedMoEKernel | None = None
         self._is_monolithic = (
             current_platform.is_cpu()
-            or self.unquantized_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM
+            or self.unquantized_backend
+            in (
+                UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+                UnquantizedMoeBackend.TORCH,
+            )
         )
 
         if self.is_monolithic:
@@ -81,7 +85,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def _select_monolithic(self) -> Callable:
         """Select the monolithic implementation based on platform."""
-        if current_platform.is_cpu():
+        if (
+            current_platform.is_cpu()
+            or self.unquantized_backend == UnquantizedMoeBackend.TORCH
+        ):
             return self.forward_monolithic_cpu
         else:
             return self.forward_monolithic_cuda
@@ -252,7 +259,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             )
             layer.w13_weight = Parameter(w13_weights_shuffled, requires_grad=False)
             layer.w2_weight = Parameter(w2_weights_shuffled, requires_grad=False)
-        elif self.unquantized_backend == UnquantizedMoeBackend.CPU:
+        elif self.unquantized_backend in (
+            UnquantizedMoeBackend.CPU,
+            UnquantizedMoeBackend.TORCH,
+        ):
             from cfie.model_executor.layers.fused_moe import cpu_fused_moe
 
             if current_platform.get_cpu_architecture() == CpuArchEnum.X86:

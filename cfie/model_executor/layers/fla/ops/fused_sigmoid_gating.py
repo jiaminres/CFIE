@@ -9,7 +9,181 @@
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+logger = init_logger(__name__)
+
+
+def _resolve_state_index(
+    ssm_state_indices: torch.Tensor | None,
+    seq_idx: int,
+    token_offset: int,
+) -> int | None:
+    if ssm_state_indices is None:
+        return None
+    if ssm_state_indices.ndim == 1:
+        flat_index = seq_idx + token_offset
+        if flat_index >= ssm_state_indices.numel():
+            return -1
+        return int(ssm_state_indices[flat_index].item())
+    return int(ssm_state_indices[seq_idx, token_offset].item())
+
+
+def _softplus_with_threshold(
+    x: torch.Tensor,
+    beta: float,
+    threshold: float,
+) -> torch.Tensor:
+    beta_x = beta * x
+    return torch.where(
+        beta_x <= threshold,
+        torch.log1p(torch.exp(beta_x)) / beta,
+        x,
+    )
+
+
+def _fused_sigmoid_gating_delta_rule_update_ref(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: float,
+    threshold: float,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    final_state: torch.Tensor,
+    inplace_final_state: bool,
+    cu_seqlens: torch.LongTensor | None,
+    ssm_state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+    use_qk_l2norm_in_kernel: bool,
+    is_kda: bool,
+    out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B, T, H, K = q.shape
+    HV, V = v.shape[2], v.shape[3]
+    hv_per_h = HV // H
+    head_index = (
+        torch.arange(HV, device=q.device, dtype=torch.long) // hv_per_h
+    )
+
+    if cu_seqlens is None:
+        q_tokens = q.reshape(B * T, H, K)
+        k_tokens = k.reshape(B * T, H, K)
+        v_tokens = v.reshape(B * T, HV, V)
+        if not is_kda:
+            a_tokens = a.reshape(B * T, HV)
+        else:
+            a_tokens = a.reshape(B * T, HV, K)
+        b_tokens = b.reshape(B * T, HV)
+        seq_ranges = [(seq_idx * T, (seq_idx + 1) * T) for seq_idx in range(B)]
+    else:
+        q_tokens = q[0]
+        k_tokens = k[0]
+        v_tokens = v[0]
+        if not is_kda:
+            a_tokens = a.reshape(-1, HV)
+        else:
+            a_tokens = a.reshape(-1, HV, K)
+        b_tokens = b.reshape(-1, HV)
+        seq_ranges = [
+            (int(cu_seqlens[seq_idx].item()), int(cu_seqlens[seq_idx + 1].item()))
+            for seq_idx in range(len(cu_seqlens) - 1)
+        ]
+
+    out_tokens = out.reshape(-1, HV, V)
+    zeros_output = torch.zeros(HV, V, device=q.device, dtype=torch.float32)
+    A_log_f32 = A_log.to(torch.float32)
+    dt_bias_f32 = dt_bias.to(torch.float32)
+
+    for seq_idx, (bos, eos) in enumerate(seq_ranges):
+        seq_len = eos - bos
+        if seq_len <= 0:
+            continue
+
+        if initial_state is None:
+            h = torch.zeros(HV, V, K, device=q.device, dtype=torch.float32)
+        elif ssm_state_indices is not None:
+            accepted_offset = 0
+            if num_accepted_tokens is not None:
+                accepted_offset = int(num_accepted_tokens[seq_idx].item()) - 1
+            state_idx = _resolve_state_index(ssm_state_indices, seq_idx, accepted_offset)
+            if state_idx is None:
+                h = torch.zeros(HV, V, K, device=q.device, dtype=torch.float32)
+            elif state_idx < 0:
+                out_tokens[bos:eos].zero_()
+                continue
+            else:
+                h = initial_state[state_idx].to(torch.float32).clone()
+        else:
+            state_base = seq_idx
+            if initial_state.shape[0] > bos:
+                state_base = bos
+            h = initial_state[state_base].to(torch.float32).clone()
+
+        for token_offset, token_idx in enumerate(range(bos, eos)):
+            q_token = q_tokens[token_idx].to(torch.float32)[head_index]
+            k_token = k_tokens[token_idx].to(torch.float32)[head_index]
+            v_token = v_tokens[token_idx].to(torch.float32)
+            beta_token = torch.sigmoid(b_tokens[token_idx].to(torch.float32))
+
+            if not is_kda:
+                x = a_tokens[token_idx].to(torch.float32) + dt_bias_f32
+                g = -torch.exp(A_log_f32) * _softplus_with_threshold(
+                    x,
+                    beta=beta,
+                    threshold=threshold,
+                )
+            else:
+                x = a_tokens[token_idx].to(torch.float32) + dt_bias_f32[:, None]
+                g = -torch.exp(A_log_f32).unsqueeze(1) * _softplus_with_threshold(
+                    x,
+                    beta=beta,
+                    threshold=threshold,
+                )
+
+            if use_qk_l2norm_in_kernel:
+                q_token = q_token / torch.sqrt((q_token * q_token).sum(dim=-1, keepdim=True) + 1e-6)
+                k_token = k_token / torch.sqrt((k_token * k_token).sum(dim=-1, keepdim=True) + 1e-6)
+
+            q_token = q_token * scale
+            if not is_kda:
+                h = h * torch.exp(g).view(HV, 1, 1)
+            else:
+                h = h * torch.exp(g)[:, None, :]
+
+            updated_v = v_token - (h * k_token[:, None, :]).sum(dim=-1)
+            updated_v = updated_v * beta_token[:, None]
+            h = h + updated_v[:, :, None] * k_token[:, None, :]
+            out_tokens[token_idx] = (h * q_token[:, None, :]).sum(dim=-1).to(torch.float32)
+
+            if inplace_final_state:
+                final_state_idx = _resolve_state_index(
+                    ssm_state_indices,
+                    seq_idx,
+                    token_offset,
+                )
+                if final_state_idx is not None and final_state_idx >= 0:
+                    final_state[final_state_idx] = h.to(final_state.dtype)
+            else:
+                final_state[token_idx] = h.to(final_state.dtype)
+
+    if ssm_state_indices is not None:
+        valid_mask = ssm_state_indices.reshape(-1) >= 0
+        if out_tokens.shape[0] == valid_mask.shape[0]:
+            out_tokens.copy_(
+                torch.where(
+                    valid_mask.view(-1, 1, 1),
+                    out_tokens,
+                    zeros_output.to(out_tokens.dtype).unsqueeze(0).expand_as(out_tokens),
+                )
+            )
+
+    return out, final_state
 
 
 @triton.heuristics(
@@ -227,6 +401,33 @@ def fused_sigmoid_gating_delta_rule_update(
         final_state = initial_state
     else:
         final_state = q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
+
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Qwen3Next fused GDN gating is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _fused_sigmoid_gating_delta_rule_update_ref(
+            A_log=A_log,
+            a=a,
+            b=b,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            beta=beta,
+            threshold=threshold,
+            scale=scale,
+            initial_state=initial_state,
+            final_state=final_state,
+            inplace_final_state=inplace_final_state,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            is_kda=is_kda,
+            out=o.squeeze(0),
+        )
 
     stride_init_state_token = initial_state.stride(0)
     stride_final_state_token = final_state.stride(0)

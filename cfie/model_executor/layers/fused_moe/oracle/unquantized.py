@@ -25,6 +25,7 @@ from cfie.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
 )
 from cfie.platforms import current_platform
+from cfie.triton_utils import HAS_TRITON
 from cfie.utils.flashinfer import has_flashinfer, has_flashinfer_cutlass_fused_moe
 
 logger = init_logger(__name__)
@@ -35,6 +36,7 @@ class UnquantizedMoeBackend(Enum):
     FLASHINFER_CUTLASS = "FlashInfer CUTLASS"
     AITER = "ROCm AITER"
     TRITON = "TRITON"
+    TORCH = "PyTorch"
     CPU = "CPU"
     XPU = "XPU"
     TPU = "TPU"
@@ -46,6 +48,7 @@ class UnquantizedMoeBackend(Enum):
 # We will directly call the kernel for those backend
 UNSUPPORTED_BACKEND = [
     UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+    UnquantizedMoeBackend.TORCH,
     UnquantizedMoeBackend.CPU,
     UnquantizedMoeBackend.TPU,
     UnquantizedMoeBackend.OOT,
@@ -56,6 +59,7 @@ def map_unquantized_backend(runner_backend: MoEBackend) -> UnquantizedMoeBackend
     """Map user's MoEBackend to UnquantizedMoeBackend."""
     mapping = {
         "triton": UnquantizedMoeBackend.TRITON,
+        "torch": UnquantizedMoeBackend.TORCH,
         "flashinfer_trtllm": UnquantizedMoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": UnquantizedMoeBackend.FLASHINFER_CUTLASS,
         "aiter": UnquantizedMoeBackend.AITER,
@@ -173,7 +177,15 @@ def select_unquantized_moe_backend(
                     "FlashInfer CUTLASS MoE is currently not available for DP.",
                     scope="local",
                 )
-            backend = UnquantizedMoeBackend.TRITON
+            if HAS_TRITON:
+                backend = UnquantizedMoeBackend.TRITON
+            else:
+                logger.info_once(
+                    "Triton is unavailable on the current CUDA runtime; "
+                    "falling back to the PyTorch Unquantized MoE backend.",
+                    scope="local",
+                )
+                backend = UnquantizedMoeBackend.TORCH
     if current_platform.is_xpu():
         backend = UnquantizedMoeBackend.XPU
     if current_platform.is_cpu():

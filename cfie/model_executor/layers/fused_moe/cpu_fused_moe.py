@@ -268,6 +268,12 @@ class CPUFusedMOE:
         self,
         layer: torch.nn.Module,
     ) -> tuple[bool, str]:
+        if (
+            layer.w13_weight.device.type != "cpu"
+            or layer.w2_weight.device.type != "cpu"
+        ):
+            return False, "none"
+
         if not hasattr(torch.ops._C, "prepack_moe_weight"):
             return False, "none"
 

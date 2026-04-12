@@ -581,10 +581,14 @@ class LayerTieredExpertCacheController:
                     "Tiered MoE cache currently does not support biased unquantized MoE"
                 )
 
-            # 当前非量化路径仅支持 Triton backend。
-            if layer.quant_method.unquantized_backend != UnquantizedMoeBackend.TRITON:
+            # 当前非量化路径支持 Triton 与 PyTorch 回退 backend。
+            if layer.quant_method.unquantized_backend not in (
+                UnquantizedMoeBackend.TRITON,
+                UnquantizedMoeBackend.TORCH,
+            ):
                 raise TypeError(
-                    "Tiered MoE cache currently only supports TRITON unquantized MoE"
+                    "Tiered MoE cache currently only supports TRITON and "
+                    "TORCH fallback unquantized MoE"
                 )
 
             # 记录当前控制器工作在非量化模式下。

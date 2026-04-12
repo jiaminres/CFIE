@@ -23,7 +23,6 @@ from cfie.model_executor.models import supports_multimodal
 from cfie.model_executor.models.interfaces import SupportsMultiModal
 from cfie.multimodal import MULTIMODAL_REGISTRY
 from cfie.platforms import current_platform
-from cfie.triton_utils import triton
 from cfie.utils.platform_utils import is_pin_memory_available
 from cfie.v1.attention.backend import CommonAttentionMetadata
 from cfie.v1.attention.backends.registry import AttentionBackendEnum
@@ -40,10 +39,10 @@ from cfie.v1.spec_decode.metadata import SpecDecodeMetadata
 from cfie.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
-    copy_and_expand_eagle_inputs_kernel,
+    copy_and_expand_eagle_inputs,
     create_vllm_config_for_draft_model,
-    eagle_prepare_inputs_padded_kernel,
-    eagle_prepare_next_token_padded_kernel,
+    eagle_prepare_inputs_padded,
+    eagle_prepare_next_token_padded,
     eagle_step_update_slot_mapping_and_metadata,
     extend_all_queries_by_N,
 )
@@ -691,21 +690,10 @@ class SpecDecodeBaseProposer:
             assert self.is_rejected_token_mask is not None
             assert self.is_masked_token_mask is not None
             # 1.
-            # Call a custom triton kernel to copy input_ids and positions
-            # into the correct slots in the preallocated buffers self.input_ids,
-            # self.positions.
+            # Copy input ids and positions into the correct slots in the
+            # preallocated drafting buffers. Triton and torch fallback share
+            # the same output layout.
             batch_size = cad.batch_size()
-            # Since we might have to copy a lot of data for prefills, we select the
-            # block size based on the max query length and limit to max 256 slots/block.
-            max_num_tokens_per_request = (
-                cad.max_query_len + self.net_num_new_slots_per_request
-            )
-            BLOCK_SIZE_TOKENS = min(
-                256, triton.next_power_of_2(max_num_tokens_per_request)
-            )
-            num_blocks = (
-                max_num_tokens_per_request + BLOCK_SIZE_TOKENS - 1
-            ) // BLOCK_SIZE_TOKENS
             total_num_input_tokens = target_token_ids.shape[0]
             total_num_output_tokens = total_num_input_tokens + (
                 self.net_num_new_slots_per_request * batch_size
@@ -722,13 +710,11 @@ class SpecDecodeBaseProposer:
                 total_num_input_tokens, dtype=torch.int32, device=self.device
             )
 
-            # Kernel grid: one program per request (row)
-            grid = (batch_size, num_blocks)
             query_start_loc = cad.query_start_loc
             query_end_loc = cad.query_start_loc[1:] - 1
             if num_rejected_tokens_gpu is not None:
                 query_end_loc = query_end_loc - num_rejected_tokens_gpu
-            copy_and_expand_eagle_inputs_kernel[grid](
+            copy_and_expand_eagle_inputs(
                 # (Padded) Inputs from the target model
                 target_token_ids_ptr=target_token_ids,
                 target_positions_ptr=target_positions,
@@ -750,7 +736,6 @@ class SpecDecodeBaseProposer:
                 total_input_tokens=total_num_input_tokens,
                 num_padding_slots_per_request=self.extra_slots_per_request,
                 shift_input_ids=self.pass_hidden_states_to_model,
-                BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
             )
             if self.pass_hidden_states_to_model:
                 assert self.parallel_drafting_hidden_state_tensor is not None
@@ -863,22 +848,13 @@ class SpecDecodeBaseProposer:
         next_token_ids = torch.empty(batch_size, dtype=torch.int32, device=device)
         valid_sampled_tokens_count = next_token_ids.new_empty(batch_size)
 
-        # Kernel grid: one program per request (row)
-        grid = (batch_size,)
-
-        # Find the next power of 2 for block sizes
-        BLOCK_SIZE_TOKENS = triton.next_power_of_2(num_tokens)
-        eagle_prepare_next_token_padded_kernel[grid](
+        eagle_prepare_next_token_padded(
             sampled_token_ids,
             discard_request_mask,
             backup_tokens_gpu,
             next_token_ids,
             valid_sampled_tokens_count,
             gpu_input_batch.vocab_size,
-            num_tokens,
-            batch_size,
-            sampled_token_ids.stride(0),
-            BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
         )
 
         return next_token_ids, valid_sampled_tokens_count
@@ -907,14 +883,12 @@ class SpecDecodeBaseProposer:
             (num_reqs,), dtype=torch.int32, device=device
         )
 
-        grid = (num_reqs,)
-        eagle_prepare_inputs_padded_kernel[grid](
+        eagle_prepare_inputs_padded(
             spec_decode_metadata.cu_num_draft_tokens,
             valid_sampled_tokens_count,
             common_attn_metadata.query_start_loc,
             token_indices_to_sample,
             num_rejected_tokens_gpu,
-            num_reqs,
         )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu

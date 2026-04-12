@@ -376,6 +376,58 @@ class DefaultMoERunner(MoERunner):
             )
         return torch.cat(outputs, dim=0)
 
+    def _apply_monolithic_with_tiered_cache(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        controller = getattr(layer, "_cfie_tiered_cache_controller", None)
+        if controller is None:
+            return self.quant_method.apply_monolithic(
+                layer=layer,
+                x=x,
+                router_logits=router_logits,
+            )
+
+        _, topk_ids = self.router.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+        )
+
+        full_unique_requested = int(torch.unique(topk_ids.detach()).numel())
+        if full_unique_requested <= layer.local_num_experts:
+            controller.prepare(topk_ids)
+            return self.quant_method.apply_monolithic(
+                layer=layer,
+                x=x,
+                router_logits=router_logits,
+            )
+
+        token_ranges = _pack_token_ranges_by_expert_capacity(
+            topk_ids,
+            layer.local_num_experts,
+        )
+
+        outputs: list[torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = []
+        for start, end in token_ranges:
+            controller.prepare(topk_ids[start:end])
+            outputs.append(
+                self.quant_method.apply_monolithic(
+                    layer=layer,
+                    x=x[start:end],
+                    router_logits=router_logits[start:end],
+                )
+            )
+
+        first_output = outputs[0]
+        if isinstance(first_output, tuple):
+            return (
+                torch.cat([output[0] for output in outputs], dim=0),
+                torch.cat([output[1] for output in outputs], dim=0),
+            )
+        return torch.cat(outputs, dim=0)
+
     @property
     def use_dp_chunking(self) -> bool:
         # 只有部分 all2all backend 支持 / 受益于 DP chunking，并且还要受环境变量开关控制。
@@ -670,7 +722,7 @@ class DefaultMoERunner(MoERunner):
             # 核心专家计算阶段。
             if self.quant_method.is_monolithic:
                 assert has_separate_shared_experts or self.shared_experts is None
-                final_hidden_states = self.quant_method.apply_monolithic(
+                final_hidden_states = self._apply_monolithic_with_tiered_cache(
                     layer=layer,
                     x=staged_hidden_states,
                     router_logits=staged_router_logits,
@@ -871,7 +923,7 @@ class DefaultMoERunner(MoERunner):
             # -----------------
             # 核心专家计算阶段。
             if self.quant_method.is_monolithic:
-                final_hidden_states = self.quant_method.apply_monolithic(
+                final_hidden_states = self._apply_monolithic_with_tiered_cache(
                     layer=layer,
                     x=hidden_states,
                     router_logits=router_logits,
