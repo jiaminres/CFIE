@@ -28,9 +28,156 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 import torch
 
+from cfie import _custom_ops as ops
+from cfie.logger import init_logger
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.math_utils import RCP_LN2
+
+logger = init_logger(__name__)
+
+
+def _supports_precompiled_prefill_attention(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+) -> bool:
+    return (
+        ops.has_precompiled_prefill_attention()
+        and q.is_cuda
+        and k.is_cuda
+        and v.is_cuda
+        and o.is_cuda
+        and b_start_loc.is_cuda
+        and b_seq_len.is_cuda
+    )
+
+
+def _try_precompiled_prefill_attention(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    is_causal: bool,
+    softmax_scale: float,
+    sliding_window_q: int | None,
+    sliding_window_k: int | None,
+) -> bool:
+    if not _supports_precompiled_prefill_attention(
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        b_start_loc=b_start_loc,
+        b_seq_len=b_seq_len,
+    ):
+        return False
+
+    try:
+        ops.prefill_attention_precompiled(
+            output=o,
+            q=q,
+            k=k,
+            v=v,
+            b_start_loc=b_start_loc,
+            b_seq_len=b_seq_len,
+            is_causal=is_causal,
+            softmax_scale=softmax_scale,
+            sliding_window_q=0 if sliding_window_q is None else sliding_window_q,
+            sliding_window_k=0 if sliding_window_k is None else sliding_window_k,
+        )
+    except (AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
+        logger.warning_once(
+            "Precompiled prefill attention compute is unavailable; "
+            "falling back to shared reference compute. Reason: %s",
+            exc,
+        )
+        return False
+
+    logger.info_once(
+        "Using precompiled prefill attention compute because Triton runtime "
+        "is unavailable."
+    )
+    return True
+
+
+def _reference_context_attention_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    *,
+    is_causal: bool,
+    softmax_scale: float,
+    sliding_window_q: int | None,
+    sliding_window_k: int | None,
+) -> None:
+    logger.warning_once(
+        "Prefill attention is falling back to the PyTorch reference path "
+        "because Triton runtime is unavailable."
+    )
+
+    start_locs_cpu = b_start_loc.to(device="cpu", dtype=torch.int64)
+    seq_lens_cpu = b_seq_len.to(device="cpu", dtype=torch.int64)
+    num_q_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    kv_group_num = num_q_heads // num_kv_heads
+
+    q_window = 0 if sliding_window_q is None else sliding_window_q
+    k_window = 0 if sliding_window_k is None else sliding_window_k
+
+    for batch_idx in range(len(seq_lens_cpu)):
+        seq_len = int(seq_lens_cpu[batch_idx].item())
+        if seq_len <= 0:
+            continue
+
+        seq_start = int(start_locs_cpu[batch_idx].item())
+        seq_stop = seq_start + seq_len
+
+        q_seq = q[seq_start:seq_stop].to(dtype=torch.float32)
+        k_seq = k[seq_start:seq_stop].to(dtype=torch.float32)
+        v_seq = v[seq_start:seq_stop].to(dtype=torch.float32)
+
+        q_heads = q_seq.permute(1, 0, 2).contiguous()
+        k_heads = k_seq.permute(1, 0, 2).contiguous()
+        v_heads = v_seq.permute(1, 0, 2).contiguous()
+
+        if kv_group_num > 1:
+            k_heads = k_heads.repeat_interleave(kv_group_num, dim=0)
+            v_heads = v_heads.repeat_interleave(kv_group_num, dim=0)
+
+        scores = torch.matmul(q_heads, k_heads.transpose(-1, -2)) * softmax_scale
+
+        positions = torch.arange(seq_len, device=q.device)
+        q_pos = positions[:, None]
+        k_pos = positions[None, :]
+        mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=q.device)
+
+        if is_causal:
+            mask &= q_pos >= k_pos
+        if q_window > 0:
+            mask &= (q_pos - k_pos) <= q_window
+        if k_window > 0:
+            mask &= (k_pos - q_pos) <= k_window
+
+        mask = mask.unsqueeze(0)
+        masked_scores = scores.masked_fill(~mask, float("-inf"))
+        row_max = masked_scores.amax(dim=-1, keepdim=True)
+        row_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
+        exp_scores = torch.exp(masked_scores - row_max) * mask.to(dtype=torch.float32)
+        denom = exp_scores.sum(dim=-1, keepdim=True)
+        probs = torch.where(denom > 0, exp_scores / denom, torch.zeros_like(exp_scores))
+        out = torch.matmul(probs, v_heads)
+        o[seq_start:seq_stop].copy_(out.permute(1, 0, 2).to(dtype=o.dtype))
 
 
 @triton.jit
@@ -207,11 +354,38 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    BLOCK = get_block_size(q.dtype)
-
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 
     sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
+    if not HAS_TRITON:
+        if _try_precompiled_prefill_attention(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            b_start_loc=b_start_loc,
+            b_seq_len=b_seq_len,
+            is_causal=is_causal,
+            softmax_scale=sm_scale,
+            sliding_window_q=sliding_window_q,
+            sliding_window_k=sliding_window_k,
+        ):
+            return
+        _reference_context_attention_fwd(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            b_start_loc=b_start_loc,
+            b_seq_len=b_seq_len,
+            is_causal=is_causal,
+            softmax_scale=sm_scale,
+            sliding_window_q=sliding_window_q,
+            sliding_window_k=sliding_window_k,
+        )
+        return
+
+    BLOCK = get_block_size(q.dtype)
     # rescale with 1/ln(2) for triton exp2
     sm_scale *= RCP_LN2
 

@@ -11,8 +11,10 @@
 import os
 
 import torch
+import cfie._custom_ops as ops
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 from .index import prepare_chunk_indices
 from .op import make_tensor_descriptor
@@ -23,6 +25,67 @@ ALLOWED_TRIL_PRECISIONS = ["ieee", "tf32"] if is_amd else ["ieee", "tf32", "tf32
 assert FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS, (
     f"FLA_TRIL_PRECISION must be one of {ALLOWED_TRIL_PRECISIONS}, but got {FLA_TRIL_PRECISION}"
 )
+logger = init_logger(__name__)
+
+
+def _solve_tril_reference(
+    A: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = torch.float,
+) -> torch.Tensor:
+    resolved_dtype = A.dtype if output_dtype is None else output_dtype
+    B, T, H, BT = A.shape
+    out = torch.zeros_like(A, dtype=resolved_dtype)
+
+    def _write_chunk(batch_idx: int, start: int, end: int) -> None:
+        if end <= start:
+            return
+        chunk_len = end - start
+        A_chunk = A[batch_idx, start:end].float()
+        identity = torch.eye(chunk_len, dtype=torch.float32, device=A.device)
+        for head_idx in range(H):
+            lower = torch.tril(A_chunk[:, head_idx, :chunk_len], diagonal=-1)
+            inverse = torch.inverse(identity + lower)
+            out[batch_idx, start:end, head_idx, :chunk_len].copy_(
+                inverse.to(resolved_dtype)
+            )
+
+    if cu_seqlens is None:
+        total_chunks = (T + BT - 1) // BT
+        for batch_idx in range(B):
+            for chunk_idx in range(total_chunks):
+                start = chunk_idx * BT
+                end = min(start + BT, T)
+                _write_chunk(batch_idx, start, end)
+    else:
+        if B != 1:
+            raise ValueError("Only batch size 1 is supported with cu_seqlens.")
+        for seq_idx in range(cu_seqlens.numel() - 1):
+            seq_start = int(cu_seqlens[seq_idx].item())
+            seq_end = int(cu_seqlens[seq_idx + 1].item())
+            seq_len = seq_end - seq_start
+            local_chunks = (seq_len + BT - 1) // BT
+            for chunk_idx in range(local_chunks):
+                start = seq_start + chunk_idx * BT
+                end = min(start + BT, seq_end)
+                _write_chunk(0, start, end)
+    return out
+
+
+def _try_precompiled_solve_tril(
+    A: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = torch.float,
+) -> torch.Tensor | None:
+    if not A.is_cuda:
+        return None
+    if not ops.has_precompiled_solve_tril():
+        return None
+    return ops.solve_tril_precompiled(
+        A,
+        cu_seqlens,
+        output_dtype,
+    )
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -527,6 +590,24 @@ def solve_tril(
     """
     assert A.shape[-1] in [16, 32, 64]
     output_dtype = A.dtype if output_dtype is None else output_dtype
+
+    if not HAS_TRITON:
+        precompiled = _try_precompiled_solve_tril(
+            A,
+            cu_seqlens,
+            output_dtype,
+        )
+        if precompiled is not None:
+            return precompiled
+        logger.warning_once(
+            "FLA solve_tril is falling back to the PyTorch reference path "
+            "because Triton runtime is unavailable."
+        )
+        return _solve_tril_reference(
+            A,
+            cu_seqlens,
+            output_dtype,
+        )
 
     B, T, H, BT = A.shape
     chunk_indices = (

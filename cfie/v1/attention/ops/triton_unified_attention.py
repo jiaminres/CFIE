@@ -9,6 +9,7 @@
 
 import torch
 
+from cfie import _custom_ops as ops
 from cfie.logger import init_logger
 from cfie.model_executor.layers.batch_invariant import cfie_is_batch_invariant
 from cfie.platforms import current_platform
@@ -981,6 +982,190 @@ def _materialize_cache_sequence(
     return seq.to(torch.float32)
 
 
+def _extract_uniform_descale_scalar(
+    descale: torch.Tensor | None,
+    *,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if descale is None:
+        return torch.ones(1, dtype=torch.float32, device=device)
+
+    descale = descale.to(device=device, dtype=torch.float32)
+    first_value = descale.reshape(-1)[:1].contiguous()
+    if not torch.allclose(descale, first_value.expand_as(descale)):
+        return None
+    return first_value
+
+
+def _compact_unified_attention_paged_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    block_size = key_cache.shape[1]
+    seq_lens_cpu = seqused_k.to(device="cpu", dtype=torch.int64)
+    flat_block_ids: list[torch.Tensor] = []
+    blocks_per_seq: list[int] = []
+
+    for seq_idx in range(len(seq_lens_cpu)):
+        seq_len = int(seq_lens_cpu[seq_idx].item())
+        num_blocks = (seq_len + block_size - 1) // block_size
+        blocks_per_seq.append(num_blocks)
+        if num_blocks <= 0:
+            continue
+        flat_block_ids.append(
+            block_table[seq_idx, :num_blocks].to(device="cpu", dtype=torch.long)
+        )
+
+    if flat_block_ids:
+        all_block_ids = torch.cat(flat_block_ids)
+        unique_block_ids, inverse = torch.unique(
+            all_block_ids,
+            sorted=True,
+            return_inverse=True,
+        )
+        selected_block_ids = unique_block_ids.to(device=key_cache.device)
+        compact_key_cache = key_cache.index_select(0, selected_block_ids)
+        compact_value_cache = value_cache.index_select(0, selected_block_ids)
+    else:
+        compact_key_cache = key_cache.narrow(0, 0, 0)
+        compact_value_cache = value_cache.narrow(0, 0, 0)
+        inverse = torch.empty(0, dtype=torch.long)
+
+    remapped_block_table = torch.zeros_like(block_table)
+    cursor = 0
+    for seq_idx, num_blocks in enumerate(blocks_per_seq):
+        if num_blocks <= 0:
+            continue
+        remapped_block_table[seq_idx, :num_blocks] = inverse[
+            cursor:cursor + num_blocks
+        ].to(device=block_table.device, dtype=block_table.dtype)
+        cursor += num_blocks
+
+    return compact_key_cache, compact_value_cache, remapped_block_table
+
+
+def _pack_key_cache_for_paged_attention_v1(key_cache: torch.Tensor) -> torch.Tensor:
+    num_blocks, _, num_kv_heads, head_size = key_cache.shape
+    x = 16 // key_cache.element_size()
+    if x <= 0 or head_size % x != 0:
+        raise ValueError(
+            f"Unsupported key cache packing for dtype={key_cache.dtype} "
+            f"and head_size={head_size}."
+        )
+    return (
+        key_cache.permute(0, 2, 3, 1)
+        .contiguous()
+        .view(num_blocks, num_kv_heads, head_size // x, x, key_cache.shape[1])
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+
+
+def _pack_value_cache_for_paged_attention_v1(
+    value_cache: torch.Tensor,
+) -> torch.Tensor:
+    return value_cache.permute(0, 2, 3, 1).contiguous()
+
+
+def _try_paged_attention_v1_unified_attention(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    window_size: tuple[int, int] | None,
+    block_table: torch.Tensor,
+    softcap: float,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    output_scale: torch.Tensor | None,
+    qq_bias: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+    mm_prefix_range: torch.Tensor | None,
+    use_alibi_sqrt: bool,
+) -> bool:
+    if max_seqlen_q != 1 or k.ndim != 4 or v.ndim != 4:
+        return False
+    if k.shape != v.shape or block_table.ndim != 2:
+        return False
+    if qq_bias is not None or sinks is not None or mm_prefix_range is not None:
+        return False
+    if output_scale is not None or softcap > 0:
+        return False
+    if window_size is not None and window_size[0] >= 0:
+        return False
+    if alibi_slopes is not None and use_alibi_sqrt:
+        return False
+    if k.shape[1] not in {8, 16, 32}:
+        return False
+
+    query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    if q.shape[0] != seqused_k.shape[0] or not torch.all(query_lens == 1):
+        return False
+
+    k_scale = _extract_uniform_descale_scalar(k_descale, device=q.device)
+    v_scale = _extract_uniform_descale_scalar(v_descale, device=q.device)
+    if k_scale is None or v_scale is None:
+        return False
+
+    compact_key_cache, compact_value_cache, remapped_block_table = (
+        _compact_unified_attention_paged_cache(
+            key_cache=k,
+            value_cache=v,
+            block_table=block_table,
+            seqused_k=seqused_k,
+        )
+    )
+
+    try:
+        packed_key_cache = _pack_key_cache_for_paged_attention_v1(compact_key_cache)
+        packed_value_cache = _pack_value_cache_for_paged_attention_v1(
+            compact_value_cache
+        )
+        logger.info_once(
+            "Using paged_attention_v1 precompiled fastpath for Triton "
+            "unified attention decode because Triton runtime is unavailable."
+        )
+        ops.paged_attention_v1(
+            out=out,
+            query=q.contiguous(),
+            key_cache=packed_key_cache,
+            value_cache=packed_value_cache,
+            num_kv_heads=k.shape[2],
+            scale=softmax_scale,
+            block_tables=remapped_block_table.contiguous(),
+            seq_lens=seqused_k.to(device=q.device, dtype=torch.int32).contiguous(),
+            block_size=k.shape[1],
+            max_seq_len=max_seqlen_k,
+            alibi_slopes=(
+                None
+                if alibi_slopes is None
+                else alibi_slopes.to(device=q.device, dtype=torch.float32).contiguous()
+            ),
+            kv_cache_dtype="fp8" if _is_fp8_dtype(k.dtype) else "auto",
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+    except (AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
+        logger.warning_once(
+            "paged_attention_v1 fastpath is unavailable for Triton unified "
+            "attention decode; falling back to the PyTorch reference path. "
+            "Reason: %s",
+            exc,
+        )
+        return False
+
+    return True
+
+
 def _reference_unified_attention(
     *,
     q: torch.Tensor,
@@ -1226,6 +1411,29 @@ def unified_attention(
         return
 
     if not HAS_TRITON:
+        if _try_paged_attention_v1_unified_attention(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+            block_table=block_table,
+            softcap=softcap,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            alibi_slopes=alibi_slopes,
+            output_scale=output_scale,
+            qq_bias=qq_bias,
+            sinks=sinks,
+            mm_prefix_range=mm_prefix_range,
+            use_alibi_sqrt=use_alibi_sqrt,
+        ):
+            return
         _reference_unified_attention(
             q=q,
             k=k,

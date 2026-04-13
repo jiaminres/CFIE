@@ -124,6 +124,27 @@ torch::Tensor correct_attn_out_precompiled(torch::Tensor& out,
                                            int64_t cp_rank,
                                            bool is_lse_base_on_e);
 
+std::tuple<torch::Tensor, torch::Tensor> dcp_lse_combine_precompiled(
+    const torch::Tensor& recv_output, const torch::Tensor& recv_lse,
+    bool return_lse, bool is_lse_base_on_e);
+
+void prefill_attention_precompiled(torch::Tensor& output,
+                                   const torch::Tensor& q,
+                                   const torch::Tensor& k,
+                                   const torch::Tensor& v,
+                                   const torch::Tensor& b_start_loc,
+                                   const torch::Tensor& b_seq_len,
+                                   bool is_causal, double softmax_scale,
+                                   int64_t sliding_window_q,
+                                   int64_t sliding_window_k);
+
+void prefix_prefill_attention_precompiled(
+    torch::Tensor& output, const torch::Tensor& q, const torch::Tensor& k,
+    const torch::Tensor& v, const torch::Tensor& gathered_ctx_k,
+    const torch::Tensor& gathered_ctx_v, const torch::Tensor& cu_ctx_lens,
+    const torch::Tensor& b_start_loc, const torch::Tensor& b_seq_len,
+    double sm_scale, int64_t sliding_window, bool skip_decode);
+
 torch::Tensor pack_seq_precompiled(const torch::Tensor& x,
                                    const torch::Tensor& lengths,
                                    double pad_value);
@@ -267,6 +288,54 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_precompiled(
     const torch::Tensor& initial_state, bool output_final_state,
     const std::optional<torch::Tensor>& cu_seqlens,
     bool use_qk_l2norm_in_kernel);
+
+std::tuple<torch::Tensor, torch::Tensor>
+fused_recurrent_gated_delta_rule_packed_decode_precompiled(
+    const torch::Tensor& mixed_qkv, const torch::Tensor& a,
+    const torch::Tensor& b, const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias, double scale, torch::Tensor& initial_state,
+    torch::Tensor& out, const torch::Tensor& ssm_state_indices,
+    bool use_qk_l2norm_in_kernel);
+
+torch::Tensor l2norm_precompiled(
+    const torch::Tensor& x, double eps,
+    const std::optional<torch::ScalarType>& output_dtype);
+
+torch::Tensor chunk_local_cumsum_precompiled(
+    const torch::Tensor& g, int64_t chunk_size, bool reverse,
+    const std::optional<torch::Tensor>& cu_seqlens, bool head_first,
+    const std::optional<torch::ScalarType>& output_dtype);
+
+torch::Tensor chunk_fwd_o_precompiled(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& h, const std::optional<torch::Tensor>& g,
+    double scale, const std::optional<torch::Tensor>& cu_seqlens,
+    int64_t block_size);
+
+torch::Tensor chunk_scaled_dot_kkt_fwd_precompiled(
+    const torch::Tensor& k, const std::optional<torch::Tensor>& g,
+    const torch::Tensor& beta, const std::optional<torch::Tensor>& cu_seqlens,
+    int64_t chunk_size,
+    const std::optional<torch::ScalarType>& output_dtype);
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>>
+chunk_gated_delta_rule_fwd_h_precompiled(
+    const torch::Tensor& k, const torch::Tensor& w, const torch::Tensor& u,
+    const std::optional<torch::Tensor>& g,
+    const std::optional<torch::Tensor>& gk,
+    const std::optional<torch::Tensor>& initial_state, bool output_final_state,
+    int64_t chunk_size, bool save_new_value,
+    const std::optional<torch::Tensor>& cu_seqlens);
+
+torch::Tensor solve_tril_precompiled(
+    const torch::Tensor& A, const std::optional<torch::Tensor>& cu_seqlens,
+    const std::optional<torch::ScalarType>& output_dtype);
+
+std::tuple<torch::Tensor, torch::Tensor> recompute_w_u_fwd_precompiled(
+    const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& beta, const torch::Tensor& g_cumsum,
+    const torch::Tensor& A, const std::optional<torch::Tensor>& cu_seqlens);
 
 std::tuple<torch::Tensor, torch::Tensor> fused_gdn_gating_precompiled(
     const torch::Tensor& A_log, const torch::Tensor& a,

@@ -9,6 +9,7 @@
 # ruff: noqa: E501
 
 import torch
+import cfie._custom_ops as ops
 
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON, tl, triton
@@ -16,6 +17,37 @@ from cfie.triton_utils import HAS_TRITON, tl, triton
 from .op import exp
 
 logger = init_logger(__name__)
+
+
+def _try_precompiled_fused_recurrent_gated_delta_rule_packed_decode(
+    *,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not mixed_qkv.is_cuda:
+        return None
+    if not ops.has_precompiled_fused_recurrent_gated_delta_rule_packed_decode():
+        return None
+    return ops.fused_recurrent_gated_delta_rule_packed_decode_precompiled(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        scale,
+        initial_state,
+        out,
+        ssm_state_indices,
+        use_qk_l2norm_in_kernel,
+    )
 
 
 def _fused_recurrent_gated_delta_rule_packed_decode_ref(
@@ -71,11 +103,13 @@ def _fused_recurrent_gated_delta_rule_packed_decode_ref(
         out_values.to(out.dtype),
         torch.zeros_like(out[:, 0]),
     )
-    initial_state.index_copy_(
-        0,
-        gather_indices,
-        updated_h.to(initial_state.dtype),
-    )
+    valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
+    if valid_indices.numel() > 0:
+        initial_state.index_copy_(
+            0,
+            gather_indices.index_select(0, valid_indices),
+            updated_h.index_select(0, valid_indices).to(initial_state.dtype),
+        )
     return out, initial_state
 
 
@@ -493,6 +527,20 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         )
 
     if not HAS_TRITON:
+        precompiled = _try_precompiled_fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            out=out,
+            ssm_state_indices=ssm_state_indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if precompiled is not None:
+            return precompiled
         logger.warning_once(
             "FLA packed recurrent decode is falling back to the PyTorch "
             "reference path because Triton runtime is unavailable."

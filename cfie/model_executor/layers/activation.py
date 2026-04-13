@@ -23,6 +23,26 @@ from cfie.utils.collection_utils import LazyDict
 logger = init_logger(__name__)
 
 
+def _bind_precompiled_op_or_fallback(
+    module: CustomOp,
+    op_name: str,
+    *,
+    native_method_name: str = "forward_native",
+) -> bool:
+    op = getattr(torch.ops._C, op_name, None)
+    if op is not None:
+        module.op = op
+        return True
+
+    logger.warning_once(
+        "Custom activation op %s is unavailable in the current runtime; "
+        "falling back to the native PyTorch path.",
+        op_name,
+    )
+    module._forward_method = getattr(module, native_method_name)
+    return False
+
+
 @triton.jit
 def _swiglustep_and_mul_kernel(
     o_ptr,
@@ -94,7 +114,7 @@ class FatreluAndMul(CustomOp):
         super().__init__()
         self.threshold = threshold
         if current_platform.is_cuda_alike():
-            self.op = torch.ops._C.fatrelu_and_mul
+            _bind_precompiled_op_or_fallback(self, "fatrelu_and_mul")
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
 
@@ -138,7 +158,7 @@ class SiluAndMul(CustomOp):
         # CUDA-like/XPU 平台优先使用底层自定义 fused kernel。
         if current_platform.is_cuda_alike() or current_platform.is_xpu():
             # 绑定已经注册到 torch.ops._C 下的 silu_and_mul 自定义算子。
-            self.op = torch.ops._C.silu_and_mul
+            _bind_precompiled_op_or_fallback(self, "silu_and_mul")
         elif current_platform.is_cpu():
             # CPU 路径没有自定义 kernel 时，回退到 PyTorch 原生实现。
             self._forward_method = self.forward_native
@@ -188,7 +208,7 @@ class MulAndSilu(CustomOp):
     def __init__(self):
         super().__init__()
         if current_platform.is_cuda_alike() or current_platform.is_xpu():
-            self.op = torch.ops._C.mul_and_silu
+            _bind_precompiled_op_or_fallback(self, "mul_and_silu")
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
 
@@ -292,9 +312,9 @@ class GeluAndMul(CustomOp):
             or current_platform.is_xpu()
         ):
             if approximate == "none":
-                self.op = torch.ops._C.gelu_and_mul
+                _bind_precompiled_op_or_fallback(self, "gelu_and_mul")
             elif approximate == "tanh":
-                self.op = torch.ops._C.gelu_tanh_and_mul
+                _bind_precompiled_op_or_fallback(self, "gelu_tanh_and_mul")
         if current_platform.is_rocm() and approximate == "tanh":
             logger.warning_once(
                 "[ROCm] PyTorch's native GELU with tanh approximation is unstable "
@@ -350,7 +370,14 @@ class SwigluOAIAndMul(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        torch.ops._C.swigluoai_and_mul(out, x, self.alpha, self.limit)
+        op = getattr(torch.ops._C, "swigluoai_and_mul", None)
+        if op is None:
+            logger.warning_once(
+                "Custom activation op swigluoai_and_mul is unavailable in "
+                "the current runtime; falling back to the native PyTorch path."
+            )
+            return self.forward_native(x)
+        op(out, x, self.alpha, self.limit)
         return out
 
     def extra_repr(self) -> str:
@@ -407,7 +434,7 @@ class NewGELU(CustomOp):
             or current_platform.is_cpu()
             or current_platform.is_xpu()
         ):
-            self.op = torch.ops._C.gelu_new
+            _bind_precompiled_op_or_fallback(self, "gelu_new")
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
@@ -435,7 +462,7 @@ class FastGELU(CustomOp):
             or current_platform.is_cpu()
             or current_platform.is_xpu()
         ):
-            self.op = torch.ops._C.gelu_fast
+            _bind_precompiled_op_or_fallback(self, "gelu_fast")
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
@@ -463,7 +490,7 @@ class QuickGELU(CustomOp):
             or current_platform.is_cpu()
             or current_platform.is_xpu()
         ):
-            self.op = torch.ops._C.gelu_quick
+            _bind_precompiled_op_or_fallback(self, "gelu_quick")
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""

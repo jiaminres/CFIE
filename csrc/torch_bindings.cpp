@@ -202,6 +202,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("correct_attn_out_precompiled", torch::kCUDA,
            &correct_attn_out_precompiled);
 
+  ops.def("dcp_lse_combine_precompiled("
+          "Tensor recv_output, Tensor recv_lse, bool return_lse=False, "
+          "bool is_lse_base_on_e=True) -> (Tensor, Tensor)");
+  ops.impl("dcp_lse_combine_precompiled", torch::kCUDA,
+           &dcp_lse_combine_precompiled);
+
+  ops.def("prefill_attention_precompiled("
+          "Tensor! output, Tensor q, Tensor k, Tensor v, "
+          "Tensor b_start_loc, Tensor b_seq_len, bool is_causal, "
+          "float softmax_scale, int sliding_window_q, "
+          "int sliding_window_k) -> ()");
+  ops.impl("prefill_attention_precompiled", torch::kCUDA,
+           &prefill_attention_precompiled);
+
+  ops.def("prefix_prefill_attention_precompiled("
+          "Tensor! output, Tensor q, Tensor k, Tensor v, "
+          "Tensor gathered_ctx_k, Tensor gathered_ctx_v, Tensor cu_ctx_lens, "
+          "Tensor b_start_loc, Tensor b_seq_len, float sm_scale, "
+          "int sliding_window, bool skip_decode) -> ()");
+  ops.impl("prefix_prefill_attention_precompiled", torch::kCUDA,
+           &prefix_prefill_attention_precompiled);
+
   ops.def("pack_seq_precompiled("
           "Tensor x, Tensor lengths, float pad_value) -> Tensor");
   ops.impl("pack_seq_precompiled", torch::kCUDA, &pack_seq_precompiled);
@@ -376,6 +398,64 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    bool use_qk_l2norm_in_kernel) -> (Tensor, Tensor)");
   ops.impl("chunk_gated_delta_rule_precompiled", torch::kCUDA,
            &chunk_gated_delta_rule_precompiled);
+
+  ops.def(
+      "fused_recurrent_gated_delta_rule_packed_decode_precompiled("
+      "    Tensor mixed_qkv, Tensor a, Tensor b, Tensor A_log,"
+      "    Tensor dt_bias, float scale, Tensor! initial_state, Tensor! out,"
+      "    Tensor ssm_state_indices, bool use_qk_l2norm_in_kernel)"
+      " -> (Tensor, Tensor)");
+  ops.impl("fused_recurrent_gated_delta_rule_packed_decode_precompiled",
+           torch::kCUDA,
+           &fused_recurrent_gated_delta_rule_packed_decode_precompiled);
+
+  ops.def(
+      "l2norm_precompiled("
+      "    Tensor x, float eps, ScalarType? output_dtype=None) -> Tensor");
+  ops.impl("l2norm_precompiled", torch::kCUDA, &l2norm_precompiled);
+
+  ops.def(
+      "chunk_local_cumsum_precompiled("
+      "    Tensor g, int chunk_size, bool reverse=False,"
+      "    Tensor? cu_seqlens=None, bool head_first=False,"
+      "    ScalarType? output_dtype=None) -> Tensor");
+  ops.impl("chunk_local_cumsum_precompiled", torch::kCUDA,
+           &chunk_local_cumsum_precompiled);
+
+  ops.def(
+      "chunk_fwd_o_precompiled("
+      "    Tensor q, Tensor k, Tensor v, Tensor h, Tensor? g,"
+      "    float scale, Tensor? cu_seqlens, int block_size) -> Tensor");
+  ops.impl("chunk_fwd_o_precompiled", torch::kCUDA, &chunk_fwd_o_precompiled);
+
+  ops.def(
+      "chunk_scaled_dot_kkt_fwd_precompiled("
+      "    Tensor k, Tensor? g, Tensor beta, Tensor? cu_seqlens,"
+      "    int chunk_size, ScalarType? output_dtype=None) -> Tensor");
+  ops.impl("chunk_scaled_dot_kkt_fwd_precompiled", torch::kCUDA,
+           &chunk_scaled_dot_kkt_fwd_precompiled);
+
+  ops.def(
+      "chunk_gated_delta_rule_fwd_h_precompiled("
+      "    Tensor k, Tensor w, Tensor u, Tensor? g=None, Tensor? gk=None,"
+      "    Tensor? initial_state=None, bool output_final_state=False,"
+      "    int chunk_size=64, bool save_new_value=True,"
+      "    Tensor? cu_seqlens=None) -> (Tensor, Tensor?, Tensor?)");
+  ops.impl("chunk_gated_delta_rule_fwd_h_precompiled", torch::kCUDA,
+           &chunk_gated_delta_rule_fwd_h_precompiled);
+
+  ops.def(
+      "solve_tril_precompiled("
+      "    Tensor A, Tensor? cu_seqlens=None,"
+      "    ScalarType? output_dtype=None) -> Tensor");
+  ops.impl("solve_tril_precompiled", torch::kCUDA, &solve_tril_precompiled);
+
+  ops.def(
+      "recompute_w_u_fwd_precompiled("
+      "    Tensor k, Tensor v, Tensor beta, Tensor g_cumsum,"
+      "    Tensor A, Tensor? cu_seqlens=None) -> (Tensor, Tensor)");
+  ops.impl("recompute_w_u_fwd_precompiled", torch::kCUDA,
+           &recompute_w_u_fwd_precompiled);
 
   ops.def(
       "fused_gdn_gating_precompiled("
@@ -993,6 +1073,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "cp_gather_cache(Tensor src_cache, Tensor! dst, Tensor block_table, "
       "Tensor cu_seq_lens, int batch_size, Tensor? seq_starts) -> ()");
   cache_ops.impl("cp_gather_cache", torch::kCUDA, &cp_gather_cache);
+
+  cache_ops.def(
+      "gather_paged_kv_cache(Tensor key_cache, Tensor value_cache, "
+      "Tensor! gathered_key, Tensor! gathered_value, Tensor block_table, "
+      "Tensor cu_seq_lens, int batch_size, Tensor? seq_starts) -> ()");
+  cache_ops.impl("gather_paged_kv_cache", torch::kCUDA,
+                 &gather_paged_kv_cache);
 
   cache_ops.def(
       "cp_gather_and_upconvert_fp8_kv_cache(Tensor src_cache, Tensor! dst, "

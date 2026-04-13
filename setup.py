@@ -169,6 +169,19 @@ class CMakeExtension(Extension):
 class CMakeBuildExt(build_ext):
     configured: set[str] = set()
 
+    @staticmethod
+    def cmake_subprocess_env() -> dict[str, str]:
+        env = os.environ.copy()
+        cuda_root = str(CUDA_ROOT)
+        cuda_alias_root = str(CUDA_ALIAS_ROOT)
+        env.setdefault("CUDA_PATH", cuda_root)
+        env.setdefault("CUDA_HOME", cuda_root)
+        env.setdefault("CUDAToolkit_ROOT", cuda_alias_root)
+        env.setdefault("CUDA_TOOLKIT_ROOT_DIR", cuda_alias_root)
+        if os.name == "nt":
+            env.setdefault("CudaToolkitDir", cuda_alias_root)
+        return env
+
     def cmake_build_dir(self) -> str:
         override = os.environ.get("CFIE_CMAKE_BUILD_DIR")
         if override:
@@ -203,6 +216,8 @@ class CMakeBuildExt(build_ext):
             f"-DCMAKE_BUILD_TYPE={cfg}",
             "-DVLLM_TARGET_DEVICE=cuda",
             f"-DVLLM_PYTHON_EXECUTABLE={to_cmake_path(sys.executable)}",
+            f"-DPython_EXECUTABLE={to_cmake_path(sys.executable)}",
+            f"-DPython3_EXECUTABLE={to_cmake_path(sys.executable)}",
             f"-DVLLM_PYTHON_PATH={os.pathsep.join(to_cmake_path(path) for path in sys.path)}",
             f"-DFETCHCONTENT_BASE_DIR={to_cmake_path(os.environ.get('FETCHCONTENT_BASE_DIR', default_fetchcontent_base_dir()))}",
             f"-DVLLM_CUTLASS_SRC_DIR={to_cmake_path(ROOT_DIR / 'third_party' / 'cutlass')}",
@@ -217,10 +232,36 @@ class CMakeBuildExt(build_ext):
             cmake_args.append(f"-DNVCC_THREADS={nvcc_threads}")
 
         build_tool: list[str] = []
-        if NINJA_EXECUTABLE is not None:
+        requested_generator = (
+            os.environ.get("CFIE_CMAKE_GENERATOR")
+            or os.environ.get("CMAKE_GENERATOR")
+        )
+        if requested_generator:
+            build_tool = ["-G", requested_generator]
+            if os.name == "nt" and requested_generator.startswith("Visual Studio"):
+                build_tool.extend(
+                    ["-A", os.environ.get("CMAKE_GENERATOR_PLATFORM", "x64")]
+                )
+            if requested_generator == "Ninja" and NINJA_EXECUTABLE is not None:
+                cmake_args.extend(
+                    [
+                        f"-DCMAKE_MAKE_PROGRAM={to_cmake_path(NINJA_EXECUTABLE)}",
+                        "-DCMAKE_JOB_POOL_COMPILE:STRING=compile",
+                        f"-DCMAKE_JOB_POOLS:STRING=compile={num_jobs}",
+                    ]
+                )
+        elif os.name == "nt":
+            build_tool = [
+                "-G",
+                "Visual Studio 17 2022",
+                "-A",
+                os.environ.get("CMAKE_GENERATOR_PLATFORM", "x64"),
+            ]
+        elif NINJA_EXECUTABLE is not None:
             build_tool = ["-G", "Ninja"]
             cmake_args.extend(
                 [
+                    f"-DCMAKE_MAKE_PROGRAM={to_cmake_path(NINJA_EXECUTABLE)}",
                     "-DCMAKE_JOB_POOL_COMPILE:STRING=compile",
                     f"-DCMAKE_JOB_POOLS:STRING=compile={num_jobs}",
                 ]
@@ -229,6 +270,12 @@ class CMakeBuildExt(build_ext):
         nvcc_name = "nvcc.exe" if os.name == "nt" else "nvcc"
         cmake_args.append(
             f"-DCMAKE_CUDA_COMPILER={to_cmake_path(CUDA_ALIAS_ROOT / 'bin' / nvcc_name)}"
+        )
+        cmake_args.extend(
+            [
+                f"-DCUDAToolkit_ROOT={to_cmake_path(CUDA_ALIAS_ROOT)}",
+                f"-DCUDA_TOOLKIT_ROOT_DIR={to_cmake_path(CUDA_ALIAS_ROOT)}",
+            ]
         )
         if CUDA_ALIAS_ROOT != CUDA_ROOT:
             cmake_args.append(
@@ -244,6 +291,7 @@ class CMakeBuildExt(build_ext):
         subprocess.check_call(
             [CMAKE_EXECUTABLE, ext.cmake_lists_dir, *build_tool, *cmake_args],
             cwd=build_dir,
+            env=self.cmake_subprocess_env(),
         )
 
     @staticmethod
@@ -254,6 +302,7 @@ class CMakeBuildExt(build_ext):
         subprocess.check_call([CMAKE_EXECUTABLE, "--version"])
         self.build_temp = self.cmake_build_dir()
         os.makedirs(self.build_temp, exist_ok=True)
+        cmake_env = self.cmake_subprocess_env()
 
         targets: list[str] = []
         for ext in self.extensions:
@@ -270,6 +319,7 @@ class CMakeBuildExt(build_ext):
                 *[f"--target={target}" for target in targets],
             ],
             cwd=self.build_temp,
+            env=cmake_env,
         )
 
         for ext in self.extensions:
@@ -292,6 +342,7 @@ class CMakeBuildExt(build_ext):
                     self.target_name(ext.name),
                 ],
                 cwd=self.build_temp,
+                env=cmake_env,
             )
 
 

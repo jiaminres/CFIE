@@ -1961,54 +1961,46 @@ class CfieConfig:
         )
 
     def validate_block_size(self) -> None:
-        """根据 DCP 与 mamba 约束校验 block_size。
-
-        在 Platform.update_block_size_for_backend()
-        完成 block_size 最终化后调用。
-        """
-        # 读取当前最终 block_size。
+        """Validate final block size against DCP and Mamba scheduling limits."""
         block_size = self.cache_config.block_size
 
-        # ----------------- 校验 DCP / PCP 的 interleave 约束 -----------------
-        # DCP 的 interleave-size 兼容性校验
         if self.parallel_config.decode_context_parallel_size > 1:
-            # 当 dcp_kv_cache_interleave_size 显式生效时，同步覆盖 cp 配置。
             if self.parallel_config.dcp_kv_cache_interleave_size > 1 and (
-                    self.parallel_config.cp_kv_cache_interleave_size
-                    != self.parallel_config.dcp_kv_cache_interleave_size
+                self.parallel_config.cp_kv_cache_interleave_size
+                != self.parallel_config.dcp_kv_cache_interleave_size
             ):
                 self.parallel_config.cp_kv_cache_interleave_size = (
                     self.parallel_config.dcp_kv_cache_interleave_size
                 )
                 logger.warning_once(
-                    "cp_kv_cache_interleave_size is overridden by dcp_kv_cache"
-                    "_interleave_size. And dcp-kv-cache-interleave-size will be "
-                    "deprecated when PCP is fully supported."
+                    "cp_kv_cache_interleave_size is overridden by "
+                    "dcp_kv_cache_interleave_size. And "
+                    "dcp-kv-cache-interleave-size will be deprecated when "
+                    "PCP is fully supported."
                 )
-            # interleave size 既不能超过 block_size，也必须整除 block_size。
             assert (
-                    self.parallel_config.cp_kv_cache_interleave_size <= block_size
-                    and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0
+                self.parallel_config.cp_kv_cache_interleave_size <= block_size
+                and block_size
+                % self.parallel_config.cp_kv_cache_interleave_size
+                == 0
             ), (
-                f"Block_size({block_size}) should be greater "
-                "than or equal to and divisible by cp_kv_cache_interleave_size "
+                f"Block_size({block_size}) should be greater than or equal to "
+                "and divisible by cp_kv_cache_interleave_size "
                 f"({self.parallel_config.cp_kv_cache_interleave_size})."
             )
 
-        # ----------------- 校验 mamba align 模式的 block_size 约束 -----------------
-        # Mamba cache 的 align 模式约束
         if self.cache_config.mamba_cache_mode == "align":
-            # align 模式下 block_size 不能超过单批 token 上限。
-            assert block_size <= self.scheduler_config.max_num_batched_tokens, (
-                "In Mamba cache align mode, block_size "
-                f"({block_size}) must be <= "
-                "max_num_batched_tokens "
-                f"({self.scheduler_config.max_num_batched_tokens})."
-            )
-            # 若 long_prefill_token_threshold 启用，则也必须不小于 block_size。
+            if block_size > self.scheduler_config.max_num_batched_tokens:
+                logger.warning_once(
+                    "Increasing max_num_batched_tokens from %d to %d because "
+                    "Mamba cache align mode requires the scheduler budget to "
+                    "cover at least one full block.",
+                    self.scheduler_config.max_num_batched_tokens,
+                    block_size,
+                )
+                self.scheduler_config.max_num_batched_tokens = block_size
             if self.scheduler_config.long_prefill_token_threshold > 0:
                 assert self.scheduler_config.long_prefill_token_threshold >= block_size
-            # align 模式要求多模态输入支持 chunked 调度。
             assert not self.scheduler_config.disable_chunked_mm_input, (
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "

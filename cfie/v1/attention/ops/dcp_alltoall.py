@@ -27,7 +27,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from cfie.triton_utils import tl, triton
+from cfie import _custom_ops as ops
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 if TYPE_CHECKING:
     from cfie.distributed.parallel_state import GroupCoordinator
@@ -100,6 +101,38 @@ def _lse_weighted_combine(
         return result, global_lse
 
     return result
+
+
+def _supports_precompiled_dcp_lse_combine(
+    *,
+    recv_output: torch.Tensor,
+    recv_lse: torch.Tensor,
+) -> bool:
+    return (
+        recv_output.is_cuda
+        and recv_lse.is_cuda
+        and ops.has_precompiled_dcp_lse_combine()
+    )
+
+
+def _try_precompiled_dcp_lse_combine(
+    recv_output: torch.Tensor,
+    recv_lse: torch.Tensor,
+    *,
+    return_lse: bool,
+    is_lse_base_on_e: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not _supports_precompiled_dcp_lse_combine(
+        recv_output=recv_output,
+        recv_lse=recv_lse,
+    ):
+        return None
+    return ops.dcp_lse_combine_precompiled(
+        recv_output,
+        recv_lse,
+        return_lse=return_lse,
+        is_lse_base_on_e=is_lse_base_on_e,
+    )
 
 
 @triton.jit
@@ -234,6 +267,25 @@ def dcp_lse_combine_triton(
         Combined output [B, H_local, D]
         If return_lse=True, also returns global_lse [B, H_local]
     """
+    if not HAS_TRITON:
+        precompiled = _try_precompiled_dcp_lse_combine(
+            recv_output,
+            recv_lse,
+            return_lse=return_lse,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
+        if precompiled is not None:
+            if return_lse:
+                return precompiled
+            return precompiled[0]
+
+        return _lse_weighted_combine(
+            recv_output,
+            recv_lse,
+            return_lse=return_lse,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
+
     N, B, H_local, D = recv_output.shape
 
     out = torch.empty(

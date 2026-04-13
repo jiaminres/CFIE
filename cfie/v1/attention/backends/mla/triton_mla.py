@@ -75,8 +75,6 @@ class TritonMLABackend(MLACommonBackend):
         use_sparse: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        if not HAS_TRITON:
-            return "Triton runtime not available"
         return None
 
 

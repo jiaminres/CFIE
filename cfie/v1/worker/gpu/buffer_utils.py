@@ -6,7 +6,7 @@ from functools import partial
 import numpy as np
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.platform_utils import is_uva_available
 from cfie.utils.torch_utils import (
     async_tensor_h2d,
@@ -171,6 +171,19 @@ class StagedWriteTensor:
         )
 
         # Write diffs to the GPU buffer
+        if not HAS_TRITON:
+            for pid in range(n):
+                row_idx = int(indices_uva[pid].item())
+                start_idx = int(starts_uva[pid].item())
+                cu_start = int(cu_lens_uva[pid - 1].item()) if pid > 0 else 0
+                cu_end = int(cu_lens_uva[pid].item())
+                if cu_end <= cu_start:
+                    continue
+                content = write_contents[cu_start:cu_end]
+                self.gpu[row_idx, start_idx : start_idx + content.shape[0]].copy_(content)
+            self.clear_staged_writes()
+            return
+
         _apply_write_kernel[(n,)](
             self.gpu,
             self.gpu.stride(0),

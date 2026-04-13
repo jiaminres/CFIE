@@ -5,9 +5,12 @@
 # https://github.com/ModelTC/lightllm/blob/main/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py
 
 import torch
+import torch.nn.functional as F
 
+from cfie import _custom_ops as ops
+from cfie.logger import init_logger
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 # Static kernels parameters
 BASE_BLOCK = 128 if current_platform.has_device_capability(80) else 64
@@ -16,6 +19,482 @@ NUM_WARPS = 4 if current_platform.is_rocm() else 8
 # To check compatibility
 IS_TURING = current_platform.get_device_capability() == (7, 5)
 float8_info = torch.finfo(current_platform.fp8_dtype())
+logger = init_logger(__name__)
+FLOAT8_DTYPES = {
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+        current_platform.fp8_dtype(),
+    )
+    if dtype is not None
+}
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in FLOAT8_DTYPES
+
+
+def _extract_scale_scalar(scale: torch.Tensor | None, *, device: torch.device) -> float:
+    if scale is None:
+        return 1.0
+    return float(scale.to(device=device, dtype=torch.float32).reshape(-1)[0].item())
+
+
+def _reshape_key_cache_for_reference(key_cache: torch.Tensor) -> torch.Tensor:
+    return key_cache.permute(0, 1, 3, 2, 4).reshape(
+        key_cache.shape[0],
+        key_cache.shape[1],
+        key_cache.shape[3],
+        key_cache.shape[2] * key_cache.shape[4],
+    )
+
+
+def _reshape_value_cache_for_reference(value_cache: torch.Tensor) -> torch.Tensor:
+    return value_cache.permute(0, 1, 3, 2).contiguous()
+
+
+def _supports_precompiled_paged_kv_gather(
+    *,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    processed_b_loc: torch.Tensor,
+) -> bool:
+    return (
+        hasattr(torch.ops, "_C_cache_ops")
+        and hasattr(torch.ops._C_cache_ops, "gather_paged_kv_cache")
+        and k_cache.is_cuda
+        and v_cache.is_cuda
+        and processed_b_loc.is_cuda
+        and k_cache.ndim == 5
+        and v_cache.ndim == 4
+        and processed_b_loc.ndim == 2
+        and k_cache.device == v_cache.device == processed_b_loc.device
+    )
+
+
+def _try_gather_paged_context_cache(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    processed_b_loc: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    if not _supports_precompiled_paged_kv_gather(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        processed_b_loc=processed_b_loc,
+    ):
+        return None, None, None
+
+    device = k_cache.device
+    ctx_lens = (
+        b_seq_len.to(device=device, dtype=torch.int32)
+        - (b_start_loc[1:] - b_start_loc[:-1]).to(device=device, dtype=torch.int32)
+    )
+    if bool(torch.any(ctx_lens < 0).item()):
+        return None, None, None
+
+    cu_ctx_lens = torch.empty(
+        (ctx_lens.numel() + 1,),
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_ctx_lens[0] = 0
+    cu_ctx_lens[1:] = torch.cumsum(ctx_lens, dim=0)
+    total_ctx_tokens = int(cu_ctx_lens[-1].item())
+    if total_ctx_tokens == 0:
+        return (
+            torch.empty(
+                (0, k.shape[1], q.shape[-1]),
+                dtype=k_cache.dtype,
+                device=device,
+            ),
+            torch.empty(
+                (0, v.shape[1], v.shape[-1]),
+                dtype=v_cache.dtype,
+                device=device,
+            ),
+            cu_ctx_lens,
+        )
+
+    gathered_key = torch.empty(
+        (total_ctx_tokens, k.shape[1], q.shape[-1]),
+        dtype=k_cache.dtype,
+        device=device,
+    )
+    gathered_value = torch.empty(
+        (total_ctx_tokens, v.shape[1], v.shape[-1]),
+        dtype=v_cache.dtype,
+        device=device,
+    )
+    try:
+        ops.gather_paged_kv_cache(
+            key_cache=k_cache,
+            value_cache=v_cache,
+            gathered_key=gathered_key,
+            gathered_value=gathered_value,
+            block_table=processed_b_loc.contiguous(),
+            cu_seq_lens=cu_ctx_lens,
+            batch_size=ctx_lens.numel(),
+        )
+    except (AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
+        logger.warning_once(
+            "Precompiled paged KV gather is unavailable for prefix prefill; "
+            "falling back to Python cache materialization. Reason: %s",
+            exc,
+        )
+        return None, None, None
+
+    logger.info_once(
+        "Using precompiled paged KV gather for prefix prefill cache "
+        "materialization because Triton runtime is unavailable."
+    )
+    return gathered_key, gathered_value, cu_ctx_lens
+
+
+def _supports_reference_sdpa_fastpath(
+    *,
+    sinks: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+) -> bool:
+    return (
+        sinks is None
+        and alibi_slopes is None
+        and hasattr(F, "scaled_dot_product_attention")
+    )
+
+
+def _supports_precompiled_prefix_prefill_attention(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    gathered_ctx_k: torch.Tensor | None,
+    gathered_ctx_v: torch.Tensor | None,
+    cu_ctx_lens: torch.Tensor | None,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    sinks: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    fp8_out_scale: torch.Tensor | float | None,
+) -> bool:
+    if (
+        not ops.has_precompiled_prefix_prefill_attention()
+        or gathered_ctx_k is None
+        or gathered_ctx_v is None
+        or cu_ctx_lens is None
+        or sinks is not None
+        or alibi_slopes is not None
+        or fp8_out_scale is not None
+    ):
+        return False
+
+    if not (
+        q.is_cuda
+        and k.is_cuda
+        and v.is_cuda
+        and o.is_cuda
+        and gathered_ctx_k.is_cuda
+        and gathered_ctx_v.is_cuda
+        and cu_ctx_lens.is_cuda
+        and b_start_loc.is_cuda
+        and b_seq_len.is_cuda
+    ):
+        return False
+
+    return not (
+        _is_fp8_dtype(q.dtype)
+        or _is_fp8_dtype(k.dtype)
+        or _is_fp8_dtype(v.dtype)
+        or _is_fp8_dtype(gathered_ctx_k.dtype)
+        or _is_fp8_dtype(gathered_ctx_v.dtype)
+    )
+
+
+def _try_precompiled_prefix_prefill_attention(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    gathered_ctx_k: torch.Tensor | None,
+    gathered_ctx_v: torch.Tensor | None,
+    cu_ctx_lens: torch.Tensor | None,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    sliding_window: int,
+    sm_scale: float,
+    skip_decode: bool,
+    sinks: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    fp8_out_scale: torch.Tensor | float | None,
+) -> bool:
+    if not _supports_precompiled_prefix_prefill_attention(
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        gathered_ctx_k=gathered_ctx_k,
+        gathered_ctx_v=gathered_ctx_v,
+        cu_ctx_lens=cu_ctx_lens,
+        b_start_loc=b_start_loc,
+        b_seq_len=b_seq_len,
+        sinks=sinks,
+        alibi_slopes=alibi_slopes,
+        fp8_out_scale=fp8_out_scale,
+    ):
+        return False
+
+    try:
+        ops.prefix_prefill_attention_precompiled(
+            output=o,
+            q=q,
+            k=k,
+            v=v,
+            gathered_ctx_k=gathered_ctx_k,
+            gathered_ctx_v=gathered_ctx_v,
+            cu_ctx_lens=cu_ctx_lens,
+            b_start_loc=b_start_loc,
+            b_seq_len=b_seq_len,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            skip_decode=skip_decode,
+        )
+    except (AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
+        logger.warning_once(
+            "Precompiled prefix prefill attention compute is unavailable; "
+            "falling back to shared reference compute. Reason: %s",
+            exc,
+        )
+        return False
+
+    logger.info_once(
+        "Using precompiled prefix prefill attention compute because Triton "
+        "runtime is unavailable."
+    )
+    return True
+
+
+def _reference_context_attention_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    processed_b_loc: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    *,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    sliding_window: int,
+    sm_scale: float,
+    skip_decode: bool,
+    fp8_out_scale: torch.Tensor | float | None,
+    sinks: torch.Tensor | None,
+) -> None:
+    logger.warning_once(
+        "Prefix prefill attention is falling back to the PyTorch reference "
+        "path because Triton runtime is unavailable."
+    )
+
+    start_locs_cpu = b_start_loc.to(device="cpu", dtype=torch.int64)
+    seq_lens_cpu = b_seq_len.to(device="cpu", dtype=torch.int64)
+    gathered_ctx_k, gathered_ctx_v, cu_ctx_lens = _try_gather_paged_context_cache(
+        q=q,
+        k=k,
+        v=v,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        processed_b_loc=processed_b_loc,
+        b_start_loc=b_start_loc,
+        b_seq_len=b_seq_len,
+    )
+    if cu_ctx_lens is None:
+        key_cache_dense = _reshape_key_cache_for_reference(k_cache)
+        value_cache_dense = _reshape_value_cache_for_reference(v_cache)
+        block_size = key_cache_dense.shape[2]
+        cu_ctx_lens_cpu = None
+    else:
+        key_cache_dense = None
+        value_cache_dense = None
+        block_size = 0
+        cu_ctx_lens_cpu = cu_ctx_lens.to(device="cpu", dtype=torch.int64)
+    num_q_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    kv_group_num = num_q_heads // num_kv_heads
+
+    if _try_precompiled_prefix_prefill_attention(
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        gathered_ctx_k=gathered_ctx_k,
+        gathered_ctx_v=gathered_ctx_v,
+        cu_ctx_lens=cu_ctx_lens,
+        b_start_loc=b_start_loc,
+        b_seq_len=b_seq_len,
+        sliding_window=sliding_window,
+        sm_scale=sm_scale,
+        skip_decode=skip_decode,
+        sinks=sinks,
+        alibi_slopes=alibi_slopes,
+        fp8_out_scale=fp8_out_scale,
+    ):
+        return
+
+    k_rescale = _extract_scale_scalar(k_scale, device=q.device)
+    v_rescale = _extract_scale_scalar(v_scale, device=q.device)
+    output_rescale = (
+        _extract_scale_scalar(fp8_out_scale, device=q.device)
+        if fp8_out_scale is not None
+        else None
+    )
+    sink_values = (
+        sinks.to(device=q.device, dtype=torch.float32).reshape(num_q_heads, 1, 1)
+        if sinks is not None
+        else None
+    )
+    alibi_values = (
+        alibi_slopes.to(device=q.device, dtype=torch.float32).reshape(num_q_heads, 1, 1)
+        if alibi_slopes is not None
+        else None
+    )
+
+    for batch_idx in range(len(seq_lens_cpu)):
+        seq_start = int(start_locs_cpu[batch_idx].item())
+        seq_stop = int(start_locs_cpu[batch_idx + 1].item())
+        query_len = seq_stop - seq_start
+        seq_len = int(seq_lens_cpu[batch_idx].item())
+        ctx_len = seq_len - query_len
+
+        if query_len <= 0:
+            continue
+        if skip_decode and query_len == 1:
+            continue
+
+        if cu_ctx_lens_cpu is not None:
+            ctx_start = int(cu_ctx_lens_cpu[batch_idx].item())
+            ctx_stop = int(cu_ctx_lens_cpu[batch_idx + 1].item())
+            ctx_k = gathered_ctx_k[ctx_start:ctx_stop]
+            ctx_v = gathered_ctx_v[ctx_start:ctx_stop]
+        else:
+            num_ctx_blocks = (ctx_len + block_size - 1) // block_size
+            if num_ctx_blocks > 0:
+                block_ids = processed_b_loc[batch_idx, :num_ctx_blocks].to(
+                    device=key_cache_dense.device,
+                    dtype=torch.long,
+                )
+                ctx_k = key_cache_dense.index_select(0, block_ids).reshape(
+                    num_ctx_blocks * block_size,
+                    num_kv_heads,
+                    -1,
+                )[:ctx_len]
+                ctx_v = value_cache_dense.index_select(0, block_ids).reshape(
+                    num_ctx_blocks * block_size,
+                    num_kv_heads,
+                    -1,
+                )[:ctx_len]
+            else:
+                ctx_k = k.new_empty((0, num_kv_heads, q.shape[-1]))
+                ctx_v = v.new_empty((0, num_kv_heads, v.shape[-1]))
+
+        if _is_fp8_dtype(ctx_k.dtype):
+            ctx_k = ctx_k.to(torch.float32) * k_rescale
+        else:
+            ctx_k = ctx_k.to(torch.float32)
+        if _is_fp8_dtype(ctx_v.dtype):
+            ctx_v = ctx_v.to(torch.float32) * v_rescale
+        else:
+            ctx_v = ctx_v.to(torch.float32)
+
+        q_seq = q[seq_start:seq_stop].to(torch.float32)
+        k_seq = k[seq_start:seq_stop].to(torch.float32)
+        v_seq = v[seq_start:seq_stop].to(torch.float32)
+
+        all_k = torch.cat([ctx_k, k_seq], dim=0)
+        all_v = torch.cat([ctx_v, v_seq], dim=0)
+
+        q_heads = q_seq.permute(1, 0, 2).contiguous()
+        k_heads = all_k.permute(1, 0, 2).contiguous()
+        v_heads = all_v.permute(1, 0, 2).contiguous()
+
+        if kv_group_num > 1:
+            k_heads = k_heads.repeat_interleave(kv_group_num, dim=0)
+            v_heads = v_heads.repeat_interleave(kv_group_num, dim=0)
+
+        scores = torch.matmul(q_heads, k_heads.transpose(-1, -2)) * sm_scale
+
+        query_positions = ctx_len + torch.arange(query_len, device=q.device)
+        key_positions = torch.arange(ctx_len + query_len, device=q.device)
+        mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+        if sliding_window > 0:
+            mask &= (query_positions.unsqueeze(1) - key_positions.unsqueeze(0)) < (
+                sliding_window
+            )
+
+        if _supports_reference_sdpa_fastpath(
+            sinks=sinks,
+            alibi_slopes=alibi_slopes,
+        ):
+            out = F.scaled_dot_product_attention(
+                q_heads.unsqueeze(0),
+                k_heads.unsqueeze(0),
+                v_heads.unsqueeze(0),
+                attn_mask=mask.unsqueeze(0).unsqueeze(0),
+                dropout_p=0.0,
+                is_causal=False,
+                scale=sm_scale,
+            ).squeeze(0)
+        else:
+            scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+
+            if alibi_values is not None:
+                relative_positions = (
+                    key_positions.unsqueeze(0) - query_positions.unsqueeze(1)
+                ).to(torch.float32)
+                scores = scores + alibi_values * relative_positions.unsqueeze(0)
+
+            if sink_values is not None:
+                scores = torch.cat(
+                    [sink_values.expand(-1, query_len, 1), scores],
+                    dim=-1,
+                )
+                sink_v = torch.zeros(
+                    (num_q_heads, 1, v_heads.shape[-1]),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                v_heads = torch.cat([sink_v, v_heads], dim=1)
+
+            row_max = scores.amax(dim=-1, keepdim=True)
+            row_max = torch.where(
+                torch.isfinite(row_max), row_max, torch.zeros_like(row_max)
+            )
+            exp_scores = torch.exp(scores - row_max)
+            denom = exp_scores.sum(dim=-1, keepdim=True)
+            probs = torch.where(
+                denom > 0,
+                exp_scores / denom,
+                torch.zeros_like(exp_scores),
+            )
+            out = torch.matmul(probs, v_heads)
+
+        if output_rescale is not None:
+            out = out * (1.0 / output_rescale)
+            out = torch.clamp(out, float8_info.min, float8_info.max)
+
+        o[seq_start:seq_stop].copy_(out.permute(1, 0, 2).to(dtype=o.dtype))
 
 
 # Here's an example autotuner config for this kernel. This config does provide
@@ -718,6 +1197,28 @@ def context_attention_fwd(
         ).to(torch.int32)
     else:
         processed_b_loc = b_loc.to(torch.int32)
+
+    if not HAS_TRITON:
+        _reference_context_attention_fwd(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            processed_b_loc=processed_b_loc,
+            b_start_loc=b_start_loc,
+            b_seq_len=b_seq_len,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            alibi_slopes=alibi_slopes,
+            sliding_window=sliding_window,
+            sm_scale=sm_scale,
+            skip_decode=skip_decode,
+            fp8_out_scale=fp8_out_scale,
+            sinks=sinks,
+        )
+        return
 
     if alibi_slopes is not None:
         assert sinks is None, "Sinks arg is not supported with alibi"

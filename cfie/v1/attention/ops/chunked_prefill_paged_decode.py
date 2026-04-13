@@ -9,13 +9,120 @@
 
 import torch
 
+from cfie.logger import init_logger
 from cfie import _custom_ops as ops
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 from .prefix_prefill import context_attention_fwd
 
+logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
+_PAGED_ATTENTION_HEAD_SIZES = {32, 64, 80, 96, 112, 120, 128, 192, 256}
+_PAGED_ATTENTION_BLOCK_SIZES = {8, 16, 32}
+
+
+def _supports_paged_attention_v1_decode_fastpath(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    sliding_window: int,
+    output_scale: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+) -> bool:
+    if not callable(getattr(ops, "paged_attention_v1", None)):
+        return False
+
+    head_size = query.shape[-1]
+    block_size = value_cache.shape[3]
+    return (
+        head_size in _PAGED_ATTENTION_HEAD_SIZES
+        and block_size in _PAGED_ATTENTION_BLOCK_SIZES
+        and sliding_window == 0
+        and output_scale is None
+        and sinks is None
+        and key_cache.ndim == 5
+        and value_cache.ndim == 4
+    )
+
+
+def _normalize_block_table_for_fastpath(
+    *,
+    block_table: torch.Tensor,
+    key_cache: torch.Tensor,
+    is_block_table_ptr: bool,
+) -> torch.Tensor:
+    if not is_block_table_ptr:
+        return block_table.to(torch.int32)
+
+    kv_element_size = key_cache.element_size()
+    block_byte_stride = key_cache.stride(0) * kv_element_size
+    base_addr = key_cache.data_ptr()
+    return ((block_table - base_addr) // block_byte_stride).to(torch.int32)
+
+
+def _run_paged_attention_v1_decode_fastpath(
+    *,
+    query: torch.Tensor,
+    output: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    num_kv_heads: int,
+    sm_scale: float,
+    alibi_slopes: torch.Tensor | None,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> bool:
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    decode_reqs = torch.nonzero(query_lens == 1, as_tuple=False).flatten()
+    if decode_reqs.numel() == 0:
+        return False
+
+    decode_token_indices = query_start_loc[:-1].index_select(
+        0, decode_reqs
+    ).to(dtype=torch.long)
+    decode_query = query.index_select(0, decode_token_indices)
+    decode_output = torch.empty_like(decode_query)
+    decode_block_table = block_table.index_select(0, decode_reqs)
+    decode_seq_lens = seq_lens.index_select(0, decode_reqs)
+
+    logger.info(
+        "Using paged_attention_v1 precompiled fastpath for chunked prefill "
+        "decode-only sub-batch because Triton runtime is unavailable."
+    )
+    try:
+        ops.paged_attention_v1(
+            out=decode_output,
+            query=decode_query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            num_kv_heads=num_kv_heads,
+            scale=sm_scale,
+            block_tables=decode_block_table,
+            seq_lens=decode_seq_lens,
+            block_size=value_cache.shape[3],
+            max_seq_len=max_seq_len,
+            alibi_slopes=alibi_slopes,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+    except (AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
+        logger.warning_once(
+            "paged_attention_v1 precompiled fastpath is unavailable for "
+            "chunked prefill decode-only sub-batch; falling back to prefix "
+            "prefill handling. Reason: %s",
+            exc,
+        )
+        return False
+    output.index_copy_(0, decode_token_indices, decode_output)
+    return True
 
 
 @triton.jit
@@ -269,6 +376,82 @@ def chunked_prefill_paged_decode(
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[2] ** 0.5)
+
+    if not HAS_TRITON:
+        if sliding_window is None or sliding_window <= 0:
+            sliding_window = 0
+
+        if key is None or value is None:
+            raise NotImplementedError(
+                "Chunked prefill fallback without Triton currently requires "
+                "materialized key/value tensors."
+            )
+
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        has_prefix_queries = bool(torch.any(query_lens > 1).item())
+        has_decode_queries = bool(torch.any(query_lens == 1).item())
+        processed_block_table = _normalize_block_table_for_fastpath(
+            block_table=block_table,
+            key_cache=key_cache,
+            is_block_table_ptr=is_block_table_ptr,
+        )
+
+        can_use_decode_fastpath = has_decode_queries and _supports_paged_attention_v1_decode_fastpath(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            sliding_window=sliding_window,
+            output_scale=output_scale,
+            sinks=sinks,
+        )
+
+        if has_prefix_queries or not can_use_decode_fastpath:
+            logger.warning_once(
+                "Chunked prefill paged decode is falling back to the prefix "
+                "prefill reference path because Triton runtime is unavailable."
+            )
+            context_attention_fwd(
+                q=query,
+                k=key,
+                v=value,
+                o=output,
+                kv_cache_dtype=kv_cache_dtype,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                b_loc=processed_block_table,
+                b_start_loc=query_start_loc,
+                b_seq_len=seq_lens,
+                max_seq_len=max_seq_len,
+                max_input_len=max_query_len,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                alibi_slopes=alibi_slopes,
+                sliding_window=sliding_window,
+                sm_scale=sm_scale,
+                skip_decode=can_use_decode_fastpath,
+                fp8_out_scale=output_scale,
+                sinks=sinks,
+                is_block_table_ptr=False,
+            )
+
+        if can_use_decode_fastpath:
+            _run_paged_attention_v1_decode_fastpath(
+                query=query,
+                output=output,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=processed_block_table,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                num_kv_heads=key.shape[1],
+                sm_scale=sm_scale,
+                alibi_slopes=alibi_slopes,
+                kv_cache_dtype=kv_cache_dtype,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        return
 
     use_alibi_slopes = alibi_slopes is not None
 

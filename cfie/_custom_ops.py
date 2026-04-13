@@ -519,6 +519,192 @@ def chunk_gated_delta_rule_precompiled(
     )
 
 
+def has_precompiled_fused_recurrent_gated_delta_rule_packed_decode() -> bool:
+    return hasattr(
+        torch.ops._C, "fused_recurrent_gated_delta_rule_packed_decode_precompiled"
+    )
+
+
+def fused_recurrent_gated_delta_rule_packed_decode_precompiled(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.fused_recurrent_gated_delta_rule_packed_decode_precompiled(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        scale,
+        initial_state,
+        out,
+        ssm_state_indices,
+        use_qk_l2norm_in_kernel,
+    )
+
+
+def has_precompiled_l2norm() -> bool:
+    return hasattr(torch.ops._C, "l2norm_precompiled")
+
+
+def l2norm_precompiled(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return torch.ops._C.l2norm_precompiled(
+        x,
+        eps,
+        output_dtype,
+    )
+
+
+def has_precompiled_chunk_local_cumsum() -> bool:
+    return hasattr(torch.ops._C, "chunk_local_cumsum_precompiled")
+
+
+def chunk_local_cumsum_precompiled(
+    g: torch.Tensor,
+    chunk_size: int,
+    reverse: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    head_first: bool = False,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return torch.ops._C.chunk_local_cumsum_precompiled(
+        g,
+        chunk_size,
+        reverse,
+        cu_seqlens,
+        head_first,
+        output_dtype,
+    )
+
+
+def has_precompiled_chunk_fwd_o() -> bool:
+    return hasattr(torch.ops._C, "chunk_fwd_o_precompiled")
+
+
+def chunk_fwd_o_precompiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    h: torch.Tensor,
+    g: torch.Tensor | None,
+    scale: float,
+    cu_seqlens: torch.Tensor | None,
+    block_size: int,
+) -> torch.Tensor:
+    return torch.ops._C.chunk_fwd_o_precompiled(
+        q,
+        k,
+        v,
+        h,
+        g,
+        scale,
+        cu_seqlens,
+        block_size,
+    )
+
+
+def has_precompiled_chunk_scaled_dot_kkt_fwd() -> bool:
+    return hasattr(torch.ops._C, "chunk_scaled_dot_kkt_fwd_precompiled")
+
+
+def chunk_scaled_dot_kkt_fwd_precompiled(
+    k: torch.Tensor,
+    g: torch.Tensor | None,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_size: int,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return torch.ops._C.chunk_scaled_dot_kkt_fwd_precompiled(
+        k,
+        g,
+        beta,
+        cu_seqlens,
+        chunk_size,
+        output_dtype,
+    )
+
+
+def has_precompiled_chunk_gated_delta_rule_fwd_h() -> bool:
+    return hasattr(torch.ops._C, "chunk_gated_delta_rule_fwd_h_precompiled")
+
+
+def chunk_gated_delta_rule_fwd_h_precompiled(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    return torch.ops._C.chunk_gated_delta_rule_fwd_h_precompiled(
+        k,
+        w,
+        u,
+        g,
+        gk,
+        initial_state,
+        output_final_state,
+        chunk_size,
+        save_new_value,
+        cu_seqlens,
+    )
+
+
+def has_precompiled_solve_tril() -> bool:
+    return hasattr(torch.ops._C, "solve_tril_precompiled")
+
+
+def solve_tril_precompiled(
+    A: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return torch.ops._C.solve_tril_precompiled(
+        A,
+        cu_seqlens,
+        output_dtype,
+    )
+
+
+def has_precompiled_recompute_w_u_fwd() -> bool:
+    return hasattr(torch.ops._C, "recompute_w_u_fwd_precompiled")
+
+
+def recompute_w_u_fwd_precompiled(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    A: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.recompute_w_u_fwd_precompiled(
+        k,
+        v,
+        beta,
+        g_cumsum,
+        A,
+        cu_seqlens,
+    )
+
+
 def has_precompiled_fused_gdn_gating() -> bool:
     return hasattr(torch.ops._C, "fused_gdn_gating_precompiled")
 
@@ -699,6 +885,18 @@ def has_precompiled_correct_attn_out() -> bool:
     return hasattr(torch.ops._C, "correct_attn_out_precompiled")
 
 
+def has_precompiled_dcp_lse_combine() -> bool:
+    return hasattr(torch.ops._C, "dcp_lse_combine_precompiled")
+
+
+def has_precompiled_prefill_attention() -> bool:
+    return hasattr(torch.ops._C, "prefill_attention_precompiled")
+
+
+def has_precompiled_prefix_prefill_attention() -> bool:
+    return hasattr(torch.ops._C, "prefix_prefill_attention_precompiled")
+
+
 def has_precompiled_pack_seq() -> bool:
     return hasattr(torch.ops._C, "pack_seq_precompiled")
 
@@ -718,6 +916,76 @@ def correct_attn_out_precompiled(
         lses,
         cp_rank,
         is_lse_base_on_e,
+    )
+
+
+def dcp_lse_combine_precompiled(
+    recv_output: torch.Tensor,
+    recv_lse: torch.Tensor,
+    return_lse: bool = False,
+    is_lse_base_on_e: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.dcp_lse_combine_precompiled(
+        recv_output,
+        recv_lse,
+        return_lse,
+        is_lse_base_on_e,
+    )
+
+
+def prefill_attention_precompiled(
+    output: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    is_causal: bool,
+    softmax_scale: float,
+    sliding_window_q: int,
+    sliding_window_k: int,
+) -> None:
+    torch.ops._C.prefill_attention_precompiled(
+        output,
+        q,
+        k,
+        v,
+        b_start_loc,
+        b_seq_len,
+        is_causal,
+        softmax_scale,
+        sliding_window_q,
+        sliding_window_k,
+    )
+
+
+def prefix_prefill_attention_precompiled(
+    output: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gathered_ctx_k: torch.Tensor,
+    gathered_ctx_v: torch.Tensor,
+    cu_ctx_lens: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    sm_scale: float,
+    sliding_window: int,
+    skip_decode: bool,
+) -> None:
+    torch.ops._C.prefix_prefill_attention_precompiled(
+        output,
+        q,
+        k,
+        v,
+        gathered_ctx_k,
+        gathered_ctx_v,
+        cu_ctx_lens,
+        b_start_loc,
+        b_seq_len,
+        sm_scale,
+        sliding_window,
+        skip_decode,
     )
 
 
@@ -1335,6 +1603,8 @@ if hasattr(torch.ops._C, "ggml_moe_a8_vec"):
 
 # cutlass
 def cutlass_scaled_mm_supports_fp4(cuda_device_capability: int) -> bool:
+    if not hasattr(torch.ops._C, "cutlass_scaled_mm_supports_fp4"):
+        return False
     return torch.ops._C.cutlass_scaled_mm_supports_fp4(cuda_device_capability)
 
 
@@ -1354,10 +1624,14 @@ def cutlass_scaled_fp4_mm(
 
 
 def cutlass_scaled_mm_supports_fp8(cuda_device_capability: int) -> bool:
+    if not hasattr(torch.ops._C, "cutlass_scaled_mm_supports_fp8"):
+        return False
     return torch.ops._C.cutlass_scaled_mm_supports_fp8(cuda_device_capability)
 
 
 def cutlass_scaled_mm_supports_block_fp8(cuda_device_capability: int) -> bool:
+    if not hasattr(torch.ops._C, "cutlass_scaled_mm_supports_block_fp8"):
+        return False
     return torch.ops._C.cutlass_scaled_mm_supports_block_fp8(cuda_device_capability)
 
 
@@ -1442,11 +1716,15 @@ def cutlass_scaled_mm_azp(
 
 
 def cutlass_sparse_scaled_mm_supported(cuda_device_capability: int) -> bool:
+    if not hasattr(torch.ops._C, "cutlass_sparse_scaled_mm_supported"):
+        return False
     return torch.ops._C.cutlass_sparse_scaled_mm_supported(cuda_device_capability)
 
 
 def cutlass_group_gemm_supported(cuda_device_capability: int) -> bool:
     if cuda_device_capability < 90 or cuda_device_capability >= 110:
+        return False
+    if not hasattr(torch.ops._C, "cutlass_group_gemm_supported"):
         return False
     try:
         return torch.ops._C.cutlass_group_gemm_supported(cuda_device_capability)
@@ -1813,6 +2091,446 @@ if hasattr(torch.ops._C, "cutlass_mxfp8_grouped_mm"):
 
 
 # gptq_marlin
+def _get_torch_op(namespace: str, op_name: str):
+    try:
+        return getattr(getattr(torch.ops, namespace), op_name)
+    except AttributeError:
+        return None
+
+
+_FLOAT8_DTYPES = {
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+        current_platform.fp8_dtype(),
+    )
+    if dtype is not None
+}
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in _FLOAT8_DTYPES
+
+
+def _extract_scale_scalar(scale: torch.Tensor | None, *, device: torch.device) -> float:
+    if scale is None:
+        return 1.0
+    return float(scale.to(device=device, dtype=torch.float32).reshape(-1)[0].item())
+
+
+def _prepare_kv_cache_values_for_store(
+    tensor: torch.Tensor,
+    *,
+    cache_dtype: torch.dtype,
+    kv_cache_dtype: str,
+    scale: torch.Tensor | None,
+) -> torch.Tensor:
+    if kv_cache_dtype.startswith("fp8"):
+        if cache_dtype == torch.uint8:
+            raise RuntimeError(
+                "Torch KV-cache fallback does not support uint8-backed FP8 "
+                "cache tensors."
+            )
+        if not _is_fp8_dtype(tensor.dtype):
+            scale_scalar = _extract_scale_scalar(scale, device=tensor.device)
+            tensor = tensor if scale_scalar == 1.0 else tensor / scale_scalar
+        return tensor.to(dtype=cache_dtype)
+    return tensor.to(dtype=cache_dtype) if tensor.dtype != cache_dtype else tensor
+
+
+def _reshape_and_cache_4d_torch_fallback(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+    valid_mask = slots >= 0
+    if not torch.any(valid_mask):
+        return
+
+    token_indices = valid_mask.nonzero(as_tuple=False).flatten()
+    slots = slots[token_indices]
+    block_size = key_cache.shape[1]
+    block_indices = torch.div(slots, block_size, rounding_mode="floor")
+    block_offsets = torch.remainder(slots, block_size)
+
+    key_values = _prepare_kv_cache_values_for_store(
+        key.index_select(0, token_indices),
+        cache_dtype=key_cache.dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        scale=k_scale,
+    )
+    value_values = _prepare_kv_cache_values_for_store(
+        value.index_select(0, token_indices),
+        cache_dtype=value_cache.dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        scale=v_scale,
+    )
+
+    key_cache[block_indices, block_offsets] = key_values
+    value_cache[block_indices, block_offsets] = value_values
+
+
+def _reshape_and_cache_head_major_torch_fallback(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+    valid_mask = slots >= 0
+    if not torch.any(valid_mask):
+        return
+
+    token_indices = valid_mask.nonzero(as_tuple=False).flatten()
+    slots = slots[token_indices]
+    block_size = key_cache.shape[3]
+    pack_x = key_cache.shape[4]
+    block_indices = torch.div(slots, block_size, rounding_mode="floor")
+    block_offsets = torch.remainder(slots, block_size)
+
+    key_values = _prepare_kv_cache_values_for_store(
+        key.index_select(0, token_indices),
+        cache_dtype=key_cache.dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        scale=k_scale,
+    )
+    value_values = _prepare_kv_cache_values_for_store(
+        value.index_select(0, token_indices),
+        cache_dtype=value_cache.dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        scale=v_scale,
+    )
+
+    if key_values.shape[-1] % pack_x != 0:
+        raise RuntimeError(
+            "Torch KV-cache fallback requires head-major key cache width to be "
+            f"divisible by pack size {pack_x}, got {key_values.shape[-1]}."
+        )
+
+    key_values = key_values.reshape(
+        key_values.shape[0],
+        key_values.shape[1],
+        key_values.shape[2] // pack_x,
+        pack_x,
+    )
+
+    key_cache[block_indices, :, :, block_offsets, :] = key_values
+    value_cache[block_indices, :, :, block_offsets] = value_values
+
+
+def _reshape_and_cache_torch_fallback(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    *,
+    op_name: str,
+) -> None:
+    logger.warning_once(
+        "Falling back to torch %s because `_C_cache_ops.%s` is unavailable. "
+        "This keeps Windows inference startup unblocked but may reduce KV "
+        "cache update throughput.",
+        op_name,
+        op_name,
+    )
+    if key_cache.ndim == 5:
+        _reshape_and_cache_head_major_torch_fallback(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+    if key_cache.ndim != 4 or value_cache.ndim != 4:
+        raise RuntimeError(
+            f"Torch fallback for {op_name} only supports 4D flash KV cache or "
+            "5D head-major key cache layouts."
+        )
+    _reshape_and_cache_4d_torch_fallback(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+
+def _reshape_and_cache_flash_diffkv_torch_fallback(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    logger.warning_once(
+        "Falling back to torch reshape_and_cache_flash_diffkv because "
+        "`_C_cache_ops.reshape_and_cache_flash_diffkv` is unavailable. "
+        "This keeps Windows inference startup unblocked but may reduce KV "
+        "cache update throughput.",
+    )
+    if kv_cache.ndim != 4:
+        raise RuntimeError(
+            "Torch fallback for reshape_and_cache_flash_diffkv only supports "
+            "4D flash KV cache layouts."
+        )
+    key_width = key.shape[-1]
+    value_width = value.shape[-1]
+    key_cache = kv_cache[..., :key_width]
+    value_cache = kv_cache[..., key_width : key_width + value_width]
+    _reshape_and_cache_4d_torch_fallback(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+
+def _pack_repacked_marlin_values(values: torch.Tensor, num_bits: int) -> torch.Tensor:
+    shifts = (
+        torch.arange(values.shape[-1], device=values.device, dtype=torch.int64)
+        * num_bits
+    )
+    shifts = shifts.view(*([1] * (values.ndim - 1)), -1)
+    return ((values.to(torch.int64) << shifts).sum(dim=-1)).to(torch.int32)
+
+
+def _unpack_row_packed_qweight(
+    packed_qweight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    pack_factor = 32 // num_bits
+    mask = (1 << num_bits) - 1
+    packed = packed_qweight.to(torch.int64) & 0xFFFFFFFF
+    shifts = (
+        torch.arange(pack_factor, device=packed_qweight.device, dtype=torch.int64)
+        * num_bits
+    )
+    unpacked = ((packed.unsqueeze(1) >> shifts.view(1, pack_factor, 1)) & mask)
+    return unpacked.reshape((size_k, size_n)).to(torch.int32)
+
+
+def _unpack_col_packed_qweight(
+    packed_qweight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    pack_factor = 32 // num_bits
+    mask = (1 << num_bits) - 1
+    packed = packed_qweight.to(torch.int64) & 0xFFFFFFFF
+    shifts = (
+        torch.arange(pack_factor, device=packed_qweight.device, dtype=torch.int64)
+        * num_bits
+    )
+    unpacked = ((packed.unsqueeze(-1) >> shifts.view(1, 1, pack_factor)) & mask)
+    return unpacked.reshape((size_k, size_n)).to(torch.int32)
+
+
+def _repack_logical_qweight_to_marlin(
+    logical_qweight: torch.Tensor,
+    num_bits: int,
+    is_a_8bit: bool,
+) -> torch.Tensor:
+    pack_factor = 32 // num_bits
+    size_k, size_n = logical_qweight.shape
+    tile_k = 32 if is_a_8bit else 16
+    tile_n = 32 if is_a_8bit else 64
+    k_tiles = size_k // tile_k
+    n_tiles = size_n // tile_n
+    tile_size = tile_k * tile_n // pack_factor
+    out_tiles = torch.empty(
+        (k_tiles, n_tiles, tile_size),
+        dtype=torch.int32,
+        device=logical_qweight.device,
+    )
+    tile_chunk_size = 8
+
+    for start in range(0, n_tiles, tile_chunk_size):
+        stop = min(start + tile_chunk_size, n_tiles)
+        tile_count = stop - start
+        q_chunk = logical_qweight[:, start * tile_n : stop * tile_n].contiguous()
+
+        if not is_a_8bit:
+            q_chunk = q_chunk.reshape((k_tiles, 16, tile_count, 64))
+            q_chunk = q_chunk.reshape((k_tiles, 2, 8, tile_count, 64))
+            q_chunk = q_chunk.reshape((k_tiles, 2, 4, 2, tile_count, 64))
+            q_chunk = q_chunk.reshape((k_tiles, 2, 4, 2, tile_count, 4, 16))
+            q_chunk = q_chunk.reshape((k_tiles, 2, 4, 2, tile_count, 4, 2, 8))
+
+            if num_bits == 4:
+                packed_vals = torch.stack(
+                    [
+                        q_chunk[:, 0, :, 0, :, :, 0, :],
+                        q_chunk[:, 1, :, 0, :, :, 0, :],
+                        q_chunk[:, 0, :, 0, :, :, 1, :],
+                        q_chunk[:, 1, :, 0, :, :, 1, :],
+                        q_chunk[:, 0, :, 1, :, :, 0, :],
+                        q_chunk[:, 1, :, 1, :, :, 0, :],
+                        q_chunk[:, 0, :, 1, :, :, 1, :],
+                        q_chunk[:, 1, :, 1, :, :, 1, :],
+                    ],
+                    dim=-1,
+                ).permute(0, 2, 4, 1, 3, 5)
+            else:
+                packed_vals_0 = torch.stack(
+                    [
+                        q_chunk[:, 0, :, 0, :, :, 0, :],
+                        q_chunk[:, 1, :, 0, :, :, 0, :],
+                        q_chunk[:, 0, :, 1, :, :, 0, :],
+                        q_chunk[:, 1, :, 1, :, :, 0, :],
+                    ],
+                    dim=-1,
+                )
+                packed_vals_1 = torch.stack(
+                    [
+                        q_chunk[:, 0, :, 0, :, :, 1, :],
+                        q_chunk[:, 1, :, 0, :, :, 1, :],
+                        q_chunk[:, 0, :, 1, :, :, 1, :],
+                        q_chunk[:, 1, :, 1, :, :, 1, :],
+                    ],
+                    dim=-1,
+                )
+                packed_vals = torch.stack([packed_vals_0, packed_vals_1], dim=-2)
+                packed_vals = packed_vals.permute(0, 2, 4, 1, 3, 5, 6)
+        else:
+            q_chunk = q_chunk.reshape((k_tiles, 32, tile_count, 32))
+            q_chunk = q_chunk.reshape((k_tiles, 2, 16, tile_count, 32))
+            q_chunk = q_chunk.reshape((k_tiles, 2, 4, 4, tile_count, 32))
+            q_chunk = q_chunk.reshape((k_tiles, 2, 4, 4, tile_count, 2, 16))
+            q_chunk = q_chunk.reshape((k_tiles, 2, 4, 4, tile_count, 2, 2, 8))
+
+            if num_bits == 4:
+                packed_vals = torch.stack(
+                    [
+                        q_chunk[:, 0, :, 0, :, :, :, :],
+                        q_chunk[:, 1, :, 0, :, :, :, :],
+                        q_chunk[:, 0, :, 1, :, :, :, :],
+                        q_chunk[:, 1, :, 1, :, :, :, :],
+                        q_chunk[:, 0, :, 2, :, :, :, :],
+                        q_chunk[:, 1, :, 2, :, :, :, :],
+                        q_chunk[:, 0, :, 3, :, :, :, :],
+                        q_chunk[:, 1, :, 3, :, :, :, :],
+                    ],
+                    dim=-1,
+                ).permute(0, 2, 5, 1, 3, 4, 6)
+            else:
+                packed_top = torch.stack(
+                    [
+                        q_chunk[:, 0, :, 0, :, :, :, :],
+                        q_chunk[:, 0, :, 1, :, :, :, :],
+                        q_chunk[:, 0, :, 2, :, :, :, :],
+                        q_chunk[:, 0, :, 3, :, :, :, :],
+                    ],
+                    dim=-1,
+                )
+                packed_bottom = torch.stack(
+                    [
+                        q_chunk[:, 1, :, 0, :, :, :, :],
+                        q_chunk[:, 1, :, 1, :, :, :, :],
+                        q_chunk[:, 1, :, 2, :, :, :, :],
+                        q_chunk[:, 1, :, 3, :, :, :, :],
+                    ],
+                    dim=-1,
+                )
+                packed_vals = torch.stack([packed_top, packed_bottom], dim=-2)
+                packed_vals = packed_vals.permute(0, 2, 5, 1, 3, 4, 6, 7)
+
+        out_tiles[:, start:stop, :] = _pack_repacked_marlin_values(
+            packed_vals, num_bits
+        ).reshape((k_tiles, tile_count, tile_size))
+
+    return out_tiles.reshape((size_k // 16, size_n * 16 // pack_factor))
+
+
+def _gptq_marlin_repack_torch_fallback(
+    b_q_weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+    is_a_8bit: bool = False,
+) -> torch.Tensor:
+    if perm.numel() and is_a_8bit:
+        raise RuntimeError(
+            "Torch fallback for gptq_marlin_repack does not support "
+            "permuted K ordering with 8-bit activations."
+        )
+
+    logger.warning_once(
+        "Falling back to torch gptq_marlin_repack because `_C."
+        "gptq_marlin_repack` is unavailable. This keeps Windows startup "
+        "unblocked but may slow checkpoint repacking."
+    )
+    logical_qweight = _unpack_row_packed_qweight(b_q_weight, num_bits, size_k, size_n)
+    if perm.numel():
+        logical_qweight = logical_qweight.index_select(
+            0, perm.to(device=logical_qweight.device, dtype=torch.long)
+        )
+    return _repack_logical_qweight_to_marlin(
+        logical_qweight, num_bits, is_a_8bit
+    ).to(b_q_weight.dtype)
+
+
+def _awq_marlin_repack_torch_fallback(
+    b_q_weight: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+    is_a_8bit: bool = False,
+) -> torch.Tensor:
+    logger.warning_once(
+        "Falling back to torch awq_marlin_repack because `_C."
+        "awq_marlin_repack` is unavailable. This keeps Windows startup "
+        "unblocked but may slow checkpoint repacking."
+    )
+    logical_qweight = _unpack_col_packed_qweight(b_q_weight, num_bits, size_k, size_n)
+    undo_interleave = (
+        [0, 4, 1, 5, 2, 6, 3, 7] if num_bits == 4 else [0, 2, 1, 3]
+    )
+    logical_qweight = logical_qweight.reshape((-1, len(undo_interleave)))
+    logical_qweight = logical_qweight.index_select(
+        1,
+        torch.tensor(
+            undo_interleave, device=logical_qweight.device, dtype=torch.long
+        ),
+    ).reshape((size_k, size_n))
+    return _repack_logical_qweight_to_marlin(
+        logical_qweight, num_bits, is_a_8bit
+    ).to(b_q_weight.dtype)
+
+
 def gptq_marlin_repack(
     b_q_weight: torch.Tensor,
     perm: torch.Tensor,
@@ -1821,7 +2539,13 @@ def gptq_marlin_repack(
     num_bits: int,
     is_a_8bit: bool = False,
 ) -> torch.Tensor:
-    return torch.ops._C.gptq_marlin_repack(
+    size_k = int(size_k)
+    size_n = int(size_n)
+    num_bits = int(num_bits)
+    op = _get_torch_op("_C", "gptq_marlin_repack")
+    if op is not None:
+        return op(b_q_weight, perm, size_k, size_n, num_bits, is_a_8bit)
+    return _gptq_marlin_repack_torch_fallback(
         b_q_weight, perm, size_k, size_n, num_bits, is_a_8bit
     )
 
@@ -1854,7 +2578,13 @@ def awq_marlin_repack(
     num_bits: int,
     is_a_8bit: bool = False,
 ) -> torch.Tensor:
-    return torch.ops._C.awq_marlin_repack(
+    size_k = int(size_k)
+    size_n = int(size_n)
+    num_bits = int(num_bits)
+    op = _get_torch_op("_C", "awq_marlin_repack")
+    if op is not None:
+        return op(b_q_weight, size_k, size_n, num_bits, is_a_8bit)
+    return _awq_marlin_repack_torch_fallback(
         b_q_weight, size_k, size_n, num_bits, is_a_8bit
     )
 
@@ -1886,6 +2616,9 @@ def gptq_marlin_moe_repack(
     num_bits: int,
     is_a_8bit: bool = False,
 ) -> torch.Tensor:
+    size_k = int(size_k)
+    size_n = int(size_n)
+    num_bits = int(num_bits)
     num_experts = b_q_weight.shape[0]
     assert size_k % 16 == 0
     output = torch.empty(
@@ -1894,7 +2627,7 @@ def gptq_marlin_moe_repack(
         dtype=b_q_weight.dtype,
     )
     for e in range(num_experts):
-        output[e] = torch.ops._C.gptq_marlin_repack(
+        output[e] = gptq_marlin_repack(
             b_q_weight[e], perm[e], size_k, size_n, num_bits, is_a_8bit
         )
     return output
@@ -1908,6 +2641,9 @@ def awq_marlin_moe_repack(
     num_bits: int,
     is_a_8bit: bool = False,
 ) -> torch.Tensor:
+    size_k = int(size_k)
+    size_n = int(size_n)
+    num_bits = int(num_bits)
     num_experts = b_q_weight.shape[0]
     assert size_k % 16 == 0
     output = torch.empty(
@@ -1916,7 +2652,7 @@ def awq_marlin_moe_repack(
         dtype=b_q_weight.dtype,
     )
     for e in range(num_experts):
-        output[e] = torch.ops._C.awq_marlin_repack(
+        output[e] = awq_marlin_repack(
             b_q_weight[e], size_k, size_n, num_bits, is_a_8bit
         )
     return output
@@ -3144,7 +3880,20 @@ def reshape_and_cache(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache(
+    op = _get_torch_op("_C_cache_ops", "reshape_and_cache")
+    if op is not None:
+        op(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+    _reshape_and_cache_torch_fallback(
         key,
         value,
         key_cache,
@@ -3153,6 +3902,7 @@ def reshape_and_cache(
         kv_cache_dtype,
         k_scale,
         v_scale,
+        op_name="reshape_and_cache",
     )
 
 
@@ -3166,7 +3916,20 @@ def reshape_and_cache_flash(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache_flash(
+    op = _get_torch_op("_C_cache_ops", "reshape_and_cache_flash")
+    if op is not None:
+        op(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+    _reshape_and_cache_torch_fallback(
         key,
         value,
         key_cache,
@@ -3175,6 +3938,7 @@ def reshape_and_cache_flash(
         kv_cache_dtype,
         k_scale,
         v_scale,
+        op_name="reshape_and_cache_flash",
     )
 
 
@@ -3187,7 +3951,19 @@ def reshape_and_cache_flash_diffkv(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache_flash_diffkv(
+    op = _get_torch_op("_C_cache_ops", "reshape_and_cache_flash_diffkv")
+    if op is not None:
+        op(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+    _reshape_and_cache_flash_diffkv_torch_fallback(
         key,
         value,
         kv_cache,
@@ -3306,6 +4082,28 @@ def cp_gather_cache(
 ) -> None:
     torch.ops._C_cache_ops.cp_gather_cache(
         src_cache, dst, block_table, cu_seq_lens, batch_size, seq_starts
+    )
+
+
+def gather_paged_kv_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    gathered_key: torch.Tensor,
+    gathered_value: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    batch_size: int,
+    seq_starts: torch.Tensor | None = None,
+) -> None:
+    torch.ops._C_cache_ops.gather_paged_kv_cache(
+        key_cache,
+        value_cache,
+        gathered_key,
+        gathered_value,
+        block_table,
+        cu_seq_lens,
+        batch_size,
+        seq_starts,
     )
 
 

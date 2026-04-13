@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from cfie.config import ModelConfig
 from cfie.model_executor.models.interfaces import SupportsMRoPE, SupportsXDRoPE
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 
@@ -98,6 +98,39 @@ class RopeState:
         num_computed_tokens: torch.Tensor,
     ) -> None:
         num_reqs = idx_mapping.shape[0]
+        if not HAS_TRITON:
+            for batch_idx in range(num_reqs):
+                req_state_idx = int(idx_mapping[batch_idx].item())
+                prefill_len = int(prefill_lens[req_state_idx].item())
+                num_computed = int(num_computed_tokens[req_state_idx].item())
+                query_start = int(query_start_loc[batch_idx].item())
+                query_end = int(query_start_loc[batch_idx + 1].item())
+                query_len = query_end - query_start
+                if query_len <= 0:
+                    continue
+
+                if num_computed < prefill_len:
+                    for dim_idx in range(self.num_dims):
+                        prefill_row_idx = self.num_dims * req_state_idx + dim_idx
+                        self.positions[dim_idx, query_start:query_end].copy_(
+                            self.prefill_positions.gpu[
+                                prefill_row_idx,
+                                num_computed : num_computed + query_len,
+                            ]
+                        )
+                else:
+                    delta = int(self.prefill_delta.gpu[req_state_idx].item())
+                    pos = torch.arange(
+                        num_computed,
+                        num_computed + query_len,
+                        device=self.positions.device,
+                        dtype=self.positions.dtype,
+                    )
+                    pos = pos + delta
+                    for dim_idx in range(self.num_dims):
+                        self.positions[dim_idx, query_start:query_end].copy_(pos)
+            return
+
         _prepare_rope_positions_kernel[(num_reqs,)](
             self.positions,
             self.positions.stride(0),

@@ -2,6 +2,8 @@
 
 #include "ops.h"
 
+#include <ATen/ops/scaled_dot_product_attention.h>
+
 #include <algorithm>
 #include <limits>
 #include <vector>
@@ -454,6 +456,276 @@ torch::Tensor correct_attn_out_precompiled(torch::Tensor& out,
                                  : torch::exp(local_lse * kLogE2);
   out.mul_(factor.unsqueeze(-1).to(out.scalar_type()));
   return lse;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> dcp_lse_combine_precompiled(
+    const torch::Tensor& recv_output, const torch::Tensor& recv_lse,
+    bool return_lse, bool is_lse_base_on_e) {
+  TORCH_CHECK(recv_output.is_cuda(),
+              "dcp_lse_combine_precompiled expects CUDA recv_output");
+  TORCH_CHECK(recv_lse.is_cuda(),
+              "dcp_lse_combine_precompiled expects CUDA recv_lse");
+  TORCH_CHECK(recv_output.dim() == 4,
+              "dcp_lse_combine_precompiled expects recv_output with shape "
+              "[N, B, H, D]");
+  TORCH_CHECK(recv_lse.dim() == 3,
+              "dcp_lse_combine_precompiled expects recv_lse with shape "
+              "[N, B, H]");
+  TORCH_CHECK(recv_output.size(0) == recv_lse.size(0) &&
+                  recv_output.size(1) == recv_lse.size(1) &&
+                  recv_output.size(2) == recv_lse.size(2),
+              "dcp_lse_combine_precompiled expects recv_output [N, B, H, D] "
+              "and recv_lse [N, B, H] to agree on [N, B, H]");
+
+  const double neg_inf = -std::numeric_limits<double>::infinity();
+  auto neg_inf_scalar = torch::full({}, neg_inf, recv_lse.options());
+
+  auto sanitized = torch::where(
+      torch::isnan(recv_lse) | torch::isinf(recv_lse), neg_inf_scalar, recv_lse);
+  auto lse_max = sanitized.amax(0);
+  lse_max = torch::where(lse_max == neg_inf_scalar, torch::zeros_like(lse_max),
+                         lse_max);
+
+  auto shifted = sanitized - lse_max.unsqueeze(0);
+  torch::Tensor weights;
+  torch::Tensor global_lse;
+  if (is_lse_base_on_e) {
+    weights = torch::exp(shifted);
+    global_lse = torch::log(weights.sum(0)) + lse_max;
+  } else {
+    weights = torch::exp(shifted * kLogE2);
+    global_lse = torch::log(weights.sum(0)) * kLog2E + lse_max;
+  }
+
+  weights = torch::where(torch::isnan(weights), torch::zeros_like(weights), weights);
+  auto weight_sum = weights.sum(0, true);
+  auto normalized = weights / weight_sum.clamp_min(1e-10);
+  auto result =
+      (recv_output.to(torch::kFloat32) *
+       normalized.unsqueeze(-1).to(torch::kFloat32))
+          .sum(0)
+          .to(recv_output.scalar_type());
+
+  if (!return_lse) {
+    global_lse = torch::empty({0}, recv_lse.options());
+  }
+
+  return {result, global_lse};
+}
+
+void prefill_attention_precompiled(torch::Tensor& output,
+                                   const torch::Tensor& q,
+                                   const torch::Tensor& k,
+                                   const torch::Tensor& v,
+                                   const torch::Tensor& b_start_loc,
+                                   const torch::Tensor& b_seq_len,
+                                   bool is_causal, double softmax_scale,
+                                   int64_t sliding_window_q,
+                                   int64_t sliding_window_k) {
+  TORCH_CHECK(output.is_cuda(),
+              "prefill_attention_precompiled expects CUDA output");
+  TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
+              "prefill_attention_precompiled expects CUDA q/k/v");
+  TORCH_CHECK(b_start_loc.is_cuda() && b_seq_len.is_cuda(),
+              "prefill_attention_precompiled expects CUDA sequence metadata");
+  TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && output.dim() == 3,
+              "prefill_attention_precompiled expects q/k/v/output with "
+              "shape [T, H, D]");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0) &&
+                  q.size(0) == output.size(0),
+              "prefill_attention_precompiled expects q/k/v/output to agree "
+              "on token dimension");
+  TORCH_CHECK(output.size(1) == q.size(1),
+              "prefill_attention_precompiled expects output heads to match "
+              "query heads");
+  TORCH_CHECK(q.size(2) == k.size(2) && q.size(2) == v.size(2) &&
+                  q.size(2) == output.size(2),
+              "prefill_attention_precompiled expects q/k/v/output to agree "
+              "on head dimension");
+  TORCH_CHECK(k.size(1) == v.size(1),
+              "prefill_attention_precompiled expects matching KV heads");
+  TORCH_CHECK(q.size(1) % k.size(1) == 0,
+              "prefill_attention_precompiled expects query heads to be a "
+              "multiple of KV heads");
+  TORCH_CHECK(b_start_loc.dim() == 1 && b_seq_len.dim() == 1,
+              "prefill_attention_precompiled expects 1D sequence metadata");
+  TORCH_CHECK(b_start_loc.numel() == b_seq_len.numel(),
+              "prefill_attention_precompiled expects b_start_loc and "
+              "b_seq_len to have the same batch size");
+
+  const int64_t batch = b_seq_len.numel();
+  const int64_t kv_group_num = q.size(1) / k.size(1);
+  const int64_t q_window = std::max<int64_t>(sliding_window_q, 0);
+  const int64_t k_window = std::max<int64_t>(sliding_window_k, 0);
+  auto starts_cpu = b_start_loc.to(torch::kLong).cpu();
+  auto seq_lens_cpu = b_seq_len.to(torch::kLong).cpu();
+  auto long_options =
+      torch::TensorOptions().dtype(torch::kLong).device(q.device());
+  auto bool_options =
+      torch::TensorOptions().dtype(torch::kBool).device(q.device());
+
+  for (int64_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
+    const int64_t seq_start = starts_cpu[batch_idx].item<int64_t>();
+    const int64_t seq_len = seq_lens_cpu[batch_idx].item<int64_t>();
+    const int64_t seq_stop = seq_start + seq_len;
+
+    TORCH_CHECK(seq_len >= 0,
+                "prefill_attention_precompiled expects non-negative "
+                "sequence lengths");
+    if (seq_len == 0) {
+      continue;
+    }
+
+    auto q_seq = q.slice(0, seq_start, seq_stop).to(torch::kFloat32);
+    auto k_seq = k.slice(0, seq_start, seq_stop).to(torch::kFloat32);
+    auto v_seq = v.slice(0, seq_start, seq_stop).to(torch::kFloat32);
+
+    auto q_heads = q_seq.permute({1, 0, 2}).contiguous();
+    auto k_heads = k_seq.permute({1, 0, 2}).contiguous();
+    auto v_heads = v_seq.permute({1, 0, 2}).contiguous();
+
+    if (kv_group_num > 1) {
+      k_heads = k_heads.repeat_interleave(kv_group_num, 0);
+      v_heads = v_heads.repeat_interleave(kv_group_num, 0);
+    }
+
+    auto positions = torch::arange(seq_len, long_options);
+    auto q_pos = positions.unsqueeze(1);
+    auto k_pos = positions.unsqueeze(0);
+    auto mask = torch::ones({seq_len, seq_len}, bool_options);
+
+    if (is_causal) {
+      mask = mask & (q_pos >= k_pos);
+    }
+    if (q_window > 0) {
+      mask = mask & ((q_pos - k_pos) <= q_window);
+    }
+    if (k_window > 0) {
+      mask = mask & ((k_pos - q_pos) <= k_window);
+    }
+
+    std::optional<at::Tensor> attn_mask(mask.unsqueeze(0).unsqueeze(0));
+    auto out = at::scaled_dot_product_attention(
+                   q_heads.unsqueeze(0), k_heads.unsqueeze(0),
+                   v_heads.unsqueeze(0), attn_mask, 0.0, false,
+                   std::optional<double>(softmax_scale), false)
+                   .squeeze(0);
+    output.slice(0, seq_start, seq_stop)
+        .copy_(out.permute({1, 0, 2}).to(output.scalar_type()));
+  }
+}
+
+void prefix_prefill_attention_precompiled(
+    torch::Tensor& output, const torch::Tensor& q, const torch::Tensor& k,
+    const torch::Tensor& v, const torch::Tensor& gathered_ctx_k,
+    const torch::Tensor& gathered_ctx_v, const torch::Tensor& cu_ctx_lens,
+    const torch::Tensor& b_start_loc, const torch::Tensor& b_seq_len,
+    double sm_scale, int64_t sliding_window, bool skip_decode) {
+  TORCH_CHECK(output.is_cuda(),
+              "prefix_prefill_attention_precompiled expects CUDA output");
+  TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
+              "prefix_prefill_attention_precompiled expects CUDA q/k/v");
+  TORCH_CHECK(gathered_ctx_k.is_cuda() && gathered_ctx_v.is_cuda(),
+              "prefix_prefill_attention_precompiled expects CUDA gathered "
+              "context tensors");
+  TORCH_CHECK(cu_ctx_lens.is_cuda(),
+              "prefix_prefill_attention_precompiled expects CUDA cu_ctx_lens");
+  TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && output.dim() == 3,
+              "prefix_prefill_attention_precompiled expects q/k/v/output with "
+              "shape [T, H, D]");
+  TORCH_CHECK(gathered_ctx_k.dim() == 3 && gathered_ctx_v.dim() == 3,
+              "prefix_prefill_attention_precompiled expects gathered context "
+              "tensors with shape [Tctx, Hkv, D]");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0) &&
+                  q.size(0) == output.size(0),
+              "prefix_prefill_attention_precompiled expects q/k/v/output to "
+              "agree on token dimension");
+  TORCH_CHECK(q.size(2) == k.size(2) && q.size(2) == v.size(2) &&
+                  q.size(2) == output.size(2),
+              "prefix_prefill_attention_precompiled expects q/k/v/output to "
+              "agree on head dimension");
+  TORCH_CHECK(k.size(1) == v.size(1) && gathered_ctx_k.size(1) == k.size(1) &&
+                  gathered_ctx_v.size(1) == v.size(1),
+              "prefix_prefill_attention_precompiled expects matching KV "
+              "heads");
+  TORCH_CHECK(q.size(1) % k.size(1) == 0,
+              "prefix_prefill_attention_precompiled expects query heads to be "
+              "a multiple of KV heads");
+  TORCH_CHECK(b_seq_len.dim() == 1 && b_start_loc.dim() == 1 &&
+                  cu_ctx_lens.dim() == 1,
+              "prefix_prefill_attention_precompiled expects 1D sequence "
+              "metadata tensors");
+  TORCH_CHECK(b_start_loc.numel() == b_seq_len.numel() + 1 &&
+                  cu_ctx_lens.numel() == b_seq_len.numel() + 1,
+              "prefix_prefill_attention_precompiled expects metadata prefix "
+              "sums with batch + 1 elements");
+
+  const int64_t batch = b_seq_len.numel();
+  const int64_t num_q_heads = q.size(1);
+  const int64_t num_kv_heads = k.size(1);
+  const int64_t kv_group_num = num_q_heads / num_kv_heads;
+  auto starts_cpu = b_start_loc.to(torch::kLong).cpu();
+  auto seq_lens_cpu = b_seq_len.to(torch::kLong).cpu();
+  auto cu_ctx_lens_cpu = cu_ctx_lens.to(torch::kLong).cpu();
+  auto long_options =
+      torch::TensorOptions().dtype(torch::kLong).device(q.device());
+
+  for (int64_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
+    const int64_t seq_start = starts_cpu[batch_idx].item<int64_t>();
+    const int64_t seq_stop = starts_cpu[batch_idx + 1].item<int64_t>();
+    const int64_t query_len = seq_stop - seq_start;
+    const int64_t seq_len = seq_lens_cpu[batch_idx].item<int64_t>();
+    const int64_t ctx_start = cu_ctx_lens_cpu[batch_idx].item<int64_t>();
+    const int64_t ctx_stop = cu_ctx_lens_cpu[batch_idx + 1].item<int64_t>();
+    const int64_t ctx_len = ctx_stop - ctx_start;
+
+    TORCH_CHECK(query_len >= 0 && ctx_len >= 0,
+                "prefix_prefill_attention_precompiled expects non-negative "
+                "sequence lengths");
+    TORCH_CHECK(seq_len == ctx_len + query_len,
+                "prefix_prefill_attention_precompiled expects seq_len to "
+                "equal ctx_len + query_len");
+    if (query_len <= 0) {
+      continue;
+    }
+    if (skip_decode && query_len == 1) {
+      continue;
+    }
+
+    auto ctx_k = gathered_ctx_k.slice(0, ctx_start, ctx_stop).to(torch::kFloat32);
+    auto ctx_v = gathered_ctx_v.slice(0, ctx_start, ctx_stop).to(torch::kFloat32);
+    auto q_seq = q.slice(0, seq_start, seq_stop).to(torch::kFloat32);
+    auto k_seq = k.slice(0, seq_start, seq_stop).to(torch::kFloat32);
+    auto v_seq = v.slice(0, seq_start, seq_stop).to(torch::kFloat32);
+
+    auto all_k = torch::cat({ctx_k, k_seq}, 0);
+    auto all_v = torch::cat({ctx_v, v_seq}, 0);
+    auto q_heads = q_seq.permute({1, 0, 2}).contiguous();
+    auto k_heads = all_k.permute({1, 0, 2}).contiguous();
+    auto v_heads = all_v.permute({1, 0, 2}).contiguous();
+    if (kv_group_num > 1) {
+      k_heads = k_heads.repeat_interleave(kv_group_num, 0);
+      v_heads = v_heads.repeat_interleave(kv_group_num, 0);
+    }
+
+    auto query_positions =
+        torch::arange(ctx_len, ctx_len + query_len, long_options);
+    auto key_positions = torch::arange(0, ctx_len + query_len, long_options);
+    auto mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1);
+    if (sliding_window > 0) {
+      mask = mask & ((query_positions.unsqueeze(1) - key_positions.unsqueeze(0)) <
+                     sliding_window);
+    }
+
+    std::optional<at::Tensor> attn_mask(mask.unsqueeze(0).unsqueeze(0));
+    auto out = at::scaled_dot_product_attention(
+                   q_heads.unsqueeze(0), k_heads.unsqueeze(0),
+                   v_heads.unsqueeze(0), attn_mask, 0.0, false,
+                   std::optional<double>(sm_scale), false)
+                   .squeeze(0);
+    output.slice(0, seq_start, seq_stop)
+        .copy_(out.permute({1, 0, 2}).to(output.scalar_type()));
+  }
 }
 
 torch::Tensor pack_seq_precompiled(const torch::Tensor& x,
@@ -1504,6 +1776,829 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_precompiled(
   }
 
   return {output, final_state};
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+fused_recurrent_gated_delta_rule_packed_decode_precompiled(
+    const torch::Tensor& mixed_qkv, const torch::Tensor& a,
+    const torch::Tensor& b, const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias, double scale, torch::Tensor& initial_state,
+    torch::Tensor& out, const torch::Tensor& ssm_state_indices,
+    bool use_qk_l2norm_in_kernel) {
+  TORCH_CHECK(mixed_qkv.is_cuda() && a.is_cuda() && b.is_cuda() &&
+                  A_log.is_cuda() && dt_bias.is_cuda() &&
+                  initial_state.is_cuda() && out.is_cuda() &&
+                  ssm_state_indices.is_cuda(),
+              "fused_recurrent_gated_delta_rule_packed_decode_precompiled "
+              "expects CUDA tensors");
+  TORCH_CHECK(mixed_qkv.dim() == 2,
+              "mixed_qkv must be 2D for packed decode");
+  TORCH_CHECK(a.dim() == 2 && b.dim() == 2,
+              "a and b must be 2D for packed decode");
+  TORCH_CHECK(A_log.dim() == 1 && dt_bias.dim() == 1,
+              "A_log and dt_bias must be 1D for packed decode");
+  TORCH_CHECK(initial_state.dim() == 4,
+              "initial_state must be 4D for packed decode");
+  TORCH_CHECK(out.dim() == 4 && out.size(1) == 1,
+              "out must have shape [B, 1, HV, V] for packed decode");
+  TORCH_CHECK(ssm_state_indices.dim() == 1,
+              "ssm_state_indices must be 1D for packed decode");
+
+  const int64_t B = mixed_qkv.size(0);
+  const int64_t HV = initial_state.size(1);
+  const int64_t V = initial_state.size(2);
+  const int64_t K = initial_state.size(3);
+
+  TORCH_CHECK(a.size(0) == B && b.size(0) == B,
+              "a and b batch size must match mixed_qkv");
+  TORCH_CHECK(a.size(1) == HV && b.size(1) == HV,
+              "a and b hidden dimension must match initial_state");
+  TORCH_CHECK(A_log.numel() == HV && dt_bias.numel() == HV,
+              "A_log and dt_bias must have HV elements");
+  TORCH_CHECK(ssm_state_indices.numel() == B,
+              "ssm_state_indices must have B elements");
+  TORCH_CHECK(out.size(0) == B && out.size(2) == HV && out.size(3) == V,
+              "out shape must match [B, 1, HV, V]");
+
+  const int64_t qkv_dim = mixed_qkv.size(1);
+  const int64_t qk_dim = qkv_dim - HV * V;
+  TORCH_CHECK(qk_dim > 0 && qk_dim % 2 == 0,
+              "Invalid packed mixed_qkv size for packed decode");
+  const int64_t q_dim = qk_dim / 2;
+  TORCH_CHECK(q_dim % K == 0,
+              "Packed decode q_dim must be divisible by K");
+  const int64_t H = q_dim / K;
+  TORCH_CHECK(H > 0 && HV % H == 0,
+              "Packed decode inferred invalid head configuration");
+  const int64_t hv_per_h = HV / H;
+
+  auto index_options =
+      torch::TensorOptions().dtype(torch::kLong).device(mixed_qkv.device());
+
+  auto safe_indices =
+      ssm_state_indices.to(mixed_qkv.device(), torch::kLong, false, false)
+          .contiguous();
+  auto valid_mask = safe_indices >= 0;
+  auto gather_indices = torch::clamp_min(safe_indices, 0);
+
+  auto mixed_qkv_f = mixed_qkv.to(torch::kFloat32);
+  auto packed_q = mixed_qkv_f.slice(1, 0, q_dim).view({B, H, K});
+  auto packed_k = mixed_qkv_f.slice(1, q_dim, 2 * q_dim).view({B, H, K});
+  auto packed_v = mixed_qkv_f.slice(1, 2 * q_dim, qkv_dim).view({B, HV, V});
+
+  std::vector<int64_t> h_index_vec(HV);
+  for (int64_t idx = 0; idx < HV; ++idx) {
+    h_index_vec[idx] = idx / hv_per_h;
+  }
+  auto h_indices = torch::tensor(h_index_vec, index_options);
+
+  auto q = packed_q.index_select(1, h_indices);
+  auto k = packed_k.index_select(1, h_indices);
+  if (use_qk_l2norm_in_kernel) {
+    q = l2norm_last_dim(q);
+    k = l2norm_last_dim(k);
+  }
+  q = q * scale;
+
+  auto h = initial_state.index_select(0, gather_indices).to(torch::kFloat32);
+  auto g_input =
+      a.to(torch::kFloat32) + dt_bias.to(torch::kFloat32).view({1, HV});
+  auto g =
+      (-torch::exp(A_log.to(torch::kFloat32)).view({1, HV, 1, 1}) *
+       softplus_with_threshold(g_input, 1.0, 20.0).view({B, HV, 1, 1}));
+  auto beta = torch::sigmoid(b.to(torch::kFloat32)).view({B, HV, 1});
+
+  h = h * torch::exp(g);
+  auto v = (packed_v - (h * k.unsqueeze(-2)).sum(-1)) * beta;
+  auto updated_h = h + v.unsqueeze(-1) * k.unsqueeze(-2);
+  auto out_values = (updated_h * q.unsqueeze(-2)).sum(-1);
+
+  auto out_slice = out.select(1, 0);
+  out_slice.copy_(torch::where(valid_mask.view({B, 1, 1}), out_values,
+                               torch::zeros_like(out_values))
+                      .to(out.scalar_type()));
+
+  if (valid_mask.any().item<bool>()) {
+    auto valid_rows = torch::nonzero(valid_mask).view(-1);
+    auto valid_gather_indices = gather_indices.index_select(0, valid_rows);
+    auto valid_updated_h =
+        updated_h.to(initial_state.scalar_type()).index_select(0, valid_rows);
+    initial_state.index_copy_(0, valid_gather_indices, valid_updated_h);
+  }
+
+  return {out, initial_state};
+}
+
+torch::Tensor l2norm_precompiled(
+    const torch::Tensor& x, double eps,
+    const std::optional<torch::ScalarType>& output_dtype) {
+  TORCH_CHECK(x.is_cuda(), "l2norm_precompiled expects CUDA input");
+  TORCH_CHECK(x.dim() >= 1, "l2norm_precompiled expects rank >= 1");
+
+  const auto original_sizes = x.sizes().vec();
+  auto x_contiguous = x.contiguous();
+  auto x_flat = x_contiguous.view({-1, x_contiguous.size(-1)});
+  auto y = l2norm_last_dim(x_flat.to(torch::kFloat32));
+  auto resolved_dtype = output_dtype.value_or(x.scalar_type());
+  return y.to(resolved_dtype).view(original_sizes);
+}
+
+torch::Tensor chunk_local_cumsum_precompiled(
+    const torch::Tensor& g, int64_t chunk_size, bool reverse,
+    const std::optional<torch::Tensor>& cu_seqlens, bool head_first,
+    const std::optional<torch::ScalarType>& output_dtype) {
+  TORCH_CHECK(g.is_cuda(), "chunk_local_cumsum_precompiled expects CUDA input");
+  TORCH_CHECK(g.dim() == 3 || g.dim() == 4,
+              "chunk_local_cumsum_precompiled expects rank 3 or 4 input");
+  TORCH_CHECK(chunk_size > 0 && (chunk_size & (chunk_size - 1)) == 0,
+              "chunk_size must be a power of 2");
+  if (cu_seqlens.has_value()) {
+    TORCH_CHECK(g.size(0) == 1,
+                "Only batch size 1 is supported when cu_seqlens are "
+                "provided");
+    TORCH_CHECK(cu_seqlens.value().dim() == 1 && cu_seqlens.value().numel() >= 2,
+                "cu_seqlens must be a 1D tensor with at least 2 elements");
+  }
+
+  auto seq_major = g.contiguous();
+  if (head_first) {
+    seq_major = g.dim() == 3 ? seq_major.permute({0, 2, 1}).contiguous()
+                             : seq_major.permute({0, 2, 1, 3}).contiguous();
+  }
+
+  const auto resolved_dtype = output_dtype.value_or(g.scalar_type());
+  auto out = torch::empty(seq_major.sizes(),
+                          seq_major.options().dtype(resolved_dtype));
+
+  auto write_sequence = [&](const torch::Tensor& src_seq,
+                            torch::Tensor dst_seq) {
+    const int64_t token_count = src_seq.size(0);
+    if (token_count == 0) {
+      return;
+    }
+    const int64_t flat_width = src_seq.numel() / token_count;
+    auto src_flat =
+        src_seq.reshape({token_count, flat_width}).to(torch::kFloat32);
+    auto dst_flat = torch::empty({token_count, flat_width},
+                                 src_flat.options().dtype(torch::kFloat32));
+
+    for (int64_t chunk_start = 0; chunk_start < token_count;
+         chunk_start += chunk_size) {
+      const int64_t chunk_end = std::min(chunk_start + chunk_size, token_count);
+      auto chunk = src_flat.slice(0, chunk_start, chunk_end);
+      auto chunk_out =
+          reverse ? torch::flip(torch::cumsum(torch::flip(chunk, {0}), 0), {0})
+                  : torch::cumsum(chunk, 0);
+      dst_flat.slice(0, chunk_start, chunk_end).copy_(chunk_out);
+    }
+
+    dst_seq.copy_(dst_flat.reshape(src_seq.sizes().vec()).to(resolved_dtype));
+  };
+
+  if (cu_seqlens.has_value()) {
+    auto cu = cu_seqlens.value().to(g.device(), torch::kLong, false, false)
+                  .contiguous();
+    const int64_t num_sequences = cu.numel() - 1;
+    for (int64_t seq_idx = 0; seq_idx < num_sequences; ++seq_idx) {
+      const int64_t seq_start = cu[seq_idx].item<int64_t>();
+      const int64_t seq_end = cu[seq_idx + 1].item<int64_t>();
+      if (seq_end <= seq_start) {
+        continue;
+      }
+      write_sequence(seq_major[0].slice(0, seq_start, seq_end),
+                     out[0].slice(0, seq_start, seq_end));
+    }
+  } else {
+    for (int64_t batch_idx = 0; batch_idx < seq_major.size(0); ++batch_idx) {
+      write_sequence(seq_major[batch_idx], out[batch_idx]);
+    }
+  }
+
+  if (head_first) {
+    return g.dim() == 3 ? out.permute({0, 2, 1}).contiguous()
+                        : out.permute({0, 2, 1, 3}).contiguous();
+  }
+  return out;
+}
+
+torch::Tensor chunk_fwd_o_precompiled(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& h, const std::optional<torch::Tensor>& g,
+    double scale, const std::optional<torch::Tensor>& cu_seqlens,
+    int64_t block_size) {
+  TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && h.is_cuda(),
+              "chunk_fwd_o_precompiled expects CUDA q/k/v/h");
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && h.dim() == 5,
+              "chunk_fwd_o_precompiled expects q/k/v rank 4 and h rank 5");
+  TORCH_CHECK(q.sizes() == k.sizes(),
+              "chunk_fwd_o_precompiled expects q and k to share shape");
+  TORCH_CHECK(q.size(0) == v.size(0) && q.size(1) == v.size(1),
+              "chunk_fwd_o_precompiled expects q/k and v to share batch/time");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+
+  const int64_t B = q.size(0);
+  const int64_t T = q.size(1);
+  const int64_t Hg = q.size(2);
+  const int64_t K = q.size(3);
+  const int64_t H = v.size(2);
+  const int64_t V = v.size(3);
+  TORCH_CHECK(Hg > 0 && H % Hg == 0,
+              "chunk_fwd_o_precompiled expects H divisible by Hg");
+  TORCH_CHECK(h.size(0) == B && h.size(2) == H && h.size(3) == V &&
+                  h.size(4) == K,
+              "chunk_fwd_o_precompiled expects h shape [B, NT, H, V, K]");
+  if (g.has_value()) {
+    TORCH_CHECK(g.value().is_cuda(),
+                "chunk_fwd_o_precompiled expects CUDA g when provided");
+    TORCH_CHECK(g.value().dim() == 3 && g.value().size(0) == B &&
+                    g.value().size(1) == T && g.value().size(2) == H,
+                "chunk_fwd_o_precompiled expects g shape [B, T, H]");
+  }
+
+  auto q_f = q.to(torch::kFloat32);
+  auto k_f = k.to(torch::kFloat32);
+  auto v_f = v.to(torch::kFloat32);
+  auto h_f = h.to(torch::kFloat32);
+  std::optional<torch::Tensor> g_f = std::nullopt;
+  if (g.has_value()) {
+    g_f = g.value().to(torch::kFloat32);
+  }
+  auto out = torch::empty_like(v);
+
+  const int64_t heads_per_group = H / Hg;
+
+  auto write_chunk = [&](int64_t batch_idx, int64_t chunk_h_idx,
+                         int64_t start, int64_t end) {
+    if (end <= start) {
+      return;
+    }
+    auto q_chunk_all = q_f[batch_idx].slice(0, start, end);
+    auto k_chunk_all = k_f[batch_idx].slice(0, start, end);
+    auto v_chunk_all = v_f[batch_idx].slice(0, start, end);
+    std::optional<torch::Tensor> g_chunk_all = std::nullopt;
+    if (g_f.has_value()) {
+      g_chunk_all = g_f.value()[batch_idx].slice(0, start, end);
+    }
+
+    for (int64_t head_idx = 0; head_idx < H; ++head_idx) {
+      const int64_t group_idx = head_idx / heads_per_group;
+      auto q_chunk = q_chunk_all.select(1, group_idx);
+      auto k_chunk = k_chunk_all.select(1, group_idx);
+      auto v_chunk = v_chunk_all.select(1, head_idx);
+      auto h_chunk = h_f[batch_idx][chunk_h_idx][head_idx];
+
+      auto out_chunk = torch::matmul(q_chunk, h_chunk.transpose(0, 1));
+      auto attn_chunk = torch::matmul(q_chunk, k_chunk.transpose(0, 1));
+      if (g_chunk_all.has_value()) {
+        auto g_chunk = g_chunk_all.value().select(1, head_idx);
+        auto g_exp = torch::exp(g_chunk).unsqueeze(-1);
+        out_chunk = out_chunk * g_exp;
+        attn_chunk =
+            attn_chunk *
+            torch::exp(g_chunk.unsqueeze(-1) - g_chunk.unsqueeze(0));
+      }
+      attn_chunk = torch::tril(attn_chunk);
+      out_chunk = (out_chunk + torch::matmul(attn_chunk, v_chunk)) * scale;
+      out[batch_idx].slice(0, start, end).select(1, head_idx).copy_(
+          out_chunk.to(out.scalar_type()));
+    }
+  };
+
+  if (cu_seqlens.has_value()) {
+    TORCH_CHECK(B == 1,
+                "Only batch size 1 is supported when cu_seqlens are provided");
+    auto cu = cu_seqlens.value().to(q.device(), torch::kLong, false, false)
+                  .contiguous();
+    TORCH_CHECK(cu.dim() == 1 && cu.numel() >= 2,
+                "cu_seqlens must be a 1D tensor with at least 2 elements");
+    int64_t global_chunk_idx = 0;
+    for (int64_t seq_idx = 0; seq_idx < cu.numel() - 1; ++seq_idx) {
+      const int64_t seq_start = cu[seq_idx].item<int64_t>();
+      const int64_t seq_end = cu[seq_idx + 1].item<int64_t>();
+      const int64_t seq_len = seq_end - seq_start;
+      const int64_t local_chunks =
+          (seq_len + block_size - 1) / block_size;
+      for (int64_t local_chunk_idx = 0; local_chunk_idx < local_chunks;
+           ++local_chunk_idx) {
+        const int64_t start = seq_start + local_chunk_idx * block_size;
+        const int64_t end = std::min(start + block_size, seq_end);
+        write_chunk(0, global_chunk_idx, start, end);
+        ++global_chunk_idx;
+      }
+    }
+    TORCH_CHECK(h.size(1) == global_chunk_idx,
+                "chunk_fwd_o_precompiled got unexpected h chunk dimension for "
+                "varlen input");
+  } else {
+    const int64_t total_chunks = (T + block_size - 1) / block_size;
+    TORCH_CHECK(h.size(1) == total_chunks,
+                "chunk_fwd_o_precompiled got unexpected h chunk dimension");
+    for (int64_t batch_idx = 0; batch_idx < B; ++batch_idx) {
+      for (int64_t chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
+        const int64_t start = chunk_idx * block_size;
+        const int64_t end = std::min(start + block_size, T);
+        write_chunk(batch_idx, chunk_idx, start, end);
+      }
+    }
+  }
+
+  return out;
+}
+
+torch::Tensor chunk_scaled_dot_kkt_fwd_precompiled(
+    const torch::Tensor& k, const std::optional<torch::Tensor>& g,
+    const torch::Tensor& beta, const std::optional<torch::Tensor>& cu_seqlens,
+    int64_t chunk_size,
+    const std::optional<torch::ScalarType>& output_dtype) {
+  TORCH_CHECK(k.is_cuda() && beta.is_cuda(),
+              "chunk_scaled_dot_kkt_fwd_precompiled expects CUDA k/beta");
+  TORCH_CHECK(k.dim() == 4 && beta.dim() == 3,
+              "chunk_scaled_dot_kkt_fwd_precompiled expects k rank 4 and "
+              "beta rank 3");
+  TORCH_CHECK(k.size(0) == beta.size(0) && k.size(1) == beta.size(1),
+              "chunk_scaled_dot_kkt_fwd_precompiled expects shared batch/time");
+  TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
+
+  const int64_t B = k.size(0);
+  const int64_t T = k.size(1);
+  const int64_t Hg = k.size(2);
+  const int64_t K = k.size(3);
+  const int64_t H = beta.size(2);
+  TORCH_CHECK(Hg > 0 && H % Hg == 0,
+              "chunk_scaled_dot_kkt_fwd_precompiled expects H divisible by Hg");
+  if (g.has_value()) {
+    TORCH_CHECK(g.value().is_cuda(),
+                "chunk_scaled_dot_kkt_fwd_precompiled expects CUDA g when "
+                "provided");
+    TORCH_CHECK(g.value().dim() == 3 && g.value().size(0) == B &&
+                    g.value().size(1) == T && g.value().size(2) == H,
+                "chunk_scaled_dot_kkt_fwd_precompiled expects g shape [B, T, H]");
+  }
+
+  const auto resolved_dtype = output_dtype.value_or(torch::kFloat32);
+  auto out = torch::zeros({B, T, H, chunk_size},
+                          k.options().dtype(resolved_dtype));
+  auto k_f = k.to(torch::kFloat32);
+  auto beta_f = beta.to(torch::kFloat32);
+  std::optional<torch::Tensor> g_f = std::nullopt;
+  if (g.has_value()) {
+    g_f = g.value().to(torch::kFloat32);
+  }
+
+  const int64_t heads_per_group = H / Hg;
+
+  auto write_chunk = [&](int64_t batch_idx, int64_t start, int64_t end) {
+    if (end <= start) {
+      return;
+    }
+    auto k_chunk_all = k_f[batch_idx].slice(0, start, end);
+    auto beta_chunk_all = beta_f[batch_idx].slice(0, start, end);
+    std::optional<torch::Tensor> g_chunk_all = std::nullopt;
+    if (g_f.has_value()) {
+      g_chunk_all = g_f.value()[batch_idx].slice(0, start, end);
+    }
+    const int64_t chunk_len = end - start;
+
+    for (int64_t head_idx = 0; head_idx < H; ++head_idx) {
+      const int64_t group_idx = head_idx / heads_per_group;
+      auto k_chunk = k_chunk_all.select(1, group_idx);
+      auto beta_chunk = beta_chunk_all.select(1, head_idx);
+      auto attn_chunk = torch::matmul(k_chunk * beta_chunk.unsqueeze(-1),
+                                      k_chunk.transpose(0, 1));
+      if (g_chunk_all.has_value()) {
+        auto g_chunk = g_chunk_all.value().select(1, head_idx);
+        attn_chunk =
+            attn_chunk *
+            torch::exp(g_chunk.unsqueeze(-1) - g_chunk.unsqueeze(0));
+      }
+      attn_chunk = torch::tril(attn_chunk, -1);
+      out[batch_idx].slice(0, start, end).select(1, head_idx)
+          .slice(1, 0, chunk_len)
+          .copy_(attn_chunk.to(resolved_dtype));
+    }
+  };
+
+  if (cu_seqlens.has_value()) {
+    TORCH_CHECK(B == 1,
+                "Only batch size 1 is supported when cu_seqlens are provided");
+    auto cu = cu_seqlens.value().to(k.device(), torch::kLong, false, false)
+                  .contiguous();
+    TORCH_CHECK(cu.dim() == 1 && cu.numel() >= 2,
+                "cu_seqlens must be a 1D tensor with at least 2 elements");
+    for (int64_t seq_idx = 0; seq_idx < cu.numel() - 1; ++seq_idx) {
+      const int64_t seq_start = cu[seq_idx].item<int64_t>();
+      const int64_t seq_end = cu[seq_idx + 1].item<int64_t>();
+      const int64_t seq_len = seq_end - seq_start;
+      const int64_t local_chunks = (seq_len + chunk_size - 1) / chunk_size;
+      for (int64_t chunk_idx = 0; chunk_idx < local_chunks; ++chunk_idx) {
+        const int64_t start = seq_start + chunk_idx * chunk_size;
+        const int64_t end = std::min(start + chunk_size, seq_end);
+        write_chunk(0, start, end);
+      }
+    }
+  } else {
+    const int64_t total_chunks = (T + chunk_size - 1) / chunk_size;
+    for (int64_t batch_idx = 0; batch_idx < B; ++batch_idx) {
+      for (int64_t chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
+        const int64_t start = chunk_idx * chunk_size;
+        const int64_t end = std::min(start + chunk_size, T);
+        write_chunk(batch_idx, start, end);
+      }
+    }
+  }
+
+  return out;
+}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>>
+chunk_gated_delta_rule_fwd_h_precompiled(
+    const torch::Tensor& k, const torch::Tensor& w, const torch::Tensor& u,
+    const std::optional<torch::Tensor>& g,
+    const std::optional<torch::Tensor>& gk,
+    const std::optional<torch::Tensor>& initial_state, bool output_final_state,
+    int64_t chunk_size, bool save_new_value,
+    const std::optional<torch::Tensor>& cu_seqlens) {
+  TORCH_CHECK(k.is_cuda() && w.is_cuda() && u.is_cuda(),
+              "chunk_gated_delta_rule_fwd_h_precompiled expects CUDA k/w/u");
+  TORCH_CHECK(k.dim() == 4 && w.dim() == 4 && u.dim() == 4,
+              "chunk_gated_delta_rule_fwd_h_precompiled expects k/w/u rank 4");
+  TORCH_CHECK(k.size(0) == w.size(0) && k.size(0) == u.size(0) &&
+                  k.size(1) == w.size(1) && k.size(1) == u.size(1),
+              "chunk_gated_delta_rule_fwd_h_precompiled expects shared "
+              "batch/time dimensions");
+  TORCH_CHECK(w.size(2) == u.size(2),
+              "chunk_gated_delta_rule_fwd_h_precompiled expects shared head "
+              "dimension for w/u");
+  TORCH_CHECK(w.size(3) == k.size(3),
+              "chunk_gated_delta_rule_fwd_h_precompiled expects shared K "
+              "dimension for k/w");
+  TORCH_CHECK(chunk_size > 0,
+              "chunk_gated_delta_rule_fwd_h_precompiled expects positive "
+              "chunk_size");
+
+  const int64_t B = k.size(0);
+  const int64_t T = k.size(1);
+  const int64_t Hg = k.size(2);
+  const int64_t K = k.size(3);
+  const int64_t H = u.size(2);
+  const int64_t V = u.size(3);
+  TORCH_CHECK(Hg > 0 && H % Hg == 0,
+              "chunk_gated_delta_rule_fwd_h_precompiled expects H divisible "
+              "by Hg");
+  TORCH_CHECK(K <= 256,
+              "chunk_gated_delta_rule_fwd_h_precompiled only supports K <= 256");
+
+  if (g.has_value()) {
+    TORCH_CHECK(g.value().is_cuda(),
+                "chunk_gated_delta_rule_fwd_h_precompiled expects CUDA g when "
+                "provided");
+    TORCH_CHECK(g.value().dim() == 3 && g.value().size(0) == B &&
+                    g.value().size(1) == T && g.value().size(2) == H,
+                "chunk_gated_delta_rule_fwd_h_precompiled expects g shape "
+                "[B, T, H]");
+  }
+  if (gk.has_value()) {
+    TORCH_CHECK(gk.value().is_cuda(),
+                "chunk_gated_delta_rule_fwd_h_precompiled expects CUDA gk when "
+                "provided");
+    TORCH_CHECK(gk.value().dim() == 4 && gk.value().size(0) == B &&
+                    gk.value().size(1) == T && gk.value().size(2) == H &&
+                    gk.value().size(3) == K,
+                "chunk_gated_delta_rule_fwd_h_precompiled expects gk shape "
+                "[B, T, H, K]");
+  }
+
+  int64_t N = B;
+  int64_t total_chunks = 0;
+  int64_t chunk_dim = (T + chunk_size - 1) / chunk_size;
+  std::optional<torch::Tensor> cu = std::nullopt;
+  if (cu_seqlens.has_value()) {
+    TORCH_CHECK(B == 1,
+                "Only batch size 1 is supported when cu_seqlens are provided");
+    cu = cu_seqlens.value().to(k.device(), torch::kLong, false, false)
+             .contiguous();
+    TORCH_CHECK(cu.value().dim() == 1 && cu.value().numel() >= 2,
+                "cu_seqlens must be a 1D tensor with at least 2 elements");
+    N = cu.value().numel() - 1;
+    for (int64_t seq_idx = 0; seq_idx < N; ++seq_idx) {
+      const int64_t seq_start = cu.value()[seq_idx].item<int64_t>();
+      const int64_t seq_end = cu.value()[seq_idx + 1].item<int64_t>();
+      TORCH_CHECK(seq_end >= seq_start,
+                  "chunk_gated_delta_rule_fwd_h_precompiled expects "
+                  "non-decreasing cu_seqlens");
+      const int64_t seq_len = seq_end - seq_start;
+      total_chunks += (seq_len + chunk_size - 1) / chunk_size;
+    }
+    chunk_dim = total_chunks;
+  } else {
+    total_chunks = B * chunk_dim;
+  }
+
+  if (initial_state.has_value()) {
+    TORCH_CHECK(initial_state.value().is_cuda(),
+                "chunk_gated_delta_rule_fwd_h_precompiled expects CUDA "
+                "initial_state when provided");
+    TORCH_CHECK(initial_state.value().dim() == 4 &&
+                    initial_state.value().size(0) == N &&
+                    initial_state.value().size(1) == H &&
+                    initial_state.value().size(2) == V &&
+                    initial_state.value().size(3) == K,
+                "chunk_gated_delta_rule_fwd_h_precompiled expects "
+                "initial_state shape [N, H, V, K]");
+  }
+
+  auto h = torch::empty({B, chunk_dim, H, V, K}, k.options());
+  std::optional<torch::Tensor> v_new = std::nullopt;
+  if (save_new_value) {
+    v_new = torch::empty_like(u);
+  }
+  std::optional<torch::Tensor> final_state = std::nullopt;
+  if (output_final_state) {
+    final_state = torch::empty({N, H, V, K}, k.options().dtype(torch::kFloat32));
+  }
+
+  auto k_f = k.to(torch::kFloat32);
+  auto w_f = w.to(torch::kFloat32);
+  auto u_f = u.to(torch::kFloat32);
+  std::optional<torch::Tensor> g_f = std::nullopt;
+  if (g.has_value()) {
+    g_f = g.value().to(torch::kFloat32);
+  }
+  std::optional<torch::Tensor> gk_f = std::nullopt;
+  if (gk.has_value()) {
+    gk_f = gk.value().to(torch::kFloat32);
+  }
+  std::optional<torch::Tensor> initial_state_f = std::nullopt;
+  if (initial_state.has_value()) {
+    initial_state_f = initial_state.value().to(torch::kFloat32);
+  }
+
+  const int64_t heads_per_group = H / Hg;
+  int64_t global_chunk_idx = 0;
+
+  auto process_sequence = [&](int64_t seq_idx, int64_t batch_idx, int64_t seq_start,
+                              int64_t seq_end) {
+    std::vector<torch::Tensor> state_per_head;
+    state_per_head.reserve(H);
+    for (int64_t head_idx = 0; head_idx < H; ++head_idx) {
+      if (initial_state_f.has_value()) {
+        state_per_head.push_back(initial_state_f.value()[seq_idx][head_idx].clone());
+      } else {
+        state_per_head.push_back(
+            torch::zeros({V, K}, k.options().dtype(torch::kFloat32)));
+      }
+    }
+
+    const int64_t seq_len = seq_end - seq_start;
+    const int64_t local_chunks = (seq_len + chunk_size - 1) / chunk_size;
+    for (int64_t local_chunk_idx = 0; local_chunk_idx < local_chunks;
+         ++local_chunk_idx) {
+      const int64_t chunk_start = seq_start + local_chunk_idx * chunk_size;
+      const int64_t chunk_end = std::min(chunk_start + chunk_size, seq_end);
+      for (int64_t head_idx = 0; head_idx < H; ++head_idx) {
+        const int64_t group_idx = head_idx / heads_per_group;
+        auto state = state_per_head[head_idx];
+        const int64_t h_chunk_idx = cu.has_value() ? global_chunk_idx : local_chunk_idx;
+        h[batch_idx][h_chunk_idx][head_idx].copy_(
+            state.to(h.scalar_type()));
+
+        auto k_chunk = k_f[batch_idx].slice(0, chunk_start, chunk_end).select(
+            1, group_idx);
+        auto w_chunk = w_f[batch_idx].slice(0, chunk_start, chunk_end).select(
+            1, head_idx);
+        auto u_chunk = u_f[batch_idx].slice(0, chunk_start, chunk_end).select(
+            1, head_idx);
+        auto delta_value =
+            u_chunk - torch::matmul(w_chunk, state.transpose(0, 1));
+
+        if (v_new.has_value()) {
+          v_new.value()[batch_idx].slice(0, chunk_start, chunk_end)
+              .select(1, head_idx)
+              .copy_(delta_value.to(v_new.value().scalar_type()));
+        }
+
+        if (g_f.has_value()) {
+          auto g_chunk = g_f.value()[batch_idx].slice(0, chunk_start, chunk_end)
+                             .select(1, head_idx);
+          auto g_last = g_chunk[-1];
+          delta_value =
+              delta_value * torch::exp(g_last - g_chunk).unsqueeze(-1);
+          state = state * torch::exp(g_last);
+        }
+        if (gk_f.has_value()) {
+          auto gk_last = gk_f.value()[batch_idx][chunk_end - 1][head_idx];
+          state = state * torch::exp(gk_last).unsqueeze(0);
+        }
+
+        state = state + torch::matmul(delta_value.transpose(0, 1), k_chunk);
+        state_per_head[head_idx] = state;
+      }
+      ++global_chunk_idx;
+    }
+
+    if (final_state.has_value()) {
+      for (int64_t head_idx = 0; head_idx < H; ++head_idx) {
+        final_state.value()[seq_idx][head_idx].copy_(state_per_head[head_idx]);
+      }
+    }
+  };
+
+  if (cu.has_value()) {
+    for (int64_t seq_idx = 0; seq_idx < N; ++seq_idx) {
+      const int64_t seq_start = cu.value()[seq_idx].item<int64_t>();
+      const int64_t seq_end = cu.value()[seq_idx + 1].item<int64_t>();
+      process_sequence(seq_idx, 0, seq_start, seq_end);
+    }
+  } else {
+    for (int64_t batch_idx = 0; batch_idx < B; ++batch_idx) {
+      process_sequence(batch_idx, batch_idx, 0, T);
+      TORCH_CHECK(global_chunk_idx == (batch_idx + 1) * chunk_dim,
+                  "chunk_gated_delta_rule_fwd_h_precompiled internal chunk "
+                  "accounting mismatch");
+    }
+  }
+
+  TORCH_CHECK(global_chunk_idx == total_chunks,
+              "chunk_gated_delta_rule_fwd_h_precompiled internal chunk "
+              "accounting mismatch");
+  return {h, v_new, final_state};
+}
+
+torch::Tensor solve_tril_precompiled(
+    const torch::Tensor& A, const std::optional<torch::Tensor>& cu_seqlens,
+    const std::optional<torch::ScalarType>& output_dtype) {
+  TORCH_CHECK(A.is_cuda(), "solve_tril_precompiled expects CUDA input");
+  TORCH_CHECK(A.dim() == 4,
+              "solve_tril_precompiled expects rank-4 input [B, T, H, BT]");
+
+  const int64_t B = A.size(0);
+  const int64_t T = A.size(1);
+  const int64_t H = A.size(2);
+  const int64_t BT = A.size(3);
+  TORCH_CHECK(BT == 16 || BT == 32 || BT == 64,
+              "solve_tril_precompiled expects BT in {16, 32, 64}");
+
+  const auto resolved_dtype = output_dtype.value_or(torch::kFloat32);
+  auto out = torch::zeros_like(A, A.options().dtype(resolved_dtype));
+
+  auto write_chunk = [&](int64_t batch_idx, int64_t start, int64_t end) {
+    if (end <= start) {
+      return;
+    }
+    const int64_t chunk_len = end - start;
+    auto A_chunk = A[batch_idx].slice(0, start, end).to(torch::kFloat32);
+    auto identity = torch::eye(chunk_len, A.options().dtype(torch::kFloat32));
+
+    for (int64_t head_idx = 0; head_idx < H; ++head_idx) {
+      auto lower =
+          torch::tril(A_chunk.select(1, head_idx).slice(1, 0, chunk_len), -1);
+      auto inverse = torch::inverse(identity + lower);
+      out[batch_idx].slice(0, start, end).select(1, head_idx).slice(
+          1, 0, chunk_len).copy_(inverse.to(resolved_dtype));
+    }
+  };
+
+  if (cu_seqlens.has_value()) {
+    TORCH_CHECK(B == 1,
+                "Only batch size 1 is supported when cu_seqlens are provided");
+    auto cu = cu_seqlens.value().to(A.device(), torch::kLong, false, false)
+                  .contiguous();
+    TORCH_CHECK(cu.dim() == 1 && cu.numel() >= 2,
+                "cu_seqlens must be a 1D tensor with at least 2 elements");
+    for (int64_t seq_idx = 0; seq_idx < cu.numel() - 1; ++seq_idx) {
+      const int64_t seq_start = cu[seq_idx].item<int64_t>();
+      const int64_t seq_end = cu[seq_idx + 1].item<int64_t>();
+      TORCH_CHECK(seq_end >= seq_start,
+                  "solve_tril_precompiled expects non-decreasing cu_seqlens");
+      const int64_t seq_len = seq_end - seq_start;
+      const int64_t local_chunks = (seq_len + BT - 1) / BT;
+      for (int64_t chunk_idx = 0; chunk_idx < local_chunks; ++chunk_idx) {
+        const int64_t start = seq_start + chunk_idx * BT;
+        const int64_t end = std::min(start + BT, seq_end);
+        write_chunk(0, start, end);
+      }
+    }
+  } else {
+    const int64_t total_chunks = (T + BT - 1) / BT;
+    for (int64_t batch_idx = 0; batch_idx < B; ++batch_idx) {
+      for (int64_t chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
+        const int64_t start = chunk_idx * BT;
+        const int64_t end = std::min(start + BT, T);
+        write_chunk(batch_idx, start, end);
+      }
+    }
+  }
+
+  return out;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> recompute_w_u_fwd_precompiled(
+    const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& beta, const torch::Tensor& g_cumsum,
+    const torch::Tensor& A, const std::optional<torch::Tensor>& cu_seqlens) {
+  TORCH_CHECK(k.is_cuda() && v.is_cuda() && beta.is_cuda() &&
+                  g_cumsum.is_cuda() && A.is_cuda(),
+              "recompute_w_u_fwd_precompiled expects CUDA inputs");
+  TORCH_CHECK(k.dim() == 4 && v.dim() == 4 && beta.dim() == 3 &&
+                  g_cumsum.dim() == 3 && A.dim() == 4,
+              "recompute_w_u_fwd_precompiled expects k/v/A rank 4 and "
+              "beta/g_cumsum rank 3");
+  TORCH_CHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) &&
+                  k.size(0) == beta.size(0) && k.size(1) == beta.size(1) &&
+                  k.size(0) == g_cumsum.size(0) &&
+                  k.size(1) == g_cumsum.size(1) &&
+                  k.size(0) == A.size(0) && k.size(1) == A.size(1),
+              "recompute_w_u_fwd_precompiled expects shared batch/time "
+              "dimensions");
+
+  const int64_t B = k.size(0);
+  const int64_t T = k.size(1);
+  const int64_t Hg = k.size(2);
+  const int64_t K = k.size(3);
+  const int64_t H = v.size(2);
+  const int64_t V = v.size(3);
+  const int64_t BT = A.size(3);
+  TORCH_CHECK(beta.size(2) == H && g_cumsum.size(2) == H && A.size(2) == H,
+              "recompute_w_u_fwd_precompiled expects head dimensions to "
+              "match v");
+  TORCH_CHECK(Hg > 0 && H % Hg == 0,
+              "recompute_w_u_fwd_precompiled expects H divisible by Hg");
+
+  auto w = torch::empty({B, T, H, K}, k.options());
+  auto u = torch::empty_like(v);
+
+  auto k_f = k.to(torch::kFloat32);
+  auto v_f = v.to(torch::kFloat32);
+  auto beta_f = beta.to(torch::kFloat32);
+  auto g_f = torch::exp(g_cumsum.to(torch::kFloat32));
+  auto A_f = A.to(torch::kFloat32);
+
+  const int64_t heads_per_group = H / Hg;
+
+  auto write_chunk = [&](int64_t batch_idx, int64_t start, int64_t end) {
+    if (end <= start) {
+      return;
+    }
+    const int64_t chunk_len = end - start;
+    auto A_chunk_all =
+        A_f[batch_idx].slice(0, start, end).slice(2, 0, chunk_len);
+
+    for (int64_t head_idx = 0; head_idx < H; ++head_idx) {
+      const int64_t group_idx = head_idx / heads_per_group;
+      auto beta_chunk =
+          beta_f[batch_idx].slice(0, start, end).select(1, head_idx).unsqueeze(-1);
+      auto g_chunk =
+          g_f[batch_idx].slice(0, start, end).select(1, head_idx).unsqueeze(-1);
+      auto A_chunk = A_chunk_all.select(1, head_idx);
+      auto v_chunk =
+          v_f[batch_idx].slice(0, start, end).select(1, head_idx);
+      auto k_chunk =
+          k_f[batch_idx].slice(0, start, end).select(1, group_idx);
+
+      auto u_chunk = torch::matmul(A_chunk, v_chunk * beta_chunk);
+      auto w_chunk = torch::matmul(A_chunk, k_chunk * beta_chunk * g_chunk);
+
+      u[batch_idx].slice(0, start, end).select(1, head_idx).copy_(
+          u_chunk.to(u.scalar_type()));
+      w[batch_idx].slice(0, start, end).select(1, head_idx).copy_(
+          w_chunk.to(w.scalar_type()));
+    }
+  };
+
+  if (cu_seqlens.has_value()) {
+    TORCH_CHECK(B == 1,
+                "Only batch size 1 is supported when cu_seqlens are provided");
+    auto cu = cu_seqlens.value().to(k.device(), torch::kLong, false, false)
+                  .contiguous();
+    TORCH_CHECK(cu.dim() == 1 && cu.numel() >= 2,
+                "cu_seqlens must be a 1D tensor with at least 2 elements");
+    for (int64_t seq_idx = 0; seq_idx < cu.numel() - 1; ++seq_idx) {
+      const int64_t seq_start = cu[seq_idx].item<int64_t>();
+      const int64_t seq_end = cu[seq_idx + 1].item<int64_t>();
+      TORCH_CHECK(seq_end >= seq_start,
+                  "recompute_w_u_fwd_precompiled expects non-decreasing "
+                  "cu_seqlens");
+      const int64_t seq_len = seq_end - seq_start;
+      const int64_t local_chunks = (seq_len + BT - 1) / BT;
+      for (int64_t chunk_idx = 0; chunk_idx < local_chunks; ++chunk_idx) {
+        const int64_t start = seq_start + chunk_idx * BT;
+        const int64_t end = std::min(start + BT, seq_end);
+        write_chunk(0, start, end);
+      }
+    }
+  } else {
+    const int64_t total_chunks = (T + BT - 1) / BT;
+    for (int64_t batch_idx = 0; batch_idx < B; ++batch_idx) {
+      for (int64_t chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
+        const int64_t start = chunk_idx * BT;
+        const int64_t end = std::min(start + BT, T);
+        write_chunk(batch_idx, start, end);
+      }
+    }
+  }
+
+  return {w, u};
 }
 
 std::tuple<torch::Tensor, torch::Tensor> fused_gdn_gating_precompiled(

@@ -10,13 +10,101 @@
 import warnings
 
 import torch
+import cfie._custom_ops as ops
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 from .index import prepare_chunk_indices
 from .utils import check_shared_mem, input_guard, should_warn_on_format_mismatch
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+logger = init_logger(__name__)
+
+
+def _chunk_local_cumsum_reference(
+    g: torch.Tensor,
+    chunk_size: int,
+    reverse: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    head_first: bool = False,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    resolved_dtype = output_dtype or g.dtype
+    if g.dim() == 3:
+        seq_major = g.permute(0, 2, 1) if head_first else g
+        restore = (
+            (lambda tensor: tensor.permute(0, 2, 1).contiguous())
+            if head_first
+            else (lambda tensor: tensor)
+        )
+    else:
+        seq_major = g.permute(0, 2, 1, 3) if head_first else g
+        restore = (
+            (lambda tensor: tensor.permute(0, 2, 1, 3).contiguous())
+            if head_first
+            else (lambda tensor: tensor)
+        )
+
+    seq_major = seq_major.contiguous()
+    out = torch.empty_like(seq_major, dtype=resolved_dtype)
+
+    def _write_sequence(
+        src: torch.Tensor,
+        dst: torch.Tensor,
+    ) -> None:
+        token_count = src.shape[0]
+        feature_shape = src.shape[1:]
+        src_flat = src.reshape(token_count, -1).float()
+        dst_flat = dst.reshape(token_count, -1)
+        for chunk_start in range(0, token_count, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, token_count)
+            chunk = src_flat[chunk_start:chunk_end]
+            if reverse:
+                chunk = torch.flip(chunk, dims=[0])
+                chunk = torch.cumsum(chunk, dim=0)
+                chunk = torch.flip(chunk, dims=[0])
+            else:
+                chunk = torch.cumsum(chunk, dim=0)
+            dst_flat[chunk_start:chunk_end].copy_(chunk.to(resolved_dtype))
+        dst.copy_(dst_flat.view(token_count, *feature_shape))
+
+    if cu_seqlens is None:
+        for batch_idx in range(seq_major.shape[0]):
+            _write_sequence(seq_major[batch_idx], out[batch_idx])
+    else:
+        for seq_idx in range(cu_seqlens.numel() - 1):
+            seq_start = int(cu_seqlens[seq_idx].item())
+            seq_end = int(cu_seqlens[seq_idx + 1].item())
+            if seq_end <= seq_start:
+                continue
+            _write_sequence(
+                seq_major[0, seq_start:seq_end],
+                out[0, seq_start:seq_end],
+            )
+    return restore(out)
+
+
+def _try_precompiled_chunk_local_cumsum(
+    g: torch.Tensor,
+    chunk_size: int,
+    reverse: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    head_first: bool = False,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    if not g.is_cuda:
+        return None
+    if not ops.has_precompiled_chunk_local_cumsum():
+        return None
+    return ops.chunk_local_cumsum_precompiled(
+        g,
+        chunk_size,
+        reverse,
+        cu_seqlens,
+        head_first,
+        output_dtype,
+    )
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -263,6 +351,29 @@ def chunk_local_cumsum(
     if cu_seqlens is not None:
         assert g.shape[0] == 1, (
             "Only batch size 1 is supported when cu_seqlens are provided"
+        )
+    if not HAS_TRITON:
+        precompiled = _try_precompiled_chunk_local_cumsum(
+            g,
+            chunk_size,
+            reverse,
+            cu_seqlens,
+            head_first,
+            output_dtype,
+        )
+        if precompiled is not None:
+            return precompiled
+        logger.warning_once(
+            "FLA chunk_local_cumsum is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _chunk_local_cumsum_reference(
+            g,
+            chunk_size,
+            reverse,
+            cu_seqlens,
+            head_first,
+            output_dtype,
         )
     if len(g.shape) == 3:
         return chunk_local_cumsum_scalar(

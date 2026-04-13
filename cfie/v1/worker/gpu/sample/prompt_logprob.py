@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from cfie.sampling_params import SamplingParams
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.outputs import LogprobsTensors
 from cfie.v1.worker.gpu.input_batch import InputBatch
 from cfie.v1.worker.gpu.sample.logprob import compute_topk_logprobs
@@ -168,6 +168,21 @@ def get_prompt_logprobs_token_ids(
 ) -> torch.Tensor:
     token_ids = torch.empty(num_tokens, dtype=torch.int64, device=idx_mapping.device)
     num_reqs = idx_mapping.shape[0]
+    if not HAS_TRITON:
+        for batch_idx in range(num_reqs):
+            req_state_idx = int(idx_mapping[batch_idx].item())
+            query_start = int(query_start_loc[batch_idx].item())
+            query_end = int(query_start_loc[batch_idx + 1].item())
+            query_len = query_end - query_start
+            if query_len <= 0:
+                continue
+
+            target_pos = int(num_computed_tokens[req_state_idx].item()) + 1
+            token_ids[query_start:query_end].copy_(
+                all_token_ids[req_state_idx, target_pos : target_pos + query_len]
+            )
+        return token_ids
+
     _prompt_logprobs_token_ids_kernel[(num_reqs,)](
         token_ids,
         query_start_loc,

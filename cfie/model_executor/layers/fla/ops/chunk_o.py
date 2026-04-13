@@ -11,8 +11,10 @@
 
 
 import torch
+import cfie._custom_ops as ops
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
@@ -20,6 +22,136 @@ from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+logger = init_logger(__name__)
+
+
+def _resolve_chunk_block_size(total_tokens: int, chunk_size: int) -> int:
+    if FLA_GDN_FIX_BT:
+        return 64
+    return min(chunk_size, max(16, triton.next_power_of_2(total_tokens)))
+
+
+def _chunk_fwd_o_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    h: torch.Tensor,
+    g: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    block_size: int = 64,
+) -> torch.Tensor:
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    B, T, Hg, K = q.shape
+    H = v.shape[2]
+    V = v.shape[3]
+    if H % Hg != 0:
+        raise ValueError(f"Expected H ({H}) to be divisible by Hg ({Hg}).")
+    heads_per_group = H // Hg
+
+    q_work = q.float()
+    k_work = k.float()
+    v_work = v.float()
+    h_work = h.float()
+    g_work = g.float() if g is not None else None
+    output = torch.empty_like(v)
+
+    if cu_seqlens is None:
+        total_chunks = (T + block_size - 1) // block_size
+        if h.shape[1] != total_chunks:
+            raise ValueError(
+                f"Expected h.shape[1] == {total_chunks}, got {h.shape[1]}."
+            )
+        chunk_iter = [
+            (batch_idx, batch_idx, chunk_idx, chunk_idx)
+            for batch_idx in range(B)
+            for chunk_idx in range(total_chunks)
+        ]
+        def _token_range(_seq_idx: int, chunk_idx: int) -> tuple[int, int]:
+            chunk_start = chunk_idx * block_size
+            return chunk_start, min(chunk_start + block_size, T)
+    else:
+        if B != 1:
+            raise ValueError("Only batch size 1 is supported with cu_seqlens.")
+        chunk_iter = []
+        global_chunk_idx = 0
+        for seq_idx in range(cu_seqlens.numel() - 1):
+            seq_start = int(cu_seqlens[seq_idx].item())
+            seq_end = int(cu_seqlens[seq_idx + 1].item())
+            seq_len = seq_end - seq_start
+            local_chunks = (seq_len + block_size - 1) // block_size
+            for local_chunk_idx in range(local_chunks):
+                chunk_iter.append((0, seq_idx, local_chunk_idx, global_chunk_idx))
+                global_chunk_idx += 1
+        if h.shape[1] != len(chunk_iter):
+            raise ValueError(
+                f"Expected h.shape[1] == {len(chunk_iter)}, got {h.shape[1]}."
+            )
+
+        def _token_range(seq_idx: int, chunk_idx: int) -> tuple[int, int]:
+            seq_start = int(cu_seqlens[seq_idx].item())
+            seq_end = int(cu_seqlens[seq_idx + 1].item())
+            chunk_start = seq_start + chunk_idx * block_size
+            return chunk_start, min(chunk_start + block_size, seq_end)
+
+    for batch_idx, seq_idx, chunk_idx, global_chunk_idx in chunk_iter:
+        start, end = _token_range(seq_idx, chunk_idx)
+        if end <= start:
+            continue
+        q_chunk_all = q_work[batch_idx, start:end]
+        k_chunk_all = k_work[batch_idx, start:end]
+        v_chunk_all = v_work[batch_idx, start:end]
+        g_chunk_all = g_work[batch_idx, start:end] if g_work is not None else None
+
+        for head_idx in range(H):
+            group_idx = head_idx // heads_per_group
+            q_chunk = q_chunk_all[:, group_idx, :]
+            k_chunk = k_chunk_all[:, group_idx, :]
+            v_chunk = v_chunk_all[:, head_idx, :]
+            h_chunk = h_work[batch_idx, global_chunk_idx, head_idx]
+
+            out_chunk = torch.matmul(q_chunk, h_chunk.transpose(0, 1))
+            attn_chunk = torch.matmul(q_chunk, k_chunk.transpose(0, 1))
+            if g_chunk_all is not None:
+                g_chunk = g_chunk_all[:, head_idx]
+                out_chunk = out_chunk * torch.exp(g_chunk).unsqueeze(-1)
+                attn_chunk = attn_chunk * torch.exp(
+                    g_chunk.unsqueeze(-1) - g_chunk.unsqueeze(0)
+                )
+            attn_chunk = torch.tril(attn_chunk)
+            out_chunk = (out_chunk + torch.matmul(attn_chunk, v_chunk)) * scale
+            output[batch_idx, start:end, head_idx].copy_(out_chunk.to(output.dtype))
+    return output
+
+
+def _try_precompiled_chunk_fwd_o(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    h: torch.Tensor,
+    g: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    block_size: int = 64,
+) -> torch.Tensor | None:
+    if not q.is_cuda:
+        return None
+    if not ops.has_precompiled_chunk_fwd_o():
+        return None
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    return ops.chunk_fwd_o_precompiled(
+        q,
+        k,
+        v,
+        h,
+        g,
+        scale,
+        cu_seqlens,
+        block_size,
+    )
 
 
 @triton.heuristics(
@@ -150,13 +282,41 @@ def chunk_fwd_o(
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
-    BT = 64 if FLA_GDN_FIX_BT else min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = _resolve_chunk_block_size(T, chunk_size)
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
+
+    if not HAS_TRITON:
+        precompiled = _try_precompiled_chunk_fwd_o(
+            q,
+            k,
+            v,
+            h,
+            g,
+            scale,
+            cu_seqlens,
+            BT,
+        )
+        if precompiled is not None:
+            return precompiled
+        logger.warning_once(
+            "FLA chunk_fwd_o is falling back to the PyTorch reference path "
+            "because Triton runtime is unavailable."
+        )
+        return _chunk_fwd_o_reference(
+            q,
+            k,
+            v,
+            h,
+            g,
+            scale,
+            cu_seqlens,
+            BT,
+        )
 
     o = torch.empty_like(v)
 

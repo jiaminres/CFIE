@@ -9,11 +9,107 @@
 # ruff: noqa: E501
 
 import torch
+import cfie._custom_ops as ops
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
+
+logger = init_logger(__name__)
+
+
+def _chunk_scaled_dot_kkt_fwd_reference(
+    k: torch.Tensor,
+    g: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    B, T, Hg, K = k.shape
+    H = beta.shape[-1]
+    if H % Hg != 0:
+        raise ValueError(f"Expected H ({H}) to be divisible by Hg ({Hg}).")
+    heads_per_group = H // Hg
+
+    k_work = k.float()
+    beta_work = beta.float()
+    g_work = g.float() if g is not None else None
+    out = torch.zeros(B, T, H, chunk_size, device=k.device, dtype=output_dtype)
+
+    if cu_seqlens is None:
+        chunk_iter = [(batch_idx, chunk_idx) for batch_idx in range(B) for chunk_idx in range((T + chunk_size - 1) // chunk_size)]
+
+        def _token_range(_batch_idx: int, chunk_idx: int) -> tuple[int, int]:
+            start = chunk_idx * chunk_size
+            return start, min(start + chunk_size, T)
+    else:
+        if B != 1:
+            raise ValueError("Only batch size 1 is supported with cu_seqlens.")
+        chunk_iter = []
+        for seq_idx in range(cu_seqlens.numel() - 1):
+            seq_start = int(cu_seqlens[seq_idx].item())
+            seq_end = int(cu_seqlens[seq_idx + 1].item())
+            seq_len = seq_end - seq_start
+            local_chunks = (seq_len + chunk_size - 1) // chunk_size
+            for local_chunk_idx in range(local_chunks):
+                chunk_iter.append((0, (seq_idx, local_chunk_idx)))
+
+        def _token_range(_batch_idx: int, seq_chunk: tuple[int, int]) -> tuple[int, int]:
+            seq_idx, chunk_idx = seq_chunk
+            seq_start = int(cu_seqlens[seq_idx].item())
+            seq_end = int(cu_seqlens[seq_idx + 1].item())
+            start = seq_start + chunk_idx * chunk_size
+            return start, min(start + chunk_size, seq_end)
+
+    for batch_idx, chunk_idx in chunk_iter:
+        start, end = _token_range(batch_idx, chunk_idx)
+        if end <= start:
+            continue
+        k_chunk_all = k_work[batch_idx, start:end]
+        beta_chunk_all = beta_work[batch_idx, start:end]
+        g_chunk_all = g_work[batch_idx, start:end] if g_work is not None else None
+        chunk_len = end - start
+
+        for head_idx in range(H):
+            group_idx = head_idx // heads_per_group
+            k_chunk = k_chunk_all[:, group_idx, :]
+            beta_chunk = beta_chunk_all[:, head_idx]
+            attn_chunk = torch.matmul(k_chunk * beta_chunk.unsqueeze(-1), k_chunk.transpose(0, 1))
+            if g_chunk_all is not None:
+                g_chunk = g_chunk_all[:, head_idx]
+                attn_chunk = attn_chunk * torch.exp(
+                    g_chunk.unsqueeze(-1) - g_chunk.unsqueeze(0)
+                )
+            attn_chunk = torch.tril(attn_chunk, diagonal=-1)
+            out[batch_idx, start:end, head_idx, :chunk_len].copy_(
+                attn_chunk.to(output_dtype)
+            )
+    return out
+
+
+def _try_precompiled_chunk_scaled_dot_kkt_fwd(
+    k: torch.Tensor,
+    g: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor | None:
+    if not k.is_cuda:
+        return None
+    if not ops.has_precompiled_chunk_scaled_dot_kkt_fwd():
+        return None
+    return ops.chunk_scaled_dot_kkt_fwd_precompiled(
+        k,
+        g,
+        beta,
+        cu_seqlens,
+        chunk_size,
+        output_dtype,
+    )
 
 
 @triton.heuristics(
@@ -132,6 +228,29 @@ def chunk_scaled_dot_kkt_fwd(
     B, T, Hg, K = k.shape
     H = beta.shape[-1]
     BT = chunk_size
+    if not HAS_TRITON:
+        precompiled = _try_precompiled_chunk_scaled_dot_kkt_fwd(
+            k,
+            g,
+            beta,
+            cu_seqlens,
+            chunk_size,
+            output_dtype,
+        )
+        if precompiled is not None:
+            return precompiled
+        logger.warning_once(
+            "FLA chunk_scaled_dot_kkt is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _chunk_scaled_dot_kkt_fwd_reference(
+            k,
+            g,
+            beta,
+            cu_seqlens,
+            chunk_size,
+            output_dtype,
+        )
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )

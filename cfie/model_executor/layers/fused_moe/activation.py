@@ -7,6 +7,10 @@ from enum import Enum
 import torch
 import torch.nn.functional as F
 
+from cfie.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class MoEActivation(Enum):
     """Activation functions for MoE layers."""
@@ -79,6 +83,29 @@ _WITHOUT_MUL: dict[MoEActivation, MoEActivation] = {
 }
 
 
+def _get_moe_custom_op(op_name: str):
+    return getattr(torch.ops._C, op_name, None)
+
+
+def _apply_gated_activation_op_or_fallback(
+    op_name: str,
+    output: torch.Tensor,
+    input: torch.Tensor,
+    fallback_fn,
+) -> None:
+    op = _get_moe_custom_op(op_name)
+    if op is not None:
+        op(output, input)
+        return
+
+    logger.warning_once(
+        "Fused MoE activation op %s is unavailable in the current runtime; "
+        "falling back to the native PyTorch path.",
+        op_name,
+    )
+    output.copy_(fallback_fn(input))
+
+
 def activation_without_mul(activation: str) -> str:
     """Get the non-gated variant of an activation function.
 
@@ -112,11 +139,32 @@ def apply_moe_activation(
 
     # Activations with gated multiplication (gate × activation(up))
     if activation == MoEActivation.SILU:
-        torch.ops._C.silu_and_mul(output, input)
+        _apply_gated_activation_op_or_fallback(
+            "silu_and_mul",
+            output,
+            input,
+            lambda x: F.silu(x[:, : x.shape[-1] // 2]) * x[:, x.shape[-1] // 2 :],
+        )
     elif activation == MoEActivation.GELU:
-        torch.ops._C.gelu_and_mul(output, input)
+        _apply_gated_activation_op_or_fallback(
+            "gelu_and_mul",
+            output,
+            input,
+            lambda x: F.gelu(x[:, : x.shape[-1] // 2]) * x[:, x.shape[-1] // 2 :],
+        )
     elif activation == MoEActivation.SWIGLUOAI:
-        torch.ops._C.swigluoai_and_mul(output, input)
+        _apply_gated_activation_op_or_fallback(
+            "swigluoai_and_mul",
+            output,
+            input,
+            lambda x: (
+                x[:, 1::2].clamp(min=-7.0, max=7.0) + 1
+            )
+            * (
+                x[:, ::2].clamp(max=7.0)
+                * torch.sigmoid(x[:, ::2].clamp(max=7.0) * 1.702)
+            ),
+        )
     elif activation == MoEActivation.SWIGLUSTEP:
         from cfie.model_executor.layers.activation import swiglustep_and_mul_triton
 

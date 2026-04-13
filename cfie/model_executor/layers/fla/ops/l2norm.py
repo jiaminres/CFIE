@@ -10,6 +10,7 @@
 import os
 
 import torch
+import cfie._custom_ops as ops
 
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON, tl, triton
@@ -18,6 +19,22 @@ BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
 logger = init_logger(__name__)
+
+
+def _try_precompiled_l2norm(
+    x: torch.Tensor,
+    eps: float,
+    output_dtype: torch.dtype | None,
+) -> torch.Tensor | None:
+    if not x.is_cuda:
+        return None
+    if not ops.has_precompiled_l2norm():
+        return None
+    return ops.l2norm_precompiled(
+        x,
+        eps=eps,
+        output_dtype=output_dtype,
+    )
 
 
 @triton.autotune(
@@ -100,6 +117,13 @@ def l2norm_fwd(
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
     if not HAS_TRITON:
+        precompiled = _try_precompiled_l2norm(
+            x,
+            eps=eps,
+            output_dtype=output_dtype,
+        )
+        if precompiled is not None:
+            return precompiled.view(x_shape_og)
         logger.warning_once(
             "FLA l2norm is falling back to the PyTorch reference path "
             "because Triton runtime is unavailable."

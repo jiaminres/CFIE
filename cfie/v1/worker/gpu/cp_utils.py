@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 
 def prepare_dcp_local_seq_lens(
@@ -18,6 +18,23 @@ def prepare_dcp_local_seq_lens(
         return
 
     max_num_reqs = dcp_local_seq_lens.shape[0]
+    if not HAS_TRITON:
+        dcp_local_seq_lens.zero_()
+        seq_slice = seq_lens[:num_reqs].to(dtype=dcp_local_seq_lens.dtype)
+        rounds = torch.div(
+            seq_slice,
+            dcp_size * cp_interleave,
+            rounding_mode="floor",
+        )
+        remainder = torch.remainder(seq_slice, dcp_size * cp_interleave)
+        remainder = torch.clamp(
+            remainder - dcp_rank * cp_interleave,
+            min=0,
+            max=cp_interleave,
+        )
+        dcp_local_seq_lens[:num_reqs].copy_(rounds * cp_interleave + remainder)
+        return
+
     BLOCK_SIZE = 128
     num_blocks = triton.cdiv(max_num_reqs, BLOCK_SIZE)
     _dcp_local_seq_lens_kernel[(num_blocks,)](

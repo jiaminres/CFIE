@@ -10,10 +10,101 @@
 # ruff: noqa: E501
 
 import torch
+import cfie._custom_ops as ops
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 from .index import prepare_chunk_indices
+
+logger = init_logger(__name__)
+
+
+def _recompute_w_u_fwd_reference(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    A: torch.Tensor,
+    cu_seqlens: torch.LongTensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B, T, Hg, K = k.shape
+    H = v.shape[2]
+    V = v.shape[3]
+    BT = A.shape[-1]
+    if Hg <= 0 or H % Hg != 0:
+        raise ValueError(f"Expected H ({H}) to be divisible by Hg ({Hg}).")
+    heads_per_group = H // Hg
+
+    w = k.new_empty(B, T, H, K)
+    u = torch.empty_like(v)
+
+    k_work = k.float()
+    v_work = v.float()
+    beta_work = beta.float()
+    g_work = torch.exp(g_cumsum.float())
+    A_work = A.float()
+
+    def _write_chunk(batch_idx: int, start: int, end: int) -> None:
+        if end <= start:
+            return
+        chunk_len = end - start
+        A_chunk_all = A_work[batch_idx, start:end, :, :chunk_len]
+        for head_idx in range(H):
+            group_idx = head_idx // heads_per_group
+            beta_chunk = beta_work[batch_idx, start:end, head_idx].unsqueeze(-1)
+            g_chunk = g_work[batch_idx, start:end, head_idx].unsqueeze(-1)
+            A_chunk = A_chunk_all[:, head_idx, :]
+            v_chunk = v_work[batch_idx, start:end, head_idx, :]
+            k_chunk = k_work[batch_idx, start:end, group_idx, :]
+            u_chunk = torch.matmul(A_chunk, v_chunk * beta_chunk)
+            w_chunk = torch.matmul(A_chunk, k_chunk * beta_chunk * g_chunk)
+            u[batch_idx, start:end, head_idx].copy_(u_chunk.to(u.dtype))
+            w[batch_idx, start:end, head_idx].copy_(w_chunk.to(w.dtype))
+
+    if cu_seqlens is None:
+        total_chunks = (T + BT - 1) // BT
+        for batch_idx in range(B):
+            for chunk_idx in range(total_chunks):
+                start = chunk_idx * BT
+                end = min(start + BT, T)
+                _write_chunk(batch_idx, start, end)
+    else:
+        if B != 1:
+            raise ValueError("Only batch size 1 is supported with cu_seqlens.")
+        for seq_idx in range(cu_seqlens.numel() - 1):
+            seq_start = int(cu_seqlens[seq_idx].item())
+            seq_end = int(cu_seqlens[seq_idx + 1].item())
+            seq_len = seq_end - seq_start
+            local_chunks = (seq_len + BT - 1) // BT
+            for chunk_idx in range(local_chunks):
+                start = seq_start + chunk_idx * BT
+                end = min(start + BT, seq_end)
+                _write_chunk(0, start, end)
+
+    return w, u
+
+
+def _try_precompiled_recompute_w_u_fwd(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    A: torch.Tensor,
+    cu_seqlens: torch.LongTensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not k.is_cuda:
+        return None
+    if not ops.has_precompiled_recompute_w_u_fwd():
+        return None
+    return ops.recompute_w_u_fwd_precompiled(
+        k,
+        v,
+        beta,
+        g_cumsum,
+        A,
+        cu_seqlens,
+    )
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -127,6 +218,30 @@ def recompute_w_u_fwd(
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
     BT = A.shape[-1]
+
+    if not HAS_TRITON:
+        precompiled = _try_precompiled_recompute_w_u_fwd(
+            k,
+            v,
+            beta,
+            g_cumsum,
+            A,
+            cu_seqlens,
+        )
+        if precompiled is not None:
+            return precompiled
+        logger.warning_once(
+            "FLA recompute_w_u_fwd is falling back to the PyTorch reference "
+            "path because Triton runtime is unavailable."
+        )
+        return _recompute_w_u_fwd_reference(
+            k,
+            v,
+            beta,
+            g_cumsum,
+            A,
+            cu_seqlens,
+        )
 
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None

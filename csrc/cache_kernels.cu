@@ -1323,6 +1323,211 @@ void cp_gather_cache(
   }
 }
 
+namespace vllm {
+template <typename scalar_t>
+__global__ void gather_paged_kv_cache(
+    const scalar_t* __restrict__ key_cache,
+    const scalar_t* __restrict__ value_cache,
+    scalar_t* __restrict__ gathered_key,
+    scalar_t* __restrict__ gathered_value,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ cu_seq_lens,
+    const int32_t physical_block_size, const int32_t num_kv_heads,
+    const int32_t head_size, const int32_t x,
+    const int64_t block_table_stride, const int64_t key_block_stride,
+    const int64_t key_head_stride, const int64_t key_group_stride,
+    const int64_t key_slot_stride, const int64_t key_x_stride,
+    const int64_t value_block_stride, const int64_t value_head_stride,
+    const int64_t value_dim_stride, const int64_t value_slot_stride,
+    const int64_t gathered_key_token_stride,
+    const int64_t gathered_key_head_stride,
+    const int64_t gathered_value_token_stride,
+    const int64_t gathered_value_head_stride,
+    const int32_t* __restrict__ seq_starts) {
+  const int64_t batch_id = blockIdx.x;
+  const int32_t num_splits = gridDim.y;
+  const int32_t split_id = blockIdx.y;
+  const int32_t seq_start = cu_seq_lens[batch_id];
+  const int32_t seq_end = cu_seq_lens[batch_id + 1];
+  const int32_t seq_len = seq_end - seq_start;
+  const int32_t split_slots = cuda_utils::ceil_div(seq_len, num_splits);
+  const int32_t split_start = split_id * split_slots;
+  const int32_t split_end = min((split_id + 1) * split_slots, seq_len);
+  if (split_start >= seq_len) {
+    return;
+  }
+
+  const int32_t initial_seq_offset =
+      split_start + (seq_starts == nullptr ? 0 : seq_starts[batch_id]);
+  int32_t logical_block_idx = initial_seq_offset / physical_block_size;
+  int32_t offset_in_block = initial_seq_offset % physical_block_size;
+
+  gathered_key += seq_start * gathered_key_token_stride;
+  gathered_value += seq_start * gathered_value_token_stride;
+  const int32_t flat_entry_size = num_kv_heads * head_size;
+
+  for (int32_t token_idx = split_start; token_idx < split_end; ++token_idx) {
+    const int32_t physical_block =
+        block_table[batch_id * block_table_stride + logical_block_idx];
+    scalar_t* gathered_key_token =
+        gathered_key + token_idx * gathered_key_token_stride;
+    scalar_t* gathered_value_token =
+        gathered_value + token_idx * gathered_value_token_stride;
+
+    for (int32_t entry_idx = threadIdx.x; entry_idx < flat_entry_size;
+         entry_idx += blockDim.x) {
+      const int32_t head_idx = entry_idx / head_size;
+      const int32_t dim_idx = entry_idx % head_size;
+      const int32_t packed_group_idx = dim_idx / x;
+      const int32_t packed_offset_idx = dim_idx % x;
+
+      gathered_key_token[head_idx * gathered_key_head_stride + dim_idx] =
+          key_cache[physical_block * key_block_stride +
+                    head_idx * key_head_stride +
+                    packed_group_idx * key_group_stride +
+                    offset_in_block * key_slot_stride +
+                    packed_offset_idx * key_x_stride];
+      gathered_value_token[head_idx * gathered_value_head_stride + dim_idx] =
+          value_cache[physical_block * value_block_stride +
+                      head_idx * value_head_stride +
+                      dim_idx * value_dim_stride +
+                      offset_in_block * value_slot_stride];
+    }
+    __syncthreads();
+
+    offset_in_block += 1;
+    if (offset_in_block == physical_block_size) {
+      logical_block_idx += 1;
+      offset_in_block = 0;
+    }
+  }
+}
+}  // namespace vllm
+
+#define CALL_GATHER_PAGED_KV_CACHE(CPY_DTYPE)                                 \
+  vllm::gather_paged_kv_cache<CPY_DTYPE><<<grid, block, 0, stream>>>(         \
+      reinterpret_cast<CPY_DTYPE*>(key_cache.data_ptr()),                     \
+      reinterpret_cast<CPY_DTYPE*>(value_cache.data_ptr()),                   \
+      reinterpret_cast<CPY_DTYPE*>(gathered_key.data_ptr()),                  \
+      reinterpret_cast<CPY_DTYPE*>(gathered_value.data_ptr()),                \
+      block_table.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(),       \
+      physical_block_size, num_kv_heads, head_size, x, block_table_stride,    \
+      key_block_stride, key_head_stride, key_group_stride, key_slot_stride,   \
+      key_x_stride, value_block_stride, value_head_stride, value_dim_stride,  \
+      value_slot_stride, gathered_key_token_stride, gathered_key_head_stride, \
+      gathered_value_token_stride, gathered_value_head_stride,                \
+      seq_starts_ptr);
+
+void gather_paged_kv_cache(
+    torch::Tensor const& key_cache,
+    torch::Tensor const& value_cache,
+    torch::Tensor const& gathered_key,
+    torch::Tensor const& gathered_value,
+    torch::Tensor const& block_table,
+    torch::Tensor const& cu_seq_lens,
+    int64_t batch_size,
+    std::optional<torch::Tensor> seq_starts) {
+  at::cuda::OptionalCUDAGuard device_guard(key_cache.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  TORCH_CHECK(key_cache.dim() == 5, "key_cache must be 5D");
+  TORCH_CHECK(value_cache.dim() == 4, "value_cache must be 4D");
+  TORCH_CHECK(gathered_key.dim() == 3, "gathered_key must be 3D");
+  TORCH_CHECK(gathered_value.dim() == 3, "gathered_value must be 3D");
+  TORCH_CHECK(block_table.dtype() == torch::kInt32,
+              "block_table must be int32");
+  TORCH_CHECK(cu_seq_lens.dtype() == torch::kInt32,
+              "cu_seq_lens must be int32");
+  if (seq_starts.has_value()) {
+    TORCH_CHECK(seq_starts.value().dtype() == torch::kInt32,
+                "seq_starts must be int32");
+  }
+
+  TORCH_CHECK(key_cache.device() == value_cache.device(),
+              "key_cache and value_cache must be on the same device");
+  TORCH_CHECK(key_cache.device() == gathered_key.device(),
+              "key_cache and gathered_key must be on the same device");
+  TORCH_CHECK(key_cache.device() == gathered_value.device(),
+              "key_cache and gathered_value must be on the same device");
+  TORCH_CHECK(key_cache.device() == block_table.device(),
+              "key_cache and block_table must be on the same device");
+  TORCH_CHECK(key_cache.device() == cu_seq_lens.device(),
+              "key_cache and cu_seq_lens must be on the same device");
+  if (seq_starts.has_value()) {
+    TORCH_CHECK(key_cache.device() == seq_starts.value().device(),
+                "key_cache and seq_starts must be on the same device");
+  }
+
+  TORCH_CHECK(key_cache.scalar_type() == value_cache.scalar_type(),
+              "key_cache and value_cache must have the same dtype");
+  TORCH_CHECK(key_cache.scalar_type() == gathered_key.scalar_type(),
+              "key_cache and gathered_key must have the same dtype");
+  TORCH_CHECK(value_cache.scalar_type() == gathered_value.scalar_type(),
+              "value_cache and gathered_value must have the same dtype");
+
+  const int32_t num_kv_heads = key_cache.size(1);
+  const int32_t head_size = gathered_key.size(2);
+  const int32_t physical_block_size = value_cache.size(3);
+  const int32_t x = key_cache.size(4);
+  TORCH_CHECK(key_cache.size(0) == value_cache.size(0),
+              "key_cache and value_cache must have the same block count");
+  TORCH_CHECK(key_cache.size(1) == value_cache.size(1),
+              "key_cache and value_cache must have the same num_kv_heads");
+  TORCH_CHECK(key_cache.size(2) * key_cache.size(4) == head_size,
+              "key_cache packed head size must match gathered_key");
+  TORCH_CHECK(value_cache.size(2) == head_size,
+              "value_cache head size must match gathered_value");
+  TORCH_CHECK(gathered_key.size(1) == num_kv_heads,
+              "gathered_key num_kv_heads mismatch");
+  TORCH_CHECK(gathered_value.size(1) == num_kv_heads,
+              "gathered_value num_kv_heads mismatch");
+  TORCH_CHECK(gathered_value.size(2) == head_size,
+              "gathered_value head size mismatch");
+  TORCH_CHECK(cu_seq_lens.numel() == batch_size + 1,
+              "cu_seq_lens must have batch_size + 1 elements");
+  TORCH_CHECK(block_table.size(0) == batch_size,
+              "block_table batch dimension must match batch_size");
+  TORCH_CHECK(gathered_key.is_contiguous(),
+              "gathered_key must be contiguous");
+  TORCH_CHECK(gathered_value.is_contiguous(),
+              "gathered_value must be contiguous");
+  if (batch_size == 0 || gathered_key.size(0) == 0) {
+    return;
+  }
+
+  const int64_t block_table_stride = block_table.stride(0);
+  const int64_t key_block_stride = key_cache.stride(0);
+  const int64_t key_head_stride = key_cache.stride(1);
+  const int64_t key_group_stride = key_cache.stride(2);
+  const int64_t key_slot_stride = key_cache.stride(3);
+  const int64_t key_x_stride = key_cache.stride(4);
+  const int64_t value_block_stride = value_cache.stride(0);
+  const int64_t value_head_stride = value_cache.stride(1);
+  const int64_t value_dim_stride = value_cache.stride(2);
+  const int64_t value_slot_stride = value_cache.stride(3);
+  const int64_t gathered_key_token_stride = gathered_key.stride(0);
+  const int64_t gathered_key_head_stride = gathered_key.stride(1);
+  const int64_t gathered_value_token_stride = gathered_value.stride(0);
+  const int64_t gathered_value_head_stride = gathered_value.stride(1);
+
+  const int32_t* seq_starts_ptr =
+      seq_starts.has_value() ? seq_starts.value().data_ptr<int32_t>() : nullptr;
+  const int num_splits = batch_size > 128 ? 2 : batch_size > 64 ? 4 : 16;
+  dim3 grid(batch_size, num_splits);
+  dim3 block(256);
+
+  const int dtype_bits = key_cache.element_size() * 8;
+  if (dtype_bits == 32) {
+    CALL_GATHER_PAGED_KV_CACHE(uint32_t);
+  } else if (dtype_bits == 16) {
+    CALL_GATHER_PAGED_KV_CACHE(uint16_t);
+  } else if (dtype_bits == 8) {
+    CALL_GATHER_PAGED_KV_CACHE(uint8_t);
+  } else {
+    TORCH_CHECK(false, "Unsupported data type width: ", dtype_bits);
+  }
+}
+
 void cp_gather_and_upconvert_fp8_kv_cache(
     torch::Tensor const& src_cache,         // [NUM_BLOCKS, BLOCK_SIZE, 656]
     torch::Tensor const& dst,               // [TOT_TOKENS, 576]

@@ -29,17 +29,27 @@ Memory-efficient attention for decoding.
 It supports page size >= 1.
 """
 
-import logging
-
 import torch
 from packaging import version
 
+from cfie.logger import init_logger
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 is_hip_ = current_platform.is_rocm()
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
+FLOAT8_DTYPES = {
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+        current_platform.fp8_dtype(),
+    )
+    if dtype is not None
+}
 
 # Only print the following warnings when triton version < 3.2.0.
 # The issue won't affect performance or accuracy.
@@ -54,6 +64,102 @@ if version.parse(triton.__version__) < version.parse("3.2.0"):
 def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in FLOAT8_DTYPES
+
+
+def _extract_decode_scale(scale: torch.Tensor | None, *, device: torch.device) -> float:
+    if scale is None:
+        return 1.0
+    return float(scale.to(device=device, dtype=torch.float32).reshape(-1)[0].item())
+
+
+def _gather_decode_paged_sequence(
+    cache: torch.Tensor,
+    req_to_token_row: torch.Tensor,
+    seq_len: int,
+    page_size: int,
+) -> torch.Tensor:
+    num_pages = (seq_len + page_size - 1) // page_size
+    page_ids = req_to_token_row[:num_pages].to(device=cache.device, dtype=torch.long)
+    cache_pages = cache.index_select(0, page_ids)
+    return cache_pages.reshape(num_pages * page_size, *cache.shape[2:])[:seq_len].contiguous()
+
+
+def _reference_decode_attention_fwd(
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    req_to_token: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    attn_logits: torch.Tensor,
+    sm_scale: float,
+    page_size: int,
+    logit_cap: float,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    logger.warning_once(
+        "Decode attention is falling back to the PyTorch reference path "
+        "because Triton runtime is unavailable."
+    )
+    attn_logits.zero_()
+
+    k_rescale = _extract_decode_scale(k_scale, device=q.device)
+    v_rescale = _extract_decode_scale(v_scale, device=q.device)
+    seq_lens_cpu = b_seq_len.to(device="cpu", dtype=torch.int64)
+    num_q_heads = q.shape[1]
+    num_kv_heads = v_buffer.shape[-2]
+    kv_group_num = num_q_heads // num_kv_heads
+
+    for batch_idx in range(q.shape[0]):
+        seq_len = int(seq_lens_cpu[batch_idx].item())
+        if seq_len <= 0:
+            o[batch_idx].zero_()
+            lse[batch_idx].fill_(float("-inf"))
+            continue
+
+        k_seq = _gather_decode_paged_sequence(
+            k_buffer,
+            req_to_token[batch_idx],
+            seq_len,
+            page_size,
+        )
+        v_seq = _gather_decode_paged_sequence(
+            v_buffer,
+            req_to_token[batch_idx],
+            seq_len,
+            page_size,
+        )
+
+        if _is_fp8_dtype(k_seq.dtype):
+            k_seq = k_seq.to(torch.float32) * k_rescale
+        else:
+            k_seq = k_seq.to(torch.float32)
+        if _is_fp8_dtype(v_seq.dtype):
+            v_seq = v_seq.to(torch.float32) * v_rescale
+        else:
+            v_seq = v_seq.to(torch.float32)
+
+        q_seq = q[batch_idx].to(torch.float32)
+        k_heads = k_seq.permute(1, 0, 2).contiguous()
+        v_heads = v_seq.permute(1, 0, 2).contiguous()
+        if kv_group_num > 1:
+            k_heads = k_heads.repeat_interleave(kv_group_num, dim=0)
+            v_heads = v_heads.repeat_interleave(kv_group_num, dim=0)
+
+        scores = torch.einsum("hd,hsd->hs", q_seq, k_heads) * sm_scale
+        if logit_cap > 0:
+            scores = logit_cap * torch.tanh(scores / logit_cap)
+
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+        out_seq = torch.einsum("hs,hsd->hd", probs, v_heads)
+        o[batch_idx].copy_(out_seq.to(dtype=o.dtype))
+        lse[batch_idx].copy_(torch.logsumexp(scores, dim=-1).to(dtype=lse.dtype))
 
 
 @triton.jit
@@ -717,6 +823,24 @@ def decode_attention_fwd(
         v_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
 
     kv_group_num = q.shape[1] // v_buffer.shape[-2]
+
+    if not HAS_TRITON:
+        _reference_decode_attention_fwd(
+            q=q,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            o=o,
+            lse=lse,
+            req_to_token=req_to_token,
+            b_seq_len=b_seq_len,
+            attn_logits=attn_logits,
+            sm_scale=sm_scale,
+            page_size=page_size,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return
 
     if kv_group_num == 1:
         # MHA
