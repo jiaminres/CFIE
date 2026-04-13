@@ -8,10 +8,12 @@ import torch
 from packaging import version
 
 from cfie import _custom_ops as ops
+from cfie.logger import init_logger
 from cfie.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.attention.backends.utils import PAD_SLOT_ID
 
+logger = init_logger(__name__)
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.0.0"))
 
 if TRITON3:
@@ -381,6 +383,31 @@ def selective_state_update(
     if num_accepted_tokens is not None:
         assert num_accepted_tokens.shape == (N,)
 
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Mamba selective state update is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        _selective_state_update_torch(
+            state=state,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            out=out,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            state_batch_indices=state_batch_indices,
+            dst_state_batch_indices=dst_state_batch_indices,
+            pad_slot_id=pad_slot_id,
+            num_accepted_tokens=num_accepted_tokens,
+            cu_seqlens=cu_seqlens,
+        )
+        return
+
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), N, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
     state_batch_indices_strides = (
@@ -477,6 +504,101 @@ def selective_state_update(
             BLOCK_SIZE_M,
             num_warps=num_warps,
         )
+
+
+def _selective_state_update_torch(
+    *,
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    out: torch.Tensor,
+    D: torch.Tensor | None,
+    z: torch.Tensor | None,
+    dt_bias: torch.Tensor | None,
+    dt_softplus: bool,
+    state_batch_indices: torch.Tensor | None,
+    dst_state_batch_indices: torch.Tensor | None,
+    pad_slot_id: int,
+    num_accepted_tokens: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> None:
+    _, nheads, dim, dstate = state.shape
+    ngroups = B.shape[1]
+    nheads_ngroups_ratio = nheads // ngroups
+    group_index = (
+        torch.arange(nheads, device=x.device, dtype=torch.long) // nheads_ngroups_ratio
+    )
+
+    if cu_seqlens is not None:
+        cu_seqlens_cpu = cu_seqlens.to(device="cpu", dtype=torch.int64)
+        num_sequences = len(cu_seqlens_cpu) - 1
+    else:
+        cu_seqlens_cpu = None
+        num_sequences = x.shape[0]
+
+    for seq_idx in range(num_sequences):
+        if cu_seqlens_cpu is not None:
+            token_start = int(cu_seqlens_cpu[seq_idx].item())
+            token_end = int(cu_seqlens_cpu[seq_idx + 1].item())
+        else:
+            token_start = seq_idx
+            token_end = seq_idx + 1
+
+        if token_end <= token_start:
+            continue
+
+        init_token_idx = 0
+        if num_accepted_tokens is not None:
+            init_token_idx = max(int(num_accepted_tokens[seq_idx].item()) - 1, 0)
+
+        if state_batch_indices is None:
+            state_batch_idx = seq_idx
+            final_dst_state_batch_idx = seq_idx
+        else:
+            state_batch_idx = int(state_batch_indices[seq_idx, init_token_idx].item())
+            if state_batch_idx == pad_slot_id:
+                continue
+            final_dst_state_batch_idx = int(
+                dst_state_batch_indices[seq_idx, init_token_idx].item()
+            )
+
+        state_work = state[state_batch_idx].to(torch.float32).clone()
+
+        for token_offset, token_idx in enumerate(range(token_start, token_end)):
+            x_t = x[token_idx].to(torch.float32)
+            dt_t = dt[token_idx].to(torch.float32)
+            if dt_bias is not None:
+                dt_t = dt_t + dt_bias.to(torch.float32)
+            if dt_softplus:
+                dt_t = torch.nn.functional.softplus(dt_t)
+
+            b_t = B[token_idx].to(torch.float32).index_select(0, group_index)
+            c_t = C[token_idx].to(torch.float32).index_select(0, group_index)
+
+            dA = torch.exp(A.to(torch.float32) * dt_t[..., None])
+            dB = b_t[:, None, :] * dt_t[..., None]
+            state_work = state_work * dA + dB * x_t[..., None]
+
+            out_t = (state_work * c_t[:, None, :]).sum(dim=-1)
+            if D is not None:
+                out_t = out_t + x_t * D.to(torch.float32)
+            if z is not None:
+                z_t = z[token_idx].to(torch.float32)
+                out_t = out_t * (z_t * torch.sigmoid(z_t))
+            out[token_idx].copy_(out_t.to(out.dtype))
+
+            if num_accepted_tokens is not None:
+                dst_token_idx = int(
+                    dst_state_batch_indices[seq_idx, token_offset].item()
+                )
+                if dst_token_idx != pad_slot_id:
+                    state[dst_token_idx].copy_(state_work.to(state.dtype))
+
+        if num_accepted_tokens is None and final_dst_state_batch_idx != pad_slot_id:
+            state[final_dst_state_batch_idx].copy_(state_work.to(state.dtype))
 
 
 def selective_scan_fn(

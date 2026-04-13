@@ -3,6 +3,7 @@
 
 #include <torch/cuda.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <optional>
 
 #ifndef USE_ROCM
   #include <cub/cub.cuh>
@@ -601,6 +602,248 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(
 }
 
 }  // namespace vllm
+
+namespace {
+
+__global__ void rejection_greedy_sample_precompiled_kernel(
+    int32_t* __restrict__ output_token_ids, int64_t output_stride,
+    const int32_t* __restrict__ cu_num_draft_tokens,
+    const int32_t* __restrict__ draft_token_ids,
+    const int32_t* __restrict__ target_argmax,
+    const int32_t* __restrict__ bonus_token_ids,
+    const bool* __restrict__ is_greedy, bool has_is_greedy, int num_reqs) {
+  const int req_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (req_idx >= num_reqs) {
+    return;
+  }
+  if (has_is_greedy && !is_greedy[req_idx]) {
+    return;
+  }
+
+  const int start_idx = req_idx == 0 ? 0 : cu_num_draft_tokens[req_idx - 1];
+  const int end_idx = cu_num_draft_tokens[req_idx];
+  const int num_draft_tokens = end_idx - start_idx;
+
+  bool rejected = false;
+  for (int pos = 0; pos < num_draft_tokens; ++pos) {
+    const int token_idx = start_idx + pos;
+    const int32_t target_token_id = target_argmax[token_idx];
+    output_token_ids[req_idx * output_stride + pos] = target_token_id;
+    if (draft_token_ids[token_idx] != target_token_id) {
+      rejected = true;
+      break;
+    }
+  }
+
+  if (!rejected) {
+    output_token_ids[req_idx * output_stride + num_draft_tokens] =
+        bonus_token_ids[req_idx];
+  }
+}
+
+__global__ void rejection_random_sample_precompiled_kernel(
+    int32_t* __restrict__ output_token_ids, int64_t output_stride,
+    const int32_t* __restrict__ cu_num_draft_tokens,
+    const int32_t* __restrict__ draft_token_ids,
+    const float* __restrict__ draft_probs, const float* __restrict__ target_probs,
+    const int32_t* __restrict__ bonus_token_ids,
+    const int32_t* __restrict__ recovered_token_ids,
+    const double* __restrict__ uniform_probs, const bool* __restrict__ is_greedy,
+    bool has_draft_probs, bool has_is_greedy, int num_reqs, int vocab_size) {
+  const int req_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (req_idx >= num_reqs) {
+    return;
+  }
+  if (has_is_greedy && is_greedy[req_idx]) {
+    return;
+  }
+
+  const int start_idx = req_idx == 0 ? 0 : cu_num_draft_tokens[req_idx - 1];
+  const int end_idx = cu_num_draft_tokens[req_idx];
+  const int num_draft_tokens = end_idx - start_idx;
+
+  bool rejected = false;
+  for (int pos = 0; pos < num_draft_tokens; ++pos) {
+    const int token_idx = start_idx + pos;
+    const int32_t draft_token_id = draft_token_ids[token_idx];
+    const double draft_prob =
+        has_draft_probs
+            ? static_cast<double>(draft_probs[token_idx * vocab_size +
+                                              draft_token_id])
+            : 1.0;
+    const double target_prob =
+        static_cast<double>(target_probs[token_idx * vocab_size + draft_token_id]);
+    const double uniform_prob = uniform_probs[token_idx];
+
+    int32_t token_id = draft_token_id;
+    if (!(draft_prob > 0.0 && target_prob / draft_prob >= uniform_prob)) {
+      rejected = true;
+      token_id = recovered_token_ids[token_idx];
+    }
+    output_token_ids[req_idx * output_stride + pos] = token_id;
+    if (rejected) {
+      break;
+    }
+  }
+
+  if (!rejected) {
+    output_token_ids[req_idx * output_stride + num_draft_tokens] =
+        bonus_token_ids[req_idx];
+  }
+}
+
+}  // namespace
+
+void rejection_greedy_sample_precompiled(
+    torch::Tensor& output_token_ids, const torch::Tensor& cu_num_draft_tokens,
+    const torch::Tensor& draft_token_ids, const torch::Tensor& target_argmax,
+    const torch::Tensor& bonus_token_ids,
+    const std::optional<torch::Tensor>& is_greedy, int64_t max_spec_len) {
+  TORCH_CHECK(output_token_ids.is_cuda(),
+              "rejection_greedy_sample_precompiled expects CUDA "
+              "output_token_ids");
+  TORCH_CHECK(cu_num_draft_tokens.is_cuda(),
+              "rejection_greedy_sample_precompiled expects CUDA "
+              "cu_num_draft_tokens");
+  TORCH_CHECK(draft_token_ids.is_cuda(),
+              "rejection_greedy_sample_precompiled expects CUDA "
+              "draft_token_ids");
+  TORCH_CHECK(target_argmax.is_cuda(),
+              "rejection_greedy_sample_precompiled expects CUDA target_argmax");
+  TORCH_CHECK(bonus_token_ids.is_cuda(),
+              "rejection_greedy_sample_precompiled expects CUDA "
+              "bonus_token_ids");
+  TORCH_CHECK(output_token_ids.scalar_type() == torch::kInt32,
+              "rejection_greedy_sample_precompiled expects int32 "
+              "output_token_ids");
+  TORCH_CHECK(cu_num_draft_tokens.scalar_type() == torch::kInt32,
+              "rejection_greedy_sample_precompiled expects int32 "
+              "cu_num_draft_tokens");
+  TORCH_CHECK(draft_token_ids.scalar_type() == torch::kInt32,
+              "rejection_greedy_sample_precompiled expects int32 "
+              "draft_token_ids");
+  TORCH_CHECK(target_argmax.scalar_type() == torch::kInt32,
+              "rejection_greedy_sample_precompiled expects int32 "
+              "target_argmax");
+  TORCH_CHECK(bonus_token_ids.scalar_type() == torch::kInt32,
+              "rejection_greedy_sample_precompiled expects int32 "
+              "bonus_token_ids");
+  TORCH_CHECK(output_token_ids.size(1) == max_spec_len + 1,
+              "rejection_greedy_sample_precompiled expects "
+              "output_token_ids.size(1) == max_spec_len + 1");
+
+  const bool has_is_greedy = is_greedy.has_value() && is_greedy.value().defined();
+  if (has_is_greedy) {
+    TORCH_CHECK(is_greedy.value().is_cuda(),
+                "rejection_greedy_sample_precompiled expects CUDA is_greedy");
+    TORCH_CHECK(is_greedy.value().scalar_type() == torch::kBool,
+                "rejection_greedy_sample_precompiled expects bool is_greedy");
+  }
+
+  const int num_reqs = static_cast<int>(cu_num_draft_tokens.size(0));
+  if (num_reqs == 0) {
+    return;
+  }
+
+  constexpr int kThreads = 128;
+  const int blocks = (num_reqs + kThreads - 1) / kThreads;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  rejection_greedy_sample_precompiled_kernel<<<blocks, kThreads, 0, stream>>>(
+      output_token_ids.data_ptr<int32_t>(), output_token_ids.stride(0),
+      cu_num_draft_tokens.data_ptr<int32_t>(), draft_token_ids.data_ptr<int32_t>(),
+      target_argmax.data_ptr<int32_t>(), bonus_token_ids.data_ptr<int32_t>(),
+      has_is_greedy ? is_greedy.value().data_ptr<bool>() : nullptr,
+      has_is_greedy, num_reqs);
+}
+
+void rejection_random_sample_precompiled(
+    torch::Tensor& output_token_ids, const torch::Tensor& cu_num_draft_tokens,
+    const torch::Tensor& draft_token_ids,
+    const std::optional<torch::Tensor>& draft_probs,
+    const torch::Tensor& target_probs, const torch::Tensor& bonus_token_ids,
+    const torch::Tensor& recovered_token_ids,
+    const torch::Tensor& uniform_probs,
+    const std::optional<torch::Tensor>& is_greedy, int64_t max_spec_len) {
+  TORCH_CHECK(output_token_ids.is_cuda(),
+              "rejection_random_sample_precompiled expects CUDA "
+              "output_token_ids");
+  TORCH_CHECK(cu_num_draft_tokens.is_cuda(),
+              "rejection_random_sample_precompiled expects CUDA "
+              "cu_num_draft_tokens");
+  TORCH_CHECK(draft_token_ids.is_cuda(),
+              "rejection_random_sample_precompiled expects CUDA "
+              "draft_token_ids");
+  TORCH_CHECK(target_probs.is_cuda(),
+              "rejection_random_sample_precompiled expects CUDA target_probs");
+  TORCH_CHECK(bonus_token_ids.is_cuda(),
+              "rejection_random_sample_precompiled expects CUDA "
+              "bonus_token_ids");
+  TORCH_CHECK(recovered_token_ids.is_cuda(),
+              "rejection_random_sample_precompiled expects CUDA "
+              "recovered_token_ids");
+  TORCH_CHECK(uniform_probs.is_cuda(),
+              "rejection_random_sample_precompiled expects CUDA uniform_probs");
+  TORCH_CHECK(output_token_ids.scalar_type() == torch::kInt32,
+              "rejection_random_sample_precompiled expects int32 "
+              "output_token_ids");
+  TORCH_CHECK(cu_num_draft_tokens.scalar_type() == torch::kInt32,
+              "rejection_random_sample_precompiled expects int32 "
+              "cu_num_draft_tokens");
+  TORCH_CHECK(draft_token_ids.scalar_type() == torch::kInt32,
+              "rejection_random_sample_precompiled expects int32 "
+              "draft_token_ids");
+  TORCH_CHECK(bonus_token_ids.scalar_type() == torch::kInt32,
+              "rejection_random_sample_precompiled expects int32 "
+              "bonus_token_ids");
+  TORCH_CHECK(recovered_token_ids.scalar_type() == torch::kInt32,
+              "rejection_random_sample_precompiled expects int32 "
+              "recovered_token_ids");
+  TORCH_CHECK(target_probs.scalar_type() == torch::kFloat32,
+              "rejection_random_sample_precompiled expects float32 "
+              "target_probs");
+  TORCH_CHECK(uniform_probs.scalar_type() == torch::kFloat64,
+              "rejection_random_sample_precompiled expects float64 "
+              "uniform_probs");
+  TORCH_CHECK(output_token_ids.size(1) == max_spec_len + 1,
+              "rejection_random_sample_precompiled expects "
+              "output_token_ids.size(1) == max_spec_len + 1");
+
+  const bool has_draft_probs = draft_probs.has_value() && draft_probs.value().defined();
+  if (has_draft_probs) {
+    TORCH_CHECK(draft_probs.value().is_cuda(),
+                "rejection_random_sample_precompiled expects CUDA draft_probs");
+    TORCH_CHECK(draft_probs.value().scalar_type() == torch::kFloat32,
+                "rejection_random_sample_precompiled expects float32 "
+                "draft_probs");
+  }
+
+  const bool has_is_greedy = is_greedy.has_value() && is_greedy.value().defined();
+  if (has_is_greedy) {
+    TORCH_CHECK(is_greedy.value().is_cuda(),
+                "rejection_random_sample_precompiled expects CUDA is_greedy");
+    TORCH_CHECK(is_greedy.value().scalar_type() == torch::kBool,
+                "rejection_random_sample_precompiled expects bool is_greedy");
+  }
+
+  const int num_reqs = static_cast<int>(cu_num_draft_tokens.size(0));
+  if (num_reqs == 0) {
+    return;
+  }
+
+  constexpr int kThreads = 128;
+  const int blocks = (num_reqs + kThreads - 1) / kThreads;
+  const int vocab_size = static_cast<int>(target_probs.size(1));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  rejection_random_sample_precompiled_kernel<<<blocks, kThreads, 0, stream>>>(
+      output_token_ids.data_ptr<int32_t>(), output_token_ids.stride(0),
+      cu_num_draft_tokens.data_ptr<int32_t>(), draft_token_ids.data_ptr<int32_t>(),
+      has_draft_probs ? draft_probs.value().data_ptr<float>() : nullptr,
+      target_probs.data_ptr<float>(), bonus_token_ids.data_ptr<int32_t>(),
+      recovered_token_ids.data_ptr<int32_t>(),
+      uniform_probs.data_ptr<double>(),
+      has_is_greedy ? is_greedy.value().data_ptr<bool>() : nullptr,
+      has_draft_probs, has_is_greedy, num_reqs, vocab_size);
+}
 
 void apply_repetition_penalties_(
     torch::Tensor& logits,             // [num_seqs, vocab_size], in-place

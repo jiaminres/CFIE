@@ -5,7 +5,10 @@
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+logger = init_logger(__name__)
 
 
 @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
@@ -145,6 +148,21 @@ def _layer_norm_fwd(
 def rms_norm_gated(
     x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True
 ):
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Mamba gated RMSNorm is falling back to the PyTorch reference path "
+            "because Triton runtime is unavailable."
+        )
+        return _rms_norm_gated_torch(
+            x,
+            weight,
+            bias,
+            z=z,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+        )
+
     x_shape_og = x.shape
     # reshape input data into 2D tensor
     x = x.reshape(-1, x.shape[-1])
@@ -170,3 +188,42 @@ def rms_norm_gated(
     )
 
     return y.reshape(x_shape_og)
+
+
+def _rms_norm_gated_torch(
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+):
+    x_shape_og = x.shape
+    hidden_dim = x.shape[-1]
+    if group_size is None:
+        group_size = hidden_dim
+    assert hidden_dim % group_size == 0
+
+    x_work = x.reshape(-1, hidden_dim).to(torch.float32)
+    z_work = None
+    if z is not None:
+        assert z.shape == x_shape_og
+        z_work = z.reshape(-1, hidden_dim).to(torch.float32)
+
+    if z_work is not None and not norm_before_gate:
+        x_work = x_work * (z_work * torch.sigmoid(z_work))
+
+    group_count = hidden_dim // group_size
+    x_grouped = x_work.view(-1, group_count, group_size)
+    variance = x_grouped.pow(2).mean(dim=-1, keepdim=True)
+    y = (x_grouped * torch.rsqrt(variance + eps)).view_as(x_work)
+
+    y = y * weight.to(device=x.device, dtype=torch.float32).view(1, hidden_dim)
+    if bias is not None:
+        y = y + bias.to(device=x.device, dtype=torch.float32).view(1, hidden_dim)
+
+    if z_work is not None and norm_before_gate:
+        y = y * (z_work * torch.sigmoid(z_work))
+
+    return y.to(dtype=x.dtype).reshape(x_shape_og)

@@ -9,7 +9,7 @@ import torch
 
 import cfie.model_executor.layers.fused_moe.modular_kernel as mk
 from cfie.model_executor.layers.fused_moe.utils import count_expert_num_tokens
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from cfie.utils.math_utils import round_up
 
@@ -181,6 +181,21 @@ def ep_scatter(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
 ):
+    if not HAS_TRITON:
+        _ep_scatter_torch(
+            recv_x,
+            recv_x_scale,
+            recv_topk,
+            num_recv_tokens_per_expert,
+            expert_map,
+            expert_start_loc,
+            output_tensor,
+            output_tensor_scale,
+            m_indices,
+            output_index,
+        )
+        return
+
     BLOCK_E = 128  # token num of per expert is aligned to 128
     BLOCK_D = 128  # block size of quantization
     num_warps = 8
@@ -235,6 +250,46 @@ def ep_scatter(
         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
     )
     return
+
+
+def _ep_scatter_torch(
+    recv_x: torch.Tensor,
+    recv_x_scale: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+) -> None:
+    alignment = 128
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    counts = num_recv_tokens_per_expert.to(torch.int64)
+    aligned_counts = ((counts + alignment - 1) // alignment) * alignment
+    starts = torch.cumsum(aligned_counts, dim=0) - aligned_counts
+    expert_start_loc.copy_(starts.to(expert_start_loc.dtype))
+
+    for expert_id in range(num_experts):
+        token_count = int(num_recv_tokens_per_expert[expert_id].item())
+        start = int(starts[expert_id].item())
+        if token_count > 0:
+            m_indices[start : start + token_count] = expert_id
+
+    for token_id in range(recv_topk.shape[0]):
+        for topk_index in range(recv_topk.shape[1]):
+            expert_id = int(recv_topk[token_id, topk_index].item())
+            if expert_map is not None and expert_id != -1:
+                expert_id = int(expert_map[expert_id].item())
+            if expert_id < 0:
+                continue
+
+            dest_token_index = int(expert_start_loc[expert_id].item())
+            output_index[token_id, topk_index] = dest_token_index
+            output_tensor[dest_token_index].copy_(recv_x[token_id])
+            output_tensor_scale[dest_token_index].copy_(recv_x_scale[token_id])
+            expert_start_loc[expert_id] += 1
 
 
 @triton.jit
@@ -308,6 +363,17 @@ def ep_gather(
     expert_map: torch.Tensor | None,
     output_tensor: torch.Tensor,
 ):
+    if not HAS_TRITON:
+        _ep_gather_torch(
+            input_tensor,
+            recv_topk_ids,
+            recv_topk_weight,
+            input_index,
+            expert_map,
+            output_tensor,
+        )
+        return
+
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
@@ -339,6 +405,33 @@ def ep_gather(
         BLOCK_D=BLOCK_D,
     )
     return
+
+
+def _ep_gather_torch(
+    input_tensor: torch.Tensor,
+    recv_topk_ids: torch.Tensor,
+    recv_topk_weight: torch.Tensor,
+    input_index: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    output_tensor: torch.Tensor,
+) -> None:
+    for token_id in range(output_tensor.shape[0]):
+        accumulator = torch.zeros(
+            output_tensor.shape[1],
+            device=output_tensor.device,
+            dtype=torch.float32,
+        )
+        for topk_index in range(recv_topk_ids.shape[1]):
+            expert_id = int(recv_topk_ids[token_id, topk_index].item())
+            if expert_map is not None and expert_id != -1:
+                expert_id = int(expert_map[expert_id].item())
+            if expert_id < 0:
+                continue
+
+            source_token_index = int(input_index[token_id, topk_index].item())
+            weight = recv_topk_weight[token_id, topk_index].to(torch.float32)
+            accumulator += input_tensor[source_token_index].to(torch.float32) * weight
+        output_tensor[token_id].copy_(accumulator.to(output_tensor.dtype))
 
 
 def deepgemm_moe_permute(

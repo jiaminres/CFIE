@@ -3,8 +3,67 @@
 
 import torch
 
+from cfie import _custom_ops as ops
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+
+def _can_use_precompiled_flash_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+) -> bool:
+    return key_cache.ndim == 4 and value_cache.ndim == 4
+
+
+def _can_use_precompiled_head_major_flash_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+) -> bool:
+    return key_cache.ndim == 5 and value_cache.ndim == 4
+
+
+def _reshape_and_cache_flash_via_precompiled(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    ops.reshape_and_cache_flash(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+
+def _reshape_and_cache_flash_head_major_via_precompiled(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    ops.reshape_and_cache(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
 
 
 @triton.jit
@@ -123,6 +182,36 @@ def triton_reshape_and_cache_flash(
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
 ):
+    if _can_use_precompiled_flash_cache(key_cache, value_cache):
+        _reshape_and_cache_flash_via_precompiled(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+    if _can_use_precompiled_head_major_flash_cache(key_cache, value_cache):
+        _reshape_and_cache_flash_head_major_via_precompiled(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+    if not HAS_TRITON:
+        raise RuntimeError(
+            "Triton is required for reshape_and_cache_flash with head-major KV "
+            "cache layout."
+        )
+
     num_heads = key.shape[1]
     head_size = key.shape[2]
 
@@ -313,6 +402,23 @@ def triton_reshape_and_cache_flash_diffkv(
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
 ):
+    if kv_cache.ndim == 4:
+        ops.reshape_and_cache_flash_diffkv(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+    if not HAS_TRITON:
+        raise RuntimeError(
+            "Triton is required for reshape_and_cache_flash_diffkv with "
+            "non-4D KV cache layout."
+        )
+
     num_heads = key.shape[1]
     head_size_k = key.shape[2]
     head_size_v = value.shape[2]

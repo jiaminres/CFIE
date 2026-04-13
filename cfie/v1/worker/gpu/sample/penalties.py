@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from cfie.sampling_params import SamplingParams
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.math_utils import cdiv
 from cfie.utils.torch_utils import async_tensor_h2d
 from cfie.v1.worker.gpu.buffer_utils import UvaBackedTensor
@@ -201,6 +201,42 @@ def apply_penalties(
     output_bin_counts: torch.Tensor,
     num_speculative_tokens: int,
 ) -> None:
+    if not HAS_TRITON:
+        vocab_size = logits.shape[1]
+        vocab_offsets = torch.arange(vocab_size, device=logits.device)
+        for token_idx in range(logits.shape[0]):
+            req_state_idx = int(expanded_idx_mapping[token_idx].item())
+            rep_penalty = float(repetition_penalty[req_state_idx].item())
+            freq_penalty = float(frequency_penalty[req_state_idx].item())
+            pres_penalty = float(presence_penalty[req_state_idx].item())
+
+            use_rep_penalty = rep_penalty != 1.0
+            use_freq_penalty = freq_penalty != 0.0
+            use_pres_penalty = pres_penalty != 0.0
+            if not (use_rep_penalty or use_freq_penalty or use_pres_penalty):
+                continue
+
+            row = logits[token_idx].to(torch.float32)
+            output_counts = output_bin_counts[req_state_idx].to(torch.int32).clone()
+
+            pos = int(expanded_local_pos[token_idx].item())
+            start_idx = token_idx - pos
+            for prev_pos in range(min(pos, num_speculative_tokens)):
+                prev_token = int(token_ids[start_idx + prev_pos + 1].item())
+                output_counts[prev_token] += 1
+
+            output_mask = output_counts > 0
+            if use_rep_penalty:
+                packed_mask = prompt_bin_mask[req_state_idx][vocab_offsets // 32]
+                prompt_mask = ((packed_mask >> (vocab_offsets % 32)) & 1).to(torch.bool)
+                scale = torch.where(prompt_mask | output_mask, rep_penalty, 1.0)
+                row = row * torch.where(row > 0, 1.0 / scale, scale)
+
+            row -= freq_penalty * output_counts.to(torch.float32)
+            row -= pres_penalty * output_mask.to(torch.float32)
+            logits[token_idx].copy_(row.to(dtype=logits.dtype))
+        return
+
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 8192
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
@@ -284,6 +320,31 @@ def bincount(
     output_bin_counts: torch.Tensor,
     max_prefill_len: int,
 ) -> None:
+    if not HAS_TRITON:
+        del max_prefill_len
+        prompt_bin_mask[expanded_idx_mapping] = 0
+        output_bin_counts[expanded_idx_mapping] = 0
+        for token_idx in range(expanded_idx_mapping.shape[0]):
+            req_state_idx = int(expanded_idx_mapping[token_idx].item())
+            req_prompt_len = int(prompt_len[req_state_idx].item())
+            req_prefill_len = int(prefill_len[req_state_idx].item())
+            prompt_tokens = all_token_ids[req_state_idx, :req_prompt_len].to(torch.int64)
+            if prompt_tokens.numel() > 0:
+                for prompt_token in prompt_tokens.tolist():
+                    prompt_bin_mask[req_state_idx, prompt_token // 32] |= (
+                        1 << (prompt_token % 32)
+                    )
+            output_tokens = all_token_ids[
+                req_state_idx, req_prompt_len:req_prefill_len
+            ].to(torch.int64)
+            if output_tokens.numel() > 0:
+                output_bin_counts[req_state_idx].scatter_add_(
+                    0,
+                    output_tokens,
+                    torch.ones_like(output_tokens, dtype=output_bin_counts.dtype),
+                )
+        return
+
     prompt_bin_mask[expanded_idx_mapping] = 0
     output_bin_counts[expanded_idx_mapping] = 0
     num_tokens = expanded_idx_mapping.shape[0]

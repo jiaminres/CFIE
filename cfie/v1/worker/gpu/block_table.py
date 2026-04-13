@@ -4,7 +4,7 @@ from collections.abc import Iterable
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.math_utils import cdiv
 from cfie.v1.attention.backends.utils import PAD_SLOT_ID
 from cfie.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
@@ -109,6 +109,10 @@ class BlockTables:
         num_reqs_padded: int,
     ) -> tuple[torch.Tensor, ...]:
         num_reqs = idx_mapping.shape[0]
+        if not HAS_TRITON:
+            self._gather_block_tables_torch(idx_mapping, num_reqs_padded)
+            return tuple(bt[:num_reqs_padded] for bt in self.input_block_tables)
+
         # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
             idx_mapping,
@@ -122,6 +126,26 @@ class BlockTables:
             BLOCK_SIZE=1024,  # type: ignore
         )
         return tuple(bt[:num_reqs_padded] for bt in self.input_block_tables)
+
+    def _gather_block_tables_torch(
+        self,
+        idx_mapping: torch.Tensor,
+        num_reqs_padded: int,
+    ) -> None:
+        num_reqs = idx_mapping.shape[0]
+        for group_id in range(self.num_kv_cache_groups):
+            src = self.block_tables[group_id].gpu
+            dst = self.input_block_tables[group_id]
+            group_num_blocks = self.num_blocks.gpu[group_id]
+            for batch_idx in range(num_reqs_padded):
+                if batch_idx >= num_reqs:
+                    dst[batch_idx].zero_()
+                    continue
+
+                req_idx = int(idx_mapping[batch_idx].item())
+                num_blocks = int(group_num_blocks[req_idx].item())
+                if num_blocks > 0:
+                    dst[batch_idx, :num_blocks].copy_(src[req_idx, :num_blocks])
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
         # NOTE(woosuk): The output may be used for CUDA graph capture.
@@ -139,6 +163,14 @@ class BlockTables:
     ) -> torch.Tensor:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
+        if not HAS_TRITON:
+            self._compute_slot_mappings_torch(
+                idx_mapping,
+                query_start_loc,
+                positions,
+            )
+            return self.slot_mappings[:, :num_tokens_padded]
+
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
             self.max_num_batched_tokens,
             idx_mapping,
@@ -156,6 +188,56 @@ class BlockTables:
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
         return self.slot_mappings[:, :num_tokens_padded]
+
+    def _compute_slot_mappings_torch(
+        self,
+        idx_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        actual_num_tokens = int(query_start_loc[idx_mapping.shape[0]].item())
+        if actual_num_tokens < self.max_num_batched_tokens:
+            self.slot_mappings[:, actual_num_tokens : self.max_num_batched_tokens] = (
+                PAD_SLOT_ID
+            )
+
+        for group_id in range(self.num_kv_cache_groups):
+            block_table = self.block_tables[group_id].gpu
+            block_size = self.block_sizes[group_id]
+            slot_mapping = self.slot_mappings[group_id]
+            for batch_idx in range(idx_mapping.shape[0]):
+                req_state_idx = int(idx_mapping[batch_idx].item())
+                start_idx = int(query_start_loc[batch_idx].item())
+                end_idx = int(query_start_loc[batch_idx + 1].item())
+                if end_idx <= start_idx:
+                    continue
+
+                pos = positions[start_idx:end_idx]
+                block_indices = pos // (block_size * self.cp_size)
+                block_offsets = pos % (block_size * self.cp_size)
+                block_numbers = block_table[
+                    req_state_idx,
+                    block_indices.to(torch.long),
+                ].to(torch.int64)
+
+                if self.cp_size == 1:
+                    slot_ids = block_numbers * block_size + block_offsets
+                else:
+                    is_local = (
+                        block_offsets // self.cp_interleave % self.cp_size
+                        == self.cp_rank
+                    )
+                    rounds = block_offsets // (self.cp_interleave * self.cp_size)
+                    remainder = block_offsets % self.cp_interleave
+                    local_offsets = rounds * self.cp_interleave + remainder
+                    slot_ids = block_numbers * block_size + local_offsets
+                    slot_ids = torch.where(
+                        is_local,
+                        slot_ids,
+                        torch.full_like(slot_ids, PAD_SLOT_ID),
+                    )
+
+                slot_mapping[start_idx:end_idx].copy_(slot_ids.to(slot_mapping.dtype))
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
         # Fill the entire slot_mappings tensor, not just the first `num_tokens` entries.

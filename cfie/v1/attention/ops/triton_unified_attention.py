@@ -12,11 +12,28 @@ import torch
 from cfie.logger import init_logger
 from cfie.model_executor.layers.batch_invariant import cfie_is_batch_invariant
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
+from cfie.v1.attention.backends.fa_utils import (
+    flash_attn_supports_sinks,
+    flash_attn_varlen_func,
+    get_flash_attn_version,
+    is_flash_attn_varlen_func_available,
+)
 
 logger = init_logger(__name__)
 is_batch_invariant = cfie_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
+FLOAT8_DTYPES = {
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+        current_platform.fp8_dtype(),
+    )
+    if dtype is not None
+}
 
 
 @triton.jit
@@ -881,6 +898,236 @@ def _get_tile_size(
     return 16 if element_size >= 2 else 32
 
 
+def _get_flash_attn_unified_attention_version(
+    q: torch.Tensor,
+    *,
+    alibi_slopes: torch.Tensor | None,
+    qq_bias: torch.Tensor | None,
+    mm_prefix_range: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+    output_scale: torch.Tensor | None,
+    use_alibi_sqrt: bool,
+) -> int | None:
+    if not current_platform.is_cuda():
+        return None
+
+    if not is_flash_attn_varlen_func_available():
+        return None
+
+    if qq_bias is not None or mm_prefix_range is not None or use_alibi_sqrt:
+        return None
+
+    if output_scale is not None:
+        return None
+
+    if sinks is not None and not flash_attn_supports_sinks():
+        return None
+
+    return get_flash_attn_version(
+        requires_alibi=alibi_slopes is not None,
+        head_size=q.shape[2],
+    )
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in FLOAT8_DTYPES
+
+
+def _select_descale_row(
+    descale: torch.Tensor | None,
+    seq_idx: int,
+    num_kv_heads: int,
+) -> torch.Tensor | None:
+    if descale is None:
+        return None
+
+    if descale.dim() == 0:
+        return descale.reshape(1).expand(num_kv_heads)
+
+    if descale.dim() == 1:
+        if descale.numel() == 1:
+            return descale.expand(num_kv_heads)
+        return descale
+
+    return descale[seq_idx]
+
+
+def _gather_paged_cache_sequence(
+    cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+) -> torch.Tensor:
+    block_size = cache.shape[1]
+    num_blocks = (seq_len + block_size - 1) // block_size
+    block_ids = block_table_row[:num_blocks].to(dtype=torch.long)
+    cache_blocks = cache.index_select(0, block_ids)
+    return cache_blocks.reshape(num_blocks * block_size, *cache.shape[2:])[
+        :seq_len
+    ].contiguous()
+
+
+def _materialize_cache_sequence(
+    cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+    descale_row: torch.Tensor | None,
+) -> torch.Tensor:
+    seq = _gather_paged_cache_sequence(cache, block_table_row, seq_len)
+    if _is_fp8_dtype(seq.dtype):
+        if descale_row is None:
+            return seq.to(torch.float32)
+        scale = descale_row.to(device=seq.device, dtype=torch.float32).view(1, -1, 1)
+        return seq.to(torch.float32) * scale
+    return seq.to(torch.float32)
+
+
+def _reference_unified_attention(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    softmax_scale: float,
+    window_size: tuple[int, int] | None,
+    block_table: torch.Tensor,
+    softcap: float,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    output_scale: torch.Tensor | None,
+    qq_bias: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+    mm_prefix_range: torch.Tensor | None,
+    use_alibi_sqrt: bool,
+) -> None:
+    logger.info_once(
+        "Using PyTorch reference fallback for Triton unified attention "
+        "because Triton runtime is unavailable."
+    )
+
+    cu_seqlens_q_cpu = cu_seqlens_q.to(device="cpu", dtype=torch.int64)
+    seqused_k_cpu = seqused_k.to(device="cpu", dtype=torch.int64)
+    num_query_heads = q.shape[1]
+    num_kv_heads = k.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+
+    if alibi_slopes is not None:
+        alibi_slopes = alibi_slopes.to(device=q.device, dtype=torch.float32)
+    if sinks is not None:
+        sinks = sinks.to(device=q.device, dtype=torch.float32)
+    if output_scale is not None:
+        output_scale = output_scale.to(device=q.device, dtype=torch.float32)
+
+    sliding_window = 0
+    if window_size is not None and window_size[0] >= 0:
+        sliding_window = 1 + window_size[0]
+
+    for seq_idx in range(len(seqused_k_cpu)):
+        q_start = int(cu_seqlens_q_cpu[seq_idx].item())
+        q_end = int(cu_seqlens_q_cpu[seq_idx + 1].item())
+        q_len = q_end - q_start
+        if q_len <= 0:
+            continue
+
+        seq_len = int(seqused_k_cpu[seq_idx].item())
+        context_len = seq_len - q_len
+
+        q_seq = q[q_start:q_end].transpose(0, 1).contiguous().to(torch.float32)
+        k_seq = _materialize_cache_sequence(
+            k,
+            block_table[seq_idx],
+            seq_len,
+            _select_descale_row(k_descale, seq_idx, num_kv_heads),
+        )
+        v_seq = _materialize_cache_sequence(
+            v,
+            block_table[seq_idx],
+            seq_len,
+            _select_descale_row(v_descale, seq_idx, num_kv_heads),
+        )
+
+        k_seq = k_seq.transpose(0, 1).contiguous()
+        v_seq = v_seq.transpose(0, 1).contiguous()
+
+        if num_queries_per_kv > 1:
+            k_seq = k_seq.repeat_interleave(num_queries_per_kv, dim=0)
+            v_seq = v_seq.repeat_interleave(num_queries_per_kv, dim=0)
+
+        scores = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * softmax_scale
+        if softcap > 0:
+            scores = torch.tanh(scores / softcap) * softcap
+
+        q_positions = torch.arange(q_len, device=q.device, dtype=torch.int64)
+        k_positions = torch.arange(seq_len, device=q.device, dtype=torch.int64)
+        query_abs = context_len + q_positions[:, None]
+        valid_mask = k_positions[None, :] <= query_abs
+
+        if sliding_window > 0:
+            valid_mask = valid_mask & (
+                (query_abs - k_positions[None, :]) < sliding_window
+            )
+
+        if mm_prefix_range is not None:
+            for range_idx in range(mm_prefix_range.shape[1]):
+                range_start = int(mm_prefix_range[seq_idx, range_idx, 0].item())
+                range_end = int(mm_prefix_range[seq_idx, range_idx, 1].item())
+                if range_start >= range_end:
+                    continue
+                q_in_range = (query_abs >= range_start) & (query_abs <= range_end)
+                k_in_range = (k_positions >= range_start) & (k_positions <= range_end)
+                valid_mask = valid_mask | (q_in_range & k_in_range[None, :])
+
+        additive_bias = torch.zeros((q_len, seq_len), device=q.device, dtype=torch.float32)
+        additive_bias.masked_fill_(~valid_mask, -torch.inf)
+
+        if alibi_slopes is not None:
+            if use_alibi_sqrt:
+                relative_pos = k_positions[None, :] - query_abs
+                alibi_offset = torch.where(
+                    relative_pos <= 0,
+                    -torch.sqrt((-relative_pos).to(torch.float32)),
+                    torch.zeros_like(relative_pos, dtype=torch.float32),
+                )
+            else:
+                alibi_offset = (k_positions - context_len).to(torch.float32)[
+                    None, :
+                ].expand(q_len, -1)
+            scores = scores + alibi_slopes.view(-1, 1, 1) * alibi_offset.unsqueeze(0)
+
+        if qq_bias is not None:
+            additive_bias[:, context_len:] += qq_bias[:q_len, :q_len].to(
+                device=q.device,
+                dtype=torch.float32,
+            )
+
+        scores = scores + additive_bias.unsqueeze(0)
+
+        if sinks is not None:
+            sink_scores = sinks.view(-1, 1, 1).expand(-1, q_len, 1)
+            sink_values = torch.zeros(
+                (v_seq.shape[0], 1, v_seq.shape[2]),
+                device=v_seq.device,
+                dtype=v_seq.dtype,
+            )
+            scores = torch.cat((sink_scores, scores), dim=-1)
+            v_seq = torch.cat((sink_values, v_seq), dim=1)
+
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+        out_seq = torch.matmul(probs, v_seq).transpose(0, 1).contiguous()
+
+        if output_scale is not None:
+            info = torch.finfo(out.dtype)
+            out_seq = torch.clamp(out_seq / output_scale, info.min, info.max).to(
+                out.dtype
+            )
+        else:
+            out_seq = out_seq.to(out.dtype)
+
+        out[q_start:q_end].copy_(out_seq)
+
+
 def unified_attention(
     q,
     k,
@@ -938,6 +1185,68 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+
+    flash_attn_version = _get_flash_attn_unified_attention_version(
+        q,
+        alibi_slopes=alibi_slopes,
+        qq_bias=qq_bias,
+        mm_prefix_range=mm_prefix_range,
+        sinks=sinks,
+        output_scale=output_scale,
+        use_alibi_sqrt=use_alibi_sqrt,
+    )
+
+    if flash_attn_version is not None:
+        logger.info_once(
+            "Using FlashAttention fastpath for Triton unified attention "
+            "when qq_bias/mm_prefix/fp8-out are absent."
+        )
+        flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=list(window_size) if window_size is not None else None,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            block_table=block_table,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=1 if is_batch_invariant else 0,
+            fa_version=flash_attn_version,
+            s_aux=sinks,
+        )
+        return
+
+    if not HAS_TRITON:
+        _reference_unified_attention(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+            block_table=block_table,
+            softcap=softcap,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            alibi_slopes=alibi_slopes,
+            output_scale=output_scale,
+            qq_bias=qq_bias,
+            sinks=sinks,
+            mm_prefix_range=mm_prefix_range,
+            use_alibi_sqrt=use_alibi_sqrt,
+        )
+        return
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)

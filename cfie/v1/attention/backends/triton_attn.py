@@ -29,6 +29,11 @@ from cfie.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from cfie.v1.attention.backends.fa_utils import (
+    flash_attn_supports_sinks,
+    get_flash_attn_version,
+    is_flash_attn_varlen_func_available,
+)
 from cfie.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from cfie.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -42,6 +47,35 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+
+
+def _supports_flash_attn_runtime_compat(
+    *,
+    head_size: int,
+    dtype: torch.dtype,
+    has_sink: bool,
+) -> bool:
+    if not current_platform.is_cuda():
+        return False
+
+    if dtype not in (torch.float16, torch.bfloat16):
+        return False
+
+    if not is_flash_attn_varlen_func_available():
+        return False
+
+    if has_sink and not flash_attn_supports_sinks():
+        return False
+
+    return get_flash_attn_version(head_size=head_size) is not None
+
+
+def _supports_reference_runtime_compat(*, dtype: torch.dtype) -> bool:
+    return current_platform.is_cuda() and dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    )
 
 
 @dataclass
@@ -365,9 +399,50 @@ class TritonAttentionBackend(AttentionBackend):
         use_sparse: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        if not HAS_TRITON:
+        if not HAS_TRITON and not _supports_reference_runtime_compat(dtype=dtype):
             return "Triton runtime not available"
         return None
+
+    @classmethod
+    def validate_configuration(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        use_per_head_quant_scales: bool,
+        device_capability: DeviceCapability,
+        attn_type: str,
+    ) -> list[str]:
+        invalid_reasons = super().validate_configuration(
+            head_size=head_size,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            block_size=block_size,
+            use_mla=use_mla,
+            has_sink=has_sink,
+            use_sparse=use_sparse,
+            use_mm_prefix=use_mm_prefix,
+            use_per_head_quant_scales=use_per_head_quant_scales,
+            device_capability=device_capability,
+            attn_type=attn_type,
+        )
+
+        if HAS_TRITON:
+            return invalid_reasons
+
+        if _supports_reference_runtime_compat(dtype=dtype):
+            invalid_reasons = [
+                reason
+                for reason in invalid_reasons
+                if reason != "Triton runtime not available"
+            ]
+
+        return invalid_reasons
 
 
 class TritonAttentionImpl(AttentionImpl):

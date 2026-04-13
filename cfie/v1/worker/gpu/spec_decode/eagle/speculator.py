@@ -9,7 +9,7 @@ from cfie.config import CfieConfig
 from cfie.config.compilation import CUDAGraphMode
 from cfie.forward_context import BatchDescriptor, set_forward_context
 from cfie.logger import init_logger
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.kv_cache_interface import KVCacheConfig
 from cfie.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -452,6 +452,18 @@ def prepare_eagle_inputs(
         dtype=torch.int64,
         device=num_sampled.device,
     )
+    if not HAS_TRITON:
+        _prepare_eagle_inputs_torch(
+            last_token_indices,
+            input_buffers,
+            input_batch,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+        )
+        return last_token_indices
+
     _prepare_eagle_inputs_kernel[(num_reqs,)](
         last_token_indices,
         input_buffers.input_ids,
@@ -467,6 +479,39 @@ def prepare_eagle_inputs(
         BLOCK_SIZE=1024,
     )
     return last_token_indices
+
+
+def _prepare_eagle_inputs_torch(
+    last_token_indices: torch.Tensor,
+    input_buffers: InputBuffers,
+    input_batch: InputBatch,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    last_sampled: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+) -> None:
+    for batch_idx in range(input_batch.num_reqs):
+        req_state_idx = int(input_batch.idx_mapping[batch_idx].item())
+        query_start = int(input_batch.query_start_loc[batch_idx].item())
+        query_end = int(input_batch.query_start_loc[batch_idx + 1].item())
+        query_len = query_end - query_start - int(num_rejected[batch_idx].item())
+
+        if int(num_sampled[batch_idx].item()) > 0:
+            next_token = last_sampled[req_state_idx].to(torch.int32)
+        else:
+            next_token = next_prefill_tokens[req_state_idx]
+
+        if query_len > 1:
+            input_buffers.input_ids[query_start : query_start + query_len - 1].copy_(
+                input_batch.input_ids[query_start + 1 : query_start + query_len]
+            )
+
+        last_token_index = query_start + query_len - 1
+        last_token_indices[batch_idx] = last_token_index
+        input_buffers.input_ids[last_token_index] = next_token
+        input_buffers.positions[query_start : query_start + query_len].copy_(
+            input_batch.positions[query_start : query_start + query_len]
+        )
 
 
 @triton.jit
@@ -551,6 +596,20 @@ def prepare_eagle_decode(
 ):
     num_reqs = draft_tokens.shape[0]
     hidden_size = output_hidden_states.shape[-1]
+    if not HAS_TRITON:
+        _prepare_eagle_decode_torch(
+            draft_tokens,
+            output_hidden_states,
+            last_token_indices,
+            target_seq_lens,
+            num_rejected,
+            input_buffers,
+            input_hidden_states,
+            max_model_len,
+            max_num_reqs,
+        )
+        return
+
     _prepare_eagle_docode_kernel[(num_reqs + 1,)](
         draft_tokens,
         output_hidden_states,
@@ -569,6 +628,35 @@ def prepare_eagle_decode(
         max_num_reqs,
         BLOCK_SIZE=1024,
     )
+
+
+def _prepare_eagle_decode_torch(
+    draft_tokens: torch.Tensor,
+    output_hidden_states: torch.Tensor,
+    last_token_indices: torch.Tensor,
+    target_seq_lens: torch.Tensor,
+    num_rejected: torch.Tensor,
+    input_buffers: InputBuffers,
+    input_hidden_states: torch.Tensor,
+    max_model_len: int,
+    max_num_reqs: int,
+) -> None:
+    num_reqs = draft_tokens.shape[0]
+    input_buffers.query_start_loc[: num_reqs + 1].copy_(
+        torch.arange(num_reqs + 1, dtype=torch.int32, device=input_buffers.device)
+    )
+    if max_num_reqs > num_reqs:
+        input_buffers.query_start_loc[num_reqs + 1 : max_num_reqs + 1] = num_reqs
+        input_buffers.seq_lens[num_reqs:max_num_reqs] = 0
+
+    for req_idx in range(num_reqs):
+        input_buffers.input_ids[req_idx] = draft_tokens[req_idx]
+        src_idx = int(last_token_indices[req_idx].item())
+        input_hidden_states[req_idx].copy_(output_hidden_states[src_idx])
+        position = int(input_buffers.positions[req_idx].item())
+        input_buffers.positions[req_idx] = min(position + 1, max_model_len - 1)
+        seq_len = int(target_seq_lens[req_idx].item()) - int(num_rejected[req_idx].item())
+        input_buffers.seq_lens[req_idx] = min(seq_len + 1, max_model_len)
 
 
 @triton.jit
@@ -625,6 +713,16 @@ def update_eagle_inputs(
     max_model_len: int,
 ):
     num_reqs, hidden_size = output_hidden_states.shape
+    if not HAS_TRITON:
+        _update_eagle_inputs_torch(
+            draft_tokens,
+            output_hidden_states,
+            input_buffers,
+            hidden_states,
+            max_model_len,
+        )
+        return
+
     _update_eagle_inputs_kernel[(num_reqs,)](
         input_buffers.input_ids,
         input_buffers.positions,
@@ -638,3 +736,20 @@ def update_eagle_inputs(
         hidden_size,
         BLOCK_SIZE=1024,
     )
+
+
+def _update_eagle_inputs_torch(
+    draft_tokens: torch.Tensor,
+    output_hidden_states: torch.Tensor,
+    input_buffers: InputBuffers,
+    hidden_states: torch.Tensor,
+    max_model_len: int,
+) -> None:
+    num_reqs = draft_tokens.shape[0]
+    for req_idx in range(num_reqs):
+        input_buffers.input_ids[req_idx] = draft_tokens[req_idx]
+        hidden_states[req_idx].copy_(output_hidden_states[req_idx])
+        position = int(input_buffers.positions[req_idx].item())
+        input_buffers.positions[req_idx] = min(position + 1, max_model_len - 1)
+        seq_len = int(input_buffers.seq_lens[req_idx].item())
+        input_buffers.seq_lens[req_idx] = min(seq_len + 1, max_model_len)

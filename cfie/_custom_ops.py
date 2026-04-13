@@ -619,6 +619,394 @@ def zero_kv_blocks_precompiled(
     )
 
 
+def has_precompiled_moe_batch_load_unquantized_runtime() -> bool:
+    return hasattr(torch.ops._C, "moe_batch_load_unquantized_runtime_precompiled")
+
+
+def moe_batch_load_unquantized_runtime_precompiled(
+    slot_ids: torch.Tensor,
+    w13_src: torch.Tensor,
+    w2_src: torch.Tensor,
+    w13_dst: torch.Tensor,
+    w2_dst: torch.Tensor,
+) -> None:
+    torch.ops._C.moe_batch_load_unquantized_runtime_precompiled(
+        slot_ids,
+        w13_src,
+        w2_src,
+        w13_dst,
+        w2_dst,
+    )
+
+
+def has_precompiled_moe_batch_load_gptq_runtime() -> bool:
+    return hasattr(torch.ops._C, "moe_batch_load_gptq_runtime_precompiled")
+
+
+def moe_batch_load_gptq_runtime_precompiled(
+    slot_ids: torch.Tensor,
+    w13_qweight_src: torch.Tensor,
+    w2_qweight_src: torch.Tensor,
+    w13_scales_src: torch.Tensor,
+    w2_scales_src: torch.Tensor,
+    w13_qzeros_src: torch.Tensor,
+    w2_qzeros_src: torch.Tensor,
+    w13_qweight_dst: torch.Tensor,
+    w2_qweight_dst: torch.Tensor,
+    w13_scales_dst: torch.Tensor,
+    w2_scales_dst: torch.Tensor,
+    w13_qzeros_dst: torch.Tensor,
+    w2_qzeros_dst: torch.Tensor,
+    w13_g_idx_src: torch.Tensor | None = None,
+    w2_g_idx_src: torch.Tensor | None = None,
+    w13_g_idx_sort_indices_src: torch.Tensor | None = None,
+    w2_g_idx_sort_indices_src: torch.Tensor | None = None,
+    w13_g_idx_dst: torch.Tensor | None = None,
+    w2_g_idx_dst: torch.Tensor | None = None,
+    w13_g_idx_sort_indices_dst: torch.Tensor | None = None,
+    w2_g_idx_sort_indices_dst: torch.Tensor | None = None,
+) -> None:
+    torch.ops._C.moe_batch_load_gptq_runtime_precompiled(
+        slot_ids,
+        w13_qweight_src,
+        w2_qweight_src,
+        w13_scales_src,
+        w2_scales_src,
+        w13_qzeros_src,
+        w2_qzeros_src,
+        w13_qweight_dst,
+        w2_qweight_dst,
+        w13_scales_dst,
+        w2_scales_dst,
+        w13_qzeros_dst,
+        w2_qzeros_dst,
+        w13_g_idx_src,
+        w2_g_idx_src,
+        w13_g_idx_sort_indices_src,
+        w2_g_idx_sort_indices_src,
+        w13_g_idx_dst,
+        w2_g_idx_dst,
+        w13_g_idx_sort_indices_dst,
+        w2_g_idx_sort_indices_dst,
+    )
+
+
+def has_precompiled_expand_batch_to_tokens() -> bool:
+    return hasattr(torch.ops._C, "expand_batch_to_tokens_precompiled")
+
+
+def has_precompiled_correct_attn_out() -> bool:
+    return hasattr(torch.ops._C, "correct_attn_out_precompiled")
+
+
+def has_precompiled_pack_seq() -> bool:
+    return hasattr(torch.ops._C, "pack_seq_precompiled")
+
+
+def has_precompiled_unpack_seq() -> bool:
+    return hasattr(torch.ops._C, "unpack_seq_precompiled")
+
+
+def correct_attn_out_precompiled(
+    out: torch.Tensor,
+    lses: torch.Tensor,
+    cp_rank: int,
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor:
+    return torch.ops._C.correct_attn_out_precompiled(
+        out,
+        lses,
+        cp_rank,
+        is_lse_base_on_e,
+    )
+
+
+def pack_seq_precompiled(
+    x: torch.Tensor,
+    lengths: torch.Tensor,
+    pad_value: float = -float("inf"),
+) -> torch.Tensor:
+    return torch.ops._C.pack_seq_precompiled(
+        x,
+        lengths,
+        pad_value,
+    )
+
+
+def unpack_seq_precompiled(
+    packed_tensor: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.unpack_seq_precompiled(
+        packed_tensor,
+        lengths,
+    )
+
+
+def expand_batch_to_tokens_precompiled(
+    x: torch.Tensor,
+    cu_num_tokens: torch.Tensor,
+    replace_from: int = 0,
+    replace_to: int = 0,
+) -> torch.Tensor:
+    return torch.ops._C.expand_batch_to_tokens_precompiled(
+        x,
+        cu_num_tokens,
+        replace_from,
+        replace_to,
+    )
+
+
+def has_precompiled_sample_recovered_tokens() -> bool:
+    return hasattr(torch.ops._C, "sample_recovered_tokens_precompiled")
+
+
+def sample_recovered_tokens_precompiled(
+    cu_num_draft_tokens: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_probs: torch.Tensor | None,
+    target_probs: torch.Tensor,
+    inv_q: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.sample_recovered_tokens_precompiled(
+        cu_num_draft_tokens,
+        draft_token_ids,
+        draft_probs,
+        target_probs,
+        inv_q,
+    )
+
+
+def has_precompiled_apply_top_k_top_p() -> bool:
+    return hasattr(torch.ops._C, "apply_top_k_top_p_precompiled")
+
+
+def apply_top_k_top_p_precompiled(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    mask_value: float = -float("inf"),
+) -> None:
+    torch.ops._C.apply_top_k_top_p_precompiled(
+        logits,
+        k,
+        p,
+        mask_value,
+    )
+
+
+def has_precompiled_rejection_greedy_sample() -> bool:
+    return hasattr(torch.ops._C, "rejection_greedy_sample_precompiled")
+
+
+def rejection_greedy_sample_precompiled(
+    output_token_ids: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_argmax: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    is_greedy: torch.Tensor | None,
+    max_spec_len: int,
+) -> None:
+    torch.ops._C.rejection_greedy_sample_precompiled(
+        output_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        target_argmax,
+        bonus_token_ids,
+        is_greedy,
+        max_spec_len,
+    )
+
+
+def has_precompiled_rejection_random_sample() -> bool:
+    return hasattr(torch.ops._C, "rejection_random_sample_precompiled")
+
+
+def rejection_random_sample_precompiled(
+    output_token_ids: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_probs: torch.Tensor | None,
+    target_probs: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    uniform_probs: torch.Tensor,
+    is_greedy: torch.Tensor | None,
+    max_spec_len: int,
+) -> None:
+    torch.ops._C.rejection_random_sample_precompiled(
+        output_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        draft_probs,
+        target_probs,
+        bonus_token_ids,
+        recovered_token_ids,
+        uniform_probs,
+        is_greedy,
+        max_spec_len,
+    )
+
+
+def has_precompiled_input_batch_prepare_prefill_inputs() -> bool:
+    return hasattr(torch.ops._C, "input_batch_prepare_prefill_inputs_precompiled")
+
+
+def input_batch_prepare_prefill_inputs_precompiled(
+    input_ids: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    prefill_len: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+) -> None:
+    torch.ops._C.input_batch_prepare_prefill_inputs_precompiled(
+        input_ids,
+        next_prefill_tokens,
+        idx_mapping,
+        query_start_loc,
+        all_token_ids,
+        prefill_len,
+        num_computed_tokens,
+    )
+
+
+def has_precompiled_input_batch_prepare_pos_seq_lens() -> bool:
+    return hasattr(torch.ops._C, "input_batch_prepare_pos_seq_lens_precompiled")
+
+
+def input_batch_prepare_pos_seq_lens_precompiled(
+    idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    pos: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> None:
+    torch.ops._C.input_batch_prepare_pos_seq_lens_precompiled(
+        idx_mapping,
+        query_start_loc,
+        num_computed_tokens,
+        pos,
+        seq_lens,
+    )
+
+
+def has_precompiled_input_batch_combine_sampled_and_draft_tokens() -> bool:
+    return hasattr(
+        torch.ops._C, "input_batch_combine_sampled_and_draft_tokens_precompiled"
+    )
+
+
+def input_batch_combine_sampled_and_draft_tokens_precompiled(
+    input_ids: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefill_len: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_logits: int,
+) -> torch.Tensor:
+    return torch.ops._C.input_batch_combine_sampled_and_draft_tokens_precompiled(
+        input_ids,
+        idx_mapping,
+        last_sampled_tokens,
+        query_start_loc,
+        seq_lens,
+        prefill_len,
+        draft_tokens,
+        cu_num_logits,
+        num_logits,
+    )
+
+
+def has_precompiled_input_batch_get_num_sampled_and_rejected() -> bool:
+    return hasattr(
+        torch.ops._C, "input_batch_get_num_sampled_and_rejected_precompiled"
+    )
+
+
+def input_batch_get_num_sampled_and_rejected_precompiled(
+    num_sampled: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    prefill_len: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.input_batch_get_num_sampled_and_rejected_precompiled(
+        num_sampled,
+        seq_lens,
+        cu_num_logits,
+        idx_mapping,
+        prefill_len,
+    )
+
+
+def has_precompiled_input_batch_post_update() -> bool:
+    return hasattr(torch.ops._C, "input_batch_post_update_precompiled")
+
+
+def input_batch_post_update_precompiled(
+    idx_mapping: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    output_bin_counts: torch.Tensor | None,
+    sampled_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    total_len: torch.Tensor,
+) -> None:
+    torch.ops._C.input_batch_post_update_precompiled(
+        idx_mapping,
+        num_computed_tokens,
+        last_sampled_tokens,
+        output_bin_counts,
+        sampled_tokens,
+        num_sampled,
+        num_rejected,
+        query_start_loc,
+        all_token_ids,
+        total_len,
+    )
+
+
+def has_precompiled_input_batch_post_update_pool() -> bool:
+    return hasattr(torch.ops._C, "input_batch_post_update_pool_precompiled")
+
+
+def input_batch_post_update_pool_precompiled(
+    idx_mapping: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    torch.ops._C.input_batch_post_update_pool_precompiled(
+        idx_mapping,
+        num_computed_tokens,
+        query_start_loc,
+    )
+
+
+def has_precompiled_input_batch_expand_idx_mapping() -> bool:
+    return hasattr(torch.ops._C, "input_batch_expand_idx_mapping_precompiled")
+
+
+def input_batch_expand_idx_mapping_precompiled(
+    idx_mapping: torch.Tensor,
+    total_num_logits: int,
+    cu_num_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.input_batch_expand_idx_mapping_precompiled(
+        idx_mapping,
+        total_num_logits,
+        cu_num_logits,
+    )
+
+
 def apply_repetition_penalties_torch(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,
@@ -2783,6 +3171,26 @@ def reshape_and_cache_flash(
         value,
         key_cache,
         value_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+
+def reshape_and_cache_flash_diffkv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    torch.ops._C_cache_ops.reshape_and_cache_flash_diffkv(
+        key,
+        value,
+        kv_cache,
         slot_mapping,
         kv_cache_dtype,
         k_scale,

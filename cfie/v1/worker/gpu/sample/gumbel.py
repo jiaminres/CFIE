@@ -2,7 +2,76 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+_UINT63_MASK = (1 << 63) - 1
+
+
+def _mix_seed_and_pos(seed_value: int, pos_value: int) -> int:
+    seed_value &= _UINT63_MASK
+    pos_value &= _UINT63_MASK
+    mixed = (
+        seed_value
+        ^ (
+            pos_value
+            + 0x9E3779B97F4A7C15
+            + ((seed_value << 6) & _UINT63_MASK)
+            + (seed_value >> 2)
+        )
+    ) & _UINT63_MASK
+    return mixed or 1
+
+
+def _make_row_generator(device: torch.device, seed_value: int) -> torch.Generator:
+    generator_device: str | torch.device = "cpu"
+    if device.type != "cpu":
+        generator_device = device
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(seed_value)
+    return generator
+
+
+def _gumbel_sample_torch(
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    pos: torch.Tensor,
+    apply_temperature: bool,
+    processed_logits_out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    num_tokens, vocab_size = logits.shape
+    sampled = torch.empty(num_tokens, device=logits.device, dtype=torch.int64)
+    for token_idx in range(num_tokens):
+        req_state_idx = int(expanded_idx_mapping[token_idx].item())
+        row = logits[token_idx].to(torch.float32)
+        temp = float(temperature[req_state_idx].item())
+        if temp != 0.0 and apply_temperature:
+            row = row / temp
+
+        if processed_logits_out is not None:
+            processed_logits_out[req_state_idx].copy_(
+                row.to(dtype=processed_logits_out.dtype)
+            )
+
+        if temp != 0.0:
+            generator = _make_row_generator(
+                logits.device,
+                _mix_seed_and_pos(
+                    int(seed[req_state_idx].item()),
+                    int(pos[token_idx].item()),
+                ),
+            )
+            uniform = torch.rand(
+                (vocab_size,),
+                generator=generator,
+                device=logits.device,
+                dtype=torch.float32,
+            ).clamp_(min=1e-7)
+            row = row + (-torch.log(-torch.log(uniform)))
+
+        sampled[token_idx] = torch.argmax(row, dim=-1)
+    return sampled
 
 
 @triton.jit
@@ -36,6 +105,13 @@ def apply_temperature(
     expanded_idx_mapping: torch.Tensor,
     temperature: torch.Tensor,
 ) -> None:
+    if not HAS_TRITON:
+        req_temperature = temperature[expanded_idx_mapping].to(torch.float32)
+        active = (req_temperature != 0.0) & (req_temperature != 1.0)
+        if torch.any(active):
+            logits[active] /= req_temperature[active].unsqueeze(1)
+        return
+
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 8192
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
@@ -124,6 +200,17 @@ def gumbel_sample(
     apply_temperature: bool,
     processed_logits_out: torch.Tensor | None = None,  # [num_reqs, vocab_size]
 ) -> torch.Tensor:
+    if not HAS_TRITON:
+        return _gumbel_sample_torch(
+            logits,
+            expanded_idx_mapping,
+            temperature,
+            seed,
+            pos,
+            apply_temperature,
+            processed_logits_out,
+        )
+
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)

@@ -692,15 +692,22 @@ class LayerTieredExpertCacheController:
 
         # 当前请求里的 experts 不能在同一轮 prepare 中被驱逐。
         protected = set(requested)
-        # 逐个检查本次需要的 experts，缺谁补谁。
+        # 先把本轮缺失 experts 聚合成一个批量加载计划。
+        # 这样 Python 主流程不再把“选 slot / 取 CPU bundle / 写 GPU slot”散成多段，
+        # 后续可直接把该批量入口替换成真正的 C++/CUDA H2D 加载算子。
+        load_plan: list[tuple[int, int]] = []
         for expert_id in requested:
             # 已经常驻在 GPU resident slots 中的 expert 直接跳过。
             if self._is_resident(expert_id):
                 continue
             # 为缺失 expert 选一个可替换 slot。
             slot = self._choose_victim_slot(protected)
-            # 再把 expert 从 CPU/NVMe 写入该 GPU slot。
-            self._load_expert_into_slot(expert_id, slot)
+            load_plan.append((expert_id, slot))
+            protected.add(expert_id)
+
+        # 再统一执行本轮专家换入。
+        if load_plan:
+            self._load_experts_into_slots(load_plan)
 
     def _unique_experts(self, topk_ids: torch.Tensor) -> list[int]:
         # 空输入直接返回空列表。
@@ -783,6 +790,12 @@ class LayerTieredExpertCacheController:
             skip_suffixes=skip_suffixes,
         )
 
+        # ------------------------------- 一次性预处理成 runtime-ready CPU static bundle -------------------------------
+        # CPU static mirror 的核心目标是“专家参数在 CPU 中已经是推理 runtime 格式”。
+        # 因此 w13/w2 合并、GPTQ Marlin repack、scale permute 这类预处理应在物化时完成一次，
+        # 后续 cache miss 只负责把 runtime-ready bundle 直接加载到 GPU resident slot。
+        bundle = self._preprocess_cpu_static_bundle(bundle)
+
         # ------------------------------- 将新物化的 bundle 注册到 CPU 静态缓存并更新占用统计 -------------------------------
         # 将当前 expert 对应的 CPU 静态 bundle 写入缓存字典。
         self._cpu_static_bundles[expert_id] = bundle
@@ -811,6 +824,153 @@ class LayerTieredExpertCacheController:
         # 返回当前 expert 对应的 CPU 静态 bundle。
         return bundle
 
+    def _preprocess_cpu_static_bundle(self, bundle: ExpertBundle) -> ExpertBundle:
+        # 已经是 runtime-ready 的 bundle 不重复处理。
+        if bundle.runtime_ready:
+            return bundle
+
+        # 量化路径下，CPU static mirror 应缓存 Marlin MoE runtime 格式：
+        # gate/up 先合并为 w13，w13/w2 qweight 做 repack，scale 做 permute。
+        if getattr(self, "_mode", "") == "gptq_marlin":
+            return self._preprocess_quantized_static_bundle(bundle)
+
+        # 非量化路径下，CPU static mirror 应缓存执行层直接消费的 w13/w2。
+        if getattr(self, "_mode", "") == "unquantized":
+            return self._preprocess_unquantized_static_bundle(bundle)
+
+        # 单测或兼容旧路径中可能通过 __new__ 构造半初始化对象；此时保持原样。
+        return bundle
+
+    def _preprocess_quantized_static_bundle(self, bundle: ExpertBundle) -> ExpertBundle:
+        # 先把 checkpoint 形态的 gate/up/down 拼成单 expert raw w13/w2。
+        raw = self._assemble_raw_weights(bundle)
+
+        # repack/scale permute 当前依赖 GPU kernel，因此只在 CPU static 物化时做一次 GPU 预处理。
+        raw_gpu = self._move_raw_weights_to_device(raw)
+        if self._gptq_desc_act:
+            if raw_gpu.w13_g_idx is None or raw_gpu.w2_g_idx is None:
+                raise RuntimeError(
+                    f"{self.layer_key}: desc_act=True requires g_idx tensors "
+                    "during CPU static preprocessing"
+                )
+            w13_g_idx_sort_indices = torch.argsort(raw_gpu.w13_g_idx, dim=-1).to(
+                torch.int32
+            )
+            w2_g_idx_sort_indices = torch.argsort(raw_gpu.w2_g_idx, dim=-1).to(
+                torch.int32
+            )
+            w13_sorted_g_idx = torch.gather(
+                raw_gpu.w13_g_idx, -1, w13_g_idx_sort_indices
+            )
+            w2_sorted_g_idx = torch.gather(
+                raw_gpu.w2_g_idx, -1, w2_g_idx_sort_indices
+            )
+        else:
+            w13_g_idx_sort_indices = self._empty_perm(raw_gpu.w13_qweight.device)
+            w2_g_idx_sort_indices = self._empty_perm(raw_gpu.w2_qweight.device)
+            w13_sorted_g_idx = None
+            w2_sorted_g_idx = None
+
+        repacked_w13 = ops.gptq_marlin_moe_repack(
+            raw_gpu.w13_qweight,
+            w13_g_idx_sort_indices,
+            raw_gpu.w13_qweight.shape[1] * self.pack_factor,
+            raw_gpu.w13_qweight.shape[2],
+            self.num_bits,
+            is_a_8bit=self.is_a_8bit,
+        )
+        repacked_w2 = ops.gptq_marlin_moe_repack(
+            raw_gpu.w2_qweight,
+            w2_g_idx_sort_indices,
+            raw_gpu.w2_qweight.shape[1] * self.pack_factor,
+            raw_gpu.w2_qweight.shape[2],
+            self.num_bits,
+            is_a_8bit=self.is_a_8bit,
+        )
+        permuted_w13_scales = marlin_moe_permute_scales(
+            s=raw_gpu.w13_scales,
+            size_k=self.layer.intermediate_size_per_partition,
+            size_n=raw_gpu.w13_scales.shape[2],
+            group_size=self.group_size,
+            is_a_8bit=self.is_a_8bit,
+        )
+        permuted_w2_scales = marlin_moe_permute_scales(
+            s=raw_gpu.w2_scales,
+            size_k=raw_gpu.w2_scales.shape[1]
+            * (self.group_size if self.group_size != -1 else self.pack_factor),
+            size_n=raw_gpu.w2_scales.shape[2],
+            group_size=self.group_size,
+            is_a_8bit=self.is_a_8bit,
+        )
+
+        tensors = {
+            "runtime.w13_qweight": self._to_cpu_static_tensor(repacked_w13[0]),
+            "runtime.w2_qweight": self._to_cpu_static_tensor(repacked_w2[0]),
+            "runtime.w13_scales": self._to_cpu_static_tensor(permuted_w13_scales[0]),
+            "runtime.w2_scales": self._to_cpu_static_tensor(permuted_w2_scales[0]),
+            "runtime.w13_qzeros": self._to_cpu_static_tensor(raw_gpu.w13_qzeros[0]),
+            "runtime.w2_qzeros": self._to_cpu_static_tensor(raw_gpu.w2_qzeros[0]),
+        }
+        if (
+                w13_sorted_g_idx is not None
+                and w2_sorted_g_idx is not None
+                and self._gptq_desc_act
+        ):
+            tensors.update(
+                {
+                    "runtime.w13_g_idx": self._to_cpu_static_tensor(
+                        w13_sorted_g_idx[0]
+                    ),
+                    "runtime.w2_g_idx": self._to_cpu_static_tensor(
+                        w2_sorted_g_idx[0]
+                    ),
+                    "runtime.w13_g_idx_sort_indices": self._to_cpu_static_tensor(
+                        w13_g_idx_sort_indices[0]
+                    ),
+                    "runtime.w2_g_idx_sort_indices": self._to_cpu_static_tensor(
+                        w2_g_idx_sort_indices[0]
+                    ),
+                }
+            )
+        return ExpertBundle(
+            tensors=tensors,
+            nbytes=bundle_nbytes(tensors),
+            pinned=all(tensor.is_pinned() for tensor in tensors.values()),
+            runtime_ready=True,
+        )
+
+    def _preprocess_unquantized_static_bundle(
+            self, bundle: ExpertBundle
+    ) -> ExpertBundle:
+        raw = self._assemble_unquantized_weights(bundle)
+        tensors = {
+            "runtime.w13_weight": self._to_cpu_static_tensor(raw.w13_weight[0]),
+            "runtime.w2_weight": self._to_cpu_static_tensor(raw.w2_weight[0]),
+        }
+        return ExpertBundle(
+            tensors=tensors,
+            nbytes=bundle_nbytes(tensors),
+            pinned=all(tensor.is_pinned() for tensor in tensors.values()),
+            runtime_ready=True,
+        )
+
+    def _to_cpu_static_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        # CPU static mirror 目标形态是 runtime-ready + pinned CPU memory。
+        # 如果当前平台或内存压力不允许 pin，保持 pageable CPU tensor 并继续运行；
+        # correctness 不能因为 pinned memory 不可用而失败。
+        cpu_tensor = tensor.detach().to(device="cpu").contiguous()
+        if not self._use_pinned_cpu or cpu_tensor.is_pinned():
+            return cpu_tensor
+        try:
+            return cpu_tensor.pin_memory()
+        except RuntimeError as exc:
+            logger.warning_once(
+                "Failed to pin runtime-ready CPU expert bundle tensor; "
+                "falling back to pageable CPU memory. error=%s",
+                exc,
+            )
+            return cpu_tensor
+
     def _get_source_bundle(self, expert_id: int) -> tuple[ExpertBundle, str]:
         # 先尝试命中 CPU static experts。
         bundle = self._materialize_cpu_static_bundle(expert_id)
@@ -825,34 +985,45 @@ class LayerTieredExpertCacheController:
         return bundle, source
 
     def _load_expert_into_slot(self, expert_id: int, slot: int) -> None:
-        # 当前主线里，动态换入专家只能来自 CPU static mirror。
-        bundle, source = self._get_source_bundle(expert_id)
-        # 统计来源命中。
-        if source == "nvme_stage":
-            self._nvme_loads += 1
-        else:
-            self._cpu_hits += 1
+        # 单 expert 入口保留给旧调用点；内部收敛到批量加载入口。
+        self._load_experts_into_slots([(expert_id, slot)])
 
-        # 把来源 bundle 按当前量化模式转换后写进目标 GPU resident slot。
-        self._write_expert_bundle(slot, bundle, self.layer)
-        # 覆盖 resident 映射表；旧 expert 若存在则在这里被驱逐。
-        self._install_mapping(expert_id, slot)
-        # 增加累计加载计数。
-        self._total_loads += 1
-        # 仅在前几次或每 100 次动态换入时打日志。
-        if self._total_loads <= 8 or self._total_loads % 100 == 0:
-            logger.info(
-                "Tiered MoE cache event: layer=%s load=%d source=%s expert=%d slot=%d "
-                "cpu_hits=%d nvme_loads=%d evictions=%d",
-                self.layer_key,
-                self._total_loads,
-                source,
-                expert_id,
-                slot,
-                self._cpu_hits,
-                self._nvme_loads,
-                self._evictions,
-            )
+    def _load_experts_into_slots(self, assignments: list[tuple[int, int]]) -> None:
+        # 当前主线里，动态换入专家只能来自 CPU static mirror。
+        bundles_and_sources: list[tuple[int, int, ExpertBundle, str]] = []
+        for expert_id, slot in assignments:
+            bundle, source = self._get_source_bundle(expert_id)
+            bundles_and_sources.append((expert_id, slot, bundle, source))
+            if source == "nvme_stage":
+                self._nvme_loads += 1
+            else:
+                self._cpu_hits += 1
+
+        # 批量写入入口：当前 Python 版逐 slot copy，但调用语义已经变成“本轮一次批量加载”。
+        # 下一步可以在这里下沉到 C++/CUDA：一次接收 N 个 CPU runtime-ready experts，
+        # 一次调度完成 N 个 resident GPU slots 的 H2D 覆盖。
+        self._write_expert_bundles(bundles_and_sources, self.layer)
+
+        for expert_id, slot, _bundle, source in bundles_and_sources:
+            # 覆盖 resident 映射表；旧 expert 若存在则在这里被驱逐。
+            self._install_mapping(expert_id, slot)
+            # 增加累计加载计数。
+            self._total_loads += 1
+            # 仅在前几次或每 100 次动态换入时打日志。
+            if self._total_loads <= 8 or self._total_loads % 100 == 0:
+                logger.info(
+                    "Tiered MoE cache event: layer=%s load=%d batch=%d source=%s "
+                    "expert=%d slot=%d cpu_hits=%d nvme_loads=%d evictions=%d",
+                    self.layer_key,
+                    self._total_loads,
+                    len(assignments),
+                    source,
+                    expert_id,
+                    slot,
+                    self._cpu_hits,
+                    self._nvme_loads,
+                    self._evictions,
+                )
 
     def _populate_prefill_burst_pool(
             self,
@@ -877,6 +1048,200 @@ class LayerTieredExpertCacheController:
             else:
                 stats.cpu_hits += 1
         return stats
+
+    def _write_expert_bundles(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            target: Any,
+    ) -> None:
+        # 当前实现先提供批量加载语义边界：同一轮 prepare 中缺失的 experts 聚合到这里统一处理。
+        # 若 bundle 已经是 runtime-ready，运行时只做 CPU -> GPU slot 拷贝，不再重复 w13/w2 合并、
+        # GPTQ Marlin repack 或 scale permute。
+        if self._try_write_runtime_ready_bundles_batch(
+                bundles_and_sources, target
+        ):
+            return
+
+        for _expert_id, slot, bundle, _source in bundles_and_sources:
+            self._write_expert_bundle(slot, bundle, target)
+
+    def _try_write_runtime_ready_bundles_batch(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            target: Any,
+    ) -> bool:
+        if not bundles_and_sources:
+            return False
+
+        bundles = [bundle for _expert_id, _slot, bundle, _source in bundles_and_sources]
+        if not all(bundle.runtime_ready for bundle in bundles):
+            return False
+
+        if self._mode == "unquantized":
+            if not ops.has_precompiled_moe_batch_load_unquantized_runtime():
+                return False
+            self._write_unquantized_runtime_ready_bundles_batch(
+                bundles_and_sources, target
+            )
+            return True
+
+        if self._mode == "gptq_marlin":
+            if not ops.has_precompiled_moe_batch_load_gptq_runtime():
+                return False
+            self._write_gptq_runtime_ready_bundles_batch(
+                bundles_and_sources, target
+            )
+            return True
+
+        return False
+
+    def _stack_runtime_ready_cpu_field(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            field_name: str,
+    ) -> torch.Tensor:
+        field_tensors = [
+            bundle.tensors[field_name]
+            for _expert_id, _slot, bundle, _source in bundles_and_sources
+        ]
+        first = field_tensors[0]
+        batch_shape = (len(field_tensors), *first.shape)
+        use_pinned_batch = all(
+            tensor.device.type == "cpu" and tensor.is_pinned()
+            for tensor in field_tensors
+        )
+
+        batch_kwargs: dict[str, Any] = {"device": "cpu", "dtype": first.dtype}
+        if use_pinned_batch:
+            batch_kwargs["pin_memory"] = True
+        try:
+            batch = torch.empty(batch_shape, **batch_kwargs)
+        except RuntimeError:
+            batch_kwargs.pop("pin_memory", None)
+            batch = torch.empty(batch_shape, **batch_kwargs)
+
+        for batch_idx, tensor in enumerate(field_tensors):
+            cpu_tensor = (
+                tensor
+                if tensor.device.type == "cpu"
+                else tensor.to(device="cpu", non_blocking=use_pinned_batch)
+            )
+            batch[batch_idx].copy_(cpu_tensor, non_blocking=use_pinned_batch)
+        return batch
+
+    def _maybe_stack_runtime_ready_cpu_field(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            field_name: str,
+    ) -> torch.Tensor | None:
+        if any(
+                field_name not in bundle.tensors
+                for _expert_id, _slot, bundle, _source in bundles_and_sources
+        ):
+            return None
+        return self._stack_runtime_ready_cpu_field(
+            bundles_and_sources, field_name
+        )
+
+    def _write_unquantized_runtime_ready_bundles_batch(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            target: Any,
+    ) -> None:
+        slot_ids = torch.tensor(
+            [slot for _expert_id, slot, _bundle, _source in bundles_and_sources],
+            dtype=torch.int64,
+        )
+        w13_batch = self._stack_runtime_ready_cpu_field(
+            bundles_and_sources, "runtime.w13_weight"
+        )
+        w2_batch = self._stack_runtime_ready_cpu_field(
+            bundles_and_sources, "runtime.w2_weight"
+        )
+        ops.moe_batch_load_unquantized_runtime_precompiled(
+            slot_ids,
+            w13_batch,
+            w2_batch,
+            target.w13_weight,
+            target.w2_weight,
+        )
+
+    def _write_gptq_runtime_ready_bundles_batch(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            target: Any,
+    ) -> None:
+        slot_ids = torch.tensor(
+            [slot for _expert_id, slot, _bundle, _source in bundles_and_sources],
+            dtype=torch.int64,
+        )
+        w13_g_idx_batch = None
+        w2_g_idx_batch = None
+        w13_g_idx_sort_indices_batch = None
+        w2_g_idx_sort_indices_batch = None
+        target_w13_g_idx = None
+        target_w2_g_idx = None
+        target_w13_g_idx_sort_indices = None
+        target_w2_g_idx_sort_indices = None
+        if hasattr(target, "w13_g_idx"):
+            w13_g_idx_batch = self._maybe_stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w13_g_idx"
+            )
+            w2_g_idx_batch = self._maybe_stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w2_g_idx"
+            )
+            w13_g_idx_sort_indices_batch = self._maybe_stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w13_g_idx_sort_indices"
+            )
+            w2_g_idx_sort_indices_batch = self._maybe_stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w2_g_idx_sort_indices"
+            )
+            if (
+                    w13_g_idx_batch is not None
+                    and w2_g_idx_batch is not None
+                    and w13_g_idx_sort_indices_batch is not None
+                    and w2_g_idx_sort_indices_batch is not None
+            ):
+                target_w13_g_idx = target.w13_g_idx
+                target_w2_g_idx = target.w2_g_idx
+                target_w13_g_idx_sort_indices = target.w13_g_idx_sort_indices
+                target_w2_g_idx_sort_indices = target.w2_g_idx_sort_indices
+
+        ops.moe_batch_load_gptq_runtime_precompiled(
+            slot_ids,
+            self._stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w13_qweight"
+            ),
+            self._stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w2_qweight"
+            ),
+            self._stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w13_scales"
+            ),
+            self._stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w2_scales"
+            ),
+            self._stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w13_qzeros"
+            ),
+            self._stack_runtime_ready_cpu_field(
+                bundles_and_sources, "runtime.w2_qzeros"
+            ),
+            target.w13_qweight,
+            target.w2_qweight,
+            target.w13_scales,
+            target.w2_scales,
+            target.w13_qzeros,
+            target.w2_qzeros,
+            w13_g_idx_batch,
+            w2_g_idx_batch,
+            w13_g_idx_sort_indices_batch,
+            w2_g_idx_sort_indices_batch,
+            target_w13_g_idx,
+            target_w2_g_idx,
+            target_w13_g_idx_sort_indices,
+            target_w2_g_idx_sort_indices,
+        )
 
     def _copy_resident_expert_to_target(
             self,
@@ -915,6 +1280,10 @@ class LayerTieredExpertCacheController:
             target.w2_weight[slot].copy_(self.layer.w2_weight[src_slot])
 
     def _write_expert_bundle(self, slot: int, bundle: ExpertBundle, target: Any) -> None:
+        if bundle.runtime_ready:
+            self._write_runtime_ready_bundle(slot, bundle, target)
+            return
+
         # ----------------- 量化路径：bundle -> CPU raw -> GPU raw -> Marlin runtime 格式 -----------------
         if self._mode == "gptq_marlin":
             # 先把 gate/up/down 三份量化张量重组回单 expert 的原始结构。
@@ -1022,6 +1391,57 @@ class LayerTieredExpertCacheController:
             runtime_w13=runtime_w13[0],
             runtime_w2=runtime_w2[0],
         )
+
+    def _write_runtime_ready_bundle(
+            self,
+            slot: int,
+            bundle: ExpertBundle,
+            target: Any,
+    ) -> None:
+        tensors = bundle.tensors
+        with torch.no_grad():
+            if self._mode == "gptq_marlin":
+                target.w13_qweight[slot].copy_(
+                    tensors["runtime.w13_qweight"], non_blocking=bundle.pinned
+                )
+                target.w2_qweight[slot].copy_(
+                    tensors["runtime.w2_qweight"], non_blocking=bundle.pinned
+                )
+                target.w13_scales[slot].copy_(
+                    tensors["runtime.w13_scales"], non_blocking=bundle.pinned
+                )
+                target.w2_scales[slot].copy_(
+                    tensors["runtime.w2_scales"], non_blocking=bundle.pinned
+                )
+                target.w13_qzeros[slot].copy_(
+                    tensors["runtime.w13_qzeros"], non_blocking=bundle.pinned
+                )
+                target.w2_qzeros[slot].copy_(
+                    tensors["runtime.w2_qzeros"], non_blocking=bundle.pinned
+                )
+                if hasattr(target, "w13_g_idx") and "runtime.w13_g_idx" in tensors:
+                    target.w13_g_idx[slot].copy_(
+                        tensors["runtime.w13_g_idx"], non_blocking=bundle.pinned
+                    )
+                    target.w2_g_idx[slot].copy_(
+                        tensors["runtime.w2_g_idx"], non_blocking=bundle.pinned
+                    )
+                    target.w13_g_idx_sort_indices[slot].copy_(
+                        tensors["runtime.w13_g_idx_sort_indices"],
+                        non_blocking=bundle.pinned,
+                    )
+                    target.w2_g_idx_sort_indices[slot].copy_(
+                        tensors["runtime.w2_g_idx_sort_indices"],
+                        non_blocking=bundle.pinned,
+                    )
+                return
+
+            target.w13_weight[slot].copy_(
+                tensors["runtime.w13_weight"], non_blocking=bundle.pinned
+            )
+            target.w2_weight[slot].copy_(
+                tensors["runtime.w2_weight"], non_blocking=bundle.pinned
+            )
 
     def _write_quantized_target_slot(
             self,
@@ -1337,13 +1757,12 @@ class LayerTieredExpertCacheController:
             )
 
     def _allocate_source_bundle(self) -> ExpertBundle:
-        # ------------------------------- 为 CPU 侧 expert 镜像分配 source bundle 容器 -------------------------------
-        # source bundle 是长期驻留的 CPU static mirror。它的规模会随“层数 × experts”线性增长，
-        # 不能使用 pinned memory，否则 Windows / CUDA 会把大量长期页锁定内存计入加速器分配压力，
-        # 在 122B + MTP drafter 这类场景下容易在初始化 CPU 静态专家池时触发 CUDA OOM。
+        # ------------------------------- 为 checkpoint 形态 expert 分配临时 source bundle 容器 -------------------------------
+        # 这个 bundle 只用于承接 safetensors 中的 gate/up/down 原始字段，随后会被一次性预处理成
+        # runtime-ready CPU static bundle。长期驻留的 CPU static mirror 不再保存 checkpoint 形态，
+        # 而是保存可直接写入推理 resident slot 的 runtime 格式。
         #
-        # 当前高效 H2D 通道由单 expert raw staging buffer 承担：动态加载时先把 pageable source bundle
-        # 拼装进可复用 raw buffer，再从 raw buffer 搬到 GPU。因此 source bundle 保持普通 CPU 内存即可。
+        # 因此这里保持普通 CPU 内存即可；真正希望加速 H2D 的是预处理后的 runtime-ready bundle。
         cpu_tensor_args = {"device": "cpu"}
 
         # 预声明 source bundle 内部保存的张量字典。

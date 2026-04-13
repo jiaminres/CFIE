@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from cfie import _custom_ops as ops
 from cfie.distributed.parallel_state import GroupCoordinator
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 
 @triton.jit
@@ -107,6 +108,70 @@ class CPTritonContext:
             self.inner_kernel[grid](*regular_args)
 
 
+def _correct_attn_out_torch(
+    out: torch.Tensor,
+    lses: torch.Tensor,
+    cp_rank: int,
+    is_lse_base_on_e: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    neg_inf = lses.new_full((), -float("inf"))
+    sanitized = torch.where(torch.isnan(lses) | torch.isinf(lses), neg_inf, lses)
+    lse_max = sanitized.amax(dim=0)
+    lse_max = torch.where(lse_max == neg_inf, torch.zeros_like(lse_max), lse_max)
+
+    shifted = sanitized - lse_max.unsqueeze(0)
+    if is_lse_base_on_e:
+        lse = torch.log(torch.exp(shifted).sum(dim=0)) + lse_max
+    else:
+        lse = torch.log2(torch.exp2(shifted).sum(dim=0)) + lse_max
+
+    local_lse = sanitized[cp_rank] - lse
+    local_lse = torch.where(
+        torch.isnan(local_lse) | torch.isinf(local_lse), neg_inf, local_lse
+    )
+    factor = torch.exp(local_lse) if is_lse_base_on_e else torch.exp2(local_lse)
+    out.mul_(factor.unsqueeze(-1).to(out.dtype))
+    return out, lse
+
+
+def _pack_seq_torch(
+    x: torch.Tensor,
+    lengths: torch.Tensor,
+    pad_value: float,
+) -> torch.Tensor:
+    lengths_cpu = lengths.to(dtype=torch.long, device="cpu").tolist()
+    batch = len(lengths_cpu)
+    max_len = max(lengths_cpu, default=0)
+    out = torch.full((batch, max_len, x.shape[1]), pad_value, device=x.device, dtype=x.dtype)
+
+    start = 0
+    for batch_idx, seq_len in enumerate(lengths_cpu):
+        if seq_len > 0:
+            out[batch_idx, :seq_len].copy_(x[start : start + seq_len])
+        start += seq_len
+    return out
+
+
+def _unpack_seq_torch(
+    packed_tensor: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    lengths_cpu = lengths.to(dtype=torch.long, device="cpu").tolist()
+    total_tokens = sum(lengths_cpu)
+    out = torch.empty(
+        (total_tokens, packed_tensor.shape[2]),
+        device=packed_tensor.device,
+        dtype=packed_tensor.dtype,
+    )
+
+    start = 0
+    for batch_idx, seq_len in enumerate(lengths_cpu):
+        if seq_len > 0:
+            out[start : start + seq_len].copy_(packed_tensor[batch_idx, :seq_len])
+        start += seq_len
+    return out
+
+
 def correct_attn_out(
     out: torch.Tensor,
     lses: torch.Tensor,
@@ -145,37 +210,52 @@ def correct_attn_out(
     B, H, D = out.shape
     N = lses.shape[0]
 
-    # Strides after we normalized shapes to 3-D views.  The kernel computes
-    # offsets for `vlse_ptr` using lses_stride_B/H, so the output buffer must
-    # have the same B/H stride layout as a slice of `lses`.
-    o_sB, o_sH, o_sD = out.stride()
-    l_sN, l_sB, l_sH = lses.stride()
+    if HAS_TRITON:
+        # Strides after we normalized shapes to 3-D views. The kernel computes
+        # offsets for `vlse_ptr` using lses_stride_B/H, so the output buffer
+        # must have the same B/H stride layout as a slice of `lses`.
+        o_sB, o_sH, o_sD = out.stride()
+        l_sN, l_sB, l_sH = lses.stride()
 
-    # Allocate LSE with the same B/H strides as `lses` so writes land correctly
-    # even when `lses` is a non-contiguous view (e.g., 4-D to 3-D squeeze).
-    lse = torch.empty_strided(
-        (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
-    )
+        # Allocate LSE with the same B/H strides as `lses` so writes land
+        # correctly even when `lses` is a non-contiguous view.
+        lse = torch.empty_strided(
+            (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
+        )
 
-    # Kernel launch config
-    grid = (B, H, 1)
+        grid = (B, H, 1)
+        regular_args = (
+            out,
+            out,
+            lses,
+            lse,
+            o_sB,
+            o_sH,
+            o_sD,
+            l_sN,
+            l_sB,
+            l_sH,
+            cp_rank,
+        )
+        const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
+        ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
+        return out, lse
 
-    regular_args = (
-        out,
+    if out.is_cuda and lses.is_cuda and ops.has_precompiled_correct_attn_out():
+        lse = ops.correct_attn_out_precompiled(
+            out,
+            lses,
+            cp_rank,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
+        return out, lse
+
+    return _correct_attn_out_torch(
         out,
         lses,
-        lse,
-        o_sB,
-        o_sH,
-        o_sD,
-        l_sN,
-        l_sB,
-        l_sH,
         cp_rank,
+        is_lse_base_on_e=is_lse_base_on_e,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
-    ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
-    return out, lse
 
 
 def _cp_lse_common(
@@ -340,22 +420,30 @@ def pack_seq_triton(
 
     # Starts are computed inside the kernel from lengths
 
-    out = torch.empty((B, Lmax, D), device=x.device, dtype=x.dtype)
-
-    grid = (B, triton.cdiv(Lmax, block_t), triton.cdiv(D, block_d))
-    _pack_seq_kernel[grid](
-        x_reshaped,
-        out,
-        lengths.int(),
-        N,
-        D,
-        Lmax,
-        PAD_VALUE=float(pad_value),
-        BLOCK_T=block_t,
-        BLOCK_D=block_d,
-        num_warps=4,
-        num_stages=2,
-    )
+    if HAS_TRITON:
+        out = torch.empty((B, Lmax, D), device=x.device, dtype=x.dtype)
+        grid = (B, triton.cdiv(Lmax, block_t), triton.cdiv(D, block_d))
+        _pack_seq_kernel[grid](
+            x_reshaped,
+            out,
+            lengths.int(),
+            N,
+            D,
+            Lmax,
+            PAD_VALUE=float(pad_value),
+            BLOCK_T=block_t,
+            BLOCK_D=block_d,
+            num_warps=4,
+            num_stages=2,
+        )
+    elif x_reshaped.is_cuda and ops.has_precompiled_pack_seq():
+        out = ops.pack_seq_precompiled(
+            x_reshaped,
+            lengths.to(device=x_reshaped.device, dtype=torch.long),
+            pad_value=float(pad_value),
+        )
+    else:
+        out = _pack_seq_torch(x_reshaped, lengths, pad_value=float(pad_value))
 
     # Reshape output back to original dimensions (except first dimension)
     if len(original_shape) > 2:
@@ -441,21 +529,28 @@ def unpack_seq_triton(
     # Calculate total number of elements
     N = int(lengths.sum().item())
 
-    out = torch.empty((N, D), device=packed_tensor.device, dtype=packed_tensor.dtype)
-
-    grid = (B, triton.cdiv(Lmax, block_t), triton.cdiv(D, block_d))
-    _unpack_seq_triton_kernel[grid](
-        packed_reshaped,
-        out,
-        lengths.int(),
-        B,
-        Lmax,
-        D,
-        BLOCK_T=block_t,
-        BLOCK_D=block_d,
-        num_warps=4,
-        num_stages=2,
-    )
+    if HAS_TRITON:
+        out = torch.empty((N, D), device=packed_tensor.device, dtype=packed_tensor.dtype)
+        grid = (B, triton.cdiv(Lmax, block_t), triton.cdiv(D, block_d))
+        _unpack_seq_triton_kernel[grid](
+            packed_reshaped,
+            out,
+            lengths.int(),
+            B,
+            Lmax,
+            D,
+            BLOCK_T=block_t,
+            BLOCK_D=block_d,
+            num_warps=4,
+            num_stages=2,
+        )
+    elif packed_reshaped.is_cuda and ops.has_precompiled_unpack_seq():
+        out = ops.unpack_seq_precompiled(
+            packed_reshaped,
+            lengths.to(device=packed_reshaped.device, dtype=torch.long),
+        )
+    else:
+        out = _unpack_seq_torch(packed_reshaped, lengths)
 
     # Reshape output back to original dimensions (except first dimension)
     if len(original_shape) > 3:

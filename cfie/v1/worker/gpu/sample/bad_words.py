@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from cfie.sampling_params import SamplingParams
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 from cfie.v1.worker.gpu.states import RequestState
 
@@ -175,6 +175,49 @@ def apply_bad_words(
     expanded_local_pos: torch.Tensor,
     max_num_bad_words: int,
 ) -> None:
+    if not HAS_TRITON:
+        del max_num_bad_words
+        for token_idx in range(logits.shape[0]):
+            req_state_idx = int(expanded_idx_mapping[token_idx].item())
+            req_num_bad_words = int(num_bad_words[req_state_idx].item())
+            if req_num_bad_words == 0:
+                continue
+
+            pos = int(expanded_local_pos[token_idx].item())
+            cur_req_first_pos = token_idx - pos
+            req_prompt_len = int(prompt_len[req_state_idx].item())
+            req_total_len = int(total_len[req_state_idx].item())
+            output_len = req_total_len - req_prompt_len
+            effective_len = output_len + pos
+
+            for bw_idx in range(req_num_bad_words):
+                start = int(bad_word_offsets[req_state_idx, bw_idx].item())
+                end = int(bad_word_offsets[req_state_idx, bw_idx + 1].item())
+                bad_word_len = end - start
+                prefix_len = bad_word_len - 1
+                if prefix_len > effective_len:
+                    continue
+
+                match = True
+                for i in range(prefix_len):
+                    expected = int(bad_word_token_ids[req_state_idx, start + i].item())
+                    actual_pos = effective_len - prefix_len + i
+                    if actual_pos >= output_len:
+                        spec_offset = actual_pos - output_len
+                        actual = int(input_ids[cur_req_first_pos + spec_offset].item())
+                    else:
+                        actual = int(
+                            all_token_ids[req_state_idx, req_prompt_len + actual_pos].item()
+                        )
+                    if expected != actual:
+                        match = False
+                        break
+
+                if match:
+                    last_token = int(bad_word_token_ids[req_state_idx, end - 1].item())
+                    logits[token_idx, last_token] = -float("inf")
+        return
+
     num_tokens = logits.shape[0]
     _bad_words_kernel[(num_tokens, max_num_bad_words)](
         logits,

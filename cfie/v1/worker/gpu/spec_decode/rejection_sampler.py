@@ -2,12 +2,141 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.worker.gpu.input_batch import InputBatch
 from cfie.v1.worker.gpu.metrics.logits import get_num_nans
 from cfie.v1.worker.gpu.sample.gumbel import gumbel_sample
 from cfie.v1.worker.gpu.sample.output import SamplerOutput
 from cfie.v1.worker.gpu.sample.sampler import Sampler
+
+_UINT63_MASK = (1 << 63) - 1
+
+
+def _mix_seed_and_pos(seed_value: int, pos_value: int) -> int:
+    seed_value &= _UINT63_MASK
+    pos_value &= _UINT63_MASK
+    mixed = (
+        seed_value
+        ^ (
+            pos_value
+            + 0x9E3779B97F4A7C15
+            + ((seed_value << 6) & _UINT63_MASK)
+            + (seed_value >> 2)
+        )
+    ) & _UINT63_MASK
+    return mixed or 1
+
+
+def _uniform_from_seed_and_pos(seed_value: int, pos_value: int) -> float:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(_mix_seed_and_pos(seed_value, pos_value))
+    return float(torch.rand((), generator=generator, dtype=torch.float32).item())
+
+
+def _strict_rejection_sample_torch(
+    target_sampled: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_speculative_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_reqs = cu_num_logits.shape[0] - 1
+    sampled = target_sampled.new_empty(num_reqs, num_speculative_steps + 1)
+    num_sampled = target_sampled.new_empty(num_reqs, dtype=torch.int32)
+
+    for req_idx in range(num_reqs):
+        start_idx = int(cu_num_logits[req_idx].item())
+        end_idx = int(cu_num_logits[req_idx + 1].item())
+        num_tokens = end_idx - start_idx
+
+        accepted = 0
+        rejected = False
+        for i in range(num_tokens - 1):
+            token = target_sampled[start_idx + i]
+            sampled[req_idx, i] = token
+            accepted += 1
+            if token != draft_sampled[start_idx + i + 1]:
+                rejected = True
+                break
+
+        if not rejected:
+            token = target_sampled[start_idx + num_tokens - 1]
+            sampled[req_idx, num_tokens - 1] = token
+            accepted += 1
+
+        num_sampled[req_idx] = accepted
+
+    return sampled, num_sampled
+
+
+def _probabilistic_rejection_sample_torch(
+    target_logits: torch.Tensor,
+    draft_logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    pos: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    num_speculative_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_reqs = cu_num_logits.shape[0] - 1
+    vocab_size = target_logits.shape[-1]
+
+    target_probs = torch.softmax(target_logits, dim=-1)
+    draft_probs = torch.softmax(draft_logits, dim=-1)
+
+    sampled = draft_sampled.new_empty(
+        num_reqs, num_speculative_steps + 1, dtype=torch.int64
+    )
+    rejected_steps = sampled.new_empty(num_reqs)
+    residual_logits = target_logits.new_empty(num_reqs, vocab_size)
+    residual_pos = pos.new_empty(num_reqs)
+
+    for req_idx in range(num_reqs):
+        start_idx = int(cu_num_logits[req_idx].item())
+        end_idx = int(cu_num_logits[req_idx + 1].item())
+        num_tokens = end_idx - start_idx
+        req_seed = int(seed[int(idx_mapping[req_idx].item())].item())
+
+        rejected_step = 0
+        for i in range(num_tokens - 1):
+            draft_token = int(draft_sampled[start_idx + i + 1].item())
+            sampled[req_idx, i] = draft_token
+            target_prob = float(target_probs[start_idx + i, draft_token].item())
+            draft_prob = float(draft_probs[req_idx, i, draft_token].item())
+            uniform_prob = _uniform_from_seed_and_pos(
+                req_seed, int(pos[start_idx + i].item())
+            )
+            if target_prob > uniform_prob * draft_prob:
+                rejected_step += 1
+                continue
+            break
+
+        rejected_steps[req_idx] = rejected_step
+        rejected_logit_idx = start_idx + rejected_step
+        if rejected_logit_idx < end_idx - 1:
+            residual_logits[req_idx] = torch.log(
+                torch.clamp(
+                    target_probs[rejected_logit_idx]
+                    - draft_probs[req_idx, rejected_step],
+                    min=0.0,
+                )
+            )
+        else:
+            residual_logits[req_idx] = target_logits[rejected_logit_idx]
+        residual_pos[req_idx] = pos[rejected_logit_idx]
+
+    resampled = gumbel_sample(
+        residual_logits,
+        idx_mapping,
+        temperature,
+        seed,
+        residual_pos,
+        apply_temperature=False,
+    )
+    sampled.scatter_(1, rejected_steps.unsqueeze(1), resampled.unsqueeze(1))
+
+    return sampled, rejected_steps + 1
 
 
 @triton.jit
@@ -52,6 +181,14 @@ def strict_rejection_sample(
     cu_num_logits: torch.Tensor,
     num_speculative_steps,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not HAS_TRITON:
+        return _strict_rejection_sample_torch(
+            target_sampled,
+            draft_sampled,
+            cu_num_logits,
+            num_speculative_steps,
+        )
+
     num_reqs = cu_num_logits.shape[0] - 1
     sampled = target_sampled.new_empty(num_reqs, num_speculative_steps + 1)
     num_sampled = target_sampled.new_empty(num_reqs, dtype=torch.int32)
@@ -211,6 +348,19 @@ def probabilistic_rejection_sample(
     seed: torch.Tensor,
     num_speculative_steps: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not HAS_TRITON:
+        return _probabilistic_rejection_sample_torch(
+            target_logits,
+            draft_logits,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            idx_mapping,
+            temperature,
+            seed,
+            num_speculative_steps,
+        )
+
     num_reqs = cu_num_logits.shape[0] - 1
     vocab_size = target_logits.shape[-1]
 

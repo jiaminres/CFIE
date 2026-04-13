@@ -7,6 +7,7 @@ import torch.nn as nn
 from packaging import version
 
 from cfie import envs
+from cfie import _custom_ops as ops
 from cfie._aiter_ops import rocm_aiter_ops
 from cfie.config.model import LogprobsMode
 from cfie.logger import init_logger
@@ -250,6 +251,10 @@ def apply_top_k_top_p(
 
     if HAS_TRITON and logits.shape[0] >= 8:
         return apply_top_k_top_p_triton(logits, k, p)
+
+    if logits.is_cuda and ops.has_precompiled_apply_top_k_top_p():
+        ops.apply_top_k_top_p_precompiled(logits, k, p)
+        return logits
 
     # Use pytorch sort implementation for small batch sizes.
     return apply_top_k_top_p_pytorch(logits, k, p)

@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie import _custom_ops
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils import random_uuid
 
 
@@ -193,6 +194,32 @@ def prepare_prefill_inputs(
     num_computed_tokens: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if not HAS_TRITON:
+        if (
+            input_ids.is_cuda
+            and _custom_ops.has_precompiled_input_batch_prepare_prefill_inputs()
+        ):
+            _custom_ops.input_batch_prepare_prefill_inputs_precompiled(
+                input_ids,
+                next_prefill_tokens,
+                idx_mapping,
+                query_start_loc,
+                all_token_ids,
+                prefill_len,
+                num_computed_tokens,
+            )
+        else:
+            _prepare_prefill_inputs_torch(
+                input_ids,
+                next_prefill_tokens,
+                idx_mapping,
+                query_start_loc,
+                all_token_ids,
+                prefill_len,
+                num_computed_tokens,
+            )
+        return
+
     _prepare_prefill_inputs_kernel[(num_reqs,)](
         input_ids,
         next_prefill_tokens,
@@ -204,6 +231,37 @@ def prepare_prefill_inputs(
         num_computed_tokens,
         BLOCK_SIZE=1024,
     )
+
+
+def _prepare_prefill_inputs_torch(
+    input_ids: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    prefill_len: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+) -> None:
+    num_reqs = idx_mapping.shape[0]
+    for batch_idx in range(num_reqs):
+        req_state_idx = int(idx_mapping[batch_idx].item())
+        prefill = int(prefill_len[req_state_idx].item())
+        num_computed = int(num_computed_tokens[req_state_idx].item())
+        if num_computed >= prefill:
+            continue
+
+        query_start = int(query_start_loc[batch_idx].item())
+        query_end = int(query_start_loc[batch_idx + 1].item())
+        query_len = query_end - query_start
+        input_ids[query_start:query_end].copy_(
+            all_token_ids[req_state_idx, num_computed : num_computed + query_len]
+        )
+
+        next_pos = num_computed + query_len
+        if next_pos < prefill:
+            next_prefill_tokens[req_state_idx] = all_token_ids[
+                req_state_idx, next_pos
+            ]
 
 
 @triton.jit
@@ -251,6 +309,28 @@ def prepare_pos_seq_lens(
     seq_lens: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if not HAS_TRITON:
+        if (
+            pos.is_cuda
+            and _custom_ops.has_precompiled_input_batch_prepare_pos_seq_lens()
+        ):
+            _custom_ops.input_batch_prepare_pos_seq_lens_precompiled(
+                idx_mapping,
+                query_start_loc,
+                num_computed_tokens,
+                pos,
+                seq_lens,
+            )
+        else:
+            _prepare_pos_seq_lens_torch(
+                idx_mapping,
+                query_start_loc,
+                num_computed_tokens,
+                pos,
+                seq_lens,
+            )
+        return
+
     # NOTE(woosuk): We do +1 because the last thread block is used
     # to pad unused seq_lens as 0 for full CUDA graphs.
     _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
@@ -262,6 +342,34 @@ def prepare_pos_seq_lens(
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
     )
+
+
+def _prepare_pos_seq_lens_torch(
+    idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    pos: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> None:
+    num_reqs = idx_mapping.shape[0]
+    if seq_lens.shape[0] > num_reqs:
+        seq_lens[num_reqs:].zero_()
+    for req_id in range(num_reqs):
+        req_state_idx = int(idx_mapping[req_id].item())
+        num_computed = int(num_computed_tokens[req_state_idx].item())
+        start = int(query_start_loc[req_id].item())
+        end = int(query_start_loc[req_id + 1].item())
+        query_len = end - start
+        seq_lens[req_id] = num_computed + query_len
+        if query_len > 0:
+            pos[start:end].copy_(
+                torch.arange(
+                    num_computed,
+                    num_computed + query_len,
+                    dtype=pos.dtype,
+                    device=pos.device,
+                )
+            )
 
 
 @triton.jit
@@ -341,6 +449,37 @@ def combine_sampled_and_draft_tokens(
         dtype=torch.int64,
         device=input_ids.device,
     )
+    if not HAS_TRITON:
+        if (
+            input_ids.is_cuda
+            and _custom_ops.has_precompiled_input_batch_combine_sampled_and_draft_tokens()
+        ):
+            return (
+                _custom_ops.input_batch_combine_sampled_and_draft_tokens_precompiled(
+                    input_ids,
+                    idx_mapping,
+                    last_sampled_tokens,
+                    query_start_loc,
+                    seq_lens,
+                    prefill_len,
+                    draft_tokens,
+                    cu_num_logits,
+                    num_logits,
+                )
+            )
+        _combine_sampled_and_draft_tokens_torch(
+            input_ids,
+            idx_mapping,
+            last_sampled_tokens,
+            query_start_loc,
+            seq_lens,
+            prefill_len,
+            draft_tokens,
+            cu_num_logits,
+            logits_indices,
+        )
+        return logits_indices
+
     _combine_sampled_and_draft_tokens_kernel[(num_reqs,)](
         input_ids,
         idx_mapping,
@@ -357,6 +496,48 @@ def combine_sampled_and_draft_tokens(
         BLOCK_SIZE=triton.next_power_of_2(num_speculative_steps + 1),
     )
     return logits_indices
+
+
+def _combine_sampled_and_draft_tokens_torch(
+    input_ids: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefill_len: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    logits_indices: torch.Tensor,
+) -> None:
+    num_reqs = idx_mapping.shape[0]
+    for batch_idx in range(num_reqs):
+        req_state_idx = int(idx_mapping[batch_idx].item())
+        cu_num_logits_start = int(cu_num_logits[batch_idx].item())
+        cu_num_logits_end = int(cu_num_logits[batch_idx + 1].item())
+        num_logits = cu_num_logits_end - cu_num_logits_start
+        query_end = int(query_start_loc[batch_idx + 1].item())
+        logits_start = query_end - num_logits
+        if num_logits > 0:
+            logits_indices[cu_num_logits_start:cu_num_logits_end].copy_(
+                torch.arange(
+                    logits_start,
+                    logits_start + num_logits,
+                    dtype=logits_indices.dtype,
+                    device=logits_indices.device,
+                )
+            )
+
+        seq_len = int(seq_lens[batch_idx].item())
+        req_prefill_len = int(prefill_len[req_state_idx].item())
+        if seq_len <= req_prefill_len or num_logits == 0:
+            continue
+
+        input_ids[query_end - num_logits] = last_sampled_tokens[req_state_idx]
+        num_draft_tokens = num_logits - 1
+        if num_draft_tokens > 0:
+            input_ids[query_end - num_draft_tokens : query_end].copy_(
+                draft_tokens[req_state_idx, :num_draft_tokens]
+            )
 
 
 @triton.jit
@@ -397,6 +578,28 @@ def get_num_sampled_and_rejected(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
     num_rejected = torch.empty_like(num_sampled)
+    if not HAS_TRITON:
+        if (
+            num_sampled.is_cuda
+            and _custom_ops.has_precompiled_input_batch_get_num_sampled_and_rejected()
+        ):
+            return _custom_ops.input_batch_get_num_sampled_and_rejected_precompiled(
+                num_sampled,
+                seq_lens,
+                cu_num_logits,
+                idx_mapping,
+                prefill_len,
+            )
+        _get_num_sampled_and_rejected_torch(
+            num_sampled,
+            num_rejected,
+            seq_lens,
+            cu_num_logits,
+            idx_mapping,
+            prefill_len,
+        )
+        return num_sampled, num_rejected
+
     _get_num_sampled_and_rejected_kernel[(num_reqs,)](
         num_sampled,
         num_rejected,
@@ -406,6 +609,31 @@ def get_num_sampled_and_rejected(
         prefill_len,
     )
     return num_sampled, num_rejected
+
+
+def _get_num_sampled_and_rejected_torch(
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    prefill_len: torch.Tensor,
+) -> None:
+    num_reqs = idx_mapping.shape[0]
+    for batch_idx in range(num_reqs):
+        req_state_idx = int(idx_mapping[batch_idx].item())
+        is_chunked_prefilling = (
+            int(seq_lens[batch_idx].item()) < int(prefill_len[req_state_idx].item())
+        )
+        if is_chunked_prefilling:
+            num_sampled[batch_idx] = 0
+            num_rejected[batch_idx] = 0
+            continue
+
+        num_logits = int(cu_num_logits[batch_idx + 1].item()) - int(
+            cu_num_logits[batch_idx].item()
+        )
+        num_rejected[batch_idx] = num_logits - num_sampled[batch_idx]
 
 
 @triton.jit
@@ -485,6 +713,38 @@ def post_update(
     total_len: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if not HAS_TRITON:
+        if (
+            all_token_ids.is_cuda
+            and _custom_ops.has_precompiled_input_batch_post_update()
+        ):
+            _custom_ops.input_batch_post_update_precompiled(
+                idx_mapping,
+                num_computed_tokens,
+                last_sampled_tokens,
+                output_bin_counts,
+                sampled_tokens,
+                num_sampled,
+                num_rejected,
+                query_start_loc,
+                all_token_ids,
+                total_len,
+            )
+        else:
+            _post_update_torch(
+                idx_mapping,
+                num_computed_tokens,
+                last_sampled_tokens,
+                output_bin_counts,
+                sampled_tokens,
+                num_sampled,
+                num_rejected,
+                query_start_loc,
+                all_token_ids,
+                total_len,
+            )
+        return
+
     _post_update_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,
@@ -501,6 +761,39 @@ def post_update(
         total_len,
         num_warps=1,
     )
+
+
+def _post_update_torch(
+    idx_mapping: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    output_bin_counts: torch.Tensor | None,
+    sampled_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    total_len: torch.Tensor,
+) -> None:
+    num_reqs = idx_mapping.shape[0]
+    for req_id in range(num_reqs):
+        req_state_idx = int(idx_mapping[req_id].item())
+        old_total_len = int(total_len[req_state_idx].item())
+        sampled = int(num_sampled[req_id].item())
+        if sampled > 0:
+            last_sampled_tokens[req_state_idx] = sampled_tokens[req_id, sampled - 1]
+            total_len[req_state_idx] = old_total_len + sampled
+
+        for i in range(sampled):
+            token_id = sampled_tokens[req_id, i]
+            all_token_ids[req_state_idx, old_total_len + i] = token_id
+            if output_bin_counts is not None:
+                output_bin_counts[req_state_idx, int(token_id.item())] += 1
+
+        query_start = int(query_start_loc[req_id].item())
+        query_end = int(query_start_loc[req_id + 1].item())
+        rejected = int(num_rejected[req_id].item())
+        num_computed_tokens[req_state_idx] += query_end - query_start - rejected
 
 
 @triton.jit
@@ -528,11 +821,42 @@ def post_update_pool(
     query_start_loc: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if not HAS_TRITON:
+        if (
+            num_computed_tokens.is_cuda
+            and _custom_ops.has_precompiled_input_batch_post_update_pool()
+        ):
+            _custom_ops.input_batch_post_update_pool_precompiled(
+                idx_mapping,
+                num_computed_tokens,
+                query_start_loc,
+            )
+        else:
+            _post_update_pool_torch(
+                idx_mapping,
+                num_computed_tokens,
+                query_start_loc,
+            )
+        return
+
     _post_update_pool_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,
         query_start_loc,
     )
+
+
+def _post_update_pool_torch(
+    idx_mapping: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    num_reqs = idx_mapping.shape[0]
+    for batch_id in range(num_reqs):
+        req_state_idx = int(idx_mapping[batch_id].item())
+        query_start = int(query_start_loc[batch_id].item())
+        query_end = int(query_start_loc[batch_id + 1].item())
+        num_computed_tokens[req_state_idx] += query_end - query_start
 
 
 @triton.jit
@@ -566,6 +890,24 @@ def expand_idx_mapping(
     expanded_local_pos = torch.empty(
         total_num_logits, dtype=torch.int32, device=idx_mapping.device
     )
+    if not HAS_TRITON:
+        if (
+            idx_mapping.is_cuda
+            and _custom_ops.has_precompiled_input_batch_expand_idx_mapping()
+        ):
+            return _custom_ops.input_batch_expand_idx_mapping_precompiled(
+                idx_mapping,
+                total_num_logits,
+                cu_num_logits,
+            )
+        _expand_idx_mapping_torch(
+            idx_mapping,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            cu_num_logits,
+        )
+        return expanded_idx_mapping, expanded_local_pos
+
     _expand_idx_mapping_kernel[(num_reqs,)](
         idx_mapping,
         expanded_idx_mapping,
@@ -574,3 +916,26 @@ def expand_idx_mapping(
         BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
     )
     return expanded_idx_mapping, expanded_local_pos
+
+
+def _expand_idx_mapping_torch(
+    idx_mapping: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+) -> None:
+    num_reqs = idx_mapping.shape[0]
+    for req_idx in range(num_reqs):
+        start_idx = int(cu_num_logits[req_idx].item())
+        end_idx = int(cu_num_logits[req_idx + 1].item())
+        num_tokens = end_idx - start_idx
+        if num_tokens <= 0:
+            continue
+        expanded_idx_mapping[start_idx:end_idx] = idx_mapping[req_idx]
+        expanded_local_pos[start_idx:end_idx].copy_(
+            torch.arange(
+                num_tokens,
+                dtype=expanded_local_pos.dtype,
+                device=expanded_local_pos.device,
+            )
+        )

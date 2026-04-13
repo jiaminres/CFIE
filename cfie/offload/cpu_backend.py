@@ -21,6 +21,10 @@ class ExpertBundle:
     nbytes: int
     # 标记 bundle 是否已经放在 pinned CPU memory 上。
     pinned: bool = False
+    # 标记 bundle 是否已经转换成运行时 kernel 可直接消费的格式。
+    # 对 GPTQ Marlin MoE 来说，这意味着 w13/w2 已合并，qweight 已 repack，
+    # scale 已 permute；运行时 miss 时只需要 H2D 拷贝到 resident slot。
+    runtime_ready: bool = False
 
 
 def bundle_nbytes(tensors: dict[str, torch.Tensor]) -> int:

@@ -3,7 +3,7 @@
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.outputs import LogprobsTensors
 
 
@@ -75,6 +75,10 @@ def _ranks_kernel(
 def compute_token_logprobs(
     logits: torch.Tensor, token_ids: torch.Tensor
 ) -> torch.Tensor:
+    if not HAS_TRITON:
+        log_probs = torch.log_softmax(logits.to(torch.float32), dim=-1)
+        return log_probs.gather(dim=1, index=token_ids.to(torch.int64))
+
     batch_size, vocab_size = logits.shape
     token_ids = token_ids.to(torch.int64)
     num_logprobs = token_ids.shape[1]
@@ -109,6 +113,16 @@ def compute_topk_logprobs(
     # logprobs tensor. Instead, we only compute and return the logprobs of
     # the topk + 1 tokens.
     logprobs = compute_token_logprobs(logits, logprob_token_ids)
+    if not HAS_TRITON:
+        sampled_logits = logits.gather(1, sampled_token_ids.to(torch.int64).unsqueeze(1))
+        token_ranks = (logits >= sampled_logits).sum(dim=-1).to(torch.int64)
+        return LogprobsTensors(
+            logprob_token_ids=logprob_token_ids,
+            logprobs=logprobs,
+            selected_token_ranks=token_ranks,
+            cu_num_generated_tokens=cu_num_logits,
+        )
+
     token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
     _ranks_kernel[(batch_size,)](
         token_ranks,

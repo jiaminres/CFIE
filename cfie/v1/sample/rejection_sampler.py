@@ -7,6 +7,7 @@ from dataclasses import replace
 import torch
 import torch.nn as nn
 
+from cfie import _custom_ops
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
@@ -402,6 +403,19 @@ def rejection_sample(
                 is_greedy,
                 max_spec_len,
             )
+        elif (
+            device.type == "cuda"
+            and _custom_ops.has_precompiled_rejection_greedy_sample()
+        ):
+            _custom_ops.rejection_greedy_sample_precompiled(
+                output_token_ids,
+                cu_num_draft_tokens.to(torch.int32),
+                draft_token_ids.to(torch.int32),
+                target_argmax.to(torch.int32),
+                bonus_token_ids.view(-1).to(torch.int32),
+                None if is_greedy is None else is_greedy.to(torch.bool),
+                max_spec_len,
+            )
         else:
             _rejection_greedy_sample_torch(
                 output_token_ids,
@@ -456,6 +470,22 @@ def rejection_sample(
             max_spec_len,
             vocab_size,
             NO_DRAFT_PROBS=draft_probs is None,
+        )
+    elif (
+        device.type == "cuda"
+        and _custom_ops.has_precompiled_rejection_random_sample()
+    ):
+        _custom_ops.rejection_random_sample_precompiled(
+            output_token_ids,
+            cu_num_draft_tokens.to(torch.int32),
+            draft_token_ids.to(torch.int32),
+            draft_probs,
+            target_probs,
+            bonus_token_ids.view(-1).to(torch.int32),
+            recovered_token_ids.to(torch.int32),
+            uniform_probs,
+            None if is_greedy is None else is_greedy.to(torch.bool),
+            max_spec_len,
         )
     else:
         _rejection_random_sample_torch(
@@ -560,6 +590,16 @@ def expand_batch_to_tokens(
     batch_size = x.shape[0]
     assert cu_num_tokens.shape[0] == batch_size
     if not HAS_TRITON:
+        if (
+            x.is_cuda
+            and _custom_ops.has_precompiled_expand_batch_to_tokens()
+        ):
+            return _custom_ops.expand_batch_to_tokens_precompiled(
+                x,
+                cu_num_tokens,
+                replace_from,
+                replace_to,
+            )
         counts = cu_num_tokens.to(device=x.device)
         counts = torch.cat((counts[:1], counts[1:] - counts[:-1]))
         expanded_x = torch.repeat_interleave(x, counts)
@@ -671,6 +711,17 @@ def sample_recovered_tokens(
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
     if not HAS_TRITON:
+        if (
+            device.type == "cuda"
+            and _custom_ops.has_precompiled_sample_recovered_tokens()
+        ):
+            return _custom_ops.sample_recovered_tokens_precompiled(
+                cu_num_draft_tokens.to(torch.int32),
+                draft_token_ids.to(torch.int32),
+                draft_probs,
+                target_probs,
+                inv_q,
+            )
         start_idx = 0
         for req_idx, num_req_draft_tokens in enumerate(num_draft_tokens):
             end_idx = start_idx + num_req_draft_tokens

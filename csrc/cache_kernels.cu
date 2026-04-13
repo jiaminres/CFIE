@@ -255,7 +255,7 @@ __global__ void reshape_and_cache_flash_kernel(
     // kv cache: [num_blocks, num_heads, block_size, head_size]
     const int lane = threadIdx.x & 31;     // 0..31 within warp
     const int warp_id = threadIdx.x >> 5;  // warp index within block
-    const int warps_per_block = blockDim.x >> 5;
+    const int warps_per_block = max(blockDim.x >> 5, 1);
 
     for (int head = warp_id; head < num_heads; head += warps_per_block) {
       const scalar_t* __restrict__ k_src_h = key_src + head * head_size;
@@ -283,6 +283,59 @@ __global__ void reshape_and_cache_flash_kernel(
 
       vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane, 32,
                                          v_op);
+    }
+  }
+}
+
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+__global__ void reshape_and_cache_flash_diffkv_kernel(
+    const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size_k]
+    const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size_v]
+    cache_t* __restrict__ kv_cache,      // [num_blocks, block_size, num_heads,
+                                         //  head_size_k + head_size_v]
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int64_t block_stride, const int64_t page_stride,
+    const int64_t head_stride, const int64_t elem_stride,
+    const int64_t key_stride, const int64_t value_stride, const int num_heads,
+    const int head_size_k, const int head_size_v, const int block_size,
+    const float* k_scale, const float* v_scale, const int kv_scale_stride) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  const scalar_t* __restrict__ key_src = key + token_idx * key_stride;
+  const scalar_t* __restrict__ value_src = value + token_idx * value_stride;
+  cache_t* __restrict__ dst_base =
+      kv_cache + block_idx * block_stride + block_offset * page_stride;
+
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int warps_per_block = max(blockDim.x >> 5, 1);
+
+  for (int head = warp_id; head < num_heads; head += warps_per_block) {
+    const scalar_t* __restrict__ key_src_h = key_src + head * head_size_k;
+    const scalar_t* __restrict__ value_src_h = value_src + head * head_size_v;
+    cache_t* __restrict__ dst_h = dst_base + static_cast<int64_t>(head) * head_stride;
+
+    const float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
+                                  ? 0.f
+                                  : k_scale[head * kv_scale_stride];
+    const float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
+                                  ? 0.f
+                                  : v_scale[head * kv_scale_stride];
+
+    CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+    CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+
+    for (int idx = lane; idx < head_size_k; idx += 32) {
+      k_op(dst_h[idx * elem_stride], key_src_h[idx]);
+    }
+    for (int idx = lane; idx < head_size_v; idx += 32) {
+      v_op(dst_h[(head_size_k + idx) * elem_stride], value_src_h[idx]);
     }
   }
 }
@@ -663,12 +716,69 @@ void reshape_and_cache_flash(
   int kv_scale_stride = (k_scale.numel() > 1) ? 1 : 0;
 
   dim3 grid(num_tokens);
-  dim3 block(std::min(num_heads * head_size, 512));
+  dim3 block(std::max(32, std::min(num_heads * head_size, 512)));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
+}
+
+#define CALL_RESHAPE_AND_CACHE_FLASH_DIFFKV(KV_T, CACHE_T, KV_DTYPE)         \
+  vllm::reshape_and_cache_flash_diffkv_kernel<KV_T, CACHE_T, KV_DTYPE>       \
+      <<<grid, block, 0, stream>>>(                                          \
+          reinterpret_cast<KV_T*>(key.data_ptr()),                           \
+          reinterpret_cast<KV_T*>(value.data_ptr()),                         \
+          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                   \
+          slot_mapping.data_ptr<int64_t>(), block_stride, page_stride,       \
+          head_stride, elem_stride, key_stride, value_stride, num_heads,     \
+          head_size_k, head_size_v, block_size,                              \
+          reinterpret_cast<const float*>(k_scale.data_ptr()),                \
+          reinterpret_cast<const float*>(v_scale.data_ptr()),                \
+          kv_scale_stride);
+
+void reshape_and_cache_flash_diffkv(
+    torch::Tensor& key,      // [num_tokens, num_heads, head_size_k]
+    torch::Tensor& value,    // [num_tokens, num_heads, head_size_v]
+    torch::Tensor& kv_cache, // [num_blocks, block_size, num_heads,
+                             //  head_size_k + head_size_v]
+    torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+    const std::string& kv_cache_dtype, torch::Tensor& k_scale,
+    torch::Tensor& v_scale) {
+  TORCH_CHECK(kv_cache.dim() == 4,
+              "reshape_and_cache_flash_diffkv expects a 4D kv_cache tensor");
+  TORCH_CHECK(kv_cache.stride(3) == 1,
+              "reshape_and_cache_flash_diffkv requires kv_cache last-dim stride "
+              "to be 1");
+
+  const int num_tokens = slot_mapping.size(0);
+  const int num_heads = key.size(1);
+  const int head_size_k = key.size(2);
+  const int head_size_v = value.size(2);
+  const int block_size = kv_cache.size(1);
+
+  const int64_t key_stride = key.stride(0);
+  const int64_t value_stride = value.stride(0);
+  const int64_t block_stride = kv_cache.stride(0);
+  const int64_t page_stride = kv_cache.stride(1);
+  const int64_t head_stride = kv_cache.stride(2);
+  const int64_t elem_stride = kv_cache.stride(3);
+
+  TORCH_CHECK(k_scale.sizes() == v_scale.sizes(),
+              "k_scale and v_scale must have the same shape");
+  TORCH_CHECK(k_scale.numel() == 1 || k_scale.numel() == num_heads,
+              "k_scale and v_scale must be of shape [1] or [num_heads]");
+  const int kv_scale_stride = (k_scale.numel() > 1) ? 1 : 0;
+
+  int threads = std::min(num_heads * std::max(head_size_k, head_size_v), 512);
+  threads = std::max(32, ((threads + 31) / 32) * 32);
+  dim3 grid(num_tokens);
+  dim3 block(threads);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
+                             CALL_RESHAPE_AND_CACHE_FLASH_DIFFKV);
 }
 
 // KV_T is the data type of key and value tensors.

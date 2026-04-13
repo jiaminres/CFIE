@@ -3,7 +3,7 @@
 import torch
 from torch._inductor.runtime.triton_helpers import libdevice
 
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 
 @triton.jit
@@ -29,6 +29,9 @@ def _num_nans_kernel(
 
 
 def get_num_nans(logits: torch.Tensor) -> torch.Tensor:
+    if not HAS_TRITON:
+        return torch.isnan(logits).sum(dim=-1).to(torch.int32)
+
     num_reqs, vocab_size = logits.shape
     BLOCK_SIZE = 8192
     num_nans = torch.empty(num_reqs, dtype=torch.int32, device=logits.device)

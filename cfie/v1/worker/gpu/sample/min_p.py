@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 
 @triton.jit
@@ -48,6 +48,19 @@ def _min_p_kernel(
 def apply_min_p(
     logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, min_p: torch.Tensor
 ) -> None:
+    if not HAS_TRITON:
+        req_min_p = min_p[expanded_idx_mapping].to(torch.float32)
+        active = req_min_p != 0.0
+        if torch.any(active):
+            active_logits = logits[active]
+            thresholds = active_logits.max(dim=-1, keepdim=True).values.to(
+                torch.float32
+            ) + torch.log(req_min_p[active]).unsqueeze(1)
+            logits[active] = torch.where(
+                active_logits < thresholds, float("-inf"), active_logits
+            )
+        return
+
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 1024
     _min_p_kernel[(num_tokens,)](

@@ -119,6 +119,88 @@ void large_context_topk(const torch::Tensor& score, torch::Tensor& indices,
                         const torch::Tensor& lengths,
                         std::optional<torch::Tensor> row_starts_opt);
 
+torch::Tensor correct_attn_out_precompiled(torch::Tensor& out,
+                                           const torch::Tensor& lses,
+                                           int64_t cp_rank,
+                                           bool is_lse_base_on_e);
+
+torch::Tensor pack_seq_precompiled(const torch::Tensor& x,
+                                   const torch::Tensor& lengths,
+                                   double pad_value);
+
+torch::Tensor unpack_seq_precompiled(const torch::Tensor& packed_tensor,
+                                     const torch::Tensor& lengths);
+
+torch::Tensor expand_batch_to_tokens_precompiled(
+    const torch::Tensor& x, const torch::Tensor& cu_num_tokens,
+    int64_t replace_from, int64_t replace_to);
+
+torch::Tensor sample_recovered_tokens_precompiled(
+    const torch::Tensor& cu_num_draft_tokens,
+    const torch::Tensor& draft_token_ids,
+    const std::optional<torch::Tensor>& draft_probs,
+    const torch::Tensor& target_probs, const torch::Tensor& inv_q);
+
+void apply_top_k_top_p_precompiled(
+    torch::Tensor& logits, const std::optional<torch::Tensor>& k,
+    const std::optional<torch::Tensor>& p, double mask_value);
+
+void rejection_greedy_sample_precompiled(
+    torch::Tensor& output_token_ids, const torch::Tensor& cu_num_draft_tokens,
+    const torch::Tensor& draft_token_ids, const torch::Tensor& target_argmax,
+    const torch::Tensor& bonus_token_ids,
+    const std::optional<torch::Tensor>& is_greedy, int64_t max_spec_len);
+
+void rejection_random_sample_precompiled(
+    torch::Tensor& output_token_ids, const torch::Tensor& cu_num_draft_tokens,
+    const torch::Tensor& draft_token_ids,
+    const std::optional<torch::Tensor>& draft_probs,
+    const torch::Tensor& target_probs, const torch::Tensor& bonus_token_ids,
+    const torch::Tensor& recovered_token_ids,
+    const torch::Tensor& uniform_probs,
+    const std::optional<torch::Tensor>& is_greedy, int64_t max_spec_len);
+
+void input_batch_prepare_prefill_inputs_precompiled(
+    torch::Tensor& input_ids, torch::Tensor& next_prefill_tokens,
+    const torch::Tensor& idx_mapping, const torch::Tensor& query_start_loc,
+    const torch::Tensor& all_token_ids, const torch::Tensor& prefill_len,
+    const torch::Tensor& num_computed_tokens);
+
+void input_batch_prepare_pos_seq_lens_precompiled(
+    const torch::Tensor& idx_mapping, const torch::Tensor& query_start_loc,
+    const torch::Tensor& num_computed_tokens, torch::Tensor& pos,
+    torch::Tensor& seq_lens);
+
+torch::Tensor input_batch_combine_sampled_and_draft_tokens_precompiled(
+    torch::Tensor& input_ids, const torch::Tensor& idx_mapping,
+    const torch::Tensor& last_sampled_tokens,
+    const torch::Tensor& query_start_loc, const torch::Tensor& seq_lens,
+    const torch::Tensor& prefill_len, const torch::Tensor& draft_tokens,
+    const torch::Tensor& cu_num_logits, int64_t num_logits);
+
+std::tuple<torch::Tensor, torch::Tensor>
+input_batch_get_num_sampled_and_rejected_precompiled(
+    torch::Tensor& num_sampled, const torch::Tensor& seq_lens,
+    const torch::Tensor& cu_num_logits, const torch::Tensor& idx_mapping,
+    const torch::Tensor& prefill_len);
+
+void input_batch_post_update_precompiled(
+    const torch::Tensor& idx_mapping, torch::Tensor& num_computed_tokens,
+    torch::Tensor& last_sampled_tokens,
+    const std::optional<torch::Tensor>& output_bin_counts,
+    const torch::Tensor& sampled_tokens, const torch::Tensor& num_sampled,
+    const torch::Tensor& num_rejected, const torch::Tensor& query_start_loc,
+    torch::Tensor& all_token_ids, torch::Tensor& total_len);
+
+void input_batch_post_update_pool_precompiled(
+    const torch::Tensor& idx_mapping, torch::Tensor& num_computed_tokens,
+    const torch::Tensor& query_start_loc);
+
+std::tuple<torch::Tensor, torch::Tensor>
+input_batch_expand_idx_mapping_precompiled(const torch::Tensor& idx_mapping,
+                                           int64_t total_num_logits,
+                                           const torch::Tensor& cu_num_logits);
+
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,
                                torch::Tensor& weight, torch::Tensor& scale,
                                double epsilon);
@@ -213,6 +295,28 @@ void zero_kv_blocks_precompiled(const torch::Tensor& block_ids,
                                 c10::List<torch::Tensor> kv_tensors,
                                 c10::List<int64_t> block_dims,
                                 c10::List<int64_t> ratios);
+
+void moe_batch_load_unquantized_runtime_precompiled(
+    const torch::Tensor& slot_ids, const torch::Tensor& w13_src,
+    const torch::Tensor& w2_src, torch::Tensor& w13_dst,
+    torch::Tensor& w2_dst);
+
+void moe_batch_load_gptq_runtime_precompiled(
+    const torch::Tensor& slot_ids, const torch::Tensor& w13_qweight_src,
+    const torch::Tensor& w2_qweight_src, const torch::Tensor& w13_scales_src,
+    const torch::Tensor& w2_scales_src, const torch::Tensor& w13_qzeros_src,
+    const torch::Tensor& w2_qzeros_src, torch::Tensor& w13_qweight_dst,
+    torch::Tensor& w2_qweight_dst, torch::Tensor& w13_scales_dst,
+    torch::Tensor& w2_scales_dst, torch::Tensor& w13_qzeros_dst,
+    torch::Tensor& w2_qzeros_dst,
+    const std::optional<torch::Tensor>& w13_g_idx_src,
+    const std::optional<torch::Tensor>& w2_g_idx_src,
+    const std::optional<torch::Tensor>& w13_g_idx_sort_indices_src,
+    const std::optional<torch::Tensor>& w2_g_idx_sort_indices_src,
+    const std::optional<torch::Tensor>& w13_g_idx_dst,
+    const std::optional<torch::Tensor>& w2_g_idx_dst,
+    const std::optional<torch::Tensor>& w13_g_idx_sort_indices_dst,
+    const std::optional<torch::Tensor>& w2_g_idx_sort_indices_dst);
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 

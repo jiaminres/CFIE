@@ -196,6 +196,106 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "row_starts_opt) -> ()");
   ops.impl("large_context_topk", torch::kCUDA, &large_context_topk);
 
+  ops.def("correct_attn_out_precompiled("
+          "Tensor! out, Tensor lses, int cp_rank, "
+          "bool is_lse_base_on_e=True) -> Tensor");
+  ops.impl("correct_attn_out_precompiled", torch::kCUDA,
+           &correct_attn_out_precompiled);
+
+  ops.def("pack_seq_precompiled("
+          "Tensor x, Tensor lengths, float pad_value) -> Tensor");
+  ops.impl("pack_seq_precompiled", torch::kCUDA, &pack_seq_precompiled);
+
+  ops.def("unpack_seq_precompiled("
+          "Tensor packed_tensor, Tensor lengths) -> Tensor");
+  ops.impl("unpack_seq_precompiled", torch::kCUDA, &unpack_seq_precompiled);
+
+  ops.def("expand_batch_to_tokens_precompiled("
+          "Tensor x, Tensor cu_num_tokens, int replace_from, "
+          "int replace_to) -> Tensor");
+  ops.impl("expand_batch_to_tokens_precompiled", torch::kCUDA,
+           &expand_batch_to_tokens_precompiled);
+
+  ops.def("sample_recovered_tokens_precompiled("
+          "Tensor cu_num_draft_tokens, Tensor draft_token_ids, "
+          "Tensor? draft_probs, Tensor target_probs, "
+          "Tensor inv_q) -> Tensor");
+  ops.impl("sample_recovered_tokens_precompiled", torch::kCUDA,
+           &sample_recovered_tokens_precompiled);
+
+  ops.def("apply_top_k_top_p_precompiled("
+          "Tensor! logits, Tensor? k, Tensor? p, float mask_value) -> ()");
+  ops.impl("apply_top_k_top_p_precompiled", torch::kCUDA,
+           &apply_top_k_top_p_precompiled);
+
+  ops.def("rejection_greedy_sample_precompiled("
+          "Tensor! output_token_ids, Tensor cu_num_draft_tokens, "
+          "Tensor draft_token_ids, Tensor target_argmax, "
+          "Tensor bonus_token_ids, Tensor? is_greedy, "
+          "int max_spec_len) -> ()");
+  ops.impl("rejection_greedy_sample_precompiled", torch::kCUDA,
+           &rejection_greedy_sample_precompiled);
+
+  ops.def("rejection_random_sample_precompiled("
+          "Tensor! output_token_ids, Tensor cu_num_draft_tokens, "
+          "Tensor draft_token_ids, Tensor? draft_probs, "
+          "Tensor target_probs, Tensor bonus_token_ids, "
+          "Tensor recovered_token_ids, Tensor uniform_probs, "
+          "Tensor? is_greedy, int max_spec_len) -> ()");
+  ops.impl("rejection_random_sample_precompiled", torch::kCUDA,
+           &rejection_random_sample_precompiled);
+
+  ops.def("input_batch_prepare_prefill_inputs_precompiled("
+          "Tensor! input_ids, Tensor! next_prefill_tokens, "
+          "Tensor idx_mapping, Tensor query_start_loc, "
+          "Tensor all_token_ids, Tensor prefill_len, "
+          "Tensor num_computed_tokens) -> ()");
+  ops.impl("input_batch_prepare_prefill_inputs_precompiled", torch::kCUDA,
+           &input_batch_prepare_prefill_inputs_precompiled);
+
+  ops.def("input_batch_prepare_pos_seq_lens_precompiled("
+          "Tensor idx_mapping, Tensor query_start_loc, "
+          "Tensor num_computed_tokens, Tensor! pos, Tensor! seq_lens) -> ()");
+  ops.impl("input_batch_prepare_pos_seq_lens_precompiled", torch::kCUDA,
+           &input_batch_prepare_pos_seq_lens_precompiled);
+
+  ops.def("input_batch_combine_sampled_and_draft_tokens_precompiled("
+          "Tensor! input_ids, Tensor idx_mapping, "
+          "Tensor last_sampled_tokens, Tensor query_start_loc, "
+          "Tensor seq_lens, Tensor prefill_len, Tensor draft_tokens, "
+          "Tensor cu_num_logits, int num_logits) -> Tensor");
+  ops.impl("input_batch_combine_sampled_and_draft_tokens_precompiled",
+           torch::kCUDA,
+           &input_batch_combine_sampled_and_draft_tokens_precompiled);
+
+  ops.def("input_batch_get_num_sampled_and_rejected_precompiled("
+          "Tensor! num_sampled, Tensor seq_lens, Tensor cu_num_logits, "
+          "Tensor idx_mapping, Tensor prefill_len) -> (Tensor, Tensor)");
+  ops.impl("input_batch_get_num_sampled_and_rejected_precompiled",
+           torch::kCUDA,
+           &input_batch_get_num_sampled_and_rejected_precompiled);
+
+  ops.def("input_batch_post_update_precompiled("
+          "Tensor idx_mapping, Tensor! num_computed_tokens, "
+          "Tensor! last_sampled_tokens, Tensor? output_bin_counts, "
+          "Tensor sampled_tokens, Tensor num_sampled, Tensor num_rejected, "
+          "Tensor query_start_loc, Tensor! all_token_ids, "
+          "Tensor! total_len) -> ()");
+  ops.impl("input_batch_post_update_precompiled", torch::kCUDA,
+           &input_batch_post_update_precompiled);
+
+  ops.def("input_batch_post_update_pool_precompiled("
+          "Tensor idx_mapping, Tensor! num_computed_tokens, "
+          "Tensor query_start_loc) -> ()");
+  ops.impl("input_batch_post_update_pool_precompiled", torch::kCUDA,
+           &input_batch_post_update_pool_precompiled);
+
+  ops.def("input_batch_expand_idx_mapping_precompiled("
+          "Tensor idx_mapping, int total_num_logits, "
+          "Tensor cu_num_logits) -> (Tensor, Tensor)");
+  ops.impl("input_batch_expand_idx_mapping_precompiled", torch::kCUDA,
+           &input_batch_expand_idx_mapping_precompiled);
+
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(
@@ -309,6 +409,30 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    int[] ratios) -> ()");
   ops.impl("zero_kv_blocks_precompiled", torch::kCUDA,
            &zero_kv_blocks_precompiled);
+
+  ops.def(
+      "moe_batch_load_unquantized_runtime_precompiled("
+      "    Tensor slot_ids, Tensor w13_src, Tensor w2_src,"
+      "    Tensor! w13_dst, Tensor! w2_dst) -> ()");
+  ops.impl("moe_batch_load_unquantized_runtime_precompiled", torch::kCUDA,
+           &moe_batch_load_unquantized_runtime_precompiled);
+
+  ops.def(
+      "moe_batch_load_gptq_runtime_precompiled("
+      "    Tensor slot_ids, Tensor w13_qweight_src, Tensor w2_qweight_src,"
+      "    Tensor w13_scales_src, Tensor w2_scales_src,"
+      "    Tensor w13_qzeros_src, Tensor w2_qzeros_src,"
+      "    Tensor! w13_qweight_dst, Tensor! w2_qweight_dst,"
+      "    Tensor! w13_scales_dst, Tensor! w2_scales_dst,"
+      "    Tensor! w13_qzeros_dst, Tensor! w2_qzeros_dst,"
+      "    Tensor? w13_g_idx_src, Tensor? w2_g_idx_src,"
+      "    Tensor? w13_g_idx_sort_indices_src,"
+      "    Tensor? w2_g_idx_sort_indices_src,"
+      "    Tensor!? w13_g_idx_dst, Tensor!? w2_g_idx_dst,"
+      "    Tensor!? w13_g_idx_sort_indices_dst,"
+      "    Tensor!? w2_g_idx_sort_indices_dst) -> ()");
+  ops.impl("moe_batch_load_gptq_runtime_precompiled", torch::kCUDA,
+           &moe_batch_load_gptq_runtime_precompiled);
 
   // Quantization ops
 #ifndef USE_ROCM
@@ -812,6 +936,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                        Tensor k_scale, Tensor v_scale) -> ()");
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
+
+  cache_ops.def(
+      "reshape_and_cache_flash_diffkv(Tensor key, Tensor value,"
+      "                               Tensor! kv_cache,"
+      "                               Tensor slot_mapping,"
+      "                               str kv_cache_dtype,"
+      "                               Tensor k_scale, Tensor v_scale) -> ()");
+  cache_ops.impl("reshape_and_cache_flash_diffkv", torch::kCUDA,
+                 &reshape_and_cache_flash_diffkv);
 
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(

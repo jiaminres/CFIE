@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from cfie.sampling_params import SamplingParams
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 MAX_NUM_ALLOWED_TOKEN_IDS = 1024
@@ -248,6 +248,39 @@ def apply_logit_bias(
     num_stop_token_ids: torch.Tensor,
     stop_token_ids: torch.Tensor,
 ) -> None:
+    if not HAS_TRITON:
+        for token_idx in range(logits.shape[0]):
+            req_state_idx = int(expanded_idx_mapping[token_idx].item())
+            row = logits[token_idx].clone()
+
+            req_num_allowed = int(num_allowed_token_ids[req_state_idx].item())
+            if req_num_allowed > 0:
+                req_allowed = allowed_token_ids[
+                    req_state_idx, :req_num_allowed
+                ].to(torch.int64)
+                filtered = torch.full_like(row, -float("inf"))
+                filtered[req_allowed] = row[req_allowed]
+                row = filtered
+
+            req_num_logit_bias = int(num_logit_bias[req_state_idx].item())
+            if req_num_logit_bias > 0:
+                req_bias_token_ids = logit_bias_token_ids[
+                    req_state_idx, :req_num_logit_bias
+                ].to(torch.int64)
+                row[req_bias_token_ids] += logit_bias[req_state_idx, :req_num_logit_bias]
+
+            req_num_stop_token_ids = int(num_stop_token_ids[req_state_idx].item())
+            if req_num_stop_token_ids > 0 and int(pos[token_idx].item()) < int(
+                min_lens[req_state_idx].item()
+            ):
+                req_stop_token_ids = stop_token_ids[
+                    req_state_idx, :req_num_stop_token_ids
+                ].to(torch.int64)
+                row[req_stop_token_ids] = -float("inf")
+
+            logits[token_idx].copy_(row)
+        return
+
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = triton.next_power_of_2(
         max(

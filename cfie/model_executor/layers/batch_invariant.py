@@ -8,7 +8,7 @@ import torch
 
 from cfie.logger import init_logger
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.platform_utils import num_compute_units
 from cfie.utils.torch_utils import is_torch_equal_or_newer
 from cfie.v1.attention.backends.registry import AttentionBackendEnum
@@ -148,6 +148,12 @@ def matmul_persistent(
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
+    if not HAS_TRITON:
+        result = torch.matmul(a, b)
+        if bias is not None:
+            result = result + bias
+        return result
+
     NUM_SMS = num_compute_units(a.device.index)
     M, K = a.shape
     K, N = b.shape
@@ -428,6 +434,8 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
         raise ValueError(
             "This implementation only supports log_softmax along the last dimension"
         )
+    if not HAS_TRITON:
+        return torch.log_softmax(input, dim=dim)
 
     # Flatten all dimensions except the last one
     original_shape = input.shape
@@ -544,6 +552,8 @@ def mean_dim(
     # Convert input to appropriate dtype if needed
     if input.dtype != dtype:
         input = input.to(dtype)
+    if not HAS_TRITON:
+        return torch.mean(input, dim=dim, keepdim=keepdim, dtype=dtype)
 
     # Get input shape and strides
     shape = list(input.shape)
@@ -677,6 +687,13 @@ def bmm_batch_invariant(a, b, *, out=None):
         )
     if a.dtype != b.dtype:
         raise ValueError(f"Incompatible dtypes: got {a.dtype} and {b.dtype}.")
+
+    if not HAS_TRITON:
+        result = torch.matmul(a, b)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
 
     B, M, K = a.shape
     _, _, N = b.shape
@@ -862,6 +879,12 @@ def rms_norm(
         f"Input last dimension ({input.shape[-1]}) must match "
         f"weight dimension ({weight.shape[0]})"
     )
+    if not HAS_TRITON:
+        input_f32 = input.to(torch.float32)
+        weight_f32 = weight.to(torch.float32)
+        variance = input_f32.pow(2).mean(dim=-1, keepdim=True)
+        output = input_f32 * torch.rsqrt(variance + eps) * weight_f32
+        return output.to(input.dtype)
 
     # Flatten all dimensions except the last one
     original_shape = input.shape
@@ -929,6 +952,15 @@ def enable_batch_invariant_mode():
     global _original_fp16_reduction_precision, _original_bf16_reduction_precision
     global _original_cublas_workspace_cfg, _original_cublaslt_workspace_size
     if _batch_invariant_MODE:
+        return
+
+    if not HAS_TRITON:
+        _batch_invariant_MODE = True
+        logger.warning_once(
+            "Batch-invariant Triton kernels are unavailable in the current "
+            "runtime; leaving CUDA matmul/reduction operators on the default "
+            "PyTorch implementations."
+        )
         return
 
     _batch_invariant_MODE = True
