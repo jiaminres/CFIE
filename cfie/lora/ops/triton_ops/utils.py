@@ -22,6 +22,39 @@ _LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
 _LORA_B_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
 
 
+def normalize_lora_weight_dims(lora_weight: torch.Tensor) -> torch.Tensor:
+    if lora_weight.ndim == 4:
+        assert lora_weight.size(1) == 1
+        return lora_weight.squeeze(dim=1)
+    assert lora_weight.ndim == 3
+    return lora_weight
+
+
+def iter_lora_token_indices(
+    token_indices_sorted_by_lora_ids: torch.Tensor,
+    num_tokens_per_lora: torch.Tensor,
+    lora_token_start_loc: torch.Tensor,
+    lora_ids: torch.Tensor,
+    num_active_loras: torch.Tensor | None = None,
+):
+    active_loras = (
+        int(num_active_loras.item()) if num_active_loras is not None else lora_ids.size(0)
+    )
+    active_loras = min(active_loras, lora_ids.size(0))
+
+    for lora_idx in range(active_loras):
+        lora_id = int(lora_ids[lora_idx].item())
+        if lora_id < 0:
+            continue
+
+        start = int(lora_token_start_loc[lora_idx].item())
+        token_count = int(num_tokens_per_lora[lora_idx].item())
+        if token_count <= 0:
+            continue
+
+        yield lora_id, token_indices_sorted_by_lora_ids.narrow(0, start, token_count)
+
+
 def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):
     """
     `_LORA_A_PTR_DICT` collects the required information during `profile_run`,
@@ -39,11 +72,7 @@ def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):
     lora_strides_d2 = []
     tensor_ptrs = []
     for lora_a_weight in lora_a_weights:
-        if lora_a_weight.ndim == 4:  # shape:(lora_num,1,size,rank)
-            assert lora_a_weight.size(1) == 1
-            lora_a_weight = lora_a_weight.squeeze(dim=1)
-        else:
-            assert lora_a_weight.ndim == 3  # shape:(lora_num,size,rank)
+        lora_a_weight = normalize_lora_weight_dims(lora_a_weight)
         assert lora_a_weight.is_contiguous()
         tensor_ptrs.append(lora_a_weight.data_ptr())
         lora_strides_d0.append(lora_a_weight.stride(0))
@@ -92,11 +121,7 @@ def _get_lora_b_ptr(
     hidden_sizes = []
     slice_offset = offset_start
     for lora_b_weight in lora_weights:
-        if lora_b_weight.ndim == 4:  # shape:(lora_num,1,size,rank)
-            assert lora_b_weight.size(1) == 1
-            lora_b_weight = lora_b_weight.squeeze(dim=1)
-        else:
-            assert lora_b_weight.ndim == 3  # shape:(lora_num,size,rank)
+        lora_b_weight = normalize_lora_weight_dims(lora_b_weight)
         assert lora_b_weight.is_contiguous()
         tensor_ptrs.append(lora_b_weight.data_ptr())
         lora_strides_d0.append(lora_b_weight.stride(0))

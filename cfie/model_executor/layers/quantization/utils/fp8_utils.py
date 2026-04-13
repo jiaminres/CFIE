@@ -31,7 +31,7 @@ from cfie.model_executor.parameter import (
 )
 from cfie.model_executor.utils import replace_parameter, set_weight_attrs
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.deep_gemm import (
     fp8_gemm_nt,
     get_tma_aligned_size,
@@ -48,6 +48,158 @@ from cfie.utils.flashinfer import (
 from cfie.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+
+def _has_per_token_group_fp8_quant_op() -> bool:
+    return hasattr(torch.ops._C, "per_token_group_fp8_quant")
+
+
+def _per_token_group_quant_fp8_reference(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float,
+    dtype: torch.dtype,
+    column_major_scales: bool,
+    tma_aligned_scales: bool,
+    out_q: torch.Tensor | None,
+    use_ue8m0: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8_min, fp8_max = get_fp8_min_max()
+    hidden_dim = x.shape[-1]
+    num_groups = hidden_dim // group_size
+
+    x_2d = x.reshape(-1, hidden_dim)
+    grouped = x_2d.to(torch.float32).reshape(-1, num_groups, group_size)
+    absmax = grouped.abs().amax(dim=-1).clamp_min(eps)
+    scales = absmax / fp8_max
+    if use_ue8m0:
+        scales = torch.exp2(torch.ceil(torch.log2(scales)))
+
+    x_q_2d = torch.clamp(
+        grouped / scales.unsqueeze(-1),
+        fp8_min,
+        fp8_max,
+    ).to(dtype).reshape(-1, hidden_dim)
+
+    if out_q is not None:
+        out_q.copy_(x_q_2d.reshape_as(out_q))
+        x_q = out_q
+    else:
+        x_q = x_q_2d.reshape_as(x)
+
+    scale_shape = x.shape[:-1] + (num_groups,)
+    if column_major_scales:
+        if tma_aligned_scales:
+            m = x.shape[-2]
+            tma_aligned_m = get_tma_aligned_size(m, 4)
+            x_s = torch.empty_strided(
+                scale_shape,
+                (1, tma_aligned_m)
+                if x.dim() == 2
+                else (tma_aligned_m * num_groups, 1, tma_aligned_m),
+                device=x.device,
+                dtype=torch.float32,
+            )
+        else:
+            x_s = torch.empty(
+                x.shape[:-2] + (num_groups, x.shape[-2]),
+                device=x.device,
+                dtype=torch.float32,
+            ).transpose(-1, -2)
+    else:
+        x_s = torch.empty(scale_shape, device=x.device, dtype=torch.float32)
+    x_s.copy_(scales.reshape(scale_shape))
+    return x_q, x_s
+
+
+def _expand_block_scales_reference(
+    scales: torch.Tensor,
+    rows: int,
+    cols: int,
+    block_rows: int,
+    block_cols: int,
+) -> torch.Tensor:
+    row_groups = torch.div(
+        torch.arange(rows, device=scales.device),
+        block_rows,
+        rounding_mode="floor",
+    )
+    col_groups = torch.div(
+        torch.arange(cols, device=scales.device),
+        block_cols,
+        rounding_mode="floor",
+    )
+    return scales.index_select(0, row_groups).index_select(1, col_groups)
+
+
+def _w8a8_triton_block_scaled_mm_reference(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    block_n, block_k = block_size
+    hidden_dim = A.shape[-1]
+    M = A.numel() // hidden_dim
+    N, K = B.shape
+
+    A_2d = A.reshape(M, hidden_dim).to(torch.float32)
+    As_2d = As.reshape(M, -1).to(torch.float32)
+    a_scale_expanded = As_2d.index_select(
+        1,
+        torch.div(
+            torch.arange(K, device=A.device),
+            block_k,
+            rounding_mode="floor",
+        ),
+    )
+    A_dq = A_2d * a_scale_expanded
+
+    b_scale_expanded = _expand_block_scales_reference(Bs.to(torch.float32), N, K, block_n, block_k)
+    B_dq = B.to(torch.float32) * b_scale_expanded
+
+    return (A_dq @ B_dq.T).reshape(A.shape[:-1] + (N,)).to(output_dtype)
+
+
+def _silu_mul_per_token_group_quant_fp8_colmajor_reference(
+    input: torch.Tensor,
+    output: torch.Tensor | None,
+    use_ue8m0: bool,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    group_size = 128
+    fp8_dtype = current_platform.fp8_dtype()
+    finfo = torch.finfo(fp8_dtype)
+    fp8_min = -224.0 if current_platform.is_fp8_fnuz() else finfo.min
+    fp8_max = 224.0 if current_platform.is_fp8_fnuz() else finfo.max
+
+    gate, up = input.chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate.to(torch.float32)) * up.to(torch.float32)
+    grouped = activated.reshape(activated.shape[0], -1, group_size)
+    scales = grouped.abs().amax(dim=-1).clamp_min(eps) / fp8_max
+    if use_ue8m0:
+        scales = torch.exp2(torch.ceil(torch.log2(scales)))
+
+    quantized = torch.clamp(
+        grouped / scales.unsqueeze(-1),
+        fp8_min,
+        fp8_max,
+    ).to(fp8_dtype).reshape(activated.shape[0], -1)
+
+    if output is None:
+        output = quantized
+    else:
+        output.copy_(quantized)
+
+    output_scales = torch.empty(
+        (activated.shape[1] // group_size, activated.shape[0]),
+        dtype=torch.float32,
+        device=input.device,
+    ).transpose(0, 1)
+    output_scales.copy_(scales)
+    return output, output_scales
 
 
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
@@ -743,6 +895,18 @@ def silu_mul_per_token_group_quant_fp8_colmajor(
     if use_ue8m0 is None:
         use_ue8m0 = is_deep_gemm_e8m0_used()
 
+    if not HAS_TRITON:
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "silu_mul_per_token_group_quant_fp8_colmajor."
+        )
+        return _silu_mul_per_token_group_quant_fp8_colmajor_reference(
+            input,
+            output,
+            use_ue8m0,
+            eps,
+        )
+
     M, N = input.size()
     N_2 = N // 2
 
@@ -922,7 +1086,7 @@ def per_token_group_quant_fp8(
 
     # prefer CUDA kernel if available
     # TODO(bnell): this causes some fp8 moe test to fail.
-    if current_platform.is_cuda() and x.is_contiguous():
+    if current_platform.is_cuda() and x.is_contiguous() and _has_per_token_group_fp8_quant_op():
         torch.ops._C.per_token_group_fp8_quant(
             x,
             x_q,
@@ -936,6 +1100,22 @@ def per_token_group_quant_fp8(
             tma_aligned_scales,
         )
         return x_q, x_s
+
+    if not HAS_TRITON:
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "per_token_group_quant_fp8."
+        )
+        return _per_token_group_quant_fp8_reference(
+            x,
+            group_size,
+            eps,
+            dtype,
+            column_major_scales,
+            tma_aligned_scales,
+            out_q,
+            use_ue8m0,
+        )
 
     # TRITON FALLBACK
     M = x.numel() // group_size
@@ -1214,6 +1394,20 @@ def w8a8_triton_block_scaled_mm(
     N, K = B.shape
     assert triton.cdiv(N, block_n) == Bs.shape[0]
     assert triton.cdiv(K, block_k) == Bs.shape[1]
+
+    if not HAS_TRITON:
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "w8a8_triton_block_scaled_mm."
+        )
+        return _w8a8_triton_block_scaled_mm_reference(
+            A,
+            B,
+            As,
+            Bs,
+            block_size,
+            output_dtype,
+        )
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)

@@ -10,8 +10,13 @@ https://arxiv.org/abs/2310.18547
 import torch
 
 from cfie.lora.ops.triton_ops.kernel_utils import do_shrink_kernel
-from cfie.lora.ops.triton_ops.utils import _get_lora_a_ptr, get_lora_op_configs
-from cfie.triton_utils import tl, triton
+from cfie.lora.ops.triton_ops.utils import (
+    _get_lora_a_ptr,
+    get_lora_op_configs,
+    iter_lora_token_indices,
+    normalize_lora_weight_dims,
+)
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.torch_utils import direct_register_custom_op
 
 
@@ -124,6 +129,51 @@ def _lora_shrink_kernel(
 
 
 @torch.inference_mode()
+def _lora_shrink_torch_fallback(
+    inputs: torch.Tensor,
+    lora_a_weights: list[torch.Tensor],
+    output_tensor: torch.Tensor,
+    token_indices_sorted_by_lora_ids: torch.Tensor,
+    num_tokens_per_lora: torch.Tensor,
+    lora_token_start_loc: torch.Tensor,
+    lora_ids: torch.Tensor,
+    num_active_loras: torch.Tensor,
+    scaling: float,
+) -> None:
+    for slice_idx, lora_a_weight in enumerate(lora_a_weights):
+        lora_a_weight = normalize_lora_weight_dims(lora_a_weight)
+        slice_output = output_tensor[slice_idx]
+
+        for lora_id, token_indices in iter_lora_token_indices(
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            num_active_loras,
+        ):
+            token_indices = token_indices.to(device=inputs.device, dtype=torch.long)
+            selected_inputs = inputs.index_select(0, token_indices)
+            selected_weights = lora_a_weight[lora_id]
+
+            if inputs.device.type == "cpu":
+                compute_dtype = torch.float32
+            else:
+                compute_dtype = torch.promote_types(
+                    selected_inputs.dtype,
+                    selected_weights.dtype,
+                )
+
+            shrunken = (
+                torch.matmul(
+                    selected_inputs.to(compute_dtype),
+                    selected_weights.to(compute_dtype).transpose(0, 1),
+                )
+                * scaling
+            ).to(slice_output.dtype)
+            slice_output.index_copy_(0, token_indices, shrunken)
+
+
+@torch.inference_mode()
 def _lora_shrink(
     inputs: torch.Tensor,  #  shape [num_tokens, hidden_size]
     lora_a_weights: list[torch.Tensor],  # shape [num_loras, lora_rank, hidden_size]
@@ -185,6 +235,20 @@ def _lora_shrink(
     assert lora_token_start_loc.size(0) == lora_ids.size(0) + 1
 
     output_tensor.zero_()
+
+    if not HAS_TRITON:
+        _lora_shrink_torch_fallback(
+            inputs,
+            lora_a_weights,
+            output_tensor,
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            num_active_loras,
+            scaling,
+        )
+        return
 
     (lora_ptr_tensor, lora_strides_d0, lora_strides_d1, lora_strides_d2) = (
         _get_lora_a_ptr(lora_a_weights, inputs.device)

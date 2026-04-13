@@ -4,7 +4,10 @@
 import torch
 from einops import rearrange
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -397,6 +400,18 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, s, kv_history):
         # Forward pass of the lightning attention algorithm
+        if not HAS_TRITON:
+            logger.warning_once(
+                "Falling back to torch lightning attention kernel because Triton is unavailable."
+            )
+            return _lightning_attention_reference(
+                q,
+                k,
+                v,
+                s,
+                kv_history=kv_history,
+            )
+
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
@@ -528,6 +543,95 @@ class _attention(torch.autograd.Function):
 lightning_attention_ = _attention.apply
 
 
+def _normalize_slope_rate(ed: torch.Tensor, num_heads: int) -> torch.Tensor:
+    if ed.dim() == 1:
+        ed = ed.view(1, -1, 1, 1)
+    elif ed.dim() == 3:
+        ed = ed.unsqueeze(0)
+    if ed.shape[1] != num_heads:
+        raise ValueError(
+            f"Expected slope_rate for {num_heads} heads, got shape {tuple(ed.shape)}"
+        )
+    return ed.to(torch.float32)
+
+
+def _lightning_attention_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    ed: torch.Tensor,
+    block_size: int = 256,
+    kv_history: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    b, h, n, d = q.shape
+    value_dim = v.shape[-1]
+    if kv_history is None:
+        state = torch.zeros(
+            (b, h, d, value_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        state = kv_history.to(torch.float32).clone().contiguous()
+
+    slopes = _normalize_slope_rate(ed, h)
+    block_histories: list[torch.Tensor] = []
+    output = torch.empty((b, h, n, value_dim), dtype=q.dtype, device=q.device)
+
+    for token_idx in range(n):
+        if token_idx % block_size == 0:
+            block_histories.append(state.clone())
+        decay = torch.exp(-slopes)
+        kv_outer = torch.einsum(
+            "bhd,bhe->bhde",
+            k[:, :, token_idx, :].to(torch.float32),
+            v[:, :, token_idx, :].to(torch.float32),
+        )
+        state = kv_outer + decay * state
+        out_token = torch.einsum(
+            "bhd,bhde->bhe",
+            q[:, :, token_idx, :].to(torch.float32),
+            state,
+        )
+        output[:, :, token_idx, :] = out_token.to(output.dtype)
+
+    block_histories.append(state.clone())
+    return output, torch.stack(block_histories, dim=2)
+
+
+def _linear_decode_forward_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_caches: torch.Tensor,
+    slope_rate: torch.Tensor,
+    slot_idx: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, num_heads, _, head_dim = q.shape
+    output = torch.zeros_like(q)
+    flat_slopes = slope_rate.reshape(-1).to(torch.float32)
+    decay = torch.exp(-flat_slopes)
+
+    for batch_idx, slot in enumerate(slot_idx.tolist()):
+        if slot < 0:
+            continue
+        slot_state = kv_caches[slot].to(torch.float32)
+        for head_idx in range(num_heads):
+            kv_outer = torch.outer(
+                k[batch_idx, head_idx, 0].to(torch.float32),
+                v[batch_idx, head_idx, 0].to(torch.float32),
+            )
+            updated_state = kv_outer + decay[head_idx] * slot_state[head_idx]
+            slot_state[head_idx] = updated_state
+            output[batch_idx, head_idx, 0] = torch.matmul(
+                q[batch_idx, head_idx, 0].to(torch.float32),
+                updated_state,
+            ).to(output.dtype)
+        kv_caches[slot].copy_(slot_state.to(kv_caches.dtype))
+
+    return rearrange(output, "b h n d -> b n (h d)").squeeze(1).contiguous()
+
+
 def lightning_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -552,6 +656,19 @@ def lightning_attention(
         output: Attention output
         kv: Updated key-value history
     """
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Falling back to torch lightning_attention because Triton is unavailable."
+        )
+        return _lightning_attention_reference(
+            q,
+            k,
+            v,
+            ed,
+            block_size=block_size,
+            kv_history=kv_history,
+        )
+
     d = q.shape[-1]
     e = v.shape[-1]
 
@@ -696,11 +813,24 @@ def linear_decode_forward_triton(
     assert k.shape == (B, H, 1, D)
     assert v.shape == (B, H, 1, D)
 
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Falling back to torch linear attention decode because Triton is unavailable."
+        )
+        return _linear_decode_forward_reference(
+            q,
+            k,
+            v,
+            kv_caches,
+            slope_rate,
+            slot_idx,
+        )
+
     # Initialize output tensor
     output = torch.empty_like(q)
 
     # Set grid dimensions for the kernel
-    grid = (B, H, D // BLOCK_SIZE)
+    grid = (B, H, (D + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
     # Calculate strides for tensors
     qkv_b_stride = q.stride(0)

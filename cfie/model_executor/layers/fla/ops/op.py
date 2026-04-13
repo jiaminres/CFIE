@@ -13,14 +13,46 @@ from cfie.triton_utils import tl, tldevice, triton
 
 from .utils import is_gather_supported
 
+
+def _make_unavailable_triton_helper(name: str):
+    def _helper(*args, **kwargs):
+        raise RuntimeError(
+            f"{name} requires a Triton runtime. "
+            "This placeholder exists only to keep the import path "
+            "stable when Triton is unavailable."
+        )
+
+    _helper.__name__ = f"{name}_unavailable"
+    return _helper
+
+
+def _resolve_triton_helper(*candidates, name: str):
+    for candidate in candidates:
+        if callable(candidate):
+            return candidate
+    return _make_unavailable_triton_helper(name)
+
+
 if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
-    exp = tldevice.fast_expf
-    log = tldevice.fast_logf
-    log2 = tldevice.fast_log2f
+    exp = _resolve_triton_helper(
+        getattr(tldevice, "fast_expf", None),
+        getattr(tl, "exp", None),
+        name="exp",
+    )
+    log = _resolve_triton_helper(
+        getattr(tldevice, "fast_logf", None),
+        getattr(tl, "log", None),
+        name="log",
+    )
+    log2 = _resolve_triton_helper(
+        getattr(tldevice, "fast_log2f", None),
+        getattr(tl, "log2", None),
+        name="log2",
+    )
 else:
-    exp = tl.exp
-    log = tl.log
-    log2 = tl.log2
+    exp = _resolve_triton_helper(getattr(tl, "exp", None), name="exp")
+    log = _resolve_triton_helper(getattr(tl, "log", None), name="log")
+    log2 = _resolve_triton_helper(getattr(tl, "log2", None), name="log2")
 
 
 if not is_gather_supported:

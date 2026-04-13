@@ -8,7 +8,10 @@
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+logger = init_logger(__name__)
 
 
 @triton.autotune(
@@ -158,6 +161,20 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
     Return:
         out: (nchunks, ngroups, chunk_size, chunk_size)
     """
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Mamba SSD chunked BMM is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _bmm_chunk_fwd_reference(
+            a=a,
+            b=b,
+            chunk_size=chunk_size,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            causal=causal,
+            output_dtype=output_dtype,
+        )
+
     seqlen, ngroups, k = a.shape
     assert b.shape == a.shape
     if a.stride(-1) != 1 and a.stride(0) != 1:
@@ -208,4 +225,40 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
             IS_CAUSAL=causal,
             dot_dtype=dot_dtype,
         )
+    return out
+
+
+def _bmm_chunk_fwd_reference(
+    a,
+    b,
+    chunk_size,
+    cu_chunk_seqlens,
+    causal=False,
+    output_dtype=None,
+):
+    seqlen, ngroups, k = a.shape
+    assert b.shape == (seqlen, ngroups, k)
+
+    nchunks = len(cu_chunk_seqlens) - 1
+    out_dtype = a.dtype if output_dtype is None else output_dtype
+    out = torch.zeros(
+        (nchunks, ngroups, chunk_size, chunk_size),
+        device=a.device,
+        dtype=out_dtype,
+    )
+
+    for chunk_idx in range(nchunks):
+        chunk_start = int(cu_chunk_seqlens[chunk_idx].item())
+        chunk_end = int(cu_chunk_seqlens[chunk_idx + 1].item())
+        chunk_len = chunk_end - chunk_start
+        if chunk_len <= 0:
+            continue
+
+        a_chunk = a[chunk_start:chunk_end].to(torch.float32).transpose(0, 1)
+        b_chunk = b[chunk_start:chunk_end].to(torch.float32).transpose(0, 1)
+        chunk_out = torch.matmul(a_chunk, b_chunk.transpose(-1, -2))
+        if causal:
+            chunk_out = torch.triu(chunk_out)
+        out[chunk_idx, :, :chunk_len, :chunk_len].copy_(chunk_out.to(out_dtype))
+
     return out

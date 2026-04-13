@@ -583,9 +583,9 @@ class LayerTieredExpertCacheController:
 
             # 当前非量化路径支持 Triton、CUDA ATen 与 PyTorch 回退 backend。
             if layer.quant_method.unquantized_backend not in (
-                UnquantizedMoeBackend.TRITON,
-                UnquantizedMoeBackend.CUDA_ATEN,
-                UnquantizedMoeBackend.TORCH,
+                    UnquantizedMoeBackend.TRITON,
+                    UnquantizedMoeBackend.CUDA_ATEN,
+                    UnquantizedMoeBackend.TORCH,
             ):
                 raise TypeError(
                     "Tiered MoE cache currently only supports TRITON, "
@@ -842,35 +842,50 @@ class LayerTieredExpertCacheController:
         return bundle
 
     def _preprocess_quantized_static_bundle(self, bundle: ExpertBundle) -> ExpertBundle:
-        # 先把 checkpoint 形态的 gate/up/down 拼成单 expert raw w13/w2。
+        # ------------------------------- 将量化 CPU 静态 bundle 预处理为 GPTQ Marlin runtime 格式 -------------------------------
+        # 先将 checkpoint 形态的 gate、up、down 张量拼装成单 expert 原始 w13 与 w2 结构。
         raw = self._assemble_raw_weights(bundle)
 
-        # repack/scale permute 当前依赖 GPU kernel，因此只在 CPU static 物化时做一次 GPU 预处理。
+        # 将拼装后的原始权重移动到目标 GPU 设备，以便后续在设备侧执行 repack 与 permute。
         raw_gpu = self._move_raw_weights_to_device(raw)
+
+        # ------------------------------- 按 desc_act 配置准备 g_idx 及其排序索引 -------------------------------
+        # 当启用了 GPTQ desc_act 时，需要显式构造排序后的 g_idx 与对应排序索引。
         if self._gptq_desc_act:
             if raw_gpu.w13_g_idx is None or raw_gpu.w2_g_idx is None:
                 raise RuntimeError(
                     f"{self.layer_key}: desc_act=True requires g_idx tensors "
                     "during CPU static preprocessing"
                 )
+
+            # 计算 w13 的 g_idx 排序索引。
             w13_g_idx_sort_indices = torch.argsort(raw_gpu.w13_g_idx, dim=-1).to(
                 torch.int32
             )
+
+            # 计算 w2 的 g_idx 排序索引。
             w2_g_idx_sort_indices = torch.argsort(raw_gpu.w2_g_idx, dim=-1).to(
                 torch.int32
             )
+
+            # 根据排序索引生成排序后的 w13 g_idx。
             w13_sorted_g_idx = torch.gather(
                 raw_gpu.w13_g_idx, -1, w13_g_idx_sort_indices
             )
+
+            # 根据排序索引生成排序后的 w2 g_idx。
             w2_sorted_g_idx = torch.gather(
                 raw_gpu.w2_g_idx, -1, w2_g_idx_sort_indices
             )
         else:
+            # 当未启用 desc_act 时，g_idx 与排序索引都使用空占位张量或 None。
             w13_g_idx_sort_indices = self._empty_perm(raw_gpu.w13_qweight.device)
             w2_g_idx_sort_indices = self._empty_perm(raw_gpu.w2_qweight.device)
             w13_sorted_g_idx = None
             w2_sorted_g_idx = None
 
+        # ------------------------------- 对量化权重执行 Marlin runtime 预处理 -------------------------------
+        # 将 w13 qweight repack 为 Marlin MoE kernel 可直接消费的布局。
         repacked_w13 = ops.gptq_marlin_moe_repack(
             raw_gpu.w13_qweight,
             w13_g_idx_sort_indices,
@@ -879,6 +894,8 @@ class LayerTieredExpertCacheController:
             self.num_bits,
             is_a_8bit=self.is_a_8bit,
         )
+
+        # 将 w2 qweight repack 为 Marlin MoE kernel 可直接消费的布局。
         repacked_w2 = ops.gptq_marlin_moe_repack(
             raw_gpu.w2_qweight,
             w2_g_idx_sort_indices,
@@ -887,6 +904,8 @@ class LayerTieredExpertCacheController:
             self.num_bits,
             is_a_8bit=self.is_a_8bit,
         )
+
+        # 对 w13 scales 按 Marlin MoE 需要的访存布局执行 permute。
         permuted_w13_scales = marlin_moe_permute_scales(
             s=raw_gpu.w13_scales,
             size_k=self.layer.intermediate_size_per_partition,
@@ -894,15 +913,19 @@ class LayerTieredExpertCacheController:
             group_size=self.group_size,
             is_a_8bit=self.is_a_8bit,
         )
+
+        # 对 w2 scales 按 Marlin MoE 需要的访存布局执行 permute。
         permuted_w2_scales = marlin_moe_permute_scales(
             s=raw_gpu.w2_scales,
             size_k=raw_gpu.w2_scales.shape[1]
-            * (self.group_size if self.group_size != -1 else self.pack_factor),
+                   * (self.group_size if self.group_size != -1 else self.pack_factor),
             size_n=raw_gpu.w2_scales.shape[2],
             group_size=self.group_size,
             is_a_8bit=self.is_a_8bit,
         )
 
+        # ------------------------------- 构造 runtime-ready 的 CPU 静态张量字典 -------------------------------
+        # 将设备侧预处理后的运行时张量转回 CPU 静态镜像格式。
         tensors = {
             "runtime.w13_qweight": self._to_cpu_static_tensor(repacked_w13[0]),
             "runtime.w2_qweight": self._to_cpu_static_tensor(repacked_w2[0]),
@@ -911,6 +934,8 @@ class LayerTieredExpertCacheController:
             "runtime.w13_qzeros": self._to_cpu_static_tensor(raw_gpu.w13_qzeros[0]),
             "runtime.w2_qzeros": self._to_cpu_static_tensor(raw_gpu.w2_qzeros[0]),
         }
+
+        # 当 desc_act 路径下同时具备排序后的 g_idx 及其排序索引时，一并写入 runtime-ready 张量字典。
         if (
                 w13_sorted_g_idx is not None
                 and w2_sorted_g_idx is not None
@@ -932,6 +957,8 @@ class LayerTieredExpertCacheController:
                     ),
                 }
             )
+
+        # 返回预处理完成的 runtime-ready ExpertBundle。
         return ExpertBundle(
             tensors=tensors,
             nbytes=bundle_nbytes(tensors),
@@ -955,15 +982,21 @@ class LayerTieredExpertCacheController:
         )
 
     def _to_cpu_static_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        # CPU static mirror 目标形态是 runtime-ready + pinned CPU memory。
-        # 如果当前平台或内存压力不允许 pin，保持 pageable CPU tensor 并继续运行；
-        # correctness 不能因为 pinned memory 不可用而失败。
+        # ------------------------------- 先将输入张量转换为 CPU 上的连续张量 -------------------------------
+        # 将输入张量从原设备分离出来，并转换为位于 CPU 上的 contiguous 张量。
         cpu_tensor = tensor.detach().to(device="cpu").contiguous()
+
+        # ------------------------------- 在无需 pin 或已经是 pinned memory 时直接返回 -------------------------------
+        # 当当前控制器未启用 pinned CPU memory，或者该张量本身已经处于 pinned 状态时，直接返回。
         if not self._use_pinned_cpu or cpu_tensor.is_pinned():
             return cpu_tensor
+
+        # ------------------------------- 在允许时尝试将 CPU 张量转换为 pinned memory -------------------------------
         try:
+            # 将当前 CPU 张量转换为 pinned memory 版本，以加快后续 H2D 传输。
             return cpu_tensor.pin_memory()
         except RuntimeError as exc:
+            # 当 pin_memory 失败时，记录一次告警并退回到普通 pageable CPU 张量。
             logger.warning_once(
                 "Failed to pin runtime-ready CPU expert bundle tensor; "
                 "falling back to pageable CPU memory. error=%s",
@@ -1493,29 +1526,53 @@ class LayerTieredExpertCacheController:
             target.w2_weight[slot].copy_(runtime_w2)
 
     def _assemble_raw_weights(self, bundle: ExpertBundle) -> _RawExpertWeights:
-        # ----------------- 预计算 w13 合并布局的列偏移 -----------------
+        # ------------------------------- 读取当前 bundle 的张量字典并预计算 w13 合并布局参数 -------------------------------
+        # 取出当前 expert bundle 中保存的张量字典，后续按字段名逐个拼装。
         tensors = bundle.tensors
+
+        # 计算合并后 w13 的总列数，对应 gate_proj 与 up_proj 两半拼接后的总宽度。
         w13_cols = 2 * self.layer.intermediate_size_per_partition
-        w13_qzeros_cols = w13_cols // self.pack_factor
+
+        # 计算 w13 前半部分的列数，对应单个 gate_proj 或 up_proj 的宽度。
         w13_half_cols = self.layer.intermediate_size_per_partition
+
+        # 计算合并后 w13_qzeros 的总列数，其列数按 pack_factor 压缩。
+        w13_qzeros_cols = w13_cols // self.pack_factor
+
+        # 计算 w13 前半部分 qzeros 的列数，其列数同样按 pack_factor 压缩。
         w13_half_qzeros_cols = w13_half_cols // self.pack_factor
-        # 量化路径必须有预分配好的 CPU raw buffer。
+
+        # ------------------------------- 校验量化路径所需的 CPU raw buffer 是否已经分配 -------------------------------
+        # 当量化路径下的 CPU raw buffer 尚未初始化时，当前 expert 不能继续执行动态加载拼装。
         if self._cpu_quantized_raw_buffer is None:
             raise RuntimeError(f"{self.layer_key}: quantized CPU raw buffer is missing")
-        # raw buffer 会被重复复用，避免每次动态加载都重新分配。
+
+        # 取出可重复复用的量化 CPU raw buffer，避免每次动态加载都重新分配。
         raw = self._cpu_quantized_raw_buffer
-        # seen_fields 用于确保 gate/up/down 的关键张量都被正确拼齐。
+
+        # ------------------------------- 初始化字段完整性检查状态 -------------------------------
+        # 用于记录 gate_proj、up_proj、down_proj 的关键字段是否已经全部写入 raw buffer。
         seen_fields: set[tuple[str, str]] = set()
+
+        # 记录 gate/up 合并路径是否已经看到 w13 对应的 g_idx 字段。
         seen_w13_g_idx = False
+
+        # 记录 down 路径是否已经看到 w2 对应的 g_idx 字段。
         seen_w2_g_idx = False
 
-        # ----------------- 逐张量把 bundle 中的 gate/up/down 权重拼进 raw buffer -----------------
+        # ------------------------------- 逐张量将 gate、up、down 权重拼装到 raw buffer 中 -------------------------------
+        # 遍历当前 bundle 中的全部张量条目，按字段名将其写入对应的 raw buffer 区域。
         for relative_name, tensor in tensors.items():
+            # 去掉 slot 前缀，只保留投影名与字段名部分。
             _, suffix = relative_name.split(".", 1)
+
+            # 将剩余部分拆成投影名和字段名两段。
             proj_name, field_name = suffix.split(".", 1)
-            # 为了后续 H2D，一律先保证源张量位于 CPU。
+
+            # 为保证后续 H2D 路径一致，先确保当前源张量位于 CPU 上。
             cpu_tensor = tensor if tensor.device.type == "cpu" else tensor.to(device="cpu")
-            # gate_proj 填到 w13 的前半段。
+
+            # 当当前张量属于 gate_proj 时，将其写入 w13 的前半部分。
             if proj_name == "gate_proj":
                 self._copy_merged_half(
                     field_name,
@@ -1525,7 +1582,8 @@ class LayerTieredExpertCacheController:
                     qzeros_offset=0,
                 )
                 seen_fields.add((proj_name, field_name))
-            # up_proj 填到 w13 的后半段。
+
+            # 当当前张量属于 up_proj 时，将其写入 w13 的后半部分。
             elif proj_name == "up_proj":
                 self._copy_merged_half(
                     field_name,
@@ -1535,17 +1593,22 @@ class LayerTieredExpertCacheController:
                     qzeros_offset=w13_half_qzeros_cols,
                 )
                 seen_fields.add((proj_name, field_name))
-            # down_proj 直接对应 w2。
+
+            # 当当前张量属于 down_proj 时，将其直接写入 w2 对应字段。
             elif proj_name == "down_proj":
                 self._copy_direct(field_name, cpu_tensor, raw)
                 seen_fields.add((proj_name, field_name))
+
+            # ------------------------------- 记录 g_idx 字段的命中情况 -------------------------------
+            # 当当前字段名为 g_idx 时，按投影类型分别记录 w13 或 w2 路径是否已看到对应字段。
             if field_name == "g_idx":
                 if proj_name in ("gate_proj", "up_proj"):
                     seen_w13_g_idx = True
                 elif proj_name == "down_proj":
                     seen_w2_g_idx = True
 
-        # ----------------- 校验动态加载所需字段是否齐全 -----------------
+        # ------------------------------- 校验动态加载所需的关键字段是否齐全 -------------------------------
+        # 定义量化动态加载路径要求必须具备的基础字段集合。
         required_fields = {
             ("gate_proj", "qweight"),
             ("gate_proj", "scales"),
@@ -1557,17 +1620,25 @@ class LayerTieredExpertCacheController:
             ("down_proj", "scales"),
             ("down_proj", "qzeros"),
         }
+
+        # 计算当前 bundle 中缺失的关键字段集合。
         missing_fields = required_fields - seen_fields
+
+        # 当存在缺失字段时，直接报错并终止当前动态加载。
         if missing_fields:
             raise KeyError(
                 f"{self.layer_key}: missing expert tensors for dynamic load: "
                 f"{sorted(missing_fields)}"
             )
+
+        # 当当前路径启用了 desc_act，但缺少 w13 或 w2 路径所需的 g_idx 字段时，直接报错。
         if self._gptq_desc_act and (not seen_w13_g_idx or not seen_w2_g_idx):
             raise KeyError(
                 f"{self.layer_key}: missing expert g_idx tensors for dynamic load"
             )
 
+        # ------------------------------- 返回当前已拼装完成的量化 raw buffer -------------------------------
+        # 返回已经完成 gate、up、down 合并写入的量化 CPU raw buffer。
         return raw
 
     def _copy_merged_half(
@@ -1579,19 +1650,29 @@ class LayerTieredExpertCacheController:
             offset: int,
             qzeros_offset: int,
     ) -> None:
-        # qweight/scales 按列偏移写入 w13 的对应半边。
+        # ------------------------------- 将 gate 或 up 分支字段写入合并后的 w13 对应半区 -------------------------------
+        # 当当前字段为 qweight 时，将该张量按列偏移写入 raw.w13_qweight 的对应半区。
         if field_name == "qweight":
             raw.w13_qweight[0, :, offset: offset + tensor.shape[-1]].copy_(tensor)
+
+        # 当当前字段为 scales 时，将该张量按列偏移写入 raw.w13_scales 的对应半区。
         elif field_name == "scales":
             raw.w13_scales[0, :, offset: offset + tensor.shape[-1]].copy_(tensor)
-        # qzeros 的列数按 pack_factor 压缩，因此使用单独的 qzeros_offset。
+
+        # ------------------------------- 将压缩列数的 qzeros 写入合并后的 w13 对应半区 -------------------------------
+        # 当当前字段为 qzeros 时，按 qzeros 专用列偏移写入 raw.w13_qzeros 的对应半区。
         elif field_name == "qzeros":
-            raw.w13_qzeros[0, :, qzeros_offset: qzeros_offset + tensor.shape[-1]].copy_(
-                tensor
-            )
+            raw.w13_qzeros[
+                0, :, qzeros_offset: qzeros_offset + tensor.shape[-1]
+            ].copy_(tensor)
+
+        # ------------------------------- 将 g_idx 写入 w13 的原始索引缓冲区 -------------------------------
+        # 当当前字段为 g_idx 时，需要先确认 w13_g_idx 原始缓冲区已经分配完成。
         elif field_name == "g_idx":
             if raw.w13_g_idx is None:
                 raise RuntimeError(f"{self.layer_key}: w13_g_idx raw buffer is missing")
+
+            # 将当前 g_idx 张量整块写入 raw.w13_g_idx。
             raw.w13_g_idx[0].copy_(tensor)
 
     def _copy_direct(
@@ -1610,19 +1691,35 @@ class LayerTieredExpertCacheController:
             raw.w2_g_idx[0].copy_(tensor)
 
     def _move_raw_weights_to_device(self, raw: _RawExpertWeights) -> _RawExpertWeights:
-        # 把 CPU raw buffer 异步搬到目标 GPU，后续 repack/permute 在设备侧完成。
+        # ------------------------------- 将量化原始权重缓冲区整体搬运到目标 GPU 设备 -------------------------------
+        # 构造并返回一份新的原始权重对象，其中各字段都已从 CPU 异步搬运到当前控制器绑定的目标 GPU 设备。
         return _RawExpertWeights(
+            # 将 w13 量化权重异步搬运到目标 GPU。
             w13_qweight=raw.w13_qweight.to(device=self.device, non_blocking=True),
+
+            # 将 w2 量化权重异步搬运到目标 GPU。
             w2_qweight=raw.w2_qweight.to(device=self.device, non_blocking=True),
+
+            # 将 w13 的 scale 张量异步搬运到目标 GPU。
             w13_scales=raw.w13_scales.to(device=self.device, non_blocking=True),
+
+            # 将 w2 的 scale 张量异步搬运到目标 GPU。
             w2_scales=raw.w2_scales.to(device=self.device, non_blocking=True),
+
+            # 将 w13 的 qzeros 张量异步搬运到目标 GPU。
             w13_qzeros=raw.w13_qzeros.to(device=self.device, non_blocking=True),
+
+            # 将 w2 的 qzeros 张量异步搬运到目标 GPU。
             w2_qzeros=raw.w2_qzeros.to(device=self.device, non_blocking=True),
+
+            # 当 w13_g_idx 存在时，将其异步搬运到目标 GPU；否则保持为 None。
             w13_g_idx=(
                 raw.w13_g_idx.to(device=self.device, non_blocking=True)
                 if raw.w13_g_idx is not None
                 else None
             ),
+
+            # 当 w2_g_idx 存在时，将其异步搬运到目标 GPU；否则保持为 None。
             w2_g_idx=(
                 raw.w2_g_idx.to(device=self.device, non_blocking=True)
                 if raw.w2_g_idx is not None

@@ -3,9 +3,67 @@
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+logger = init_logger(__name__)
 
 AWQ_TRITON_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
+
+
+def _has_awq_dequantize_precompiled() -> bool:
+    return hasattr(torch.ops._C, "awq_dequantize")
+
+
+def _has_awq_gemm_precompiled() -> bool:
+    return hasattr(torch.ops._C, "awq_gemm")
+
+
+def _awq_unpack_int4(
+    packed: torch.Tensor,
+    *,
+    out_features: int,
+) -> torch.Tensor:
+    reverse_awq_order = torch.tensor(
+        [0, 4, 1, 5, 2, 6, 3, 7],
+        dtype=torch.int32,
+        device=packed.device,
+    )
+    shifts = reverse_awq_order.mul(4).view(1, 1, 8)
+    unpacked = (
+        packed.to(torch.int32).unsqueeze(-1).bitwise_right_shift(shifts).bitwise_and(0xF)
+    )
+    return unpacked.reshape(packed.shape[0], out_features)
+
+
+def _awq_dequantize_reference(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    zeros: torch.Tensor,
+) -> torch.Tensor:
+    in_features = qweight.shape[0]
+    out_features = qweight.shape[1] * 8
+    group_size = qweight.shape[0] // scales.shape[0]
+
+    unpacked_weight = _awq_unpack_int4(qweight, out_features=out_features)
+    unpacked_zeros = _awq_unpack_int4(zeros, out_features=out_features)
+    group_indices = torch.arange(in_features, device=qweight.device) // group_size
+
+    dequantized = (
+        unpacked_weight.to(torch.float32)
+        - unpacked_zeros.index_select(0, group_indices).to(torch.float32)
+    ) * scales.index_select(0, group_indices).to(torch.float32)
+    return dequantized.to(scales.dtype)
+
+
+def _awq_gemm_reference(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+) -> torch.Tensor:
+    weight = _awq_dequantize_reference(qweight, scales, qzeros)
+    return torch.matmul(input.to(weight.dtype), weight)
 
 
 @triton.jit
@@ -237,6 +295,25 @@ def awq_dequantize_triton(
     block_size_x: int = 32,
     block_size_y: int = 32,
 ) -> torch.Tensor:
+    if not HAS_TRITON:
+        if qweight.is_cuda and _has_awq_dequantize_precompiled():
+            logger.warning_once(
+                "Falling back to `_C.awq_dequantize` because Triton AWQ is unavailable."
+            )
+            return torch.ops._C.awq_dequantize(
+                qweight,
+                scales,
+                zeros,
+                1,
+                block_size_x,
+                block_size_y,
+            )
+
+        logger.warning_once(
+            "Falling back to torch AWQ dequantize because Triton and `_C.awq_dequantize` are unavailable."
+        )
+        return _awq_dequantize_reference(qweight, scales, zeros)
+
     K = qweight.shape[0]
     M = scales.shape[1]
     group_size = qweight.shape[0] // scales.shape[0]
@@ -294,6 +371,24 @@ def awq_gemm_triton(
     block_size_n: int = 32,
     block_size_k: int = 32,
 ) -> torch.Tensor:
+    if not HAS_TRITON:
+        if input.is_cuda and _has_awq_gemm_precompiled():
+            logger.warning_once(
+                "Falling back to `_C.awq_gemm` because Triton AWQ is unavailable."
+            )
+            return torch.ops._C.awq_gemm(
+                input,
+                qweight,
+                scales,
+                qzeros,
+                split_k_iters,
+            )
+
+        logger.warning_once(
+            "Falling back to torch AWQ GEMM because Triton and `_C.awq_gemm` are unavailable."
+        )
+        return _awq_gemm_reference(input, qweight, scales, qzeros)
+
     M, K = input.shape
     N = qweight.shape[1] * 8
     group_size = qweight.shape[0] // qzeros.shape[0]

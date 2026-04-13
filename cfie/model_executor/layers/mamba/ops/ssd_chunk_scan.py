@@ -8,10 +8,15 @@
 
 from packaging import version
 
-from cfie.model_executor.layers.mamba.ops.triton_helpers import fast_exp
-from cfie.triton_utils import tl, triton
+import torch
 
-TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+from cfie.logger import init_logger
+from cfie.model_executor.layers.mamba.ops.triton_helpers import fast_exp
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+logger = init_logger(__name__)
+
+TRITON_22 = HAS_TRITON and version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
 @triton.autotune(
@@ -447,6 +452,26 @@ def _chunk_scan_fwd(
     assert states.shape == (nchunks, nheads, headdim, dstate)
     assert seq_idx.shape == (nchunks,)
 
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Mamba SSD chunk scan is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _chunk_scan_fwd_reference(
+            cb=cb,
+            x=x,
+            dt=dt,
+            dA_cumsum=dA_cumsum,
+            C=C,
+            states=states,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            out=out,
+            seq_idx=seq_idx,
+            D=D,
+            z=z,
+            initial_states=initial_states,
+        )
+
     grid = lambda META: (
         triton.cdiv(chunk_size, META["BLOCK_SIZE_M"])
         * triton.cdiv(headdim, META["BLOCK_SIZE_N"]),
@@ -524,4 +549,82 @@ def _chunk_scan_fwd(
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
     )
+    return
+
+
+def _chunk_scan_fwd_reference(
+    cb,
+    x,
+    dt,
+    dA_cumsum,
+    C,
+    states,
+    cu_chunk_seqlens,
+    out,
+    seq_idx,
+    D=None,
+    z=None,
+    initial_states=None,
+):
+    seqlen, nheads, headdim = x.shape
+    _, nchunks, chunk_size = dt.shape
+    _, ngroups, dstate = C.shape
+    assert nheads % ngroups == 0
+    assert C.shape == (seqlen, ngroups, dstate)
+    assert cb.shape == (nchunks, ngroups, chunk_size, chunk_size)
+    if D is not None:
+        assert D.shape == (nheads, headdim) or D.shape == (nheads,)
+    if z is not None:
+        assert z.shape == x.shape
+    if initial_states is not None:
+        assert initial_states.shape[1:] == (nheads, headdim, dstate)
+    assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
+    assert states.shape == (nchunks, nheads, headdim, dstate)
+    assert seq_idx.shape == (nchunks,)
+
+    heads_per_group = nheads // ngroups
+    for chunk_idx in range(nchunks):
+        chunk_start = int(cu_chunk_seqlens[chunk_idx].item())
+        chunk_end = int(cu_chunk_seqlens[chunk_idx + 1].item())
+        chunk_len = chunk_end - chunk_start
+        if chunk_len <= 0:
+            continue
+
+        current_seq_idx = int(seq_idx[chunk_idx].item())
+        previous_seq_idx = int(seq_idx[chunk_idx - 1].item()) if chunk_idx > 0 else -1
+        sequence_changed = chunk_idx == 0 or current_seq_idx != previous_seq_idx
+
+        for head_idx in range(nheads):
+            group_idx = head_idx // heads_per_group
+            if initial_states is not None and sequence_changed:
+                previous_state = initial_states[current_seq_idx, head_idx].to(torch.float32)
+            elif sequence_changed:
+                previous_state = torch.zeros(
+                    (headdim, dstate), device=x.device, dtype=torch.float32
+                )
+            else:
+                previous_state = states[chunk_idx - 1, head_idx].to(torch.float32)
+
+            C_chunk = C[chunk_start:chunk_end, group_idx].to(torch.float32)
+            dA_chunk = dA_cumsum[head_idx, chunk_idx, :chunk_len].to(torch.float32)
+            acc = torch.matmul(C_chunk, previous_state.transpose(0, 1))
+            acc *= torch.exp(dA_chunk).unsqueeze(-1)
+
+            cb_chunk = cb[chunk_idx, group_idx, :chunk_len, :chunk_len].to(torch.float32)
+            x_chunk = x[chunk_start:chunk_end, head_idx].to(torch.float32)
+            dt_chunk = dt[head_idx, chunk_idx, :chunk_len].to(torch.float32)
+            intra_scale = torch.exp(dA_chunk[:, None] - dA_chunk[None, :])
+            intra_scale = torch.tril(intra_scale * dt_chunk.unsqueeze(0))
+            acc += torch.matmul(cb_chunk * intra_scale, x_chunk)
+
+            if D is not None:
+                D_head = D[head_idx].to(torch.float32)
+                acc += x_chunk * D_head
+
+            if z is not None:
+                z_chunk = z[chunk_start:chunk_end, head_idx].to(torch.float32)
+                acc *= z_chunk * torch.sigmoid(z_chunk)
+
+            out[chunk_start:chunk_end, head_idx].copy_(acc.to(out.dtype))
+
     return

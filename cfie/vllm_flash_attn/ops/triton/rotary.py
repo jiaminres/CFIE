@@ -5,8 +5,10 @@ from typing import Optional, Union
 
 import torch
 
-import triton
-import triton.language as tl
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -131,6 +133,127 @@ def rotary_kernel(
         tl.store(OUT, out, mask=(rm[:, None] < seqlen) & (rk[None, :] < rotary_dim))
 
 
+def _rotate_half_reference(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
+    if interleaved:
+        x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
+        rotated = torch.stack(
+            (-x_reshaped[..., 1], x_reshaped[..., 0]),
+            dim=-1,
+        )
+        return rotated.reshape_as(x)
+
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def _build_rotary_positions(
+    x: torch.Tensor,
+    *,
+    batch: int,
+    seqlen: int,
+    is_varlen: bool,
+    seqlen_offsets: Union[int, torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if not is_varlen:
+        base_positions = torch.arange(seqlen, device=x.device, dtype=torch.long)
+        if isinstance(seqlen_offsets, torch.Tensor):
+            return base_positions.unsqueeze(0) + seqlen_offsets.to(
+                device=x.device,
+                dtype=torch.long,
+            ).unsqueeze(1)
+        return base_positions.unsqueeze(0) + int(seqlen_offsets)
+
+    assert cu_seqlens is not None
+    positions = torch.empty((x.shape[0],), device=x.device, dtype=torch.long)
+    cu_seqlens_cpu = cu_seqlens.to(device="cpu", dtype=torch.long)
+    if isinstance(seqlen_offsets, torch.Tensor):
+        offsets_cpu = seqlen_offsets.to(device="cpu", dtype=torch.long)
+    else:
+        offsets_cpu = None
+
+    for batch_idx in range(batch):
+        start = int(cu_seqlens_cpu[batch_idx].item())
+        end = int(cu_seqlens_cpu[batch_idx + 1].item())
+        seq_offset = (
+            int(offsets_cpu[batch_idx].item())
+            if offsets_cpu is not None
+            else int(seqlen_offsets)
+        )
+        positions[start:end] = torch.arange(
+            end - start,
+            device=x.device,
+            dtype=torch.long,
+        ) + seq_offset
+    return positions
+
+
+def _apply_rotary_reference(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    seqlen_offsets: Union[int, torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor],
+    max_seqlen: Optional[int],
+    *,
+    interleaved: bool,
+    inplace: bool,
+    conjugate: bool,
+) -> torch.Tensor:
+    is_varlen = cu_seqlens is not None
+    if not is_varlen:
+        batch, seqlen, _, headdim = x.shape
+    else:
+        assert max_seqlen is not None
+        total_seqlen, _, headdim = x.shape
+        batch = cu_seqlens.shape[0] - 1
+        seqlen = max_seqlen
+
+    seqlen_ro, rotary_half_dim = cos.shape
+    rotary_dim = rotary_half_dim * 2
+    assert rotary_dim <= headdim
+    assert seqlen_ro >= seqlen
+
+    output = x if inplace else x.clone()
+    x_rot = x[..., :rotary_dim]
+
+    positions = _build_rotary_positions(
+        x,
+        batch=batch,
+        seqlen=seqlen,
+        is_varlen=is_varlen,
+        seqlen_offsets=seqlen_offsets,
+        cu_seqlens=cu_seqlens,
+    )
+    flat_positions = positions.reshape(-1)
+    cos_pos = cos.to(device=x.device).index_select(0, flat_positions)
+    sin_pos = sin.to(device=x.device).index_select(0, flat_positions)
+    if conjugate:
+        sin_pos = -sin_pos
+
+    if not is_varlen:
+        cos_pos = cos_pos.view(batch, seqlen, 1, rotary_half_dim)
+        sin_pos = sin_pos.view(batch, seqlen, 1, rotary_half_dim)
+    else:
+        cos_pos = cos_pos.view(total_seqlen, 1, rotary_half_dim)
+        sin_pos = sin_pos.view(total_seqlen, 1, rotary_half_dim)
+
+    if interleaved:
+        cos_full = torch.repeat_interleave(cos_pos, 2, dim=-1)
+        sin_full = torch.repeat_interleave(sin_pos, 2, dim=-1)
+    else:
+        cos_full = torch.cat((cos_pos, cos_pos), dim=-1)
+        sin_full = torch.cat((sin_pos, sin_pos), dim=-1)
+
+    rotated = (
+        x_rot.to(torch.float32) * cos_full.to(torch.float32)
+        + _rotate_half_reference(x_rot.to(torch.float32), interleaved)
+        * sin_full.to(torch.float32)
+    ).to(dtype=x.dtype)
+    output[..., :rotary_dim] = rotated
+    return output
+
+
 def apply_rotary(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -184,6 +307,23 @@ def apply_rotary(
         seqlen_offsets = seqlen_offsets.contiguous()
     else:
         assert seqlen_offsets + seqlen <= seqlen_ro
+
+    if not HAS_TRITON:
+        logger.warning_once(
+            "vllm_flash_attn rotary is unavailable because Triton runtime is "
+            "not present; falling back to the shared torch rotary path."
+        )
+        return _apply_rotary_reference(
+            x,
+            cos,
+            sin,
+            seqlen_offsets,
+            cu_seqlens,
+            max_seqlen,
+            interleaved=interleaved,
+            inplace=inplace,
+            conjugate=conjugate,
+        )
 
     output = torch.empty_like(x) if not inplace else x
     if rotary_dim < headdim and not inplace:

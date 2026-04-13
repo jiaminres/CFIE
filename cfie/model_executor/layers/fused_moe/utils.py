@@ -6,6 +6,7 @@ from math import prod
 import torch
 
 from cfie import _custom_ops as ops
+from cfie.logger import init_logger
 from cfie.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
@@ -25,9 +26,11 @@ from cfie.model_executor.layers.quantization.utils.mxfp8_utils import (
 from cfie.model_executor.layers.quantization.utils.w8a8_utils import (
     per_tensor_dequantize,
 )
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.math_utils import cdiv
 from cfie.utils.torch_utils import is_torch_equal_or_newer
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -62,6 +65,35 @@ def _count_expert_num_tokens(
         tl.store(expert_num_tokens_ptr + curr_expert, tl.sum(acc))
 
 
+def _count_expert_num_tokens_reference(
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    expert_map: torch.Tensor | None,
+) -> torch.Tensor:
+    expert_num_tokens = torch.zeros(
+        (num_local_experts), device=topk_ids.device, dtype=torch.int32
+    )
+    if num_local_experts == 0 or topk_ids.numel() == 0:
+        return expert_num_tokens
+
+    flat_ids = topk_ids.reshape(-1).to(torch.long)
+    valid = flat_ids >= 0
+    if not torch.any(valid):
+        return expert_num_tokens
+
+    valid_ids = flat_ids[valid]
+    if expert_map is not None:
+        valid_ids = expert_map[valid_ids]
+
+    valid_ids = valid_ids.to(torch.long)
+    valid_ids = valid_ids[(valid_ids >= 0) & (valid_ids < num_local_experts)]
+    if valid_ids.numel() == 0:
+        return expert_num_tokens
+
+    counts = torch.bincount(valid_ids, minlength=num_local_experts)
+    return counts.to(device=topk_ids.device, dtype=torch.int32)
+
+
 def count_expert_num_tokens(
     topk_ids: torch.Tensor, num_local_experts: int, expert_map: torch.Tensor | None
 ) -> torch.Tensor:
@@ -81,6 +113,15 @@ def count_expert_num_tokens(
     of tokens assigned to the ith expert.
     """
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Fused MoE count_expert_num_tokens is falling back to the "
+            "PyTorch reference path because Triton runtime is unavailable."
+        )
+        return _count_expert_num_tokens_reference(
+            topk_ids, num_local_experts, expert_map
+        )
+
     expert_num_tokens = torch.empty(
         (num_local_experts), device=topk_ids.device, dtype=torch.int32
     )

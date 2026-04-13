@@ -17,7 +17,7 @@ from cfie.logger import init_logger
 from cfie.model_executor.custom_op import CustomOp
 from cfie.model_executor.utils import set_weight_attrs
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.collection_utils import LazyDict
 
 logger = init_logger(__name__)
@@ -412,6 +412,12 @@ class SwigluStepAndMul(CustomOp):
         return gate * up
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if not HAS_TRITON:
+            logger.warning_once(
+                "Custom activation op swiglustep_and_mul is falling back to "
+                "the native PyTorch path because Triton runtime is unavailable."
+            )
+            return self.forward_native(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)

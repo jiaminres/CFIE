@@ -11,9 +11,103 @@ from typing import Any
 import torch
 
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 logger = logging.getLogger(__name__)
+
+
+def _has_per_token_group_quant_int8_op() -> bool:
+    return hasattr(torch.ops._C, "per_token_group_quant_int8")
+
+
+def _per_token_quant_int8_reference(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    original_shape = x.shape
+    x_2d = x.reshape(-1, original_shape[-1]).to(torch.float32)
+    absmax = x_2d.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    scales = absmax / 127.0
+    x_q = torch.clamp(x_2d / scales, -128.0, 127.0).to(torch.int8)
+    return x_q.reshape(original_shape), scales.reshape(*original_shape[:-1], 1)
+
+
+def _per_token_group_quant_int8_reference(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hidden_dim = x.shape[-1]
+    num_groups = hidden_dim // group_size
+    iinfo = torch.iinfo(dtype)
+    int8_min = float(iinfo.min)
+    int8_max = float(iinfo.max)
+
+    grouped = x.reshape(-1, hidden_dim).to(torch.float32).reshape(-1, num_groups, group_size)
+    scales = grouped.abs().amax(dim=-1).clamp_min(eps) / int8_max
+    x_q = torch.clamp(
+        grouped / scales.unsqueeze(-1),
+        int8_min,
+        int8_max,
+    ).to(dtype).reshape_as(x)
+    x_s = scales.reshape(x.shape[:-1] + (num_groups,))
+    return x_q, x_s
+
+
+def _expand_block_scales_reference(
+    scales: torch.Tensor,
+    rows: int,
+    cols: int,
+    block_rows: int,
+    block_cols: int,
+) -> torch.Tensor:
+    row_groups = torch.div(
+        torch.arange(rows, device=scales.device),
+        block_rows,
+        rounding_mode="floor",
+    )
+    col_groups = torch.div(
+        torch.arange(cols, device=scales.device),
+        block_cols,
+        rounding_mode="floor",
+    )
+    return scales.index_select(0, row_groups).index_select(1, col_groups)
+
+
+def _w8a8_block_int8_matmul_reference(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    block_n, block_k = block_size
+    hidden_dim = A.shape[-1]
+    M = A.numel() // hidden_dim
+    N, K = B.shape
+
+    A_2d = A.reshape(M, hidden_dim).to(torch.float32)
+    As_2d = As.reshape(M, -1).to(torch.float32)
+    a_scale_expanded = As_2d.index_select(
+        1,
+        torch.div(
+            torch.arange(K, device=A.device),
+            block_k,
+            rounding_mode="floor",
+        ),
+    )
+    A_dq = A_2d * a_scale_expanded
+
+    b_scale_expanded = _expand_block_scales_reference(
+        Bs.to(torch.float32),
+        N,
+        K,
+        block_n,
+        block_k,
+    )
+    B_dq = B.to(torch.float32) * b_scale_expanded
+    return (A_dq @ B_dq.T).reshape(A.shape[:-1] + (N,)).to(output_dtype)
 
 
 def apply_w8a8_block_int8_linear(
@@ -125,6 +219,12 @@ def per_token_quant_int8(x):
     original_shape = x.shape
     if x.dim() > 2:
         x = x.view(-1, original_shape[-1])
+    if not HAS_TRITON:
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "per_token_quant_int8."
+        )
+        return _per_token_quant_int8_reference(x.reshape(original_shape))
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     x_q = torch.empty((M, N), device=x.device, dtype=torch.int8)
@@ -229,11 +329,18 @@ def per_token_group_quant_int8(
         dtype=torch.float32,
     )
     # prefer CUDA kernel if available
-    if current_platform.is_cuda():
+    if current_platform.is_cuda() and _has_per_token_group_quant_int8_op():
         torch.ops._C.per_token_group_quant_int8(
             x, x_q, x_s, group_size, eps, float(int8_min), float(int8_max)
         )
         return x_q, x_s
+
+    if not HAS_TRITON:
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "per_token_group_quant_int8."
+        )
+        return _per_token_group_quant_int8_reference(x, group_size, eps, dtype)
 
     M = x.numel() // group_size
     N = group_size
@@ -424,6 +531,20 @@ def w8a8_block_int8_matmul(
     N, K = B.shape
     assert triton.cdiv(N, block_n) == Bs.shape[0]
     assert triton.cdiv(K, block_k) == Bs.shape[1]
+
+    if not HAS_TRITON:
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "w8a8_block_int8_matmul."
+        )
+        return _w8a8_block_int8_matmul_reference(
+            A,
+            B,
+            As,
+            Bs,
+            block_size,
+            output_dtype,
+        )
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)

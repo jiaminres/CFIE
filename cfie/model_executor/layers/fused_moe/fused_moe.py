@@ -52,10 +52,39 @@ from cfie.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+
+def _has_moe_wna16_gemm_op() -> bool:
+    return hasattr(torch.ops, "_moe_C") and hasattr(
+        torch.ops._moe_C, "moe_wna16_gemm"
+    )
+
+
+def _zero_experts_compute_reference(
+    expert_indices: torch.Tensor,
+    expert_scales: torch.Tensor,
+    num_experts: int,
+    zero_expert_type: str,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    if zero_expert_type != "identity":
+        raise NotImplementedError(
+            f"Unsupported zero_expert_type={zero_expert_type!r} without Triton."
+        )
+
+    zero_expert_mask = expert_indices >= num_experts
+    zero_expert_scales = expert_scales.clone()
+    zero_expert_scales[~zero_expert_mask] = 0.0
+
+    expert_indices[zero_expert_mask] = 0
+    expert_scales[zero_expert_mask] = 0.0
+
+    scale_sum = zero_expert_scales.sum(dim=-1, keepdim=True).to(hidden_states.dtype)
+    return hidden_states * scale_sum
 
 
 @triton.jit
@@ -878,6 +907,14 @@ def dispatch_fused_moe_kernel(
             num_experts=B.size(0),
             bit=4 if use_int4_w4a16 else 8,
         )
+        has_precompiled_wna16 = _has_moe_wna16_gemm_op()
+
+        if not HAS_TRITON and has_precompiled_wna16:
+            logger.info(
+                "Fused MoE WNA16 is falling back to `_moe_C.moe_wna16_gemm` "
+                "because Triton runtime is unavailable."
+            )
+            use_moe_wna16_cuda = True
 
         if use_moe_wna16_cuda:
             invoke_fused_moe_wna16_cuda_kernel(
@@ -896,6 +933,13 @@ def dispatch_fused_moe_kernel(
                 block_shape,
             )
             return
+
+        if not HAS_TRITON:
+            raise RuntimeError(
+                "Fused MoE WNA16 requires Triton or `_moe_C.moe_wna16_gemm` "
+                "in the current runtime."
+            )
+
         invoke_fused_moe_wna16_triton_kernel(
             A,
             B,
@@ -986,6 +1030,19 @@ def zero_experts_compute_triton(
     zero_expert_type: str,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
+    if not HAS_TRITON:
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "zero_experts_compute_triton."
+        )
+        return _zero_experts_compute_reference(
+            expert_indices,
+            expert_scales,
+            num_experts,
+            zero_expert_type,
+            hidden_states,
+        )
+
     N = expert_indices.numel()
     top_k = expert_indices.size(-1)
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
@@ -1935,7 +1992,9 @@ class TritonExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return current_platform.is_cuda_alike() or current_platform.is_xpu()
+        return HAS_TRITON and (
+            current_platform.is_cuda_alike() or current_platform.is_xpu()
+        )
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:

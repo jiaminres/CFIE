@@ -16,8 +16,11 @@ from typing import Literal
 import torch
 from torch.library import wrap_triton
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.math_utils import cdiv
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -84,6 +87,23 @@ def triton_scale_swizzle(
     )
 
 
+def _mx_block_rearrange_reference(scale_tensor: torch.Tensor) -> torch.Tensor:
+    rows, cols = scale_tensor.shape
+    n_row_blocks = cdiv(rows, 128)
+    n_col_blocks = cdiv(cols, 4)
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * 4
+
+    padded = scale_tensor
+    if (rows, cols) != (padded_rows, padded_cols):
+        padded = scale_tensor.new_zeros((padded_rows, padded_cols))
+        padded[:rows, :cols].copy_(scale_tensor)
+
+    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+    return rearranged
+
+
 def triton_mx_block_rearrange(scale_tensor: torch.Tensor) -> torch.Tensor:
     """
     Rearranges an E8M0 tensor scale from row-major format to
@@ -110,6 +130,15 @@ def triton_mx_block_rearrange(scale_tensor: torch.Tensor) -> torch.Tensor:
     n_col_blocks = triton.cdiv(cols, 4)
     padded_rows = n_row_blocks * 128
     padded_cols = n_col_blocks * 4
+
+    if not HAS_TRITON:
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "triton_mx_block_rearrange."
+        )
+        return _mx_block_rearrange_reference(scale_tensor).reshape(
+            padded_rows, padded_cols
+        )
 
     out = scale_tensor.new_empty((padded_rows, padded_cols))
 
@@ -160,23 +189,14 @@ def to_blocked(
         Rearranged tensor of shape (32*cdiv(H,128), 16*cdiv(W,4))
     """
     if backend == "triton":
+        if not HAS_TRITON:
+            logger.warning(
+                "Triton is unavailable; using torch reference for "
+                "qutlass_utils.to_blocked."
+            )
+            return _mx_block_rearrange_reference(input_matrix).flatten()
         return triton_mx_block_rearrange(input_matrix).flatten()
     elif backend != "torch":
         raise ValueError(f'backend must be "torch" or "triton", got {backend!r}')
 
-    rows, cols = input_matrix.shape
-    n_row_blocks = cdiv(rows, 128)
-    n_col_blocks = cdiv(cols, 4)
-
-    # Calculate the padded shape
-    padded_rows = n_row_blocks * 128
-    padded_cols = n_col_blocks * 4
-
-    padded = input_matrix
-    assert (rows, cols) == (padded_rows, padded_cols)
-
-    # Rearrange the blocks
-    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
-    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
-
-    return rearranged.flatten()
+    return _mx_block_rearrange_reference(input_matrix).flatten()

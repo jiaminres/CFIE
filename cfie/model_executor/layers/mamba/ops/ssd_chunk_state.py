@@ -7,11 +7,15 @@
 # ruff: noqa: E501
 
 import torch
+import torch.nn.functional as F
 
+from cfie.logger import init_logger
 from cfie.model_executor.layers.mamba.ops.triton_helpers import fast_exp
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 from .mamba_ssm import softplus
+
+logger = init_logger(__name__)
 
 
 @triton.autotune(
@@ -311,6 +315,21 @@ def _chunk_cumsum_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
 ):
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Mamba SSD chunk cumsum is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _chunk_cumsum_fwd_reference(
+            dt=dt,
+            A=A,
+            chunk_size=chunk_size,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+        )
+
     seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
     if dt_bias is not None:
@@ -356,6 +375,21 @@ def _chunk_cumsum_fwd(
 def _chunk_state_fwd(
     B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_in_fp32=True
 ):
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Mamba SSD chunk state is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _chunk_state_fwd_reference(
+            B=B,
+            x=x,
+            dt=dt,
+            dA_cumsum=dA_cumsum,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            states=states,
+            states_in_fp32=states_in_fp32,
+        )
+
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -408,4 +442,100 @@ def _chunk_state_fwd(
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
         )
+    return states
+
+
+def _softplus_with_threshold_torch(x: torch.Tensor) -> torch.Tensor:
+    return torch.where(x <= 20.0, F.softplus(x), x)
+
+
+def _chunk_cumsum_fwd_reference(
+    dt,
+    A,
+    chunk_size,
+    cu_chunk_seqlens,
+    dt_bias=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+):
+    seqlen, nheads = dt.shape
+    assert A.shape == (nheads,)
+    if dt_bias is not None:
+        assert dt_bias.shape == (nheads,)
+
+    nchunks = cu_chunk_seqlens.shape[0] - 1
+    dt_out = torch.zeros(
+        (nheads, nchunks, chunk_size), device=dt.device, dtype=torch.float32
+    )
+    dA_cumsum = torch.zeros_like(dt_out)
+
+    for chunk_idx in range(nchunks):
+        chunk_start = int(cu_chunk_seqlens[chunk_idx].item())
+        chunk_end = int(cu_chunk_seqlens[chunk_idx + 1].item())
+        chunk_len = chunk_end - chunk_start
+        if chunk_len <= 0:
+            continue
+
+        dt_chunk = dt[chunk_start:chunk_end].transpose(0, 1).to(torch.float32)
+        if dt_bias is not None:
+            dt_chunk = dt_chunk + dt_bias.to(torch.float32).unsqueeze(-1)
+        if dt_softplus:
+            dt_chunk = _softplus_with_threshold_torch(dt_chunk)
+        dt_chunk = torch.clamp(dt_chunk, min=dt_limit[0], max=dt_limit[1])
+
+        dt_out[:, chunk_idx, :chunk_len] = dt_chunk
+        dA_cumsum[:, chunk_idx, :chunk_len] = torch.cumsum(
+            dt_chunk * A.to(torch.float32).unsqueeze(-1),
+            dim=-1,
+        )
+
+    return dA_cumsum, dt_out
+
+
+def _chunk_state_fwd_reference(
+    B,
+    x,
+    dt,
+    dA_cumsum,
+    cu_chunk_seqlens,
+    states=None,
+    states_in_fp32=True,
+):
+    seqlen, nheads, headdim = x.shape
+    _, nchunks, chunk_size = dt.shape
+    _, ngroups, dstate = B.shape
+    assert nheads % ngroups == 0
+    assert B.shape == (seqlen, ngroups, dstate)
+    assert dt.shape == (nheads, nchunks, chunk_size)
+    assert dA_cumsum.shape == dt.shape
+
+    if states is None:
+        states_dtype = torch.float32 if states_in_fp32 else B.dtype
+        states = torch.empty(
+            (nchunks, nheads, headdim, dstate),
+            device=x.device,
+            dtype=states_dtype,
+        )
+    else:
+        assert states.shape == (nchunks, nheads, headdim, dstate)
+
+    heads_per_group = nheads // ngroups
+    for chunk_idx in range(nchunks):
+        chunk_start = int(cu_chunk_seqlens[chunk_idx].item())
+        chunk_end = int(cu_chunk_seqlens[chunk_idx + 1].item())
+        chunk_len = chunk_end - chunk_start
+        if chunk_len <= 0:
+            states[chunk_idx].zero_()
+            continue
+
+        for head_idx in range(nheads):
+            group_idx = head_idx // heads_per_group
+            x_chunk = x[chunk_start:chunk_end, head_idx].to(torch.float32)
+            b_chunk = B[chunk_start:chunk_end, group_idx].to(torch.float32)
+            dA_chunk = dA_cumsum[head_idx, chunk_idx, :chunk_len].to(torch.float32)
+            dt_chunk = dt[head_idx, chunk_idx, :chunk_len].to(torch.float32)
+            scale = torch.exp(dA_chunk[-1] - dA_chunk) * dt_chunk
+            chunk_state = x_chunk.transpose(0, 1) @ (b_chunk * scale.unsqueeze(-1))
+            states[chunk_idx, head_idx].copy_(chunk_state.to(states.dtype))
+
     return states

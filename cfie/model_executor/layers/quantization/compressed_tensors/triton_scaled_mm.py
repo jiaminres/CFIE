@@ -4,7 +4,10 @@
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.logger import init_logger
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+logger = init_logger(__name__)
 
 
 def is_weak_contiguous(x: torch.Tensor):
@@ -13,6 +16,41 @@ def is_weak_contiguous(x: torch.Tensor):
     is_not_transpose = strides[0] == 1 and (strides[1] >= max(1, sizes[0]))
     is_transpose = strides[1] == 1 and (strides[0] >= max(1, sizes[1]))
     return is_transpose or is_not_transpose
+
+
+def _has_cutlass_scaled_mm_op() -> bool:
+    return hasattr(torch.ops._C, "cutlass_scaled_mm")
+
+
+def _triton_scaled_mm_reference(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    accumulator = torch.matmul(input.to(torch.float32), weight.to(torch.float32))
+    accumulator = accumulator * scale_a.to(torch.float32)
+    accumulator = accumulator * scale_b.to(torch.float32).T
+    if bias is not None:
+        accumulator = accumulator + bias.to(torch.float32)
+    return accumulator.to(out_dtype)
+
+
+def _can_use_cutlass_scaled_mm_precompiled(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> bool:
+    return (
+        input.is_cuda
+        and weight.is_cuda
+        and out_dtype in (torch.float16, torch.bfloat16)
+        and weight.shape[0] % 16 == 0
+        and weight.shape[1] % 16 == 0
+        and _has_cutlass_scaled_mm_op()
+    )
 
 
 @triton.jit
@@ -168,13 +206,41 @@ def triton_scaled_mm(
     assert is_weak_contiguous(input)
     assert is_weak_contiguous(weight)
 
+    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
+
+    if not HAS_TRITON:
+        if _can_use_cutlass_scaled_mm_precompiled(input, weight, out_dtype):
+            logger.info_once(
+                "Compressed-tensors Triton scaled_mm is falling back to `_C.cutlass_scaled_mm` because Triton runtime is unavailable."
+            )
+            result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+            torch.ops._C.cutlass_scaled_mm(
+                result,
+                input,
+                weight,
+                scale_a,
+                scale_b,
+                bias,
+            )
+            return result.to(out_dtype)
+
+        logger.warning_once(
+            "Compressed-tensors Triton scaled_mm is falling back to the shared torch reference path because Triton runtime is unavailable."
+        )
+        return _triton_scaled_mm_reference(
+            input,
+            weight,
+            scale_a,
+            scale_b,
+            out_dtype,
+            bias,
+        )
+
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
     result = torch.empty((M, N), dtype=out_dtype, device=input.device)
-
-    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
     if use_heuristic:
         is_small_N = N < 8192
@@ -187,6 +253,9 @@ def triton_scaled_mm(
             tile_shape = (64, 128, 128)
         else:
             tile_shape = (128, 128, 128)
+
+    else:
+        tile_shape = (block_size_m, block_size_n, block_size_k)
 
     block_size_m, block_size_n, block_size_k = tile_shape
 

@@ -10,8 +10,13 @@ https://arxiv.org/abs/2310.18547
 import torch
 
 from cfie.lora.ops.triton_ops.kernel_utils import do_expand_kernel
-from cfie.lora.ops.triton_ops.utils import _get_lora_b_ptr, get_lora_op_configs
-from cfie.triton_utils import tl, triton
+from cfie.lora.ops.triton_ops.utils import (
+    _get_lora_b_ptr,
+    get_lora_op_configs,
+    iter_lora_token_indices,
+    normalize_lora_weight_dims,
+)
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.torch_utils import direct_register_custom_op
 
 
@@ -128,6 +133,58 @@ def _lora_expand_kernel(
 
 
 @torch.inference_mode()
+def _lora_expand_torch_fallback(
+    inputs: torch.Tensor,
+    lora_b_weights: list[torch.Tensor],
+    output_tensor: torch.Tensor,
+    token_indices_sorted_by_lora_ids: torch.Tensor,
+    num_tokens_per_lora: torch.Tensor,
+    lora_token_start_loc: torch.Tensor,
+    lora_ids: torch.Tensor,
+    num_active_loras: torch.Tensor,
+    offset_start: int,
+    add_inputs: bool,
+) -> None:
+    current_offset = offset_start
+
+    for slice_idx, lora_b_weight in enumerate(lora_b_weights):
+        lora_b_weight = normalize_lora_weight_dims(lora_b_weight)
+        hidden_size = lora_b_weight.size(1)
+        slice_input = inputs[slice_idx]
+        slice_output = output_tensor[:, current_offset : current_offset + hidden_size]
+        current_offset += hidden_size
+
+        for lora_id, token_indices in iter_lora_token_indices(
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            num_active_loras,
+        ):
+            token_indices = token_indices.to(device=slice_input.device, dtype=torch.long)
+            selected_inputs = slice_input.index_select(0, token_indices)
+            selected_weights = lora_b_weight[lora_id]
+
+            if slice_input.device.type == "cpu":
+                compute_dtype = torch.float32
+            else:
+                compute_dtype = torch.promote_types(
+                    selected_inputs.dtype,
+                    selected_weights.dtype,
+                )
+
+            expanded = torch.matmul(
+                selected_inputs.to(compute_dtype),
+                selected_weights.to(compute_dtype).transpose(0, 1),
+            ).to(slice_output.dtype)
+
+            if add_inputs:
+                expanded = expanded + slice_output.index_select(0, token_indices)
+
+            slice_output.index_copy_(0, token_indices, expanded)
+
+
+@torch.inference_mode()
 def _lora_expand(
     inputs: torch.Tensor,  # shape [num_slices, num_tokens, lora_rank]
     lora_b_weights: list[torch.Tensor],  # shape [num_lora, hidden_size, lora_rank]
@@ -186,6 +243,21 @@ def _lora_expand(
     assert token_lora_mapping.size(0) == token_indices_sorted_by_lora_ids.size(0)
     assert lora_ids.size(0) == num_tokens_per_lora.size(0)
     assert lora_token_start_loc.size(0) == lora_ids.size(0) + 1
+
+    if not HAS_TRITON:
+        _lora_expand_torch_fallback(
+            inputs,
+            lora_b_weights,
+            output_tensor,
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            num_active_loras,
+            offset_start,
+            add_inputs,
+        )
+        return
 
     (
         slice_start_tensor,

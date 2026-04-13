@@ -22,14 +22,15 @@ from cfie.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.import_utils import has_triton_kernels
 
 logger = init_logger(__name__)
 
 use_legacy_triton_kernels = False
+HAS_TRITON_KERNELS = HAS_TRITON and has_triton_kernels()
 
-if has_triton_kernels():
+if HAS_TRITON_KERNELS:
     try:
         import triton_kernels.swiglu
         from triton_kernels.matmul_ogs import (
@@ -63,6 +64,15 @@ if has_triton_kernels():
             "version is compatible. Error: %s",
             e,
         )
+
+
+def _require_triton_kernels(feature: str) -> None:
+    if HAS_TRITON_KERNELS:
+        return
+    raise RuntimeError(
+        f"{feature} requires Triton + triton_kernels runtime. "
+        "Backend selection should avoid this path when Triton is unavailable."
+    )
 
 
 @triton.jit
@@ -116,6 +126,7 @@ def legacy_routing_from_bitmatrix(
     Replacement for the removed triton_kernels.routing.routing_from_bitmatrix.
     Creates routing data from a bitmatrix representation.
     """
+    _require_triton_kernels("legacy_routing_from_bitmatrix")
     if use_legacy_triton_kernels:
         from triton_kernels.routing import routing_from_bitmatrix
 
@@ -151,6 +162,7 @@ def legacy_routing(
     Replacement for the removed triton_kernels.routing.routing function.
     Computes routing data from gating logits.
     """
+    _require_triton_kernels("legacy_routing")
     if use_legacy_triton_kernels:
         from triton_kernels.routing import routing
 
@@ -212,6 +224,8 @@ def triton_kernel_moe_forward(
             unpadded_N_w2=unpadded_N_w2,
             unpadded_K_w2=unpadded_K_w2,
         )
+
+    _require_triton_kernels("triton_kernel_moe_forward")
 
     if expert_map is not None:
         # With expert parallelism, legacy_routing produces routing data
@@ -286,6 +300,7 @@ def triton_kernel_fused_experts(
     a1q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of fused expert computation using OAI kernels."""
+    _require_triton_kernels("triton_kernel_fused_experts")
     assert activation == MoEActivation.SWIGLUOAI, (
         "Only SWIGLUOAI activation is supported"
     )
@@ -463,6 +478,7 @@ def make_routing_data(
     topk_weights: torch.Tensor,
     num_local_experts: int,
 ) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
+    _require_triton_kernels("make_routing_data")
     topk_ids = topk_ids.to(torch.int16)
     topk_weights = topk_weights.to(torch.bfloat16)
 
@@ -514,9 +530,8 @@ def make_routing_data(
 class BaseOAITritonExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
-        raise NotImplementedError(
-            "OAITritonExperts is not yet used by an Oracle. "
-            "This method should not be called."
+        return HAS_TRITON_KERNELS and (
+            current_platform.is_cuda() or current_platform.is_rocm()
         )
 
     @staticmethod

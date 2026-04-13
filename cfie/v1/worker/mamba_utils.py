@@ -7,17 +7,22 @@ from typing import Any
 
 import torch
 
+from cfie.logger import init_logger
 from cfie.config import CacheConfig
 from cfie.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
+    get_conv_copy_spec,
+    get_temporal_copy_spec,
 )
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.math_utils import cdiv
 from cfie.v1.core.sched.output import SchedulerOutput
 from cfie.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from cfie.v1.utils import CpuGpuBuffer
 from cfie.v1.worker.gpu_input_batch import CachedRequestState
 from cfie.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -40,6 +45,12 @@ def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
 
 
 def batch_memcpy(src_ptrs, dst_ptrs, sizes):
+    if not HAS_TRITON:
+        raise RuntimeError(
+            "batch_memcpy requires Triton runtime support. "
+            "Use do_mamba_copy_block() so the shared PyTorch fallback can "
+            "be selected when Triton is unavailable."
+        )
     batch = src_ptrs.shape[0]
     assert dst_ptrs.shape[0] == batch
     assert sizes.shape[0] == batch
@@ -68,6 +79,10 @@ class MambaCopyBuffers:
     dst_ptrs: CpuGpuBuffer
     sizes: CpuGpuBuffer
     offset: int = 0
+    python_copies: list[tuple[torch.Tensor, torch.Tensor, int]] = dataclasses.field(
+        default_factory=list,
+        repr=False,
+    )
 
     @classmethod
     def create(
@@ -88,6 +103,49 @@ class MambaCopyBuffers:
             dst_ptrs=make_buffer(n, dtype=torch.int64),
             sizes=make_buffer(n, dtype=torch.int32),
         )
+
+
+def _reset_copy_buffers(copy_bufs: MambaCopyBuffers) -> None:
+    copy_bufs.offset = 0
+    copy_bufs.python_copies.clear()
+
+
+def _resolve_mamba_copy_tensors(
+    *,
+    state: torch.Tensor,
+    block_ids: list[int],
+    src_block_idx: int,
+    dest_block_idx: int,
+    num_accepted_tokens: int,
+    state_copy_func: MambaStateCopyFunc,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dest_tensor = state[block_ids[dest_block_idx]]
+    if state_copy_func is get_conv_copy_spec:
+        src_tensor = state[block_ids[src_block_idx], num_accepted_tokens - 1 :]
+        return src_tensor, dest_tensor
+    if state_copy_func is get_temporal_copy_spec:
+        src_tensor = state[block_ids[src_block_idx + num_accepted_tokens - 1]]
+        return src_tensor, dest_tensor
+    raise NotImplementedError(
+        "Unsupported Mamba state copy function for no-Triton fallback: "
+        f"{state_copy_func!r}"
+    )
+
+
+def _copy_mamba_state_torch_fallback(
+    copy_bufs: MambaCopyBuffers,
+    n: int,
+) -> None:
+    logger.warning_once(
+        "Mamba state block copy is falling back to the shared PyTorch path "
+        "because Triton runtime is unavailable."
+    )
+    for src_tensor, dst_tensor, num_elements in copy_bufs.python_copies[:n]:
+        if num_elements == 0:
+            continue
+        src_flat = src_tensor.reshape(-1)[:num_elements].clone()
+        dst_flat = dst_tensor.view(-1)
+        dst_flat[:num_elements].copy_(src_flat, non_blocking=True)
 
 
 def collect_mamba_copy_meta(
@@ -117,13 +175,26 @@ def collect_mamba_copy_meta(
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache[0]
             for state, state_copy_func in zip(kv_caches, mamba_state_copy_funcs):
+                num_accepted_tokens = accept_token_bias + 1
                 copy_spec = state_copy_func(
-                    state, block_ids, src_block_idx, accept_token_bias + 1
+                    state, block_ids, src_block_idx, num_accepted_tokens
                 )
 
                 src_ptrs_np[offset] = copy_spec.start_addr
                 dst_ptrs_np[offset] = state[dest_block_id].data_ptr()
                 sizes_np[offset] = copy_spec.num_elements * state.element_size()
+                if not HAS_TRITON:
+                    src_tensor, dst_tensor = _resolve_mamba_copy_tensors(
+                        state=state,
+                        block_ids=block_ids,
+                        src_block_idx=src_block_idx,
+                        dest_block_idx=dest_block_idx,
+                        num_accepted_tokens=num_accepted_tokens,
+                        state_copy_func=state_copy_func,
+                    )
+                    copy_bufs.python_copies.append(
+                        (src_tensor, dst_tensor, copy_spec.num_elements)
+                    )
                 offset += 1
 
     copy_bufs.offset = offset
@@ -132,6 +203,10 @@ def collect_mamba_copy_meta(
 def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
     n = copy_bufs.offset
     if n == 0:
+        return
+    if not HAS_TRITON:
+        _copy_mamba_state_torch_fallback(copy_bufs, n)
+        copy_bufs.python_copies.clear()
         return
     batch_memcpy(
         copy_bufs.src_ptrs.copy_to_gpu(n),
@@ -171,7 +246,7 @@ def preprocess_mamba(
     for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
         mamba_state_idx.pop(req_id, None)
 
-    copy_bufs.offset = 0
+    _reset_copy_buffers(copy_bufs)
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
@@ -233,7 +308,7 @@ def postprocess_mamba(
     num_accepted_tokens_cpu = input_batch.num_accepted_tokens_cpu
     # NOTE: can be optimized as this function always returns the same result
     mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
-    copy_bufs.offset = 0
+    _reset_copy_buffers(copy_bufs)
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         num_computed_tokens = req_state.num_computed_tokens

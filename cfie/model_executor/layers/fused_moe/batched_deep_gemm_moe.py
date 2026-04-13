@@ -23,7 +23,7 @@ from cfie.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
 )
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.deep_gemm import (
     DeepGemmQuantScaleFMT,
     fp8_m_grouped_gemm_nt_masked,
@@ -34,6 +34,10 @@ from cfie.utils.deep_gemm import (
 from cfie.utils.math_utils import cdiv, round_up
 
 logger = init_logger(__name__)
+
+
+def _has_persistent_masked_m_silu_mul_quant_op() -> bool:
+    return hasattr(torch.ops._C, "persistent_masked_m_silu_mul_quant")
 
 
 def scales_shape_stride_dtype(
@@ -206,15 +210,45 @@ def persistent_masked_m_silu_mul_quant(
         DeepGemmQuantScaleFMT.UE8M0,
     ]
 
+    if not HAS_TRITON and not _has_persistent_masked_m_silu_mul_quant_op():
+        logger.warning_once(
+            "Batched DeepGEMM persistent_masked_m_silu_mul_quant is falling "
+            "back to the PyTorch reference path because Triton runtime is "
+            "unavailable and the precompiled `_C` op is unavailable."
+        )
+        return _persistent_masked_m_silu_mul_quant_reference(
+            y,
+            tokens_per_expert,
+            y_q,
+            y_s,
+            group_size,
+            quant_scale_fmt,
+        )
+
     cuda_arch = current_platform.get_device_capability(
         device_id=y.device.index
     ).to_int()
 
-    if cuda_arch >= 80:
+    if cuda_arch >= 80 and _has_persistent_masked_m_silu_mul_quant_op():
         torch.ops._C.persistent_masked_m_silu_mul_quant(
             y, tokens_per_expert, y_q, y_s, ceil_ue8m0
         )
     else:
+        if not HAS_TRITON:
+            logger.warning_once(
+                "Batched DeepGEMM persistent_masked_m_silu_mul_quant is falling "
+                "back to the PyTorch reference path because Triton runtime is "
+                "unavailable."
+            )
+            return _persistent_masked_m_silu_mul_quant_reference(
+                y,
+                tokens_per_expert,
+                y_q,
+                y_s,
+                group_size,
+                quant_scale_fmt,
+            )
+
         stride_cnt_e = tokens_per_expert.stride()[0]
 
         # Static grid over experts and H-groups.
@@ -257,6 +291,58 @@ def persistent_masked_m_silu_mul_quant(
             NUM_STAGES=4,
             num_warps=1,
         )
+
+    return y_q, y_s
+
+
+def _persistent_masked_m_silu_mul_quant_reference(
+    y: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    y_q: torch.Tensor,
+    y_s: torch.Tensor,
+    group_size: int,
+    quant_scale_fmt: DeepGemmQuantScaleFMT,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert quant_scale_fmt != DeepGemmQuantScaleFMT.UE8M0, (
+        "The PyTorch reference path does not support UE8M0-packed DeepGEMM "
+        "activation scales yet."
+    )
+
+    E, _, H2 = y.shape
+    H = H2 // 2
+    G = H // group_size
+
+    fp8_dtype = y_q.dtype
+    fp8_info = torch.finfo(fp8_dtype)
+    ceil_ue8m0 = quant_scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
+
+    y_q.zero_()
+    y_s.zero_()
+
+    for expert_idx in range(E):
+        num_tokens = int(tokens_per_expert[expert_idx].item())
+        if num_tokens <= 0:
+            continue
+
+        gate = y[expert_idx, :num_tokens, :H].to(torch.float32)
+        up = y[expert_idx, :num_tokens, H:].to(torch.float32)
+        activated = torch.nn.functional.silu(gate) * up
+        activated_groups = activated.view(num_tokens, G, group_size)
+
+        scales = (
+            activated_groups.abs().amax(dim=-1).clamp_min(1e-10) / fp8_info.max
+        )
+        if ceil_ue8m0:
+            scales = torch.pow(2.0, torch.ceil(torch.log2(scales)))
+
+        quantized = torch.clamp(
+            activated_groups / scales.unsqueeze(-1),
+            fp8_info.min,
+            fp8_info.max,
+        ).to(fp8_dtype)
+
+        y_q[expert_idx, :num_tokens] = quantized.view(num_tokens, H)
+        y_s[expert_idx, :num_tokens] = scales.to(dtype=y_s.dtype)
 
     return y_q, y_s
 

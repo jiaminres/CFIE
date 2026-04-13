@@ -8,8 +8,11 @@
 
 import torch
 
+from cfie.logger import init_logger
 from cfie.model_executor.layers.mamba.ops.triton_helpers import fast_exp
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
+
+logger = init_logger(__name__)
 
 
 @triton.autotune(
@@ -106,6 +109,19 @@ def _state_passing_fwd(
     initial_states=None,
     out_dtype=None,
 ):
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Mamba SSD state passing is falling back to the PyTorch "
+            "reference path because Triton runtime is unavailable."
+        )
+        return _state_passing_fwd_reference(
+            states=states,
+            dA_cumsum=dA_cumsum,
+            last_chunk_indices=last_chunk_indices,
+            initial_states=initial_states,
+            out_dtype=out_dtype,
+        )
+
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
     batch = last_chunk_indices.shape[0]
@@ -143,4 +159,41 @@ def _state_passing_fwd(
             stride_initstates_dim=initial_states_strides[2],
             HAS_INITSTATES=initial_states is not None,
         )
+    return out
+
+
+def _state_passing_fwd_reference(
+    states,
+    dA_cumsum,
+    last_chunk_indices,
+    initial_states=None,
+    out_dtype=None,
+):
+    nchunks, nheads, dim = states.shape
+    chunk_size = dA_cumsum.shape[-1]
+    batch = last_chunk_indices.shape[0]
+    assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
+    if initial_states is not None:
+        assert initial_states.shape == (batch, nheads, dim)
+
+    out_dtype = states.dtype if out_dtype is None else out_dtype
+    out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
+
+    chunk_start = 0
+    for batch_idx in range(batch):
+        chunk_end = int(last_chunk_indices[batch_idx].item()) + 1
+        running_state = (
+            initial_states[batch_idx].to(torch.float32).clone()
+            if initial_states is not None
+            else torch.zeros((nheads, dim), device=states.device, dtype=torch.float32)
+        )
+
+        for chunk_idx in range(chunk_start, chunk_end):
+            new_states = states[chunk_idx].to(torch.float32)
+            dA_last = dA_cumsum[:, chunk_idx, chunk_size - 1].to(torch.float32)
+            running_state = torch.exp(dA_last).unsqueeze(-1) * running_state + new_states
+            out[chunk_idx].copy_(running_state.to(out_dtype))
+
+        chunk_start = chunk_end
+
     return out

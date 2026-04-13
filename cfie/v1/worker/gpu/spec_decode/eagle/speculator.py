@@ -453,6 +453,9 @@ def prepare_eagle_inputs(
         device=num_sampled.device,
     )
     if not HAS_TRITON:
+        logger.warning_once(
+            "Eagle prepare_eagle_inputs is falling back to the PyTorch reference path because Triton runtime is unavailable."
+        )
         _prepare_eagle_inputs_torch(
             last_token_indices,
             input_buffers,
@@ -597,6 +600,9 @@ def prepare_eagle_decode(
     num_reqs = draft_tokens.shape[0]
     hidden_size = output_hidden_states.shape[-1]
     if not HAS_TRITON:
+        logger.warning_once(
+            "Eagle prepare_eagle_decode is falling back to the PyTorch reference path because Triton runtime is unavailable."
+        )
         _prepare_eagle_decode_torch(
             draft_tokens,
             output_hidden_states,
@@ -714,6 +720,9 @@ def update_eagle_inputs(
 ):
     num_reqs, hidden_size = output_hidden_states.shape
     if not HAS_TRITON:
+        logger.warning_once(
+            "Eagle update_eagle_inputs is falling back to the PyTorch reference path because Triton runtime is unavailable."
+        )
         _update_eagle_inputs_torch(
             draft_tokens,
             output_hidden_states,

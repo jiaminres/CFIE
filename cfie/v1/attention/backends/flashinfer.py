@@ -8,16 +8,50 @@ from typing import ClassVar
 
 import numpy as np
 import torch
-from flashinfer import (
-    BatchDecodeWithPagedKVCacheWrapper,
-    BatchPrefillWithPagedKVCacheWrapper,
-    BatchPrefillWithRaggedKVCacheWrapper,
-    MultiLevelCascadeAttentionWrapper,
-)
-from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
-from flashinfer.prefill import trtllm_batch_context_with_kv_cache
-from flashinfer.utils import FP4Tensor
 from typing_extensions import override
+
+FLASHINFER_IMPORT_ERROR: ImportError | None = None
+try:
+    from flashinfer import (
+        BatchDecodeWithPagedKVCacheWrapper,
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+        MultiLevelCascadeAttentionWrapper,
+    )
+    from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
+    from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+    from flashinfer.utils import FP4Tensor
+
+    HAS_FLASHINFER = True
+except ImportError as exc:
+    FLASHINFER_IMPORT_ERROR = exc
+    HAS_FLASHINFER = False
+
+    def _raise_flashinfer_unavailable() -> None:
+        raise ImportError(
+            "FlashInfer is required for the FlashInfer attention backend, "
+            "but the flashinfer Python package is not installed or not "
+            "compatible with the current environment."
+        ) from FLASHINFER_IMPORT_ERROR
+
+    class _FlashInferUnavailable:
+        def __init__(self, *args, **kwargs):
+            _raise_flashinfer_unavailable()
+
+    def _flashinfer_unavailable(*args, **kwargs):
+        _raise_flashinfer_unavailable()
+
+    BatchDecodeWithPagedKVCacheWrapper = _FlashInferUnavailable
+    BatchPrefillWithPagedKVCacheWrapper = _FlashInferUnavailable
+    BatchPrefillWithRaggedKVCacheWrapper = _FlashInferUnavailable
+    MultiLevelCascadeAttentionWrapper = _FlashInferUnavailable
+    fast_decode_plan = _flashinfer_unavailable
+    trtllm_batch_decode_with_kv_cache = _flashinfer_unavailable
+    trtllm_batch_context_with_kv_cache = _flashinfer_unavailable
+
+    class FP4Tensor:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            _raise_flashinfer_unavailable()
 
 from cfie import envs
 from cfie.config import (
@@ -38,7 +72,7 @@ from cfie.model_executor.layers.quantization.utils.quant_utils import (
 )
 from cfie.platforms import current_platform
 from cfie.platforms.interface import DeviceCapability
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.flashinfer import (
     can_use_trtllm_attention,
     use_trtllm_attention,
@@ -75,6 +109,12 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
+
+if not HAS_FLASHINFER:
+    logger.info_once(
+        "FlashInfer python package is not installed or not compatible; "
+        "the FlashInfer attention backend will be unavailable on this build."
+    )
 
 trtllm_gen_workspace_buffer = None
 
@@ -158,6 +198,25 @@ def trtllm_prefill_attn_kvfp8_dequant(
         dtype=torch.int32,
         device=block_tables_prefill.device,
     ).reshape(batch_size, num_of_page_per_token)
+    if not HAS_TRITON:
+        logger.warning_once(
+            "Triton is unavailable for FlashInfer TRTLLM KV FP8 dequant; "
+            "falling back to the shared PyTorch reference path."
+        )
+        flat_block_tables = block_tables_prefill.to(
+            device=kv_cache.device,
+            dtype=torch.int64,
+        ).reshape(-1)
+        valid_mask = flat_block_tables > 0
+        if torch.any(valid_mask):
+            gathered_pages = kv_cache.index_select(0, flat_block_tables[valid_mask]).to(
+                torch.float32
+            )
+            gathered_pages[:, 0].mul_(float(k_scale.item()))
+            gathered_pages[:, 1].mul_(float(v_scale.item()))
+            target_pages = valid_mask.nonzero(as_tuple=False).flatten() + 1
+            mock_kv_cache[target_pages] = gathered_pages.to(dequant_dtype)
+        return mock_kv_cache, mock_block_table
     grid = (batch_size, num_of_page_per_token)
     _trtllm_prefill_attn_kvfp8_dequant[grid](
         kv_cache,
@@ -359,6 +418,22 @@ class FlashInferBackend(AttentionBackend):
     def get_supported_head_sizes(cls) -> list[int]:
         # https://github.com/flashinfer-ai/flashinfer/blob/3d55c71a62052c590c130897d3a3db49b14fcc34/include/flashinfer/utils.cuh#L157
         return [64, 128, 256]
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if not HAS_FLASHINFER:
+            return "flashinfer python package not installed"
+        return None
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:

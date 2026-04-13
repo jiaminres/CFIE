@@ -745,6 +745,24 @@ def decode_attention_fwd_normal(
     k_scale=None,
     v_scale=None,
 ):
+    if not HAS_TRITON:
+        _reference_decode_attention_fwd(
+            q=q,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            o=o,
+            lse=lse,
+            req_to_token=req_to_token,
+            b_seq_len=b_seq_len,
+            attn_logits=attn_logits,
+            sm_scale=sm_scale,
+            page_size=page_size,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return
+
     _decode_att_m_fwd(
         q,
         k_buffer,
@@ -780,6 +798,24 @@ def decode_attention_fwd_grouped(
     k_scale=None,
     v_scale=None,
 ):
+    if not HAS_TRITON:
+        _reference_decode_attention_fwd(
+            q=q,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            o=o,
+            lse=lse,
+            req_to_token=req_to_token,
+            b_seq_len=b_seq_len,
+            attn_logits=attn_logits,
+            sm_scale=sm_scale,
+            page_size=page_size,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return
+
     _decode_grouped_att_m_fwd(
         q,
         k_buffer,

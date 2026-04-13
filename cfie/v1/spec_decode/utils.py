@@ -3,6 +3,7 @@
 import torch
 
 from cfie.config import CfieConfig, replace
+from cfie.logger import init_logger
 from cfie.offload.policy import PLAN_KEY
 from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.attention.backends.utils import (
@@ -10,6 +11,7 @@ from cfie.v1.attention.backends.utils import (
 )
 
 PADDING_SLOT_ID = -1
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -106,6 +108,9 @@ def eagle_step_update_slot_mapping_and_metadata(
     n_blocks_per_req = block_table_tensor.shape[1]
 
     if not HAS_TRITON:
+        logger.warning_once(
+            "Spec decode eagle_step_update_slot_mapping_and_metadata is falling back to the PyTorch reference path because Triton runtime is unavailable."
+        )
         new_position = positions_1d + 1
         exceeds_max = new_position >= max_model_len
         clamped_position = torch.where(
@@ -264,6 +269,9 @@ def eagle_prepare_inputs_padded(
     num_reqs = valid_sampled_tokens_count.shape[0]
 
     if not HAS_TRITON:
+        logger.warning_once(
+            "Spec decode eagle_prepare_inputs_padded is falling back to the PyTorch reference path because Triton runtime is unavailable."
+        )
         num_draft_tokens = torch.empty_like(valid_sampled_tokens_count)
         if num_reqs > 0:
             num_draft_tokens[0] = cu_num_draft_tokens[0]
@@ -308,6 +316,9 @@ def eagle_prepare_next_token_padded(
     batch_size, num_sampled_tokens_per_req = sampled_token_ids.shape
 
     if not HAS_TRITON:
+        logger.warning_once(
+            "Spec decode eagle_prepare_next_token_padded is falling back to the PyTorch reference path because Triton runtime is unavailable."
+        )
         valid_mask = (sampled_token_ids != -1) & (sampled_token_ids < vocab_size)
         valid_count = valid_mask.sum(dim=1).to(valid_sampled_tokens_count.dtype)
 
@@ -514,6 +525,9 @@ def copy_and_expand_eagle_inputs(
     batch_size = query_end_loc_ptr.shape[0]
 
     if not HAS_TRITON:
+        logger.warning_once(
+            "Spec decode copy_and_expand_eagle_inputs is falling back to the PyTorch reference path because Triton runtime is unavailable."
+        )
         last_input_index = total_input_tokens - 1
         for request_idx in range(batch_size):
             query_start_loc = int(query_start_loc_ptr[request_idx].item())

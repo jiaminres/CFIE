@@ -5,6 +5,7 @@
 import torch
 
 import cfie.model_executor.layers.fused_moe.modular_kernel as mk
+from cfie.logger import init_logger
 from cfie.model_executor.layers.fused_moe.activation import MoEActivation
 from cfie.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -33,8 +34,77 @@ from cfie.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
+logger = init_logger(__name__)
+
+
+def _dequantize_batched_moe_tensor_reference(
+    tensor: torch.Tensor,
+    scale: torch.Tensor | None,
+    *,
+    per_act_token_quant: bool,
+) -> torch.Tensor:
+    if scale is None:
+        return tensor.to(torch.float32)
+
+    scale = scale.to(torch.float32)
+    if per_act_token_quant or scale.numel() == 1:
+        return tensor.to(torch.float32) * scale
+
+    return tensor.to(torch.float32) * group_broadcast(scale, tensor.shape)
+
+
+def _invoke_moe_batched_reference(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    B_scale: torch.Tensor | None,
+    use_fp8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_act_token_quant: bool,
+) -> None:
+    if use_int8_w8a16 or use_int4_w4a16:
+        raise RuntimeError(
+            "Batched MoE WNA16 without Triton is not supported by the shared "
+            "torch reference path."
+        )
+
+    C.zero_()
+
+    num_experts = expert_num_tokens.numel()
+    A_scale = normalize_batched_scales_shape(A_scale, num_experts)
+    B_scale = normalize_batched_scales_shape(B_scale, num_experts)
+
+    for expert_idx in range(num_experts):
+        num_tokens = int(expert_num_tokens[expert_idx].item())
+        if num_tokens <= 0:
+            continue
+
+        input_tensor = A[expert_idx, :num_tokens]
+        weight_tensor = B[expert_idx]
+
+        if use_fp8_w8a8:
+            input_tensor = _dequantize_batched_moe_tensor_reference(
+                input_tensor,
+                None if A_scale is None else A_scale[expert_idx, :num_tokens],
+                per_act_token_quant=per_act_token_quant,
+            )
+            weight_tensor = _dequantize_batched_moe_tensor_reference(
+                weight_tensor,
+                None if B_scale is None else B_scale[expert_idx],
+                per_act_token_quant=False,
+            )
+        else:
+            input_tensor = input_tensor.to(torch.float32)
+            weight_tensor = weight_tensor.to(torch.float32)
+
+        C[expert_idx, :num_tokens] = (input_tensor @ weight_tensor.transpose(0, 1)).to(
+            C.dtype
+        )
 
 @triton.jit
 def moe_mmk(
@@ -395,6 +465,25 @@ def invoke_moe_batched_triton_kernel(
     block_shape: list[int] | None = None,
 ):
     assert not use_int4_w4a16
+    if not HAS_TRITON:
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "invoke_moe_batched_triton_kernel."
+        )
+        _invoke_moe_batched_reference(
+            A=A,
+            B=B,
+            C=C,
+            expert_num_tokens=expert_num_tokens,
+            A_scale=A_scale,
+            B_scale=B_scale,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_act_token_quant=per_act_token_quant,
+        )
+        return
+
     max_num_tokens = A.size(1)
     K = A.size(2)
     N = C.size(2)
@@ -905,7 +994,7 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return current_platform.is_cuda_alike()
+        return HAS_TRITON and current_platform.is_cuda_alike()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
