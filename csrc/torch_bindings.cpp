@@ -6,20 +6,33 @@
 #include <torch/library.h>
 #include <torch/version.h>
 
-// Note on op signatures:
-// The X_meta signatures are for the meta functions corresponding to op X.
-// They must be kept in sync with the signature for X. Generally, only
-// functions that return Tensors require a meta function.
+// 本文件集中把 C++ / CUDA 算子暴露给 PyTorch；
+// Python 层看到的 `torch.ops.<namespace>.*` 入口，最终都会从这里拿到 schema 和后端实现。
 //
-// See the following links for detailed docs on op registration and function
-// schemas.
+// `ops.def(...)` 负责声明 PyTorch 侧 schema，决定算子名称、参数签名和返回值形态。
+// `ops.impl(...)` 负责把同名 schema 绑定到具体后端实现；本文件大多数实现绑定到 CUDA，
+// 也有少量 helper 绑定到 CPU。
+//
+// 如果某个算子在这里只有 `def(...)`、没有对应的 `impl(...)`，
+// 通常表示它依赖条件编译，并会在满足编译条件的源文件里补做实现注册。
+//
+// 关于 meta 函数的说明：
+// `X_meta` 这一类签名表示与算子 `X` 对应的 meta 函数签名。
+// 它们必须与 `X` 本身的函数签名保持同步。
+// 一般来说，只有返回 `Tensor` 的函数才需要配套的 meta 函数。
+//
+// 关于算子注册和函数 schema 的详细文档，可参考下面链接。
 // https://docs.google.com/document/d/1_W62p8WJOQQUzPsJYa7s701JXt0qf2OfLub2sbkHOaU/edit#heading=h.ptttacy8y1u9
 // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
 
-TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  // vLLM custom ops
-  //
 
+// ------------------------------- 注册主命名空间下的自定义算子 -------------------------------
+// 下面这一整段是主算子表；
+// 推理热链、量化热链、MoE 热链以及若干运行时辅助算子都会先在这里声明 schema。
+TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+  // ------------------------------- 注册基础辅助算子与轻量工具入口 -------------------------------
+  // 这几项算子会被更高层的 Python 逻辑直接探测或复用，
+  // 负责提供量化 helper、弱引用张量包装以及 CPU Tensor 到 CUDA 视图的桥接能力。
   ops.def(
       "persistent_masked_m_silu_mul_quant(Tensor input, Tensor counts, Tensor! "
       "y_q, Tensor! y_s,"
@@ -34,9 +47,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
 
-  // Attention ops
-  // Compute the attention between an input query and the cached
-  // keys/values using PagedAttention.
+  // ------------------------------- 注册 Attention 与稀疏索引相关算子 -------------------------------
+  // 这一段负责把分页注意力、注意力结果合并以及稀疏注意力索引转换入口注册到 PyTorch；
+  // 调度器和 worker 在构造好 block table / cache 之后，会沿这些入口进入底层 CUDA 实现。
   ops.def(
       "paged_attention_v1("
       "    Tensor! out, Tensor query, Tensor key_cache,"
@@ -49,7 +62,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    int blocksparse_head_sliding_step) -> ()");
   ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);
 
-  // PagedAttention V2.
+  // `paged_attention_v2` 相比 v1 额外暴露中间缓冲区，
+  // 方便底层实现分步累计 softmax 所需的统计量。
   ops.def(
       "paged_attention_v2("
       "    Tensor! out, Tensor! exp_sums, Tensor! max_logits,"
@@ -63,9 +77,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    int blocksparse_head_sliding_step) -> ()");
   ops.impl("paged_attention_v2", torch::kCUDA, &paged_attention_v2);
 
-  // Merge attn states
-  // Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
-  // can be used to combine partial attention results (in the split-KV case)
+  // 这个入口用于合并拆分 KV 之后得到的部分 attention 结果，
+  // 对应 split-KV 场景下把 prefix / suffix 两段结果重新拼成统一输出。
   ops.def(
       "merge_attn_states("
       "    Tensor! output,"
@@ -100,8 +113,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &convert_vertical_slash_indexes_mergehead);
 #endif
 
-  // Activation ops
-  // Activation function used in SwiGLU.
+  // ------------------------------- 注册激活函数与常规归一化算子 -------------------------------
+  // 这一段主要服务 MLP / 门控前馈层；
+  // 多个 `def + impl` 对虽然形式重复，但它们分别对应不同激活族和量化族的真实 CUDA kernel。
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
@@ -119,15 +133,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
   ops.impl("mul_and_silu", torch::kCUDA, &mul_and_silu);
 
-  // Activation function used in GeGLU with `none` approximation.
+  // `gelu_and_mul` 对应 GeGLU 的精确近似路径。
   ops.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
-  // Activation function used in GeGLU with `tanh` approximation.
+  // `gelu_tanh_and_mul` 对应 GeGLU 的 `tanh` 近似路径。
   ops.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
 
-  // FATReLU implementation.
+  // `fatrelu_and_mul` 负责 FATReLU 变体。
   ops.def("fatrelu_and_mul(Tensor! out, Tensor input, float threshold) -> ()");
   ops.impl("fatrelu_and_mul", torch::kCUDA, &fatrelu_and_mul);
 
@@ -140,32 +154,34 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> ()");
   ops.impl("swigluoai_and_mul", torch::kCUDA, &swigluoai_and_mul);
 
-  // GELU implementation used in GPT-2.
+  // `gelu_new` 对应 GPT-2 风格 GELU。
   ops.def("gelu_new(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_new", torch::kCUDA, &gelu_new);
 
-  // Approximate GELU implementation.
+  // `gelu_fast` 提供更快的 GELU 近似实现。
   ops.def("gelu_fast(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_fast", torch::kCUDA, &gelu_fast);
 
-  // Quick GELU implementation.
+  // `gelu_quick` 提供另一条 quick GELU 路径。
   ops.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_quick", torch::kCUDA, &gelu_quick);
 
-  // Layernorm
-  // Apply Root Mean Square (RMS) Normalization to the input tensor.
+  // `rms_norm` 和后续 `fused_add_rms_norm` 是最常见的归一化基础入口，
+  // 上层模型构图会先通过这些名字拿到对应 kernel。
   ops.def(
       "rms_norm(Tensor! result, Tensor input, Tensor weight, float epsilon) -> "
       "()");
   ops.impl("rms_norm", torch::kCUDA, &rms_norm);
 
-  // In-place fused Add and RMS Normalization.
+  // 这里注册就地 add + RMSNorm 融合版本，
+  // 让 residual 更新和归一化能复用同一条 CUDA 热链。
   ops.def(
       "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight, "
       "float epsilon) -> ()");
   ops.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
 
-  // Function for fused QK Norm and RoPE
+  // 这一项把 QK 归一化与 RoPE 旋转合并到同一个入口，
+  // 供需要降低中间 Tensor 往返的注意力路径使用。
   ops.def(
       "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
       "int num_heads_k, int num_heads_v, int head_dim, float eps, "
@@ -173,14 +189,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_neox, Tensor position_ids) -> ()");
   ops.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
 
-  // Apply repetition penalties to logits in-place
+  // 这里注册 logits 原地重复惩罚，
+  // 供采样前的后处理逻辑直接在 GPU 上调整分布。
   ops.def(
       "apply_repetition_penalties_(Tensor! logits, Tensor prompt_mask, "
       "Tensor output_mask, Tensor repetition_penalties) -> ()");
   ops.impl("apply_repetition_penalties_", torch::kCUDA,
            &apply_repetition_penalties_);
 
-  // Optimized top-k per row operation
+  // 这一组 top-k helper 主要服务 prefill / decode 采样前的候选截断。
   ops.def(
       "top_k_per_row_prefill(Tensor logits, Tensor rowStarts, Tensor rowEnds, "
       "Tensor! indices, int numRows, int stride0, "
@@ -199,6 +216,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "row_starts_opt) -> ()");
   ops.impl("large_context_topk", torch::kCUDA, &large_context_topk);
 
+  // ------------------------------- 注册 Windows / 共享预编译推理热链算子 -------------------------------
+  // 下面这批 `_precompiled` 入口是当前 Windows 无 Triton 场景的重要统一落点；
+  // Python 层会先走统一 selector，再决定是否命中这些 `_C` / CUDA 实现。
+
+  // 这一组 attention helper 负责在共享路径下修正注意力输出、
+  // 处理 DCP/LSE 合并，以及 prefill / prefix prefill 的基础算子。
   ops.def("correct_attn_out_precompiled("
           "Tensor! out, Tensor lses, int cp_rank, "
           "bool is_lse_base_on_e=True) -> Tensor");
@@ -253,6 +276,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("apply_top_k_top_p_precompiled", torch::kCUDA,
            &apply_top_k_top_p_precompiled);
 
+  // 这一组 rejection / sample helper 用于 speculative decode 的接受-拒绝流程，
+  // 让草稿 token 的保留、替换和恢复逻辑留在 GPU 热链中完成。
   ops.def("rejection_greedy_sample_precompiled("
           "Tensor! output_token_ids, Tensor cu_num_draft_tokens, "
           "Tensor draft_token_ids, Tensor target_argmax, "
@@ -278,6 +303,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("input_batch_prepare_prefill_inputs_precompiled", torch::kCUDA,
            &input_batch_prepare_prefill_inputs_precompiled);
 
+  // 这一组 `input_batch_*` 入口负责把调度器输出的索引、位置信息和采样结果
+  // 整理成 worker 可直接消费的批输入结构。
   ops.def("input_batch_prepare_pos_seq_lens_precompiled("
           "Tensor idx_mapping, Tensor query_start_loc, "
           "Tensor num_computed_tokens, Tensor! pos, Tensor! seq_lens) -> ()");
@@ -330,6 +357,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            torch::kCUDA,
            &eagle_step_update_slot_mapping_and_metadata_precompiled);
 
+  // 这一组 `eagle_*` / `prepare_*` 入口服务 EAGLE speculative decode，
+  // 负责把草稿输入、slot mapping 和 decode 元数据整理成后续模型执行所需的形态。
   ops.def("eagle_prepare_inputs_padded_precompiled("
           "Tensor cu_num_draft_tokens, Tensor valid_sampled_tokens_count, "
           "Tensor query_start_loc_gpu, Tensor! token_indices_to_sample, "
@@ -383,8 +412,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("update_eagle_inputs_precompiled", torch::kCUDA,
            &update_eagle_inputs_precompiled);
 
-  // Layernorm-quant
-  // Apply Root Mean Square (RMS) Normalization to the input tensor.
+  // ------------------------------- 注册归一化与量化融合热链 -------------------------------
+  // 这几项入口把 RMSNorm 与静态 / 动态量化拼成单次 kernel，
+  // 目的是减少中间 Tensor 落地，给量化推理主链直接复用。
   ops.def(
       "rms_norm_static_fp8_quant(Tensor! result, Tensor input, Tensor weight, "
       "Tensor scale, float epsilon) -> "
@@ -392,7 +422,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("rms_norm_static_fp8_quant", torch::kCUDA,
            &rms_norm_static_fp8_quant);
 
-  // In-place fused Add and RMS Normalization.
+  // 这里把 residual 融合更新和静态 FP8 量化版 RMSNorm 合在一起注册。
   ops.def(
       "fused_add_rms_norm_static_fp8_quant(Tensor! result, Tensor input, "
       "Tensor! residual, Tensor weight, "
@@ -400,7 +430,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fused_add_rms_norm_static_fp8_quant", torch::kCUDA,
            &fused_add_rms_norm_static_fp8_quant);
 
-  // Fused Layernorm + Quant kernels
+  // 动态逐 token 量化版本会在运行时回填 scale，
+  // 适合需要随输入波动动态估计量化尺度的路径。
   ops.def(
       "rms_norm_dynamic_per_token_quant(Tensor! result, Tensor input, "
       "Tensor weight, Tensor! scale, float epsilon, "
@@ -408,7 +439,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("rms_norm_dynamic_per_token_quant", torch::kCUDA,
            &rms_norm_dynamic_per_token_quant);
 
-  // Fused Layernorm + Block quant kernels
+  // block 量化版本需要额外的分组信息，
+  // 供更细粒度的块级量化内核直接消费。
   ops.def(
       "rms_norm_per_block_quant(Tensor! result, Tensor input, "
       "Tensor weight, Tensor! scale, float epsilon, "
@@ -416,14 +448,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_scale_transposed) -> ()");
   ops.impl("rms_norm_per_block_quant", torch::kCUDA, &rms_norm_per_block_quant);
 
-  // Rotary embedding
-  // Apply GPT-NeoX or GPT-J style rotary embedding to query and key.
+  // ------------------------------- 注册 RoPE、FLA 与 Mamba 共享预编译算子 -------------------------------
+  // 这一段集中服务旋转位置编码、FLA 门控 / 状态更新以及 Mamba 卷积热链，
+  // 是 Windows 无 Triton 时最关键的一批共享 `_precompiled` 入口。
+
+  // `rotary_embedding` 负责传统 GPT-NeoX / GPT-J 风格的 RoPE 旋转。
   ops.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   ops.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
 
+  // `mrope_rotary_embedding` 对应多段式 mRoPE 变体，
+  // 直接返回新的 query / key 张量对。
   ops.def(
       "mrope_rotary_embedding("
       "    Tensor query, Tensor key, Tensor cos, Tensor sin, int head_size,"
@@ -438,6 +475,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    bool is_rms_norm, str activation) -> Tensor");
   ops.impl("gated_layer_norm", torch::kCUDA, &gated_layer_norm);
 
+  // 下面这些 FLA `_precompiled` 入口覆盖门控更新、局部 cumsum、
+  // recurrent / chunk 前向和若干线性代数 helper，
+  // 供 Python selector 在无 Triton 时命中共享 CUDA 闭环。
   ops.def(
       "fused_sigmoid_gating_delta_rule_update_precompiled("
       "    Tensor A_log, Tensor a, Tensor b, Tensor dt_bias,"
@@ -548,6 +588,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("causal_conv1d_update_precompiled", torch::kCUDA,
            &causal_conv1d_update_precompiled);
 
+  // 这一组 MoE helper 负责统计专家 token 数、处理零专家快路径、
+  // 清零 KV block，以及把 runtime-ready 专家权重批量装入 GPU slot。
   ops.def(
       "count_expert_num_tokens_precompiled("
       "    Tensor topk_ids, int num_local_experts, Tensor? expert_map) -> Tensor");
@@ -600,40 +642,42 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("moe_batched_mm_precompiled", torch::kCUDA,
            &moe_batched_mm_precompiled);
 
-  // Quantization ops
+  // ------------------------------- 注册量化、GEMM 与专用后端算子 -------------------------------
+  // 这一大段同时承接 AWQ / Marlin / CUTLASS / GGML / GPTQ / FP8 / INT8 / AllSpark 等族的入口；
+  // Python 层会按模型类型、设备能力和量化配置选择其中合适的 schema。
 #ifndef USE_ROCM
-  // DeepSeek V3 fused A GEMM (SM 9.0+, bf16 only, 1-16 tokens).
+  // `dsv3_fused_a_gemm` 只在满足设备条件时提供实现，
+  // 这里先暴露 schema，真正的 `impl` 会在对应源文件里按条件补注册。
   ops.def(
       "dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  // conditionally compiled so impl registration is in source file
+  // 具体实现依赖条件编译，因此不在本文件直接绑定 `impl(...)`。
 
-  // Quantized GEMM for AWQ.
+  // 这一对入口负责 AWQ 的量化 GEMM 与反量化。
   ops.def(
       "awq_gemm(Tensor _in_feats, Tensor _kernel, Tensor _scaling_factors, "
       "Tensor _zeros, SymInt split_k_iters) -> Tensor");
   ops.impl("awq_gemm", torch::kCUDA, &awq_gemm);
 
-  // Dequantization for AWQ.
   ops.def(
       "awq_dequantize(Tensor _kernel, Tensor _scaling_factors, "
       "Tensor _zeros, SymInt split_k_iters, int thx, int thy) -> Tensor");
   ops.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
 
-  // Note about marlin kernel 'workspace' arguments:
-  // Technically these should be mutable since they are modified by the kernel.
-  // But since they are set back to zero once the kernel is finished we can
-  // hand wave and say that they have no net effect.
+  // 关于 Marlin kernel 的 `workspace` 参数，这里需要特别说明：
+  // 从底层执行看，kernel 的确会临时改写 `workspace`；
+  // 但它在返回前会把内容恢复，因此从 PyTorch schema 视角可以把它视作“净效果不变”的输入。
   //
-  // The reason to mark 'workspace' as immutable is so that they don't interfere
-  // with using ScalarType arguments in the ops. If they are marked as mutable,
-  // pytorch throws an assert in
-  // 'torch._higher_order_ops._register_effectful_op' that prevents these
-  // kernels from being torch.compile'd.
-  // See the following document for more info on custom types and ops that use
-  // custom types:
+  // 这里故意不把 `workspace` 标成可变参数，
+  // 是为了避免它干扰 `ScalarType` 一类自定义参数参与 schema 推导。
+  // 如果把它声明成可变参数，PyTorch 会在
+  // `torch._higher_order_ops._register_effectful_op` 处触发断言，
+  // 从而阻断这些 kernel 进入 `torch.compile` 路径。
+  //
+  // 更完整的背景可参考下面文档。
   // https://docs.google.com/document/d/18fBMPuOJ0fY5ZQ6YyrHUppw9FA332CpNtgB6SOIgyuA
 
-  // Machete (Dense) Optimized Mixed Precision GEMM for Hopper.
+  // 这一组是 Hopper 上的 Machete dense mixed-precision GEMM 能力；
+  // 只先注册 schema，实际实现按编译条件在其它源文件中补绑定。
   ops.def(
       "machete_supported_schedules("
       "   ScalarType a_type,"
@@ -664,12 +708,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "   int b_type,"
       "   ScalarType? group_scales_type"
       ") -> Tensor");
-  // conditionally compiled so impl registration is in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
   ops.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
   ops.impl("permute_cols", torch::kCUDA, &permute_cols);
 
-  // Marlin Optimized Quantized GEMM (supports GPTQ, AWQ, FP8, NVFP4, MXFP4).
+  // 这一组是 Marlin 系列量化 GEMM 与相关预处理入口，
+  // 覆盖 GPTQ、AWQ、FP8、NVFP4、MXFP4 等多种量化格式。
   ops.def(
       "marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
       "Tensor? b_bias_or_none,Tensor b_scales, "
@@ -678,27 +723,27 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "g_idx_or_none, Tensor? perm_or_none, Tensor workspace, int b_type_id, "
       "SymInt size_m, SymInt size_n, SymInt size_k, bool is_k_full, "
       "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
-  // conditionally compiled so impl registration is in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // gptq_marlin repack from GPTQ.
+  // 把 GPTQ 权重重排到 Marlin kernel 期望的布局。
   ops.def(
       "gptq_marlin_repack(Tensor b_q_weight, Tensor perm, "
       "SymInt size_k, SymInt size_n, int num_bits, bool is_a_8bit) -> Tensor");
-  // conditionally compiled so impl registrations are in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // awq_marlin repack from AWQ.
+  // 把 AWQ 权重重排到 Marlin kernel 期望的布局。
   ops.def(
       "awq_marlin_repack(Tensor b_q_weight, SymInt size_k, "
       "SymInt size_n, int num_bits, bool is_a_8bit) -> Tensor");
-  // conditionally compiled so impl registrations are in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // preprocess W-int4A-fp8 weight for marlin kernel
+  // 预处理 `W-int4A-fp8` 权重，使其能直接进入 Marlin kernel。
   ops.def(
       "marlin_int4_fp8_preprocess(Tensor qweight, "
       "Tensor? qzeros_or_none, bool inplace) -> Tensor");
-  // conditionally compiled so impl registrations are in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // CUTLASS w4a8 GEMM
+  // 这一组是 CUTLASS 的 `w4a8` dense / grouped GEMM 入口。
   ops.def(
       "cutlass_w4a8_mm("
       "   Tensor A,"
@@ -710,13 +755,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "   ScalarType? out_type,"
       "   str?   maybe_schedule"
       ") -> Tensor");
-  // pack scales
+  // 把 scale 打包成 CUTLASS 侧更易消费的布局。
   ops.def("cutlass_pack_scale_fp8(Tensor scales) -> Tensor");
-  // encode and reorder weight matrix
+  // 把 INT4 权重编码并重排成 CUTLASS kernel 期望的布局。
   ops.def("cutlass_encode_and_reorder_int4b(Tensor B) -> Tensor");
-  // conditionally compiled so impl registration is in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // CUTLASS w4a8 grouped GEMM
   ops.def(
       "cutlass_w4a8_moe_mm("
       "   Tensor! out_tensors,"
@@ -737,28 +781,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "cutlass_encode_and_reorder_int4b_grouped(Tensor b_tensors) -> (Tensor, "
       "Tensor)");
-  // conditionally compiled so impl registration is in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
 #endif
 
-  // Dequantization for GGML.
+  // 这一组 GGML 入口负责反量化、矩阵乘和 MoE 相关辅助 kernel。
   ops.def(
       "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
       "dtype) -> Tensor");
   ops.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
 
-  // mmvq kernel for GGML.
   ops.def(
       "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
       "-> Tensor");
   ops.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
 
-  // mmq kernel for GGML.
   ops.def(
       "ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
   ops.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
 
-  // moe kernel for GGML.
   ops.def(
       "ggml_moe_a8(Tensor X, Tensor W, "
       "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
@@ -775,46 +816,44 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
 #ifndef USE_ROCM
-  // CUTLASS nvfp4 block scaled GEMM
+  // 下面这一组是 CUTLASS / DeepSeek / MLA 的专用入口，
+  // 覆盖 NVFP4、MXFP8、稀疏 GEMM 和 SM100 MLA decode 等路径。
   ops.def(
       "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
       "                      Tensor block_scale_a, Tensor block_scale_b,"
       "                      Tensor alpha) -> ()");
   ops.impl("cutlass_scaled_fp4_mm", torch::kCUDA, &cutlass_scaled_fp4_mm);
 
-  // cutlass nvfp4 block scaled group GEMM
   ops.def(
       "cutlass_fp4_group_mm(Tensor! out, Tensor a, Tensor b,"
-      " Tensor a_blockscale, Tensor b_blockscales, Tensor alphas,"
-      " Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets) -> ()");
-  // conditionally compiled so impl registration is in source file
+       " Tensor a_blockscale, Tensor b_blockscales, Tensor alphas,"
+       " Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets) -> ()");
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // Expert-specialization mxfp8 blockscaled grouped quantization (SM100+).
+  // 面向专家并行分组格式的 MXFP8 分块量化入口。
   ops.def(
       "mxfp8_experts_quant("
       " Tensor input, Tensor problem_sizes, Tensor expert_offsets,"
       " Tensor blockscale_offsets, Tensor! quant_output, Tensor! scale_factor)"
       " -> ()");
-  // conditionally compiled so impl registration is in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // Expert-specialization mxfp8 blockscaled grouped GEMM (SM100+).
+  // 面向专家并行分组格式的 MXFP8 grouped GEMM 入口。
   ops.def(
       "cutlass_mxfp8_grouped_mm("
       " Tensor a, Tensor b, Tensor sfa, Tensor sfb, Tensor! out,"
       " Tensor problem_sizes, Tensor expert_offsets, Tensor blockscale_offsets)"
       " -> ()");
-  // conditionally compiled so impl registration is in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // CUTLASS w8a8 GEMM, supporting symmetric per-tensor or per-row/column
-  // quantization, as well as bias
+  // `cutlass_scaled_mm` 与 `cutlass_scaled_mm_azp` 是当前最常用的 `w8a8` dense GEMM 入口，
+  // 分别覆盖对称量化和带零点补偿的非对称量化路径。
   ops.def(
       "cutlass_scaled_mm(Tensor! out, Tensor a,"
       "                  Tensor b, Tensor a_scales,"
       "                  Tensor b_scales, Tensor? bias) -> ()");
   ops.impl("cutlass_scaled_mm", torch::kCUDA, &cutlass_scaled_mm);
 
-  // CUTLASS w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
-  // quantization.
   ops.def(
       "cutlass_scaled_mm_azp(Tensor! out, Tensor a,"
       "                  Tensor b, Tensor a_scales,"
@@ -822,17 +861,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                  Tensor? azp, Tensor? bias) -> ()");
   ops.impl("cutlass_scaled_mm_azp", torch::kCUDA, &cutlass_scaled_mm_azp);
 
-  // Check if cutlass scaled_mm is supported for CUDA devices of the given
-  // capability
+  // 这些 capability 查询入口会在 Python 层做算子选择时先被调用，
+  // 用来判断当前设备是否满足对应 CUTLASS kernel 的运行前提。
   ops.def("cutlass_scaled_mm_supports_fp8(int cuda_device_capability) -> bool");
   ops.impl("cutlass_scaled_mm_supports_fp8", &cutlass_scaled_mm_supports_fp8);
 
-  // Check if cutlass grouped gemm is supported for CUDA devices of the given
-  // capability
   ops.def("cutlass_group_gemm_supported(int cuda_device_capability) -> bool");
   ops.impl("cutlass_group_gemm_supported", &cutlass_group_gemm_supported);
 
-  // CUTLASS w8a8 grouped GEMM
   ops.def(
       "cutlass_moe_mm(Tensor! out_tensors, Tensor a_tensors, Tensor b_tensors, "
       "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
@@ -841,12 +877,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "               bool per_out_ch) -> ()");
   ops.impl("cutlass_moe_mm", torch::kCUDA, &cutlass_moe_mm);
 
-  // A function that computes data required to run fused MoE with w8a8 grouped
-  // GEMM. It takes topk_ids as an input, and computes expert_offsets
-  // (token start indices of each expert). In addition to this, it computes
-  // problem sizes for each expert's multiplication used by the two mms called
-  // from fused MoE operation, and arrays with permutations required to shuffle
-  // and de-shuffle the input/output of the fused operation.
+  // 这组数据准备入口并不直接做 GEMM，
+  // 而是先根据 `topk_ids` 或 `expert_num_tokens` 计算 experts 偏移、problem size 以及输入输出重排信息，
+  // 供 fused MoE 的两次矩阵乘直接消费。
   ops.def(
       "get_cutlass_moe_mm_data(Tensor topk_ids, Tensor! expert_offsets, "
       "                        Tensor! problem_sizes1, Tensor! problem_sizes2, "
@@ -856,8 +889,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "()");
   ops.impl("get_cutlass_moe_mm_data", torch::kCUDA, &get_cutlass_moe_mm_data);
 
-  // compute per-expert problem sizes from expert_first_token_offset
-  // produced by vLLM's moe_permute kernel
   ops.def(
       "get_cutlass_moe_mm_problem_sizes_from_expert_offsets("
       "    Tensor expert_first_token_offset, "
@@ -867,11 +898,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("get_cutlass_moe_mm_problem_sizes_from_expert_offsets", torch::kCUDA,
            &get_cutlass_moe_mm_problem_sizes_from_expert_offsets);
 
-  // A function that computes data required to run fused MoE with w8a8 grouped
-  // GEMM in batched expert format. It takes expert_num_tokens
-  // as an input, and computes expert_offsets (token start indices of each
-  // expert). In addition to this, it computes problem sizes for each expert's
-  // multiplication used by the two mms called from fused MoE operation.
   ops.def(
       "get_cutlass_batched_moe_mm_data(Tensor! expert_offsets, "
       "                             Tensor! problem_sizes1, "
@@ -882,22 +908,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("get_cutlass_batched_moe_mm_data", torch::kCUDA,
            &get_cutlass_batched_moe_mm_data);
 
-  // Check if cutlass scaled_mm supports block quantization (used by DeepSeekV3)
   ops.def(
       "cutlass_scaled_mm_supports_block_fp8(int cuda_device_capability) -> "
       "bool");
   ops.impl("cutlass_scaled_mm_supports_block_fp8",
            &cutlass_scaled_mm_supports_block_fp8);
 
-  // Check if cutlass sparse scaled_mm is supported for CUDA devices of the
-  // given capability
   ops.def(
       "cutlass_sparse_scaled_mm_supported(int cuda_device_capability) -> bool");
   ops.impl("cutlass_sparse_scaled_mm_supported",
            &cutlass_sparse_scaled_mm_supported);
 
-  // CUTLASS sparse GEMM, supporting symmetric per-tensor or per-row/column
-  // quantization, as well as bias
+  // `cutlass_scaled_sparse_mm` 与 `cutlass_sparse_compress` 负责稀疏量化矩阵乘链路。
   ops.def(
       "cutlass_scaled_sparse_mm(Tensor! out, Tensor a,"
       "                         Tensor bt_nzs,"
@@ -905,41 +927,38 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                         Tensor b_scales, Tensor? bias) -> ()");
   ops.impl("cutlass_scaled_sparse_mm", torch::kCUDA, &cutlass_scaled_sparse_mm);
 
-  // CUTLASS sparse matrix compressor
   ops.def("cutlass_sparse_compress(Tensor a) -> Tensor[]");
   ops.impl("cutlass_sparse_compress", &cutlass_sparse_compress);
 
-  // SM100 CUTLASS MLA decode
+  // 这两项是 SM100 MLA decode 专用入口，
+  // 仍然采用“先声明 schema，再按条件在实现文件中补注册”的模式。
   ops.def(
       "sm100_cutlass_mla_decode(Tensor! out, Tensor! lse, Tensor q_nope,"
       "                         Tensor q_pe, Tensor kv_c_and_k_pe_cache,"
       "                         Tensor seq_lens, Tensor page_table,"
       "                         Tensor workspace, float scale,"
       "                         int num_kv_splits) -> ()");
-  // conditionally compiled so impl in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // SM100 CUTLASS MLA workspace
   ops.def(
       "sm100_cutlass_mla_get_workspace_size(int max_seq_len, int num_batches,"
       "                                     int sm_count, int num_kv_splits) "
       "-> int");
-  // conditionally compiled so impl in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // Compute NVFP4 block quantized tensor.
+  // 下面这一组是 NVFP4 / FP4 量化与能力探测入口。
   ops.def(
       "scaled_fp4_quant(Tensor! output, Tensor input,"
       "                 Tensor! output_scale, Tensor input_scale, bool "
       "is_sf_swizzled_layout) -> ()");
   ops.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
 
-  // Compute NVFP4 experts quantization.
   ops.def(
       "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
       "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
       "Tensor output_scale_offset_by_experts) -> ()");
   ops.impl("scaled_fp4_experts_quant", torch::kCUDA, &scaled_fp4_experts_quant);
 
-  // Fused SiLU+Mul+NVFP4 experts quantization.
   ops.def(
       "silu_and_mul_scaled_fp4_experts_quant(Tensor! output, Tensor! "
       "output_scale,"
@@ -948,15 +967,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("silu_and_mul_scaled_fp4_experts_quant", torch::kCUDA,
            &silu_and_mul_scaled_fp4_experts_quant);
 
-  // Check if cutlass_scaled_mm_fp4 is supported for CUDA devices
-  // of the given capability
   ops.def("cutlass_scaled_mm_supports_fp4(int cuda_device_capability) -> bool");
   ops.impl("cutlass_scaled_mm_supports_fp4", &cutlass_scaled_mm_supports_fp4);
 #endif
 
-  // Quantized GEMM for GPTQ.
-  // Note: even though the C++ inferred schema is correct for this op, it seems
-  // to prevent the meta function registry.
+  // 下面这一组是 GPTQ、FP8、INT8 和扫描类 kernel 的通用入口。
+  // `gptq_gemm` 这里显式写 schema，而不是完全依赖 C++ 自动推断，
+  // 是为了避开 meta function 注册链上的兼容问题。
   ops.def(
       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, "
       "Tensor b_gptq_scales, Tensor b_g_idx, bool use_exllama, bool "
@@ -964,27 +981,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> Tensor");
   ops.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
 
-  // Post processing for GPTQ.
+  // `gptq_shuffle` 用于 GPTQ 权重的后处理重排。
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   ops.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
-  // Compute FP8 quantized tensor for given scaling factor.
-  // Supports per-tensor, per-channel, per-token, and arbitrary 2D group
-  // scaling. Optional group_m/group_n specify the group shape explicitly;
-  // required for 1D scales to disambiguate per-channel vs per-token.
+  // 静态 FP8 量化入口支持按 tensor、按通道、按 token 以及二维 group 缩放；
+  // 当 scale 是一维时，需要用 `group_shape` 消歧到底是按通道还是按 token。
   ops.def(
       "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale, "
       "(int, int)? group_shape=None) -> ()");
   ops.impl("static_scaled_fp8_quant", torch::kCUDA, &static_scaled_fp8_quant);
 
-  // Compute dynamic-per-tensor FP8 quantized tensor and scaling factor.
+  // 这一项会在运行时回写整 tensor 的动态 scale。
   ops.def(
       "dynamic_scaled_fp8_quant(Tensor! result, Tensor input, Tensor! scale) "
       "-> "
       "()");
   ops.impl("dynamic_scaled_fp8_quant", torch::kCUDA, &dynamic_scaled_fp8_quant);
 
-  // Compute dynamic-per-token FP8 quantized tensor and scaling factor.
+  // 这一项会按 token 粒度回写动态 scale，适合波动更大的输入分布。
   ops.def(
       "dynamic_per_token_scaled_fp8_quant(Tensor! result, Tensor input, "
       "Tensor! scale, Tensor? scale_ub) -> "
@@ -992,20 +1007,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("dynamic_per_token_scaled_fp8_quant", torch::kCUDA,
            &dynamic_per_token_scaled_fp8_quant);
 
-  // Compute int8 quantized tensor for given scaling factor.
+  // 静态 INT8 量化入口。
   ops.def(
       "static_scaled_int8_quant(Tensor! result, Tensor input, Tensor scale,"
       "Tensor? azp) -> ()");
   ops.impl("static_scaled_int8_quant", torch::kCUDA, &static_scaled_int8_quant);
 
-  // Compute int8 quantized tensor and scaling factor
+  // 动态 INT8 量化入口，同时回写 scale 和可选零点补偿。
   ops.def(
       "dynamic_scaled_int8_quant(Tensor! result, Tensor input, Tensor! scale, "
       "Tensor!? azp) -> ()");
   ops.impl("dynamic_scaled_int8_quant", torch::kCUDA,
            &dynamic_scaled_int8_quant);
 
-  // Mamba selective scan kernel
+  // `selective_scan_fwd` 是 Mamba 状态扫描热链的核心入口。
   ops.def(
       "selective_scan_fwd(Tensor! u, Tensor! delta,"
       "Tensor! A, Tensor! B, Tensor! C,"
@@ -1024,12 +1039,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? last_chunk_indices) -> ()");
   ops.impl("selective_scan_fwd", torch::kCUDA, &selective_scan_fwd);
 
-  // Hadamard transforms
+  // `hadacore_transform` 负责 Hadamard 变换类 helper。
   ops.def("hadacore_transform(Tensor! x, bool inplace) -> Tensor");
 
 #ifndef USE_ROCM
-  // Compute per-token-group FP8 quantized tensor and scaling factor.
-  // The dummy arguments are here so we can correctly fuse with RMSNorm.
+  // 这一组 DeepGEMM / token-group 量化入口的 dummy 参数不是冗余字段，
+  // 而是为了让它们在图编译与 RMSNorm 融合路径里保持正确的 schema。
   ops.def(
       "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
       "output_s, "
@@ -1039,8 +1054,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("per_token_group_fp8_quant", torch::kCUDA,
            &per_token_group_quant_fp8);
 
-  // Compute per-token-group 8-bit quantized tensor and UE8M0-packed,
-  // TMA-aligned scales for DeepGEMM.
+  // 这里输出的是 UE8M0 打包且 TMA 对齐的 scale，
+  // 专门服务 DeepGEMM 的后续消费格式。
   ops.def(
       "per_token_group_fp8_quant_packed(Tensor input, Tensor! output_q, "
       "Tensor! output_s_packed, int group_size, float eps, float fp8_min, "
@@ -1048,7 +1063,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("per_token_group_fp8_quant_packed", torch::kCUDA,
            &per_token_group_quant_8bit_packed);
 
-  // Compute per-token-group INT8 quantized tensor and scaling factor.
+  // 这是 token-group 粒度的 INT8 量化版本。
   ops.def(
       "per_token_group_quant_int8(Tensor input, Tensor! output_q, Tensor! "
       "output_s, int group_size, float eps, float int8_min, float int8_max) -> "
@@ -1056,34 +1071,37 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("per_token_group_quant_int8", torch::kCUDA,
            &per_token_group_quant_int8);
 
-  // reorder weight for AllSpark Ampere W8A16 Fused Gemm kernel
+  // 下面两项服务 AllSpark Ampere `W8A16` fused GEMM；
+  // 第一项先把权重重排到指定布局，第二项再暴露真正的 GEMM schema。
   ops.def(
       "rearrange_kn_weight_as_n32k16_order(Tensor b_qweight, Tensor b_scales, "
       "Tensor? b_zeros, "
       "bool has_zp, Tensor! b_qweight_reorder, Tensor! b_scales_reorder, "
       "Tensor!? b_zeros_reorder, "
       "int K, int N, int N_32align) -> ()");
-  //  conditionally compiled so impl in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 
-  // AllSpark quantization ops
   ops.def(
       "allspark_w8a16_gemm(Tensor a, Tensor b_qweight, Tensor b_scales, "
       "Tensor? b_qzeros, "
       "SymInt n, SymInt group_size, SymInt sm_count, SymInt sm_version, SymInt "
       "CUBLAS_M_THRESHOLD, bool has_zp, bool n32k16_reorder) -> Tensor");
-  //  conditionally compiled so impl in source file
+  // 具体实现依赖条件编译，因此本文件只声明 schema。
 #endif
 }
 
+// ------------------------------- 注册 KV Cache 与页缓存相关算子 -------------------------------
+// 这一组入口负责缓存 block 的搬运、重排、量化写入和按页 gather，
+// 是 scheduler / worker 把 block table 落成真实 KV 内存布局时会直接触达的底层接口。
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
-  // Cache ops
-  // Swap in (out) the cache blocks from src to dst.
+    // `swap_blocks` 负责在两个缓存张量之间按 block 映射做交换或拷贝。
   cache_ops.def(
       "swap_blocks(Tensor src, Tensor! dst,"
       "            int block_size_in_bytes, Tensor block_mapping) -> ()");
   cache_ops.impl("swap_blocks", torch::kCUDA, &swap_blocks);
 
-  // Reshape the key and value tensors and cache them.
+  // 这一组 `reshape_and_cache*` 入口负责把当前 step 生成的 key / value
+  // 整理成页缓存布局，并按 `slot_mapping` 写入目标 cache。
   cache_ops.def(
       "reshape_and_cache(Tensor key, Tensor value,"
       "                  Tensor! key_cache, Tensor! value_cache,"
@@ -1092,7 +1110,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                  Tensor k_scale, Tensor v_scale) -> ()");
   cache_ops.impl("reshape_and_cache", torch::kCUDA, &reshape_and_cache);
 
-  // Reshape the key and value tensors and cache them.
   cache_ops.def(
       "reshape_and_cache_flash(Tensor key, Tensor value,"
       "                        Tensor! key_cache,"
@@ -1112,7 +1129,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("reshape_and_cache_flash_diffkv", torch::kCUDA,
                  &reshape_and_cache_flash_diffkv);
 
-  // Concat kv_c and k_pe and cache them.
+  // 这一组 MLA helper 会先拼接或旋转 Q/K，再把结果落入专用 cache 形态。
   cache_ops.def(
       "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"
       "                     Tensor! kv_cache,"
@@ -1121,7 +1138,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                     Tensor scale) -> ()");
   cache_ops.impl("concat_and_cache_mla", torch::kCUDA, &concat_and_cache_mla);
 
-  // Rotate Q and K, then write to kv cache for MLA
   cache_ops.def(
       "concat_and_cache_mla_rope_fused("
       "                     Tensor positions,"
@@ -1137,14 +1153,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("concat_and_cache_mla_rope_fused", torch::kCUDA,
                  &concat_and_cache_mla_rope_fused);
 
-  // Convert the key and value cache to fp8 data type.
+  // `convert_fp8` 负责把现有 cache 转成 FP8 表示。
   cache_ops.def(
       "convert_fp8(Tensor! dst_cache, Tensor src_cache, float scale, "
       "str kv_cache_dtype) -> ()");
   cache_ops.impl("convert_fp8", torch::kCUDA, &convert_fp8);
 
-  // Gather cache blocks from src_cache to dst, dequantizing from
-  // src_cache's dtype to dst's dtype if necessary.
+  // 下面这一组 gather 入口负责按 block_table 把缓存块收集出来；
+  // 如果源缓存是量化格式，还会在需要时顺带做反量化或升精度。
   cache_ops.def(
       "gather_and_maybe_dequant_cache(Tensor src_cache, Tensor! dst, "
       "                               Tensor block_table, Tensor cu_seq_lens, "
@@ -1192,22 +1208,27 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
                  &cp_gather_indexer_k_quant_cache);
 }
 
-TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
-  // Cuda utils
 
-  // Gets the specified device attribute.
+// ------------------------------- 注册 CUDA 设备信息查询辅助入口 -------------------------------
+// 这一小段不参与模型热链计算，
+// 主要给 Python 层做设备能力判断和 kernel 选择时提供只读查询接口。
+TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
+  // 查询指定设备属性值。
   cuda_utils.def("get_device_attribute(int attribute, int device_id) -> int");
   cuda_utils.impl("get_device_attribute", &get_device_attribute);
 
-  // Gets the maximum shared memory per block device attribute.
+  // 查询单个 block 可用的最大 shared memory。
   cuda_utils.def(
       "get_max_shared_memory_per_block_device_attribute(int device_id) -> int");
   cuda_utils.impl("get_max_shared_memory_per_block_device_attribute",
                   &get_max_shared_memory_per_block_device_attribute);
 }
 
+
+// ------------------------------- 注册自定义 all-reduce 与共享缓冲算子 -------------------------------
+// 这组入口负责初始化通信句柄、注册共享缓冲区以及触发自定义 all-reduce；
+// 分布式或张量并行路径会通过这里把底层通信能力暴露给 Python 层。
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
-  // Custom all-reduce kernels
   custom_ar.def(
       "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
       "int rank, bool fully_connected) -> int");
@@ -1231,7 +1252,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
 
   custom_ar.def("free_shared_buffer", &free_shared_buffer);
 #ifdef USE_ROCM
-  // Quick Reduce all-reduce kernels
+  // ROCm 场景下额外补 Quick Reduce 相关入口。
   custom_ar.def(
       "qr_all_reduce(int fa, Tensor inp, Tensor out, int quant_level, bool "
       "cast_bf2half) -> ()");
@@ -1245,9 +1266,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def("qr_open_handles(int _fa, Tensor[](b!) handles) -> ()");
   custom_ar.impl("qr_open_handles", torch::kCPU, &qr_open_handles);
 
-  // Max input size in bytes
+  // 查询 Quick Reduce 当前支持的最大输入字节数。
   custom_ar.def("qr_max_size", &qr_max_size);
 #endif
 }
+
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
