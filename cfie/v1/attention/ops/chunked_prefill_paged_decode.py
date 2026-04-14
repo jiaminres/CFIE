@@ -381,12 +381,6 @@ def chunked_prefill_paged_decode(
         if sliding_window is None or sliding_window <= 0:
             sliding_window = 0
 
-        if key is None or value is None:
-            raise NotImplementedError(
-                "Chunked prefill fallback without Triton currently requires "
-                "materialized key/value tensors."
-            )
-
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         has_prefix_queries = bool(torch.any(query_lens > 1).item())
         has_decode_queries = bool(torch.any(query_lens == 1).item())
@@ -406,6 +400,11 @@ def chunked_prefill_paged_decode(
         )
 
         if has_prefix_queries or not can_use_decode_fastpath:
+            if key is None or value is None:
+                raise NotImplementedError(
+                    "Chunked prefill fallback without Triton currently requires "
+                    "materialized key/value tensors for prefix-prefill handling."
+                )
             logger.warning_once(
                 "Chunked prefill paged decode is falling back to the prefix "
                 "prefill reference path because Triton runtime is unavailable."
@@ -444,7 +443,9 @@ def chunked_prefill_paged_decode(
                 query_start_loc=query_start_loc,
                 seq_lens=seq_lens,
                 max_seq_len=max_seq_len,
-                num_kv_heads=key.shape[1],
+                num_kv_heads=(
+                    key.shape[1] if key is not None else key_cache.shape[1]
+                ),
                 sm_scale=sm_scale,
                 alibi_slopes=alibi_slopes,
                 kv_cache_dtype=kv_cache_dtype,

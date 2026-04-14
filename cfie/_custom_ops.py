@@ -877,6 +877,66 @@ def moe_batch_load_gptq_runtime_precompiled(
     )
 
 
+def has_precompiled_moe_batched_mm() -> bool:
+    return hasattr(torch.ops._C, "moe_batched_mm_precompiled")
+
+
+def moe_batched_mm_precompiled(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        expert_num_tokens: torch.Tensor,
+        A_scale: torch.Tensor | None,
+        B_scale: torch.Tensor | None,
+        use_fp8_w8a8: bool,
+        per_act_token_quant: bool,
+) -> None:
+    torch.ops._C.moe_batched_mm_precompiled(
+        A,
+        B,
+        C,
+        expert_num_tokens,
+        A_scale,
+        B_scale,
+        use_fp8_w8a8,
+        per_act_token_quant,
+    )
+
+
+def has_precompiled_count_expert_num_tokens() -> bool:
+    return hasattr(torch.ops._C, "count_expert_num_tokens_precompiled")
+
+
+def count_expert_num_tokens_precompiled(
+        topk_ids: torch.Tensor,
+        num_local_experts: int,
+        expert_map: torch.Tensor | None,
+) -> torch.Tensor:
+    return torch.ops._C.count_expert_num_tokens_precompiled(
+        topk_ids,
+        num_local_experts,
+        expert_map,
+    )
+
+
+def has_precompiled_zero_experts_compute_identity() -> bool:
+    return hasattr(torch.ops._C, "zero_experts_compute_identity_precompiled")
+
+
+def zero_experts_compute_identity_precompiled(
+        expert_indices: torch.Tensor,
+        expert_scales: torch.Tensor,
+        num_experts: int,
+        hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.zero_experts_compute_identity_precompiled(
+        expert_indices,
+        expert_scales,
+        num_experts,
+        hidden_states,
+    )
+
+
 def has_precompiled_expand_batch_to_tokens() -> bool:
     return hasattr(torch.ops._C, "expand_batch_to_tokens_precompiled")
 
@@ -1272,6 +1332,209 @@ def input_batch_expand_idx_mapping_precompiled(
         idx_mapping,
         total_num_logits,
         cu_num_logits,
+    )
+
+
+def has_precompiled_eagle_step_update_slot_mapping_and_metadata() -> bool:
+    return hasattr(
+        torch.ops._C,
+        "eagle_step_update_slot_mapping_and_metadata_precompiled",
+    )
+
+
+def eagle_step_update_slot_mapping_and_metadata_precompiled(
+        positions_1d: torch.Tensor,
+        block_table_tensor: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_size: int,
+        max_model_len: int,
+        out_clamped_positions: torch.Tensor,
+        out_slot_mapping: torch.Tensor,
+        input_batch_size: int,
+) -> None:
+    torch.ops._C.eagle_step_update_slot_mapping_and_metadata_precompiled(
+        positions_1d,
+        block_table_tensor,
+        seq_lens,
+        block_size,
+        max_model_len,
+        out_clamped_positions,
+        out_slot_mapping,
+        input_batch_size,
+    )
+
+
+def has_precompiled_eagle_prepare_inputs_padded() -> bool:
+    return hasattr(torch.ops._C, "eagle_prepare_inputs_padded_precompiled")
+
+
+def eagle_prepare_inputs_padded_precompiled(
+        cu_num_draft_tokens: torch.Tensor,
+        valid_sampled_tokens_count: torch.Tensor,
+        query_start_loc_gpu: torch.Tensor,
+        token_indices_to_sample: torch.Tensor,
+        num_rejected_tokens_gpu: torch.Tensor,
+) -> None:
+    torch.ops._C.eagle_prepare_inputs_padded_precompiled(
+        cu_num_draft_tokens,
+        valid_sampled_tokens_count,
+        query_start_loc_gpu,
+        token_indices_to_sample,
+        num_rejected_tokens_gpu,
+    )
+
+
+def has_precompiled_eagle_prepare_next_token_padded() -> bool:
+    return hasattr(torch.ops._C, "eagle_prepare_next_token_padded_precompiled")
+
+
+def eagle_prepare_next_token_padded_precompiled(
+        sampled_token_ids: torch.Tensor,
+        discard_request_mask: torch.Tensor,
+        backup_next_token_ids: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        valid_sampled_tokens_count: torch.Tensor,
+        vocab_size: int,
+) -> None:
+    torch.ops._C.eagle_prepare_next_token_padded_precompiled(
+        sampled_token_ids,
+        discard_request_mask,
+        backup_next_token_ids,
+        next_token_ids,
+        valid_sampled_tokens_count,
+        vocab_size,
+    )
+
+
+def has_precompiled_copy_and_expand_eagle_inputs() -> bool:
+    return hasattr(torch.ops._C, "copy_and_expand_eagle_inputs_precompiled")
+
+
+def copy_and_expand_eagle_inputs_precompiled(
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        out_input_ids: torch.Tensor,
+        out_positions: torch.Tensor,
+        out_is_rejected_token_mask: torch.Tensor,
+        out_is_masked_token_mask: torch.Tensor,
+        out_new_token_indices: torch.Tensor,
+        out_hidden_state_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        query_end_loc: torch.Tensor,
+        padding_token_id: int,
+        parallel_drafting_token_id: int,
+        total_input_tokens: int,
+        num_padding_slots_per_request: int,
+        shift_input_ids: bool,
+) -> None:
+    torch.ops._C.copy_and_expand_eagle_inputs_precompiled(
+        target_token_ids,
+        target_positions,
+        next_token_ids,
+        out_input_ids,
+        out_positions,
+        out_is_rejected_token_mask,
+        out_is_masked_token_mask,
+        out_new_token_indices,
+        out_hidden_state_mapping,
+        query_start_loc,
+        query_end_loc,
+        padding_token_id,
+        parallel_drafting_token_id,
+        total_input_tokens,
+        num_padding_slots_per_request,
+        shift_input_ids,
+    )
+
+
+def has_precompiled_prepare_eagle_inputs() -> bool:
+    return hasattr(torch.ops._C, "prepare_eagle_inputs_precompiled")
+
+
+def prepare_eagle_inputs_precompiled(
+        last_token_indices: torch.Tensor,
+        eagle_input_ids: torch.Tensor,
+        eagle_positions: torch.Tensor,
+        target_input_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        query_start_loc: torch.Tensor,
+) -> None:
+    torch.ops._C.prepare_eagle_inputs_precompiled(
+        last_token_indices,
+        eagle_input_ids,
+        eagle_positions,
+        target_input_ids,
+        target_positions,
+        idx_mapping,
+        last_sampled,
+        next_prefill_tokens,
+        num_sampled,
+        num_rejected,
+        query_start_loc,
+    )
+
+
+def has_precompiled_prepare_eagle_decode() -> bool:
+    return hasattr(torch.ops._C, "prepare_eagle_decode_precompiled")
+
+
+def prepare_eagle_decode_precompiled(
+        draft_tokens: torch.Tensor,
+        output_hidden_states: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        target_seq_lens: torch.Tensor,
+        num_rejected: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        input_hidden_states: torch.Tensor,
+        max_model_len: int,
+        max_num_reqs: int,
+) -> None:
+    torch.ops._C.prepare_eagle_decode_precompiled(
+        draft_tokens,
+        output_hidden_states,
+        last_token_indices,
+        target_seq_lens,
+        num_rejected,
+        input_ids,
+        positions,
+        query_start_loc,
+        seq_lens,
+        input_hidden_states,
+        max_model_len,
+        max_num_reqs,
+    )
+
+
+def has_precompiled_update_eagle_inputs() -> bool:
+    return hasattr(torch.ops._C, "update_eagle_inputs_precompiled")
+
+
+def update_eagle_inputs_precompiled(
+        draft_tokens: torch.Tensor,
+        output_hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        max_model_len: int,
+) -> None:
+    torch.ops._C.update_eagle_inputs_precompiled(
+        draft_tokens,
+        output_hidden_states,
+        input_ids,
+        positions,
+        seq_lens,
+        hidden_states,
+        max_model_len,
     )
 
 
@@ -3553,6 +3816,9 @@ def wvSplitKQ(
 
 # moe
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
+    if not input.is_cuda or not output.is_cuda:
+        output.copy_(input.sum(dim=1).to(output.dtype))
+        return
     torch.ops._moe_C.moe_sum(input, output)
 
 

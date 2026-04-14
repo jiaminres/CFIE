@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from cfie import _custom_ops as ops
 from cfie.config import CfieConfig, replace
 from cfie.logger import init_logger
 from cfie.offload.policy import PLAN_KEY
 from cfie.triton_utils import HAS_TRITON, tl, triton
+from cfie.utils.runtime_fallback_trace import record as record_runtime_fallback
 from cfie.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
@@ -108,6 +110,32 @@ def eagle_step_update_slot_mapping_and_metadata(
     n_blocks_per_req = block_table_tensor.shape[1]
 
     if not HAS_TRITON:
+        if (
+            ops.has_precompiled_eagle_step_update_slot_mapping_and_metadata()
+            and all(
+                tensor.is_cuda
+                for tensor in (
+                    positions_1d,
+                    block_table_tensor,
+                    seq_lens,
+                    out_clamped_positions,
+                    out_slot_mapping,
+                )
+            )
+        ):
+            record_runtime_fallback("spec_decode.eagle.slot_mapping", "precompiled")
+            ops.eagle_step_update_slot_mapping_and_metadata_precompiled(
+                positions_1d,
+                block_table_tensor,
+                seq_lens,
+                block_size,
+                max_model_len,
+                out_clamped_positions,
+                out_slot_mapping,
+                input_batch_size,
+            )
+            return
+        record_runtime_fallback("spec_decode.eagle.slot_mapping", "torch")
         logger.warning_once(
             "Spec decode eagle_step_update_slot_mapping_and_metadata is falling back to the PyTorch reference path because Triton runtime is unavailable."
         )
@@ -269,6 +297,31 @@ def eagle_prepare_inputs_padded(
     num_reqs = valid_sampled_tokens_count.shape[0]
 
     if not HAS_TRITON:
+        if (
+            ops.has_precompiled_eagle_prepare_inputs_padded()
+            and all(
+                tensor.is_cuda
+                for tensor in (
+                    cu_num_draft_tokens,
+                    valid_sampled_tokens_count,
+                    query_start_loc_gpu,
+                    token_indices_to_sample,
+                    num_rejected_tokens_gpu,
+                )
+            )
+        ):
+            record_runtime_fallback(
+                "spec_decode.eagle.prepare_inputs_padded", "precompiled"
+            )
+            ops.eagle_prepare_inputs_padded_precompiled(
+                cu_num_draft_tokens,
+                valid_sampled_tokens_count,
+                query_start_loc_gpu,
+                token_indices_to_sample,
+                num_rejected_tokens_gpu,
+            )
+            return
+        record_runtime_fallback("spec_decode.eagle.prepare_inputs_padded", "torch")
         logger.warning_once(
             "Spec decode eagle_prepare_inputs_padded is falling back to the PyTorch reference path because Triton runtime is unavailable."
         )
@@ -316,6 +369,34 @@ def eagle_prepare_next_token_padded(
     batch_size, num_sampled_tokens_per_req = sampled_token_ids.shape
 
     if not HAS_TRITON:
+        if (
+            ops.has_precompiled_eagle_prepare_next_token_padded()
+            and all(
+                tensor.is_cuda
+                for tensor in (
+                    sampled_token_ids,
+                    discard_request_mask,
+                    backup_next_token_ids,
+                    next_token_ids,
+                    valid_sampled_tokens_count,
+                )
+            )
+        ):
+            record_runtime_fallback(
+                "spec_decode.eagle.prepare_next_token_padded", "precompiled"
+            )
+            ops.eagle_prepare_next_token_padded_precompiled(
+                sampled_token_ids,
+                discard_request_mask,
+                backup_next_token_ids,
+                next_token_ids,
+                valid_sampled_tokens_count,
+                vocab_size,
+            )
+            return
+        record_runtime_fallback(
+            "spec_decode.eagle.prepare_next_token_padded", "torch"
+        )
         logger.warning_once(
             "Spec decode eagle_prepare_next_token_padded is falling back to the PyTorch reference path because Triton runtime is unavailable."
         )
@@ -525,6 +606,48 @@ def copy_and_expand_eagle_inputs(
     batch_size = query_end_loc_ptr.shape[0]
 
     if not HAS_TRITON:
+        if (
+            ops.has_precompiled_copy_and_expand_eagle_inputs()
+            and all(
+                tensor.is_cuda
+                for tensor in (
+                    target_token_ids_ptr,
+                    target_positions_ptr,
+                    next_token_ids_ptr,
+                    out_input_ids_ptr,
+                    out_positions_ptr,
+                    out_is_rejected_token_mask_ptr,
+                    out_is_masked_token_mask_ptr,
+                    out_new_token_indices_ptr,
+                    out_hidden_state_mapping_ptr,
+                    query_start_loc_ptr,
+                    query_end_loc_ptr,
+                )
+            )
+        ):
+            record_runtime_fallback(
+                "spec_decode.eagle.copy_expand_inputs", "precompiled"
+            )
+            ops.copy_and_expand_eagle_inputs_precompiled(
+                target_token_ids_ptr,
+                target_positions_ptr,
+                next_token_ids_ptr,
+                out_input_ids_ptr,
+                out_positions_ptr,
+                out_is_rejected_token_mask_ptr,
+                out_is_masked_token_mask_ptr,
+                out_new_token_indices_ptr,
+                out_hidden_state_mapping_ptr,
+                query_start_loc_ptr,
+                query_end_loc_ptr,
+                padding_token_id,
+                parallel_drafting_token_id,
+                total_input_tokens,
+                num_padding_slots_per_request,
+                shift_input_ids,
+            )
+            return
+        record_runtime_fallback("spec_decode.eagle.copy_expand_inputs", "torch")
         logger.warning_once(
             "Spec decode copy_and_expand_eagle_inputs is falling back to the PyTorch reference path because Triton runtime is unavailable."
         )

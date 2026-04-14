@@ -4,6 +4,7 @@
 
 import torch
 
+from cfie import _custom_ops as ops
 import cfie.model_executor.layers.fused_moe.modular_kernel as mk
 from cfie.logger import init_logger
 from cfie.model_executor.layers.fused_moe.activation import MoEActivation
@@ -12,7 +13,11 @@ from cfie.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
-from cfie.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
+from cfie.model_executor.layers.fused_moe.fused_moe import (
+    _has_moe_wna16_gemm_op,
+    dispatch_fused_moe_kernel,
+    try_get_optimal_moe_config,
+)
 from cfie.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
     TopKWeightAndReduceNaiveBatched,
@@ -39,6 +44,141 @@ from cfie.triton_utils import HAS_TRITON, tl, triton
 logger = init_logger(__name__)
 
 
+def _unpack_int4_pairs_on_k_reference(
+    packed_tensor: torch.Tensor,
+    logical_k: int,
+) -> torch.Tensor:
+    packed = packed_tensor.to(torch.int32) & 0xFF
+    unpacked = torch.empty(
+        (packed_tensor.size(0), packed_tensor.size(1) * 2),
+        dtype=torch.int32,
+        device=packed_tensor.device,
+    )
+    unpacked[:, 0::2] = packed & 0xF
+    unpacked[:, 1::2] = (packed >> 4) & 0xF
+    return unpacked[:, :logical_k].contiguous()
+
+
+def _unpack_int4_pairs_on_n_reference(
+    packed_tensor: torch.Tensor,
+    logical_n: int,
+) -> torch.Tensor:
+    packed = packed_tensor.to(torch.int32) & 0xFF
+    unpacked = torch.empty(
+        (packed_tensor.size(0) * 2, packed_tensor.size(1)),
+        dtype=torch.int32,
+        device=packed_tensor.device,
+    )
+    unpacked[0::2, :] = packed & 0xF
+    unpacked[1::2, :] = (packed >> 4) & 0xF
+    return unpacked[:logical_n, :].contiguous()
+
+
+def _expand_batched_wna16_group_param_reference(
+    param: torch.Tensor,
+    *,
+    logical_n: int,
+    logical_k: int,
+    group_size: int,
+    packed_n_dim: bool,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if packed_n_dim:
+        param = _unpack_int4_pairs_on_n_reference(param, logical_n)
+
+    if param.ndim == 0:
+        param = param.view(1, 1)
+    elif param.ndim == 1:
+        if param.numel() == logical_n:
+            param = param.view(logical_n, 1)
+        else:
+            param = param.view(1, -1)
+    elif param.ndim != 2:
+        raise ValueError(
+            "Expected WNA16 group parameter to be 0D/1D/2D, "
+            f"but got shape={tuple(param.shape)}."
+        )
+
+    if param.size(0) != logical_n and param.size(1) == logical_n:
+        param = param.transpose(0, 1).contiguous()
+
+    if param.size(0) == 1 and logical_n != 1:
+        param = param.expand(logical_n, param.size(1))
+
+    if param.size(0) != logical_n:
+        raise ValueError(
+            "Unable to align WNA16 group parameter with output-channel "
+            f"dimension: shape={tuple(param.shape)} logical_n={logical_n}."
+        )
+
+    param = param.to(dtype)
+
+    if param.size(1) == logical_k:
+        return param.contiguous()
+
+    if param.size(1) == 1:
+        return param.expand(logical_n, logical_k).contiguous()
+
+    effective_group_size = group_size
+    if effective_group_size <= 0:
+        effective_group_size = (logical_k + param.size(1) - 1) // param.size(1)
+
+    expanded = param.repeat_interleave(effective_group_size, dim=1)
+    if expanded.size(1) < logical_k:
+        raise ValueError(
+            "Expanded WNA16 group parameter is shorter than logical_k: "
+            f"shape={tuple(param.shape)} logical_k={logical_k} "
+            f"group_size={effective_group_size}."
+        )
+
+    return expanded[:, :logical_k].contiguous()
+
+
+def _dequantize_batched_wna16_weight_reference(
+    weight_tensor: torch.Tensor,
+    scale_tensor: torch.Tensor | None,
+    zero_point_tensor: torch.Tensor | None,
+    *,
+    use_int4_w4a16: bool,
+    block_shape: list[int] | None,
+) -> torch.Tensor:
+    logical_n = weight_tensor.size(0)
+    logical_k = weight_tensor.size(1) * 2 if use_int4_w4a16 else weight_tensor.size(1)
+    group_size = 0 if block_shape is None or len(block_shape) < 2 else int(block_shape[1])
+
+    if use_int4_w4a16:
+        weight_values = _unpack_int4_pairs_on_k_reference(weight_tensor, logical_k)
+        zero_point_default = 8.0
+    else:
+        weight_values = weight_tensor.to(torch.int32)
+        zero_point_default = 128.0
+
+    if scale_tensor is None:
+        raise RuntimeError("WNA16 batched reference requires weight scales.")
+
+    expanded_scale = _expand_batched_wna16_group_param_reference(
+        scale_tensor,
+        logical_n=logical_n,
+        logical_k=logical_k,
+        group_size=group_size,
+        packed_n_dim=False,
+        dtype=torch.float32,
+    )
+
+    if zero_point_tensor is None:
+        return (weight_values.to(torch.float32) - zero_point_default) * expanded_scale
+
+    expanded_zero_point = _expand_batched_wna16_group_param_reference(
+        zero_point_tensor,
+        logical_n=logical_n,
+        logical_k=logical_k,
+        group_size=group_size,
+        packed_n_dim=use_int4_w4a16,
+        dtype=torch.float32,
+    )
+    return (weight_values.to(torch.float32) - expanded_zero_point) * expanded_scale
+
+
 def _dequantize_batched_moe_tensor_reference(
     tensor: torch.Tensor,
     scale: torch.Tensor | None,
@@ -62,17 +202,13 @@ def _invoke_moe_batched_reference(
     expert_num_tokens: torch.Tensor,
     A_scale: torch.Tensor | None,
     B_scale: torch.Tensor | None,
+    B_zp: torch.Tensor | None,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     per_act_token_quant: bool,
+    block_shape: list[int] | None,
 ) -> None:
-    if use_int8_w8a16 or use_int4_w4a16:
-        raise RuntimeError(
-            "Batched MoE WNA16 without Triton is not supported by the shared "
-            "torch reference path."
-        )
-
     C.zero_()
 
     num_experts = expert_num_tokens.numel()
@@ -98,6 +234,31 @@ def _invoke_moe_batched_reference(
                 None if B_scale is None else B_scale[expert_idx],
                 per_act_token_quant=False,
             )
+        elif use_int4_w4a16:
+            input_tensor = input_tensor.to(torch.float32)
+            weight_tensor = _dequantize_batched_wna16_weight_reference(
+                weight_tensor,
+                None if B_scale is None else B_scale[expert_idx],
+                None if B_zp is None else B_zp[expert_idx],
+                use_int4_w4a16=use_int4_w4a16,
+                block_shape=block_shape,
+            )
+        elif use_int8_w8a16:
+            input_tensor = input_tensor.to(torch.float32)
+            if B_zp is None or B_zp.numel() == 0:
+                weight_tensor = _dequantize_batched_moe_tensor_reference(
+                    weight_tensor,
+                    None if B_scale is None else B_scale[expert_idx],
+                    per_act_token_quant=False,
+                )
+            else:
+                weight_tensor = _dequantize_batched_wna16_weight_reference(
+                    weight_tensor,
+                    None if B_scale is None else B_scale[expert_idx],
+                    B_zp[expert_idx],
+                    use_int4_w4a16=False,
+                    block_shape=block_shape,
+                )
         else:
             input_tensor = input_tensor.to(torch.float32)
             weight_tensor = weight_tensor.to(torch.float32)
@@ -105,6 +266,122 @@ def _invoke_moe_batched_reference(
         C[expert_idx, :num_tokens] = (input_tensor @ weight_tensor.transpose(0, 1)).to(
             C.dtype
         )
+
+
+def _try_dispatch_batched_wna16_shared(
+    *,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    B_scale: torch.Tensor | None,
+    B_zp: torch.Tensor | None,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    config: dict[str, int],
+    compute_type: object | None,
+    block_shape: list[int] | None,
+) -> bool:
+    if not A.is_cuda:
+        return False
+    if not (use_int8_w8a16 or use_int4_w4a16):
+        return False
+    if block_shape is None or len(block_shape) < 2 or int(block_shape[1]) <= 0:
+        return False
+    if not HAS_TRITON and not _has_moe_wna16_gemm_op():
+        return False
+
+    C.zero_()
+    block_size_m = max(1, int(config["BLOCK_SIZE_M"]))
+    for expert_idx in range(expert_num_tokens.numel()):
+        num_tokens = int(expert_num_tokens[expert_idx].item())
+        if num_tokens <= 0:
+            continue
+
+        num_token_blocks = (num_tokens + block_size_m - 1) // block_size_m
+        padded_num_tokens = num_token_blocks * block_size_m
+        sorted_token_ids = torch.arange(
+            padded_num_tokens,
+            dtype=torch.int32,
+            device=A.device,
+        )
+        if padded_num_tokens > num_tokens:
+            sorted_token_ids[num_tokens:] = num_tokens
+
+        expert_ids = torch.zeros(
+            (num_token_blocks,),
+            dtype=torch.int32,
+            device=A.device,
+        )
+        num_tokens_post_padded = torch.tensor(
+            [padded_num_tokens],
+            dtype=torch.int32,
+            device=A.device,
+        )
+
+        dispatch_fused_moe_kernel(
+            A=A[expert_idx, :num_tokens].contiguous(),
+            B=B[expert_idx : expert_idx + 1].contiguous(),
+            C=C[expert_idx, :num_tokens].unsqueeze(1),
+            A_scale=None,
+            B_scale=None if B_scale is None else B_scale[expert_idx : expert_idx + 1],
+            B_zp=None if B_zp is None else B_zp[expert_idx : expert_idx + 1],
+            topk_weights=None,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=False,
+            top_k=1,
+            config=config,
+            compute_type=compute_type,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=False,
+            block_shape=block_shape,
+            B_bias=None,
+        )
+
+    return True
+
+
+def _try_precompiled_moe_batched_kernel(
+    *,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    B_scale: torch.Tensor | None,
+    use_fp8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_act_token_quant: bool,
+) -> bool:
+    if not A.is_cuda:
+        return False
+    if use_int8_w8a16 or use_int4_w4a16:
+        return False
+    if not ops.has_precompiled_moe_batched_mm():
+        return False
+
+    num_experts = expert_num_tokens.numel()
+    A_scale = normalize_batched_scales_shape(A_scale, num_experts)
+    B_scale = normalize_batched_scales_shape(B_scale, num_experts)
+
+    ops.moe_batched_mm_precompiled(
+        A=A,
+        B=B,
+        C=C,
+        expert_num_tokens=expert_num_tokens,
+        A_scale=A_scale,
+        B_scale=B_scale,
+        use_fp8_w8a8=use_fp8_w8a8,
+        per_act_token_quant=per_act_token_quant,
+    )
+    return True
+
 
 @triton.jit
 def moe_mmk(
@@ -464,8 +741,74 @@ def invoke_moe_batched_triton_kernel(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
 ):
-    assert not use_int4_w4a16
+    if B_zp is not None and B_zp.numel() == 0:
+        B_zp = None
+
+    prefers_shared_wna16_dispatch = (
+        block_shape is not None
+        and len(block_shape) >= 2
+        and int(block_shape[1]) > 0
+        and (use_int4_w4a16 or use_int8_w8a16)
+    )
+
+    if prefers_shared_wna16_dispatch and _try_dispatch_batched_wna16_shared(
+        A=A,
+        B=B,
+        C=C,
+        expert_num_tokens=expert_num_tokens,
+        B_scale=B_scale,
+        B_zp=B_zp,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        config=config,
+        compute_type=compute_type,
+        block_shape=block_shape,
+    ):
+        quant_scheme = "int4_w4a16" if use_int4_w4a16 else "int8_w8a16"
+        logger.info(
+            "Batched MoE %s is using shared "
+            "`dispatch_fused_moe_kernel` for a unified WNA16 path.",
+            quant_scheme,
+        )
+        return
+
     if not HAS_TRITON:
+        if _try_dispatch_batched_wna16_shared(
+            A=A,
+            B=B,
+            C=C,
+            expert_num_tokens=expert_num_tokens,
+            B_scale=B_scale,
+            B_zp=B_zp,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            config=config,
+            compute_type=compute_type,
+            block_shape=block_shape,
+        ):
+            logger.info(
+                "Batched MoE WNA16 is falling back to shared "
+                "`dispatch_fused_moe_kernel` because Triton runtime is "
+                "unavailable."
+            )
+            return
+        if _try_precompiled_moe_batched_kernel(
+            A=A,
+            B=B,
+            C=C,
+            expert_num_tokens=expert_num_tokens,
+            A_scale=A_scale,
+            B_scale=B_scale,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_act_token_quant=per_act_token_quant,
+        ):
+            logger.info(
+                "Batched MoE is falling back to `_C.moe_batched_mm_precompiled` "
+                "because Triton runtime is unavailable."
+            )
+            return
         logger.warning(
             "Triton is unavailable; falling back to torch reference for "
             "invoke_moe_batched_triton_kernel."
@@ -477,12 +820,21 @@ def invoke_moe_batched_triton_kernel(
             expert_num_tokens=expert_num_tokens,
             A_scale=A_scale,
             B_scale=B_scale,
+            B_zp=B_zp,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
             per_act_token_quant=per_act_token_quant,
+            block_shape=block_shape,
         )
         return
+
+    if use_int4_w4a16:
+        raise RuntimeError(
+            "Batched MoE int4_w4a16 Triton execution is not implemented in "
+            "this file yet. Use the shared WNA16 dispatch fallback or the "
+            "torch reference path when Triton is unavailable."
+        )
 
     max_num_tokens = A.size(1)
     K = A.size(2)
@@ -755,8 +1107,6 @@ class NaiveBatchedExperts(mk.FusedMoEExpertsModular):
             num_dispatchers=num_dispatchers,
         )
         assert not self.quant_config.use_int8_w8a8, "NYI"
-        assert not self.quant_config.use_int8_w8a16, "NYI"
-        assert not self.quant_config.use_int4_w4a16, "NYI"
         assert self.quant_config.ocp_mx_scheme is None, "NYI"
 
     @staticmethod
@@ -823,9 +1173,10 @@ class NaiveBatchedExperts(mk.FusedMoEExpertsModular):
         assert self.max_num_tokens is not None
         num_dp = self.num_dispatchers
         num_experts = local_num_experts
-        workspace13 = (num_experts, self.max_num_tokens * num_dp, K)
-        workspace2 = (self.max_num_tokens * num_dp, N)
-        output = workspace13
+        activation_out_dim = self.adjust_N_for_activation(N, activation)
+        workspace13 = (num_experts, self.max_num_tokens * num_dp, N)
+        workspace2 = (num_experts, self.max_num_tokens * num_dp, activation_out_dim)
+        output = (num_experts, self.max_num_tokens * num_dp, K)
         return (workspace13, workspace2, output)
 
     def dequant(self, t: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -835,6 +1186,45 @@ class NaiveBatchedExperts(mk.FusedMoEExpertsModular):
             return t.to(f32) * scale
         else:
             return t.to(f32) * group_broadcast(scale, t.shape)
+
+    def _dequantize_weight_only_tensor(
+        self,
+        weight: torch.Tensor,
+        scale: torch.Tensor | None,
+        zp: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.quant_config.use_int4_w4a16:
+            return _dequantize_batched_wna16_weight_reference(
+                weight,
+                scale,
+                zp,
+                use_int4_w4a16=True,
+                block_shape=self.block_shape,
+            )
+
+        if self.quant_config.use_int8_w8a16:
+            if zp is None or zp.numel() == 0:
+                return _dequantize_batched_moe_tensor_reference(
+                    weight,
+                    scale,
+                    per_act_token_quant=False,
+                )
+            return _dequantize_batched_wna16_weight_reference(
+                weight,
+                scale,
+                zp,
+                use_int4_w4a16=False,
+                block_shape=self.block_shape,
+            )
+
+        if self.quant_config.use_fp8_w8a16:
+            return _dequantize_batched_moe_tensor_reference(
+                weight,
+                scale,
+                per_act_token_quant=False,
+            )
+
+        return weight.to(torch.float32)
 
     def apply(
         self,
@@ -861,7 +1251,8 @@ class NaiveBatchedExperts(mk.FusedMoEExpertsModular):
         num_local_experts = w1.size(0)
         assert num_local_experts == w1.size(0), f"{num_local_experts} == {w1.size(0)}"
 
-        N = w1.size(1) // 2
+        intermediate_dim = w1.size(1)
+        activation_out_dim = self.adjust_N_for_activation(intermediate_dim, activation)
 
         for expert in range(num_local_experts):
             # Indexing expert_num_tokens doesn't work w/cudagraphs or inductor
@@ -876,13 +1267,27 @@ class NaiveBatchedExperts(mk.FusedMoEExpertsModular):
             if num == 0:
                 continue
 
-            tmp = _resize_cache(workspace2, (num, N))
+            tmp = _resize_cache(workspace2, (num, activation_out_dim))
 
             if self.quant_config.is_quantized:
                 assert a1q_scale is not None and self.w1_scale is not None
                 input = self.dequant(hidden_states[expert, :, :], a1q_scale[expert])
                 w1_dq = self.dequant(w1[expert], self.w1_scale[expert])
                 input = input[:num] @ w1_dq.transpose(0, 1)
+            elif (
+                self.quant_config.use_fp8_w8a16
+                or self.quant_config.use_int8_w8a16
+                or self.quant_config.use_int4_w4a16
+            ):
+                assert self.w1_scale is not None
+                w1_dq = self._dequantize_weight_only_tensor(
+                    w1[expert],
+                    self.w1_scale[expert],
+                    None if self.w1_zp is None else self.w1_zp[expert],
+                )
+                input = hidden_states[expert, :num, :].to(torch.float32) @ w1_dq.transpose(
+                    0, 1
+                )
             else:
                 input = hidden_states[expert, :num, :] @ w1[expert].transpose(0, 1)
 
@@ -891,6 +1296,17 @@ class NaiveBatchedExperts(mk.FusedMoEExpertsModular):
             if self.quant_config.is_quantized:
                 assert self.w2_scale is not None
                 w2_dq = self.dequant(w2[expert], self.w2_scale[expert])
+            elif (
+                self.quant_config.use_fp8_w8a16
+                or self.quant_config.use_int8_w8a16
+                or self.quant_config.use_int4_w4a16
+            ):
+                assert self.w2_scale is not None
+                w2_dq = self._dequantize_weight_only_tensor(
+                    w2[expert],
+                    self.w2_scale[expert],
+                    None if self.w2_zp is None else self.w2_zp[expert],
+                )
             else:
                 w2_dq = w2[expert]
 
@@ -984,8 +1400,6 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             num_dispatchers=num_dispatchers,
         )
         assert not self.quant_config.use_int8_w8a8, "NYI"
-        assert not self.quant_config.use_int8_w8a16, "NYI"
-        assert not self.quant_config.use_int4_w4a16, "NYI"
         assert self.quant_config.ocp_mx_scheme is None, "NYI"
 
     @staticmethod
@@ -994,7 +1408,7 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return HAS_TRITON and current_platform.is_cuda_alike()
+        return current_platform.is_cuda_alike()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -1129,7 +1543,16 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             block_shape=self.block_shape,
         )
 
-        if hidden_states.dtype == torch.bfloat16:
+        if not HAS_TRITON:
+            if hidden_states.dtype not in [
+                torch.float32,
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+            ]:
+                raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+            compute_type = None
+        elif hidden_states.dtype == torch.bfloat16:
             compute_type = tl.bfloat16
         elif hidden_states.dtype == torch.float16:
             compute_type = tl.float16

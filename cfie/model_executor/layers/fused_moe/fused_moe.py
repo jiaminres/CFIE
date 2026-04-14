@@ -39,11 +39,14 @@ from cfie.model_executor.layers.fused_moe.utils import (
     _resize_cache,
     disable_inplace,
     moe_kernel_quantize_input,
+    normalize_batched_scales_shape,
+    normalize_scales_shape,
 )
 from cfie.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
 from cfie.model_executor.layers.quantization.utils.mxfp6_utils import dequant_mxfp6
 from cfie.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    group_broadcast,
     kFp8Dynamic128Sym,
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
@@ -58,10 +61,274 @@ from cfie.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
+def _cdiv_fn(numerator: int, denominator: int) -> int:
+    return (numerator + denominator - 1) // denominator
+
+
 def _has_moe_wna16_gemm_op() -> bool:
     return hasattr(torch.ops, "_moe_C") and hasattr(
         torch.ops._moe_C, "moe_wna16_gemm"
     )
+
+
+def _dequantize_fused_moe_tensor_reference(
+    tensor: torch.Tensor,
+    scale: torch.Tensor | None,
+    *,
+    per_act_token_quant: bool,
+) -> torch.Tensor:
+    if scale is None:
+        return tensor.to(torch.float32)
+
+    scale = normalize_scales_shape(scale).to(torch.float32)
+    if tensor.ndim == 1:
+        scale = scale.reshape(-1)
+    if per_act_token_quant or scale.numel() == 1:
+        return tensor.to(torch.float32) * scale
+
+    return tensor.to(torch.float32) * group_broadcast(scale, tensor.shape)
+
+
+def _slice_fused_moe_scale_rows(
+    scale: torch.Tensor | None,
+    row_indices: torch.Tensor,
+) -> torch.Tensor | None:
+    if scale is None:
+        return None
+    if scale.ndim == 0 or scale.numel() == 1:
+        return scale
+    if scale.size(0) == 1:
+        return scale
+    return scale.index_select(0, row_indices)
+
+
+def _iter_fused_moe_assignments(
+    *,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    total_assignments: int,
+) -> list[tuple[int, int]]:
+    if sorted_token_ids is None:
+        flat_expert_ids = expert_ids.reshape(-1)
+        limit = min(total_assignments, flat_expert_ids.numel())
+        return [
+            (flat_idx, int(flat_expert_ids[flat_idx].item()))
+            for flat_idx in range(limit)
+            if int(flat_expert_ids[flat_idx].item()) >= 0
+        ]
+
+    if expert_ids.numel() == 0:
+        return []
+
+    valid_tokens = min(int(num_tokens_post_padded.item()), sorted_token_ids.numel())
+    block_size = max(1, (sorted_token_ids.numel() + expert_ids.numel() - 1) // expert_ids.numel())
+    assignments: list[tuple[int, int]] = []
+
+    for padded_idx in range(valid_tokens):
+        flat_idx = int(sorted_token_ids[padded_idx].item())
+        if flat_idx < 0 or flat_idx >= total_assignments:
+            continue
+        block_idx = min(padded_idx // block_size, expert_ids.numel() - 1)
+        expert_id = int(expert_ids[block_idx].item())
+        if expert_id < 0:
+            continue
+        assignments.append((flat_idx, expert_id))
+
+    return assignments
+
+
+def _try_precompiled_fused_moe_kernel(
+    *,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    B_scale: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    block_shape: list[int] | None,
+    B_bias: torch.Tensor | None,
+) -> bool:
+    if not A.is_cuda:
+        return False
+    if use_int8_w8a16 or use_int4_w4a16:
+        return False
+    if block_shape is not None and any(int(dim) > 0 for dim in block_shape):
+        return False
+
+    C.zero_()
+    flat_output = C.view(-1, C.size(-1))
+    total_assignments = flat_output.size(0)
+    assignments = _iter_fused_moe_assignments(
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        total_assignments=total_assignments,
+    )
+
+    filtered_assignments = [
+        (flat_idx, expert_id)
+        for flat_idx, expert_id in assignments
+        if 0 <= expert_id < B.size(0)
+    ]
+    if not filtered_assignments:
+        return True
+
+    flat_indices = torch.tensor(
+        [flat_idx for flat_idx, _ in filtered_assignments],
+        dtype=torch.int64,
+        device=A.device,
+    )
+    expert_indices = torch.tensor(
+        [expert_id for _, expert_id in filtered_assignments],
+        dtype=torch.int64,
+        device=A.device,
+    )
+    src_rows = torch.div(flat_indices, top_k, rounding_mode="floor")
+
+    stable_offsets = torch.arange(
+        expert_indices.numel(),
+        dtype=torch.int64,
+        device=A.device,
+    )
+    sort_order = torch.argsort(expert_indices * total_assignments + stable_offsets)
+    flat_indices = flat_indices.index_select(0, sort_order)
+    expert_indices = expert_indices.index_select(0, sort_order)
+    src_rows = src_rows.index_select(0, sort_order)
+
+    use_w8a8 = use_fp8_w8a8 or use_int8_w8a8
+    A_scale = normalize_scales_shape(A_scale)
+    B_scale = normalize_batched_scales_shape(B_scale, B.size(0))
+    flat_topk_weights = (
+        topk_weights.reshape(-1).to(torch.float32) if topk_weights is not None else None
+    )
+
+    start = 0
+    for expert_id, count in enumerate(
+        torch.bincount(expert_indices, minlength=B.size(0)).tolist()
+    ):
+        if count <= 0:
+            continue
+
+        end = start + count
+        group_rows = src_rows[start:end]
+        group_flat_indices = flat_indices[start:end]
+        input_tensor = A.index_select(0, group_rows)
+        weight_tensor = B[expert_id]
+
+        if use_w8a8:
+            input_tensor = _dequantize_fused_moe_tensor_reference(
+                input_tensor,
+                _slice_fused_moe_scale_rows(A_scale, group_rows),
+                per_act_token_quant=per_channel_quant,
+            )
+            weight_tensor = _dequantize_fused_moe_tensor_reference(
+                weight_tensor,
+                None if B_scale is None else B_scale[expert_id],
+                per_act_token_quant=False,
+            )
+        else:
+            input_tensor = input_tensor.to(torch.float32)
+            weight_tensor = weight_tensor.to(torch.float32)
+
+        output_tensor = input_tensor @ weight_tensor.transpose(0, 1)
+        if B_bias is not None:
+            output_tensor = output_tensor + B_bias[expert_id].to(torch.float32)
+        if mul_routed_weight:
+            assert flat_topk_weights is not None
+            output_tensor = output_tensor * flat_topk_weights.index_select(
+                0, group_flat_indices
+            ).unsqueeze(1)
+
+        flat_output.index_copy_(0, group_flat_indices, output_tensor.to(C.dtype))
+        start = end
+
+    return True
+
+
+def _invoke_fused_moe_reference(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    B_scale: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    B_bias: torch.Tensor | None,
+) -> None:
+    if use_int8_w8a16 or use_int4_w4a16:
+        raise RuntimeError(
+            "Fused MoE WNA16 without Triton is not supported by the shared "
+            "torch reference path."
+        )
+
+    C.zero_()
+    flat_output = C.view(-1, C.size(-1))
+    total_assignments = flat_output.size(0)
+    assignments = _iter_fused_moe_assignments(
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        total_assignments=total_assignments,
+    )
+
+    use_w8a8 = use_fp8_w8a8 or use_int8_w8a8
+    A_scale = normalize_scales_shape(A_scale)
+    B_scale = normalize_batched_scales_shape(B_scale, B.size(0))
+    flat_topk_weights = (
+        topk_weights.reshape(-1).to(torch.float32) if topk_weights is not None else None
+    )
+
+    for flat_idx, expert_id in assignments:
+        if expert_id >= B.size(0):
+            continue
+
+        input_row_idx = flat_idx // top_k
+        input_tensor = A[input_row_idx]
+        weight_tensor = B[expert_id]
+
+        if use_w8a8:
+            input_tensor = _dequantize_fused_moe_tensor_reference(
+                input_tensor,
+                None if A_scale is None else A_scale[input_row_idx],
+                per_act_token_quant=per_channel_quant,
+            )
+            weight_tensor = _dequantize_fused_moe_tensor_reference(
+                weight_tensor,
+                None if B_scale is None else B_scale[expert_id],
+                per_act_token_quant=False,
+            )
+        else:
+            input_tensor = input_tensor.to(torch.float32)
+            weight_tensor = weight_tensor.to(torch.float32)
+
+        output_tensor = input_tensor @ weight_tensor.transpose(0, 1)
+        if B_bias is not None:
+            output_tensor = output_tensor + B_bias[expert_id].to(torch.float32)
+        if mul_routed_weight:
+            assert flat_topk_weights is not None
+            output_tensor = output_tensor * flat_topk_weights[flat_idx]
+
+        flat_output[flat_idx].copy_(output_tensor.to(C.dtype))
 
 
 def _zero_experts_compute_reference(
@@ -621,14 +888,15 @@ def invoke_fused_moe_wna16_cuda_kernel(
     top_k: int,
     config: dict[str, Any],
     block_shape: list[int],
+    bit: int,
 ):
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
     assert block_shape is None or block_shape[0] == 0
+    assert bit in (4, 8)
 
     M = A.size(0)
     num_tokens = M * top_k
-    bit = 4
 
     config = config.copy()
     config.update(
@@ -638,7 +906,7 @@ def invoke_fused_moe_wna16_cuda_kernel(
             num_valid_tokens=num_tokens,
             size_k=A.size(1),
             size_n=B.size(1),
-            num_experts=B.size(1),
+            num_experts=B.size(0),
             group_size=block_shape[1],
             real_top_k=top_k,
             block_size_m=config["BLOCK_SIZE_M"],
@@ -709,7 +977,7 @@ def invoke_fused_moe_wna16_triton_kernel(
             num_valid_tokens=num_tokens,
             size_k=A.size(1),
             size_n=B.size(1),
-            num_experts=B.size(1),
+            num_experts=B.size(0),
             group_size=block_shape[1],
             real_top_k=top_k,
             block_size_m=config["BLOCK_SIZE_M"],
@@ -768,7 +1036,7 @@ def invoke_fused_moe_triton_kernel(
     mul_routed_weight: bool,
     top_k: int,
     config: dict[str, Any],
-    compute_type: tl.dtype,
+    compute_type: Any | None,
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
@@ -783,10 +1051,10 @@ def invoke_fused_moe_triton_kernel(
 
     if use_fp8_w8a8 or use_int8_w8a8:
         assert B_scale is not None
-        assert block_shape is None or triton.cdiv(
+        assert block_shape is None or _cdiv_fn(
             B.size(-2), block_shape[0]
         ) == B_scale.size(-2)
-        assert block_shape is None or triton.cdiv(
+        assert block_shape is None or _cdiv_fn(
             B.size(-1), block_shape[1]
         ) == B_scale.size(-1)
     elif use_int8_w8a16 or use_int4_w4a16:
@@ -795,6 +1063,57 @@ def invoke_fused_moe_triton_kernel(
     else:
         assert A_scale is None
         assert B_scale is None
+
+    if not HAS_TRITON:
+        if _try_precompiled_fused_moe_kernel(
+            A=A,
+            B=B,
+            C=C,
+            A_scale=A_scale,
+            B_scale=B_scale,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=mul_routed_weight,
+            top_k=top_k,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            B_bias=B_bias,
+        ):
+            logger.info(
+                "Fused MoE is falling back to shared CUDA grouped execution "
+                "because Triton runtime is unavailable."
+            )
+            return
+        logger.warning(
+            "Triton is unavailable; falling back to torch reference for "
+            "invoke_fused_moe_triton_kernel."
+        )
+        _invoke_fused_moe_reference(
+            A=A,
+            B=B,
+            C=C,
+            A_scale=A_scale,
+            B_scale=B_scale,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=mul_routed_weight,
+            top_k=top_k,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            B_bias=B_bias,
+        )
+        return
 
     M = A.size(0)
     num_tokens = M * top_k
@@ -880,7 +1199,7 @@ def dispatch_fused_moe_kernel(
     mul_routed_weight: bool,
     top_k: int,
     config: dict[str, Any],
-    compute_type: tl.dtype,
+    compute_type: Any | None,
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
@@ -929,9 +1248,10 @@ def dispatch_fused_moe_kernel(
                 num_tokens_post_padded,
                 mul_routed_weight,
                 top_k,
-                config,
-                block_shape,
-            )
+            config,
+            block_shape,
+            4 if use_int4_w4a16 else 8,
+        )
             return
 
         if not HAS_TRITON:
@@ -1031,6 +1351,24 @@ def zero_experts_compute_triton(
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
     if not HAS_TRITON:
+        if (
+            zero_expert_type == "identity"
+            and hidden_states.is_cuda
+            and expert_indices.is_cuda
+            and expert_scales.is_cuda
+            and ops.has_precompiled_zero_experts_compute_identity()
+        ):
+            logger.info(
+                "zero_experts_compute_triton is falling back to "
+                "`_C.zero_experts_compute_identity_precompiled` because "
+                "Triton runtime is unavailable."
+            )
+            return ops.zero_experts_compute_identity_precompiled(
+                expert_indices,
+                expert_scales,
+                num_experts,
+                hidden_states,
+            )
         logger.warning(
             "Triton is unavailable; falling back to torch reference for "
             "zero_experts_compute_triton."
@@ -1260,8 +1598,9 @@ def get_moe_wna16_block_config(
         num_blocks = num_m_blocks * num_n_blocks * num_k_blocks
 
         if size_k % 256 == 0 and num_blocks >= 256 and block_size_k < 256:
+            previous_block_size_k = block_size_k
             block_size_k = 256
-            num_blocks = num_blocks // (256 // block_size_k)
+            num_blocks = num_blocks // (256 // previous_block_size_k)
 
         if (
             num_m_blocks <= 16
@@ -1822,7 +2161,11 @@ def fused_experts_impl(
         dtype=hidden_states.dtype,
     )
 
-    if hidden_states.dtype == torch.bfloat16:
+    if not HAS_TRITON:
+        if hidden_states.dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+        compute_type = None
+    elif hidden_states.dtype == torch.bfloat16:
         compute_type = tl.bfloat16
     elif hidden_states.dtype == torch.float16:
         compute_type = tl.float16
@@ -1992,9 +2335,7 @@ class TritonExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return HAS_TRITON and (
-            current_platform.is_cuda_alike() or current_platform.is_xpu()
-        )
+        return current_platform.is_cuda_alike() or current_platform.is_xpu()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -2125,7 +2466,17 @@ class TritonExperts(mk.FusedMoEExpertsModular):
             block_shape=self.block_shape,
         )
 
-        if hidden_states.dtype == torch.bfloat16:
+        if not HAS_TRITON:
+            if hidden_states.dtype not in [
+                torch.float32,
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ]:
+                raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+            compute_type = None
+        elif hidden_states.dtype == torch.bfloat16:
             compute_type = tl.bfloat16
         elif hidden_states.dtype == torch.float16:
             compute_type = tl.float16
@@ -2311,7 +2662,17 @@ class TritonWNA16Experts(TritonExperts):
             block_shape=self.block_shape,
         )
 
-        if hidden_states.dtype == torch.bfloat16:
+        if not HAS_TRITON:
+            if hidden_states.dtype not in [
+                torch.float32,
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ]:
+                raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+            compute_type = None
+        elif hidden_states.dtype == torch.bfloat16:
             compute_type = tl.bfloat16
         elif hidden_states.dtype == torch.float16:
             compute_type = tl.float16
@@ -2337,22 +2698,26 @@ class TritonWNA16Experts(TritonExperts):
             topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
 
-        invoke_fused_moe_wna16_triton_kernel(
-            hidden_states,
-            w1,
-            intermediate_cache1,
-            self.w1_scale,
-            self.quant_config.w1_zp,
-            None,  # topk_weights
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            False,  # mul_routed_weights
-            top_k_num,
-            config,
+        dispatch_fused_moe_kernel(
+            A=hidden_states,
+            B=w1,
+            C=intermediate_cache1,
+            A_scale=None,
+            B_scale=self.w1_scale,
+            B_zp=self.quant_config.w1_zp,
+            topk_weights=None,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=False,
+            top_k=top_k_num,
+            config=config,
             compute_type=compute_type,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
             use_int8_w8a16=self.quant_config.use_int8_w8a16,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
+            per_channel_quant=self.per_act_token_quant,
             block_shape=self.block_shape,
         )
 
@@ -2370,22 +2735,26 @@ class TritonWNA16Experts(TritonExperts):
             self.block_shape,
         )
 
-        invoke_fused_moe_wna16_triton_kernel(
-            qintermediate_cache2,
-            w2,
-            intermediate_cache3,
-            self.w2_scale,
-            self.quant_config.w2_zp,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input,
-            1,
-            config,
+        dispatch_fused_moe_kernel(
+            A=qintermediate_cache2,
+            B=w2,
+            C=intermediate_cache3,
+            A_scale=a2q_scale,
+            B_scale=self.w2_scale,
+            B_zp=self.quant_config.w2_zp,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=not apply_router_weight_on_input,
+            top_k=1,
+            config=config,
             compute_type=compute_type,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
             use_int8_w8a16=self.quant_config.use_int8_w8a16,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
+            per_channel_quant=self.per_act_token_quant,
             block_shape=self.block_shape,
         )
 

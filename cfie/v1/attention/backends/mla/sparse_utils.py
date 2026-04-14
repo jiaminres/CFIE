@@ -4,7 +4,7 @@
 
 import torch
 
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 
 
 # Kernel with prefill workspace support and valid count tracking
@@ -158,6 +158,39 @@ def triton_convert_req_index_to_global_index(
         assert prefill_workspace_starts is not None  # for mypy
         assert prefill_workspace_request_ids.is_contiguous()
         assert prefill_workspace_starts.is_contiguous()
+
+    if not HAS_TRITON:
+        token_blocks = torch.div(token_indices_c, BLOCK_SIZE, rounding_mode="floor")
+        inblock_offsets = token_indices_c.remainder(BLOCK_SIZE)
+        valid_blocks = (token_blocks >= 0) & (token_blocks < max_num_blocks_per_req)
+
+        safe_blocks = token_blocks.clamp(0, max_num_blocks_per_req - 1)
+        safe_req_ids = req_id_c.to(torch.long).clamp(0, block_table_c.size(0) - 1)
+        selected_block_tables = block_table_c.index_select(0, safe_req_ids)
+        gathered_blocks = selected_block_tables.gather(1, safe_blocks)
+        out.copy_(gathered_blocks * BLOCK_SIZE + inblock_offsets)
+
+        invalid_tokens = (token_indices_c < 0) | ~valid_blocks
+        if HAS_PREFILL_WORKSPACE:
+            assert prefill_workspace_request_ids is not None
+            assert prefill_workspace_starts is not None
+            prefill_req_ids = prefill_workspace_request_ids.contiguous()
+            is_prefill = prefill_req_ids >= 0
+            safe_prefill_req_ids = prefill_req_ids.clamp(
+                0, prefill_workspace_starts.numel() - 1
+            )
+            workspace_starts = prefill_workspace_starts.contiguous().gather(
+                0, safe_prefill_req_ids
+            )
+            prefill_out = workspace_starts[:, None] + token_indices_c
+            out.copy_(torch.where(is_prefill[:, None], prefill_out, out))
+
+        out.masked_fill_(invalid_tokens, -1)
+        if return_valid_counts:
+            assert valid_counts is not None
+            valid_counts.copy_((~invalid_tokens).sum(dim=1).to(torch.int32))
+            return out, valid_counts
+        return out
 
     # Exact 2D grid: tokens × column tiles
     grid = (num_tokens, tiles_per_row)

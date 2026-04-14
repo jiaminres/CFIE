@@ -12,6 +12,7 @@ import torch
 from cfie import _custom_ops as ops
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON, tl, triton
+from cfie.utils.runtime_fallback_trace import record as record_runtime_fallback
 
 logger = init_logger(__name__)
 
@@ -468,7 +469,9 @@ def fused_sigmoid_gating_delta_rule_update(
             is_kda=is_kda,
         )
         if precompiled is not None:
+            record_runtime_fallback("fla.fused_sigmoid_gating", "precompiled")
             return precompiled
+        record_runtime_fallback("fla.fused_sigmoid_gating", "reference")
         logger.warning_once(
             "Qwen3Next fused GDN gating is falling back to the PyTorch "
             "reference path because Triton runtime is unavailable."

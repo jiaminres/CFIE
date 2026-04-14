@@ -303,6 +303,9 @@ class CMakeBuildExt(build_ext):
         self.build_temp = self.cmake_build_dir()
         os.makedirs(self.build_temp, exist_ok=True)
         cmake_env = self.cmake_subprocess_env()
+        cfg = getattr(envs, "CMAKE_BUILD_TYPE", None) or (
+            "Debug" if self.debug else "RelWithDebInfo"
+        )
 
         targets: list[str] = []
         for ext in self.extensions:
@@ -310,17 +313,16 @@ class CMakeBuildExt(build_ext):
             targets.append(self.target_name(ext.name))
 
         num_jobs, _ = self.compute_num_jobs()
-        subprocess.check_call(
-            [
-                CMAKE_EXECUTABLE,
-                "--build",
-                ".",
-                f"-j={num_jobs}",
-                *[f"--target={target}" for target in targets],
-            ],
-            cwd=self.build_temp,
-            env=cmake_env,
-        )
+        build_cmd = [
+            CMAKE_EXECUTABLE,
+            "--build",
+            ".",
+            f"-j={num_jobs}",
+            *[f"--target={target}" for target in targets],
+        ]
+        if os.name == "nt":
+            build_cmd.extend(["--config", cfg])
+        subprocess.check_call(build_cmd, cwd=self.build_temp, env=cmake_env)
 
         for ext in self.extensions:
             outdir = Path(self.get_ext_fullpath(ext.name)).parent.resolve()
@@ -340,6 +342,7 @@ class CMakeBuildExt(build_ext):
                     str(prefix),
                     "--component",
                     self.target_name(ext.name),
+                    *(["--config", cfg] if os.name == "nt" else []),
                 ],
                 cwd=self.build_temp,
                 env=cmake_env,

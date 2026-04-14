@@ -35,7 +35,7 @@ from cfie.v1.kv_cache_interface import AttentionSpec
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 if current_platform.is_rocm():
-    from cfie.triton_utils import tl, triton
+    from cfie.triton_utils import HAS_TRITON, tl, triton
 
     def block_size(x, head_dim):
         return min(65536 // x.element_size(), triton.next_power_of_2(head_dim))
@@ -159,6 +159,24 @@ if current_platform.is_rocm():
         assert kv_cache_layout in ["NHD", "SHUFFLE"], (
             "kv_cache_layout only support NHD, SHUFFLE"
         )
+        if not HAS_TRITON:
+            _cp_mha_gather_cache_reference(
+                key_cache,
+                value_cache,
+                key,
+                value,
+                block_tables,
+                k_scales,
+                v_scales,
+                cu_seqlens_kv,
+                token_to_batch,
+                seq_starts,
+                dequant,
+                kv_cache_layout,
+                total_tokens,
+            )
+            return
+
         head_dim = key.shape[2]
         x = 16 // key_cache.element_size()
         # assert dequant is True, "Currently, we only support "\
@@ -257,6 +275,17 @@ if current_platform.is_rocm():
         k_scales: torch.Tensor,
         v_scales: torch.Tensor,
     ):
+        if not HAS_TRITON:
+            _reshape_and_cache_shuffle_reference(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                kv_cache_dtype,
+            )
+            return
+
         num_tokens = slot_mapping.shape[0]
         _, num_kv_heads, head_size = key.shape
         num_blocks, block_size, _, _ = key_cache.shape
@@ -297,6 +326,119 @@ if current_platform.is_rocm():
             BLOCK_SIZE=head_size,
             QUANT=QUANT,
             IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
+        )
+
+
+def _cp_mha_gather_cache_reference(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_tables: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    token_to_batch: torch.Tensor,
+    seq_starts: torch.Tensor,
+    dequant: bool,
+    kv_cache_layout: str,
+    total_tokens: int,
+) -> None:
+    head_dim = key.shape[2]
+    num_heads = key.shape[1]
+    page_size = key_cache.shape[1]
+    x = 16 // key_cache.element_size()
+
+    if kv_cache_layout == "SHUFFLE":
+        key_cache_view = key_cache.view(
+            key_cache.shape[0],
+            num_heads,
+            head_dim // x,
+            page_size,
+            x,
+        )
+        value_cache_view = value_cache.view(
+            value_cache.shape[0],
+            num_heads,
+            page_size // x,
+            head_dim,
+            x,
+        )
+
+    for token_id in range(total_tokens):
+        batch_idx = int(token_to_batch[token_id].item())
+        batch_start = int(seq_starts[batch_idx].item())
+        token_start = int(cu_seqlens_kv[batch_idx].item())
+        batch_offset = token_id - token_start + batch_start
+        block_offset = batch_offset // page_size
+        slot_id = batch_offset % page_size
+        block_id = int(block_tables[batch_idx, block_offset].item())
+
+        if kv_cache_layout == "NHD":
+            key_val = key_cache[block_id, slot_id, :, :]
+            value_val = value_cache[block_id, slot_id, :, :]
+        elif kv_cache_layout == "SHUFFLE":
+            key_val = key_cache_view[block_id, :, :, slot_id, :].reshape(
+                num_heads, head_dim
+            )
+            value_val = value_cache_view[
+                block_id, :, slot_id // x, :, slot_id % x
+            ]
+        else:
+            raise ValueError(f"Unsupported kv_cache_layout: {kv_cache_layout}")
+
+        if dequant:
+            key_val = key_val.to(torch.float32) * k_scales.reshape(-1)[0].to(
+                torch.float32
+            )
+            value_val = value_val.to(torch.float32) * v_scales.reshape(-1)[0].to(
+                torch.float32
+            )
+
+        key[token_id].copy_(key_val.to(key.dtype))
+        value[token_id].copy_(value_val.to(value.dtype))
+
+
+def _reshape_and_cache_shuffle_reference(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+) -> None:
+    del kv_cache_dtype
+    num_tokens = slot_mapping.shape[0]
+    _, num_kv_heads, head_size = key.shape
+    num_blocks, block_size, _, _ = key_cache.shape
+    x = 16 // key_cache.element_size()
+    key_cache_view = key_cache.view(
+        num_blocks,
+        num_kv_heads,
+        head_size // x,
+        block_size,
+        x,
+    )
+    value_cache_view = value_cache.view(
+        num_blocks,
+        num_kv_heads,
+        block_size // x,
+        head_size,
+        x,
+    )
+    for token_id in range(num_tokens):
+        slot_id = int(slot_mapping[token_id].item())
+        if slot_id < 0:
+            continue
+        block_id = slot_id // block_size
+        block_offset = slot_id % block_size
+        key_cache_view[block_id, :, :, block_offset, :].copy_(
+            key[token_id].reshape(num_kv_heads, head_size // x, x).to(
+                key_cache_view.dtype
+            )
+        )
+        value_cache_view[block_id, :, block_offset // x, :, block_offset % x].copy_(
+            value[token_id].to(value_cache_view.dtype)
         )
 
 

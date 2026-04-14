@@ -402,6 +402,7 @@ class SwigluStepAndMul(CustomOp):
         if limit is None:
             raise ValueError("SwigluStepAndMul requires limit to be set.")
         self.limit = limit
+        self.op = getattr(torch.ops._C, "swiglustep_and_mul", None)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
@@ -412,6 +413,13 @@ class SwigluStepAndMul(CustomOp):
         return gate * up
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        op = getattr(self, "op", None)
+        if op is not None:
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            op(out, x, self.limit)
+            return out
         if not HAS_TRITON:
             logger.warning_once(
                 "Custom activation op swiglustep_and_mul is falling back to "

@@ -3,7 +3,7 @@
 
 import torch
 
-from cfie.triton_utils import LOG2E, LOGE2, tl, triton
+from cfie.triton_utils import HAS_TRITON, LOG2E, LOGE2, tl, triton
 
 
 @triton.jit
@@ -210,6 +210,9 @@ def triton_bf16_mla_sparse_interface(
     sm_scale *= LOG2E
 
     kv_group_num = num_heads_q // num_heads_kv
+    if not HAS_TRITON:
+        return _bf16_mla_sparse_reference(q, kv, indices, sm_scale / LOG2E, d_v)
+
     grid = (
         num_tokens,
         triton.cdiv(num_heads_q, min(BLOCK_H, kv_group_num)),
@@ -261,5 +264,44 @@ def triton_bf16_mla_sparse_interface(
         BLOCK_DPE=BLOCK_DPE,
         LOGE2=LOGE2,
     )
+
+    return out, max_logits, softmax_lse
+
+
+def _bf16_mla_sparse_reference(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, num_heads_q, dim_qk = q.shape
+    num_kv_tokens, num_heads_kv, _ = kv.shape
+    kv_group_num = num_heads_q // num_heads_kv
+    out = torch.zeros((num_tokens, num_heads_q, d_v), dtype=q.dtype, device=q.device)
+    max_logits = torch.full(
+        (num_tokens, num_heads_q), float("-inf"), dtype=torch.float32, device=q.device
+    )
+    softmax_lse = torch.full_like(max_logits, float("-inf"))
+
+    for token_idx in range(num_tokens):
+        for head_idx in range(num_heads_q):
+            kv_head_idx = min(head_idx // kv_group_num, num_heads_kv - 1)
+            head_indices = indices[token_idx, kv_head_idx]
+            valid_mask = (head_indices >= 0) & (head_indices < num_kv_tokens)
+            if not bool(valid_mask.any().item()):
+                continue
+
+            safe_indices = head_indices[valid_mask]
+            q_vec = q[token_idx, head_idx].to(torch.float32)
+            k_vec = kv[safe_indices, kv_head_idx, :dim_qk].to(torch.float32)
+            logits = torch.matmul(k_vec, q_vec) * sm_scale
+            weights = torch.softmax(logits, dim=0)
+            v_vec = kv[safe_indices, kv_head_idx, :d_v].to(torch.float32)
+            out[token_idx, head_idx].copy_(
+                torch.matmul(weights.to(v_vec.dtype), v_vec).to(out.dtype)
+            )
+            max_logits[token_idx, head_idx] = logits.max()
+            softmax_lse[token_idx, head_idx] = torch.logsumexp(logits, dim=0)
 
     return out, max_logits, softmax_lse

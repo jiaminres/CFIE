@@ -157,12 +157,15 @@ bool cutlass_scaled_mm_supports_block_fp8(int64_t cuda_device_capability) {
 bool cutlass_group_gemm_supported(int64_t cuda_device_capability) {
   // CUTLASS grouped FP8 kernels need at least CUDA 12.3 and SM90 (Hopper)
   // or CUDA 12.8 and SM100 (Blackwell)
+  // Note that `cutlass_moe_mm` is currently compiled only for the concrete
+  // SM90 / SM100 specializations below. The SM120 data-prep helpers are
+  // available, but the grouped GEMM entry itself is not wired yet.
 
 #if defined CUDA_VERSION
-  if (cuda_device_capability >= 100) {
+  if (cuda_device_capability >= 100 && cuda_device_capability < 110) {
     return CUDA_VERSION >= 12080;
   }
-  if (cuda_device_capability >= 90) {
+  if (cuda_device_capability >= 90 && cuda_device_capability < 100) {
     return CUDA_VERSION >= 12030;
   }
 #endif

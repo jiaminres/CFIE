@@ -7,11 +7,11 @@ from cfie.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.triton_utils.allocation import set_triton_allocator
 from cfie.utils.torch_utils import direct_register_custom_op
 
-from .utils import supports_pdl, supports_tma
+from .utils import iter_fused_moe_lora_assignments, supports_pdl, supports_tma
 
 
 @triton.jit
@@ -413,6 +413,40 @@ def _fused_moe_lora_kernel(
 
 
 @torch.inference_mode()
+def _fused_moe_lora_shrink_torch_fallback(
+    a_intermediate_cache1: torch.Tensor,
+    qcurr_hidden_states: torch.Tensor,
+    lora_a_stacked: list[torch.Tensor],
+    expert_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    num_tokens_post_padded: torch.Tensor | None,
+    token_lora_mapping: torch.Tensor,
+    top_k_num: int,
+    lora_ids: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    num_active_loras: torch.Tensor,
+) -> None:
+    for slice_idx, lora_a_weights in enumerate(lora_a_stacked):
+        for lora_id, token_idx, topk_idx, expert_id in iter_fused_moe_lora_assignments(
+            token_lora_mapping,
+            expert_ids,
+            top_k_num,
+            sorted_token_ids=sorted_token_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            lora_ids=lora_ids,
+            num_active_loras=num_active_loras,
+        ):
+            if adapter_enabled[lora_id].item() == 0:
+                continue
+            hidden_state = qcurr_hidden_states[token_idx].to(torch.float32)
+            lora_a = lora_a_weights[lora_id, expert_id].to(torch.float32)
+            shrink_out = torch.matmul(hidden_state, lora_a.transpose(0, 1)).to(
+                a_intermediate_cache1.dtype
+            )
+            a_intermediate_cache1[slice_idx, token_idx, topk_idx].copy_(shrink_out)
+
+
+@torch.inference_mode()
 def _fused_moe_lora_shrink(
     a_intermediate_cache1: torch.Tensor,
     # (num_slices, num_tokens, top_k_num, max_lora_rank)
@@ -476,6 +510,22 @@ def _fused_moe_lora_shrink(
         grid_lora_dim,
     )
 
+    if not HAS_TRITON:
+        _fused_moe_lora_shrink_torch_fallback(
+            a_intermediate_cache1,
+            qcurr_hidden_states,
+            lora_a_stacked,
+            expert_ids,
+            sorted_token_ids,
+            num_tokens_post_padded,
+            token_lora_mapping,
+            top_k_num,
+            lora_ids,
+            adapter_enabled,
+            num_active_loras,
+        )
+        return
+
     a_desc = None
     b_desc = None
     if use_tma and num_slices == 1:
@@ -527,6 +577,53 @@ def _fused_moe_lora_shrink(
         IS_PRIMARY=True,
         **shrink_config,
     )
+
+
+@torch.inference_mode()
+def _fused_moe_lora_expand_torch_fallback(
+    output: torch.Tensor,
+    a_intermediate_cache1: torch.Tensor,
+    lora_b_stacked: list[torch.Tensor],
+    topk_weights: torch.Tensor,
+    expert_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    num_tokens_post_padded: torch.Tensor | None,
+    token_lora_mapping: torch.Tensor,
+    top_k_num: int,
+    lora_ids: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    num_active_loras: torch.Tensor,
+    w1_output_dim_size: int,
+    num_slices: int,
+    offset: int,
+    mul_routed_weight: bool,
+) -> None:
+    out_view = output[:, :, offset : offset + num_slices * w1_output_dim_size]
+    for slice_idx, lora_b_weights in enumerate(lora_b_stacked):
+        slice_out = out_view[
+            :,
+            :,
+            slice_idx * w1_output_dim_size : (slice_idx + 1) * w1_output_dim_size,
+        ]
+        for lora_id, token_idx, topk_idx, expert_id in iter_fused_moe_lora_assignments(
+            token_lora_mapping,
+            expert_ids,
+            top_k_num,
+            sorted_token_ids=sorted_token_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            lora_ids=lora_ids,
+            num_active_loras=num_active_loras,
+        ):
+            if adapter_enabled[lora_id].item() == 0:
+                continue
+            intermediate = a_intermediate_cache1[slice_idx, token_idx, topk_idx].to(
+                torch.float32
+            )
+            lora_b = lora_b_weights[lora_id, expert_id].to(torch.float32)
+            expanded = torch.matmul(intermediate, lora_b.transpose(0, 1))
+            if mul_routed_weight:
+                expanded = expanded * topk_weights[token_idx, topk_idx].to(torch.float32)
+            slice_out[token_idx, topk_idx].add_(expanded.to(slice_out.dtype))
 
 
 @torch.inference_mode()
@@ -619,6 +716,27 @@ def _fused_moe_lora_expand(
             )
     else:
         b_desc = None
+
+    if not HAS_TRITON:
+        _fused_moe_lora_expand_torch_fallback(
+            output,
+            a_intermediate_cache1.view(num_slices, M, top_k_num, -1),
+            lora_b_stacked,
+            topk_weights,
+            expert_ids,
+            sorted_token_ids,
+            num_tokens_post_padded,
+            token_lora_mapping,
+            top_k_num,
+            lora_ids,
+            adapter_enabled,
+            num_active_loras,
+            w1_output_dim_size,
+            num_slices,
+            offset,
+            mul_routed_weight,
+        )
+        return
 
     _fused_moe_lora_kernel[grid](
         a_intermediate_cache1,
@@ -742,7 +860,7 @@ def _fused_moe_lora(
 
     # TMA is not currently compatiple with fully_sharded due to the non-determinism
     # of token id sorting across ranks.
-    use_tma = supports_tma(device) and not fully_sharded
+    use_tma = HAS_TRITON and supports_tma(device) and not fully_sharded
 
     intermediate_cache_shape = (
         num_slices,
@@ -772,7 +890,7 @@ def _fused_moe_lora(
         device=device,
     )
 
-    use_gdc = supports_pdl(device) and not fully_sharded
+    use_gdc = HAS_TRITON and supports_pdl(device) and not fully_sharded
     _fused_moe_lora_shrink(
         a_intermediate_cache1,
         qcurr_hidden_states,

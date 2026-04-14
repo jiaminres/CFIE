@@ -222,6 +222,61 @@ input_batch_expand_idx_mapping_precompiled(const torch::Tensor& idx_mapping,
                                            int64_t total_num_logits,
                                            const torch::Tensor& cu_num_logits);
 
+void eagle_step_update_slot_mapping_and_metadata_precompiled(
+    const torch::Tensor& positions_1d, const torch::Tensor& block_table_tensor,
+    torch::Tensor& seq_lens, int64_t block_size, int64_t max_model_len,
+    torch::Tensor& out_clamped_positions, torch::Tensor& out_slot_mapping,
+    int64_t input_batch_size);
+
+void eagle_prepare_inputs_padded_precompiled(
+    const torch::Tensor& cu_num_draft_tokens,
+    const torch::Tensor& valid_sampled_tokens_count,
+    const torch::Tensor& query_start_loc_gpu,
+    torch::Tensor& token_indices_to_sample,
+    torch::Tensor& num_rejected_tokens_gpu);
+
+void eagle_prepare_next_token_padded_precompiled(
+    const torch::Tensor& sampled_token_ids,
+    const torch::Tensor& discard_request_mask,
+    const torch::Tensor& backup_next_token_ids, torch::Tensor& next_token_ids,
+    torch::Tensor& valid_sampled_tokens_count, int64_t vocab_size);
+
+void copy_and_expand_eagle_inputs_precompiled(
+    const torch::Tensor& target_token_ids,
+    const torch::Tensor& target_positions, const torch::Tensor& next_token_ids,
+    torch::Tensor& out_input_ids, torch::Tensor& out_positions,
+    torch::Tensor& out_is_rejected_token_mask,
+    torch::Tensor& out_is_masked_token_mask,
+    torch::Tensor& out_new_token_indices,
+    torch::Tensor& out_hidden_state_mapping,
+    const torch::Tensor& query_start_loc, const torch::Tensor& query_end_loc,
+    int64_t padding_token_id, int64_t parallel_drafting_token_id,
+    int64_t total_input_tokens, int64_t num_padding_slots_per_request,
+    bool shift_input_ids);
+
+void prepare_eagle_inputs_precompiled(
+    torch::Tensor& last_token_indices, torch::Tensor& eagle_input_ids,
+    torch::Tensor& eagle_positions, const torch::Tensor& target_input_ids,
+    const torch::Tensor& target_positions, const torch::Tensor& idx_mapping,
+    const torch::Tensor& last_sampled,
+    const torch::Tensor& next_prefill_tokens, const torch::Tensor& num_sampled,
+    const torch::Tensor& num_rejected, const torch::Tensor& query_start_loc);
+
+void prepare_eagle_decode_precompiled(
+    const torch::Tensor& draft_tokens, const torch::Tensor& output_hidden_states,
+    const torch::Tensor& last_token_indices,
+    const torch::Tensor& target_seq_lens, const torch::Tensor& num_rejected,
+    torch::Tensor& input_ids, torch::Tensor& positions,
+    torch::Tensor& query_start_loc, torch::Tensor& seq_lens,
+    torch::Tensor& input_hidden_states, int64_t max_model_len,
+    int64_t max_num_reqs);
+
+void update_eagle_inputs_precompiled(
+    const torch::Tensor& draft_tokens, const torch::Tensor& output_hidden_states,
+    torch::Tensor& input_ids, torch::Tensor& positions,
+    torch::Tensor& seq_lens, torch::Tensor& hidden_states,
+    int64_t max_model_len);
+
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,
                                torch::Tensor& weight, torch::Tensor& scale,
                                double epsilon);
@@ -360,6 +415,14 @@ torch::Tensor causal_conv1d_update_precompiled(
     const std::optional<torch::Tensor>& block_idx_last_scheduled_token,
     const std::optional<torch::Tensor>& initial_state_idx);
 
+torch::Tensor count_expert_num_tokens_precompiled(
+    const torch::Tensor& topk_ids, int64_t num_local_experts,
+    const std::optional<torch::Tensor>& expert_map);
+
+torch::Tensor zero_experts_compute_identity_precompiled(
+    torch::Tensor& expert_indices, torch::Tensor& expert_scales,
+    int64_t num_experts, const torch::Tensor& hidden_states);
+
 void zero_kv_blocks_precompiled(const torch::Tensor& block_ids,
                                 c10::List<torch::Tensor> kv_tensors,
                                 c10::List<int64_t> block_dims,
@@ -387,6 +450,13 @@ void moe_batch_load_gptq_runtime_precompiled(
     const std::optional<torch::Tensor>& w13_g_idx_sort_indices_dst,
     const std::optional<torch::Tensor>& w2_g_idx_sort_indices_dst);
 
+void moe_batched_mm_precompiled(
+    const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& C,
+    const torch::Tensor& expert_num_tokens,
+    const std::optional<torch::Tensor>& A_scale,
+    const std::optional<torch::Tensor>& B_scale, bool use_fp8_w8a8,
+    bool per_act_token_quant);
+
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
@@ -413,6 +483,8 @@ void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void fatrelu_and_mul(torch::Tensor& out, torch::Tensor& input,
                      double threshold);
+void swiglustep_and_mul(torch::Tensor& out, torch::Tensor& input,
+                        double limit = 7.0);
 void swigluoai_and_mul(torch::Tensor& out, torch::Tensor& input,
                        double alpha = 1.702, double limit = 7.0);
 

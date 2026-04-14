@@ -131,6 +131,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("fatrelu_and_mul(Tensor! out, Tensor input, float threshold) -> ()");
   ops.impl("fatrelu_and_mul", torch::kCUDA, &fatrelu_and_mul);
 
+  ops.def("swiglustep_and_mul(Tensor! out, Tensor input, float limit=7.0) -> ()");
+  ops.impl("swiglustep_and_mul", torch::kCUDA, &swiglustep_and_mul);
+
   ops.def(
       "swigluoai_and_mul(Tensor! out, Tensor input, float alpha=1.702, float "
       "limit=7.0) "
@@ -318,6 +321,68 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("input_batch_expand_idx_mapping_precompiled", torch::kCUDA,
            &input_batch_expand_idx_mapping_precompiled);
 
+  ops.def("eagle_step_update_slot_mapping_and_metadata_precompiled("
+          "Tensor positions_1d, Tensor block_table_tensor, "
+          "Tensor! seq_lens, int block_size, int max_model_len, "
+          "Tensor! out_clamped_positions, Tensor! out_slot_mapping, "
+          "int input_batch_size) -> ()");
+  ops.impl("eagle_step_update_slot_mapping_and_metadata_precompiled",
+           torch::kCUDA,
+           &eagle_step_update_slot_mapping_and_metadata_precompiled);
+
+  ops.def("eagle_prepare_inputs_padded_precompiled("
+          "Tensor cu_num_draft_tokens, Tensor valid_sampled_tokens_count, "
+          "Tensor query_start_loc_gpu, Tensor! token_indices_to_sample, "
+          "Tensor! num_rejected_tokens_gpu) -> ()");
+  ops.impl("eagle_prepare_inputs_padded_precompiled", torch::kCUDA,
+           &eagle_prepare_inputs_padded_precompiled);
+
+  ops.def("eagle_prepare_next_token_padded_precompiled("
+          "Tensor sampled_token_ids, Tensor discard_request_mask, "
+          "Tensor backup_next_token_ids, Tensor! next_token_ids, "
+          "Tensor! valid_sampled_tokens_count, int vocab_size) -> ()");
+  ops.impl("eagle_prepare_next_token_padded_precompiled", torch::kCUDA,
+           &eagle_prepare_next_token_padded_precompiled);
+
+  ops.def("copy_and_expand_eagle_inputs_precompiled("
+          "Tensor target_token_ids, Tensor target_positions, "
+          "Tensor next_token_ids, Tensor! out_input_ids, "
+          "Tensor! out_positions, Tensor! out_is_rejected_token_mask, "
+          "Tensor! out_is_masked_token_mask, Tensor! out_new_token_indices, "
+          "Tensor! out_hidden_state_mapping, Tensor query_start_loc, "
+          "Tensor query_end_loc, int padding_token_id, "
+          "int parallel_drafting_token_id, int total_input_tokens, "
+          "int num_padding_slots_per_request, bool shift_input_ids) -> ()");
+  ops.impl("copy_and_expand_eagle_inputs_precompiled", torch::kCUDA,
+           &copy_and_expand_eagle_inputs_precompiled);
+
+  ops.def("prepare_eagle_inputs_precompiled("
+          "Tensor! last_token_indices, Tensor! eagle_input_ids, "
+          "Tensor! eagle_positions, Tensor target_input_ids, "
+          "Tensor target_positions, Tensor idx_mapping, "
+          "Tensor last_sampled, Tensor next_prefill_tokens, "
+          "Tensor num_sampled, Tensor num_rejected, "
+          "Tensor query_start_loc) -> ()");
+  ops.impl("prepare_eagle_inputs_precompiled", torch::kCUDA,
+           &prepare_eagle_inputs_precompiled);
+
+  ops.def("prepare_eagle_decode_precompiled("
+          "Tensor draft_tokens, Tensor output_hidden_states, "
+          "Tensor last_token_indices, Tensor target_seq_lens, "
+          "Tensor num_rejected, Tensor! input_ids, Tensor! positions, "
+          "Tensor! query_start_loc, Tensor! seq_lens, "
+          "Tensor! input_hidden_states, int max_model_len, "
+          "int max_num_reqs) -> ()");
+  ops.impl("prepare_eagle_decode_precompiled", torch::kCUDA,
+           &prepare_eagle_decode_precompiled);
+
+  ops.def("update_eagle_inputs_precompiled("
+          "Tensor draft_tokens, Tensor output_hidden_states, "
+          "Tensor! input_ids, Tensor! positions, Tensor! seq_lens, "
+          "Tensor! hidden_states, int max_model_len) -> ()");
+  ops.impl("update_eagle_inputs_precompiled", torch::kCUDA,
+           &update_eagle_inputs_precompiled);
+
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(
@@ -484,6 +549,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &causal_conv1d_update_precompiled);
 
   ops.def(
+      "count_expert_num_tokens_precompiled("
+      "    Tensor topk_ids, int num_local_experts, Tensor? expert_map) -> Tensor");
+  ops.impl("count_expert_num_tokens_precompiled", torch::kCUDA,
+           &count_expert_num_tokens_precompiled);
+
+  ops.def(
+      "zero_experts_compute_identity_precompiled("
+      "    Tensor(a!) expert_indices, Tensor(b!) expert_scales,"
+      "    int num_experts, Tensor hidden_states) -> Tensor");
+  ops.impl("zero_experts_compute_identity_precompiled", torch::kCUDA,
+           &zero_experts_compute_identity_precompiled);
+
+  ops.def(
       "zero_kv_blocks_precompiled("
       "    Tensor block_ids, Tensor[] kv_tensors, int[] block_dims,"
       "    int[] ratios) -> ()");
@@ -513,6 +591,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor!? w2_g_idx_sort_indices_dst) -> ()");
   ops.impl("moe_batch_load_gptq_runtime_precompiled", torch::kCUDA,
            &moe_batch_load_gptq_runtime_precompiled);
+
+  ops.def(
+      "moe_batched_mm_precompiled("
+      "    Tensor A, Tensor B, Tensor! C, Tensor expert_num_tokens,"
+      "    Tensor? A_scale, Tensor? B_scale, bool use_fp8_w8a8,"
+      "    bool per_act_token_quant) -> ()");
+  ops.impl("moe_batched_mm_precompiled", torch::kCUDA,
+           &moe_batched_mm_precompiled);
 
   // Quantization ops
 #ifndef USE_ROCM

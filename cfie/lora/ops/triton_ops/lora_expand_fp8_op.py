@@ -13,8 +13,12 @@ from cfie.lora.ops.triton_ops.fp8_kernel_utils import do_expand_kernel_fp8
 from cfie.lora.ops.triton_ops.utils import (
     _get_lora_b_ptr,
     get_lora_op_configs,
+    iter_lora_token_indices,
+    materialize_lora_token_scales,
+    materialize_lora_weight_scales,
+    normalize_lora_weight_dims,
 )
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.torch_utils import direct_register_custom_op
 
 _EXPAND_LORA_SCALE_PTR_DICT: dict[tuple[int, ...], torch.tensor] = {}
@@ -172,6 +176,76 @@ def _lora_expand_kernel_fp8(
 
 
 @torch.inference_mode()
+def _lora_expand_fp8_torch_fallback(
+    inputs: torch.Tensor,
+    lora_b_weights: list[torch.Tensor],
+    output_tensor: torch.Tensor,
+    token_indices_sorted_by_lora_ids: torch.Tensor,
+    num_tokens_per_lora: torch.Tensor,
+    lora_token_start_loc: torch.Tensor,
+    lora_ids: torch.Tensor,
+    num_active_loras: int,
+    b_scale: list[torch.Tensor] | None,
+    a_scale: torch.Tensor | None,
+    offset_start: int,
+    add_inputs: bool,
+    group_k: int,
+    group_n: int,
+    use_fp8_w8a8: bool,
+    per_channel_quant: bool,
+) -> None:
+    current_offset = offset_start
+
+    for slice_idx, lora_b_weight in enumerate(lora_b_weights):
+        lora_b_weight = normalize_lora_weight_dims(lora_b_weight)
+        slice_weight_scale = b_scale[slice_idx] if b_scale is not None else None
+        hidden_size = lora_b_weight.size(1)
+        slice_input = inputs[slice_idx]
+        slice_output = output_tensor[:, current_offset : current_offset + hidden_size]
+        current_offset += hidden_size
+
+        for lora_id, token_indices in iter_lora_token_indices(
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            num_active_loras,
+        ):
+            token_indices = token_indices.to(device=slice_input.device, dtype=torch.long)
+            selected_inputs = slice_input.index_select(0, token_indices).to(torch.float32)
+            selected_weights = lora_b_weight[lora_id].to(torch.float32)
+
+            if use_fp8_w8a8:
+                input_scale = materialize_lora_token_scales(
+                    a_scale,
+                    token_indices,
+                    selected_inputs.size(1),
+                    group_k=group_k,
+                ).to(device=selected_inputs.device, dtype=torch.float32)
+                weight_scale = materialize_lora_weight_scales(
+                    slice_weight_scale,
+                    lora_id,
+                    selected_weights.size(0),
+                    selected_weights.size(1),
+                    group_n=group_n,
+                    group_k=group_k,
+                    per_channel_quant=per_channel_quant,
+                ).to(device=selected_weights.device, dtype=torch.float32)
+                selected_inputs = selected_inputs * input_scale
+                selected_weights = selected_weights * weight_scale
+
+            expanded = torch.matmul(
+                selected_inputs,
+                selected_weights.transpose(0, 1),
+            ).to(slice_output.dtype)
+
+            if add_inputs:
+                expanded = expanded + slice_output.index_select(0, token_indices)
+
+            slice_output.index_copy_(0, token_indices, expanded)
+
+
+@torch.inference_mode()
 def _lora_expand_fp8(
     inputs: torch.Tensor,  # shape [num_slices, num_tokens, lora_rank]
     lora_b_weights: list[torch.Tensor],  # FP8 [num_lora, hidden_size, lora_rank]
@@ -245,6 +319,27 @@ def _lora_expand_fp8(
     assert token_lora_mapping.size(0) == token_indices_sorted_by_lora_ids.size(0)
     assert lora_ids.size(0) == num_tokens_per_lora.size(0)
     assert lora_token_start_loc.size(0) == lora_ids.size(0) + 1
+
+    if not HAS_TRITON:
+        _lora_expand_fp8_torch_fallback(
+            inputs,
+            lora_b_weights,
+            output_tensor,
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            num_active_loras,
+            b_scale,
+            a_scale,
+            offset_start,
+            add_inputs,
+            group_k,
+            group_n,
+            use_fp8_w8a8,
+            per_channel_quant,
+        )
+        return
 
     (
         slice_start_tensor,

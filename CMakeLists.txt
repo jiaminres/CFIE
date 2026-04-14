@@ -1028,8 +1028,10 @@ define_extension_target(
 if(WIN32)
   target_compile_options(_C PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/FI${CFIE_WINDOWS_FORCE_INCLUDE_HEADER}>
+    $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
     $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CFIE_WINDOWS_FORCE_INCLUDE_HEADER_CMAKE}>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
   target_compile_definitions(_C PRIVATE
     CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING=1)
@@ -1222,8 +1224,10 @@ define_extension_target(
 if(WIN32)
   target_compile_options(_moe_C PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/FI${CFIE_WINDOWS_FORCE_INCLUDE_HEADER}>
+    $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
     $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CFIE_WINDOWS_FORCE_INCLUDE_HEADER_CMAKE}>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
   target_compile_definitions(_moe_C PRIVATE
     CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING=1)

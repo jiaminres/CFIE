@@ -36,7 +36,41 @@ from cfie.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from cfie.model_executor.layers.fused_moe.zero_expert_fused_moe import (
     ZeroExpertFusedMoE,
 )
-from cfie.triton_utils import HAS_TRITON
+from cfie.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
+    BatchedDeepGemmExperts,
+)
+from cfie.model_executor.layers.fused_moe.cutlass_moe import (
+    CutlassBatchedExpertsFp8,
+    CutlassExpertsFp8,
+    CutlassExpertsW4A8Fp8,
+    cutlass_moe_w4a8_fp8,
+)
+from cfie.model_executor.layers.fused_moe.deep_gemm_moe import DeepGemmExperts
+from cfie.model_executor.layers.fused_moe.fused_batched_moe import (
+    BatchedTritonExperts,
+)
+from cfie.model_executor.layers.fused_moe.fused_moe import (
+    TritonExperts,
+    TritonWNA16Experts,
+    fused_experts,
+    get_config_file_name,
+)
+from cfie.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+    AiterExperts,
+)
+from cfie.model_executor.layers.fused_moe.router.fused_topk_router import (
+    fused_topk,
+)
+from cfie.model_executor.layers.fused_moe.router.grouped_topk_router import (
+    GroupedTopk,
+)
+from cfie.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
+    TritonOrDeepGemmExperts,
+)
+from cfie.model_executor.layers.fused_moe.xpu_fused_moe import (
+    XPUExperts,
+    XPUExpertsFp8,
+)
 
 _config: dict[str, Any] | None = None
 
@@ -74,69 +108,22 @@ __all__ = [
     "override_config",
     "get_config",
 ]
-
-if HAS_TRITON:
-    # import to register the custom ops
-    from cfie.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
-        BatchedDeepGemmExperts,
-    )
-    from cfie.model_executor.layers.fused_moe.cutlass_moe import (
-        CutlassBatchedExpertsFp8,
-        CutlassExpertsFp8,
-        CutlassExpertsW4A8Fp8,
-        cutlass_moe_w4a8_fp8,
-    )
-    from cfie.model_executor.layers.fused_moe.deep_gemm_moe import DeepGemmExperts
-    from cfie.model_executor.layers.fused_moe.fused_batched_moe import (
-        BatchedTritonExperts,
-    )
-    from cfie.model_executor.layers.fused_moe.fused_moe import (
-        TritonExperts,
-        TritonWNA16Experts,
-        fused_experts,
-        get_config_file_name,
-    )
-    from cfie.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-        AiterExperts,
-    )
-    from cfie.model_executor.layers.fused_moe.router.fused_topk_router import (
-        fused_topk,
-    )
-    from cfie.model_executor.layers.fused_moe.router.grouped_topk_router import (
-        GroupedTopk,
-    )
-    from cfie.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
-        TritonOrDeepGemmExperts,
-    )
-    from cfie.model_executor.layers.fused_moe.xpu_fused_moe import (
-        XPUExperts,
-        XPUExpertsFp8,
-    )
-
-    __all__ += [
-        "AiterExperts",
-        "fused_topk",
-        "fused_experts",
-        "get_config_file_name",
-        "GroupedTopk",
-        "cutlass_moe_w4a8_fp8",
-        "CutlassExpertsFp8",
-        "CutlassBatchedExpertsFp8",
-        "CutlassExpertsW4A8Fp8",
-        "TritonExperts",
-        "TritonWNA16Experts",
-        "BatchedTritonExperts",
-        "DeepGemmExperts",
-        "BatchedDeepGemmExperts",
-        "TritonOrDeepGemmExperts",
-        "XPUExperts",
-        "XPUExpertsFp8",
-    ]
-else:
-    # Some model classes directly use the custom ops. Add placeholders
-    # to avoid import errors.
-    def _raise_exception(method: str):
-        raise NotImplementedError(f"{method} is not implemented as lack of triton.")
-
-    fused_topk = lambda *args, **kwargs: _raise_exception("fused_topk")
-    fused_experts = lambda *args, **kwargs: _raise_exception("fused_experts")
+__all__ += [
+    "AiterExperts",
+    "fused_topk",
+    "fused_experts",
+    "get_config_file_name",
+    "GroupedTopk",
+    "cutlass_moe_w4a8_fp8",
+    "CutlassExpertsFp8",
+    "CutlassBatchedExpertsFp8",
+    "CutlassExpertsW4A8Fp8",
+    "TritonExperts",
+    "TritonWNA16Experts",
+    "BatchedTritonExperts",
+    "DeepGemmExperts",
+    "BatchedDeepGemmExperts",
+    "TritonOrDeepGemmExperts",
+    "XPUExperts",
+    "XPUExpertsFp8",
+]

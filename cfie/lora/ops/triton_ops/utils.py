@@ -30,16 +30,26 @@ def normalize_lora_weight_dims(lora_weight: torch.Tensor) -> torch.Tensor:
     return lora_weight
 
 
+def normalize_lora_scale_dims(lora_scale: torch.Tensor) -> torch.Tensor:
+    if lora_scale.ndim == 4:
+        assert lora_scale.size(1) == 1
+        return lora_scale.squeeze(dim=1)
+    return lora_scale
+
+
 def iter_lora_token_indices(
     token_indices_sorted_by_lora_ids: torch.Tensor,
     num_tokens_per_lora: torch.Tensor,
     lora_token_start_loc: torch.Tensor,
     lora_ids: torch.Tensor,
-    num_active_loras: torch.Tensor | None = None,
+    num_active_loras: torch.Tensor | int | None = None,
 ):
-    active_loras = (
-        int(num_active_loras.item()) if num_active_loras is not None else lora_ids.size(0)
-    )
+    if isinstance(num_active_loras, int):
+        active_loras = num_active_loras
+    elif num_active_loras is not None:
+        active_loras = int(num_active_loras.item())
+    else:
+        active_loras = lora_ids.size(0)
     active_loras = min(active_loras, lora_ids.size(0))
 
     for lora_idx in range(active_loras):
@@ -53,6 +63,170 @@ def iter_lora_token_indices(
             continue
 
         yield lora_id, token_indices_sorted_by_lora_ids.narrow(0, start, token_count)
+
+
+def iter_fused_moe_lora_assignments(
+    token_lora_mapping: torch.Tensor,
+    expert_ids: torch.Tensor,
+    top_k_num: int,
+    *,
+    sorted_token_ids: torch.Tensor | None = None,
+    num_tokens_post_padded: torch.Tensor | None = None,
+    lora_ids: torch.Tensor | None = None,
+    num_active_loras: torch.Tensor | int | None = None,
+):
+    if sorted_token_ids is None:
+        flat_expert_ids = expert_ids.reshape(-1)
+        total_assignments = flat_expert_ids.numel()
+        for flat_idx in range(total_assignments):
+            token_idx = flat_idx // top_k_num
+            if token_idx >= token_lora_mapping.size(0):
+                break
+            expert_id = int(flat_expert_ids[flat_idx].item())
+            if expert_id < 0:
+                continue
+            lora_id = int(token_lora_mapping[token_idx].item())
+            if lora_id < 0:
+                continue
+            yield lora_id, token_idx, flat_idx % top_k_num, expert_id
+        return
+
+    assert lora_ids is not None
+    active_loras = (
+        num_active_loras
+        if isinstance(num_active_loras, int)
+        else int(num_active_loras.item()) if num_active_loras is not None else lora_ids.size(0)
+    )
+    active_loras = min(active_loras, lora_ids.size(0), sorted_token_ids.size(0))
+    max_token_slots = token_lora_mapping.size(0) * top_k_num
+
+    for lora_slot in range(active_loras):
+        lora_id = int(lora_ids[lora_slot].item())
+        if lora_id < 0:
+            continue
+        padded_count = (
+            int(num_tokens_post_padded[lora_slot].item())
+            if num_tokens_post_padded is not None
+            else sorted_token_ids.size(1)
+        )
+        padded_count = min(padded_count, sorted_token_ids.size(1), expert_ids.size(1))
+        for col_idx in range(padded_count):
+            flat_idx = int(sorted_token_ids[lora_slot, col_idx].item())
+            expert_id = int(expert_ids[lora_slot, col_idx].item())
+            if flat_idx < 0 or flat_idx >= max_token_slots or expert_id < 0:
+                continue
+            token_idx = flat_idx // top_k_num
+            yield lora_id, token_idx, flat_idx % top_k_num, expert_id
+
+
+def materialize_lora_token_scales(
+    a_scale: torch.Tensor | None,
+    token_indices: torch.Tensor,
+    width: int,
+    *,
+    group_k: int = 0,
+) -> torch.Tensor:
+    if a_scale is None:
+        return torch.ones((token_indices.numel(), width), dtype=torch.float32)
+
+    scale = normalize_lora_scale_dims(a_scale).to(torch.float32)
+    if scale.ndim == 0 or scale.numel() == 1:
+        return scale.reshape(1, 1).expand(token_indices.numel(), width)
+
+    select_indices = token_indices.to(device=scale.device, dtype=torch.long)
+    if scale.ndim == 1:
+        selected = (
+            scale.index_select(0, select_indices)
+            if scale.size(0) > int(select_indices.max().item())
+            else scale
+        )
+        if selected.numel() == 1:
+            return selected.reshape(1, 1).expand(token_indices.numel(), width)
+        return selected.reshape(-1, 1).expand(-1, width)
+
+    selected = (
+        scale.index_select(0, select_indices)
+        if scale.size(0) > int(select_indices.max().item())
+        else scale
+    )
+    if selected.ndim == 1:
+        return selected.reshape(-1, 1).expand(-1, width)
+    if group_k > 0:
+        k_groups = torch.div(
+            torch.arange(width, device=selected.device),
+            group_k,
+            rounding_mode="floor",
+        ).clamp_max(selected.size(1) - 1)
+        return selected.index_select(1, k_groups)
+    if selected.size(1) == 1:
+        return selected.expand(-1, width)
+    if selected.size(1) >= width:
+        return selected[:, :width]
+    return selected[:, -1:].expand(-1, width)
+
+
+def materialize_lora_weight_scales(
+    weight_scale: torch.Tensor | None,
+    lora_id: int,
+    output_width: int,
+    input_width: int,
+    *,
+    group_n: int = 0,
+    group_k: int = 0,
+    per_channel_quant: bool = False,
+) -> torch.Tensor:
+    if weight_scale is None:
+        return torch.ones((output_width, input_width), dtype=torch.float32)
+
+    scale = normalize_lora_scale_dims(weight_scale).to(torch.float32)
+    if scale.ndim > 0 and scale.size(0) > lora_id:
+        scale = scale[lora_id]
+
+    if scale.ndim == 0 or scale.numel() == 1:
+        return scale.reshape(1, 1).expand(output_width, input_width)
+
+    if group_k > 0 and group_n > 0:
+        if scale.ndim == 1:
+            if scale.numel() == (output_width + group_n - 1) // group_n:
+                n_groups = torch.div(
+                    torch.arange(output_width, device=scale.device),
+                    group_n,
+                    rounding_mode="floor",
+                ).clamp_max(scale.numel() - 1)
+                return scale.index_select(0, n_groups).reshape(-1, 1).expand(
+                    -1, input_width
+                )
+            if scale.numel() == (input_width + group_k - 1) // group_k:
+                k_groups = torch.div(
+                    torch.arange(input_width, device=scale.device),
+                    group_k,
+                    rounding_mode="floor",
+                ).clamp_max(scale.numel() - 1)
+                return scale.index_select(0, k_groups).reshape(1, -1).expand(
+                    output_width, -1
+                )
+        if scale.ndim == 1:
+            scale = scale.reshape(-1, 1)
+        n_groups = torch.div(
+            torch.arange(output_width, device=scale.device),
+            group_n,
+            rounding_mode="floor",
+        ).clamp_max(scale.size(0) - 1)
+        k_groups = torch.div(
+            torch.arange(input_width, device=scale.device),
+            group_k,
+            rounding_mode="floor",
+        ).clamp_max(scale.size(1) - 1)
+        return scale.index_select(0, n_groups).index_select(1, k_groups)
+
+    if per_channel_quant or (scale.ndim == 1 and scale.numel() >= output_width):
+        scale_vec = scale.reshape(-1)
+        n_groups = torch.arange(output_width, device=scale.device).clamp_max(
+            scale_vec.numel() - 1
+        )
+        return scale_vec.index_select(0, n_groups).reshape(-1, 1).expand(-1, input_width)
+
+    return scale.reshape(1, 1).expand(output_width, input_width)
 
 
 def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):

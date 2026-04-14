@@ -114,6 +114,17 @@ def count_expert_num_tokens(
     """
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
     if not HAS_TRITON:
+        if topk_ids.is_cuda and ops.has_precompiled_count_expert_num_tokens() and (
+            expert_map is None or expert_map.is_cuda
+        ):
+            logger.info_once(
+                "Fused MoE count_expert_num_tokens is falling back to "
+                "`_C.count_expert_num_tokens_precompiled` because Triton "
+                "runtime is unavailable."
+            )
+            return ops.count_expert_num_tokens_precompiled(
+                topk_ids, num_local_experts, expert_map
+            )
         logger.warning_once(
             "Fused MoE count_expert_num_tokens is falling back to the "
             "PyTorch reference path because Triton runtime is unavailable."

@@ -13,6 +13,7 @@ from cfie.config.model import LogprobsMode
 from cfie.logger import init_logger
 from cfie.platforms import CpuArchEnum, current_platform
 from cfie.triton_utils import HAS_TRITON
+from cfie.utils.runtime_fallback_trace import record as record_runtime_fallback
 
 if HAS_TRITON:
     from cfie.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
@@ -250,13 +251,16 @@ def apply_top_k_top_p(
         return logits
 
     if HAS_TRITON and logits.shape[0] >= 8:
+        record_runtime_fallback("sample.topk_topp", "triton")
         return apply_top_k_top_p_triton(logits, k, p)
 
     if logits.is_cuda and ops.has_precompiled_apply_top_k_top_p():
+        record_runtime_fallback("sample.topk_topp", "precompiled")
         ops.apply_top_k_top_p_precompiled(logits, k, p)
         return logits
 
     # Use pytorch sort implementation for small batch sizes.
+    record_runtime_fallback("sample.topk_topp", "pytorch")
     return apply_top_k_top_p_pytorch(logits, k, p)
 
 

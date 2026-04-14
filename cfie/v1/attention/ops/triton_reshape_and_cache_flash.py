@@ -6,6 +6,7 @@ import torch
 from cfie import _custom_ops as ops
 from cfie.platforms import current_platform
 from cfie.triton_utils import HAS_TRITON, tl, triton
+from cfie.utils.runtime_fallback_trace import record as record_runtime_fallback
 
 
 def _can_use_precompiled_flash_cache(
@@ -183,6 +184,7 @@ def triton_reshape_and_cache_flash(
     v_scale: torch.Tensor,  # float32
 ):
     if _can_use_precompiled_flash_cache(key_cache, value_cache):
+        record_runtime_fallback("attention.reshape_cache_flash", "precompiled_block")
         _reshape_and_cache_flash_via_precompiled(
             key,
             value,
@@ -195,6 +197,7 @@ def triton_reshape_and_cache_flash(
         )
         return
     if _can_use_precompiled_head_major_flash_cache(key_cache, value_cache):
+        record_runtime_fallback("attention.reshape_cache_flash", "precompiled_head_major")
         _reshape_and_cache_flash_head_major_via_precompiled(
             key,
             value,
@@ -207,6 +210,7 @@ def triton_reshape_and_cache_flash(
         )
         return
     if not HAS_TRITON:
+        record_runtime_fallback("attention.reshape_cache_flash", "triton_required")
         raise RuntimeError(
             "Triton is required for reshape_and_cache_flash with head-major KV "
             "cache layout."

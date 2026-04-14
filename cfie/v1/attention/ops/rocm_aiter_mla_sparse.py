@@ -7,7 +7,7 @@ import torch
 
 from cfie.forward_context import get_forward_context
 from cfie.platforms import current_platform
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from cfie.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 
@@ -88,6 +88,15 @@ def indexer_k_quant_and_cache_triton(
     block_tile_size=16,
     head_tile_size=16,
 ):
+    if not HAS_TRITON:
+        _indexer_k_quant_and_cache_reference(
+            k,
+            kv_cache,
+            slot_mapping,
+            scale_fmt,
+        )
+        return
+
     num_blocks = kv_cache.shape[0]
     head_dim = k.shape[-1]
     num_tokens = slot_mapping.shape[0]
@@ -115,6 +124,44 @@ def indexer_k_quant_and_cache_triton(
         IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
         USE_UE8M0=scale_fmt == "ue8m0",
     )
+
+
+def _indexer_k_quant_and_cache_reference(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    scale_fmt,
+) -> None:
+    num_blocks = kv_cache.shape[0]
+    head_dim = k.shape[-1]
+    block_size = kv_cache.shape[1]
+    kv_cache_flat = kv_cache.view(num_blocks, -1)
+    kv_cache_value = kv_cache_flat[:, : block_size * head_dim].view(
+        current_platform.fp8_dtype()
+    )
+    kv_cache_scale = kv_cache_flat[:, block_size * head_dim :].view(torch.float32)
+
+    for token_idx in range(slot_mapping.shape[0]):
+        slot_id = int(slot_mapping[token_idx].item())
+        if slot_id < 0:
+            continue
+        block_id = slot_id // block_size
+        block_offset = slot_id % block_size
+        value = k[token_idx].to(torch.float32)
+        amax = value.abs().max()
+        if current_platform.fp8_dtype() == torch.float8_e4m3fnuz:
+            scale = torch.maximum(amax, amax.new_tensor(1e-4)) / 224.0
+        else:
+            scale = torch.maximum(amax, amax.new_tensor(1e-4)) / 448.0
+        if scale_fmt == "ue8m0":
+            scale = torch.exp2(torch.ceil(torch.log2(scale)))
+
+        start = block_offset * head_dim
+        end = start + head_dim
+        kv_cache_value[block_id, start:end].copy_(
+            (value / scale).to(kv_cache_value.dtype)
+        )
+        kv_cache_scale[block_id, block_offset] = scale.to(kv_cache_scale.dtype)
 
 
 @triton.jit
@@ -186,6 +233,17 @@ def cp_gather_indexer_k_quant_cache_triton(
     block_tile_size: int = 16,
     head_tile_size: int = 16,
 ):
+    if not HAS_TRITON:
+        _cp_gather_indexer_k_quant_cache_reference(
+            k_cache,
+            k_fp8,
+            k_fp8_scale,
+            block_table,
+            cu_seqlen,
+            token_to_seq,
+        )
+        return
+
     num_tokens = k_fp8.size(0)
     block_size = k_cache.size(1)
     block_table_stride = block_table.stride(0)
@@ -215,6 +273,40 @@ def cp_gather_indexer_k_quant_cache_triton(
         block_tile_size,
         head_tile_size,
     )
+
+
+def _cp_gather_indexer_k_quant_cache_reference(
+    k_cache: torch.Tensor,
+    k_fp8: torch.Tensor,
+    k_fp8_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    token_to_seq: torch.Tensor,
+) -> None:
+    num_tokens = k_fp8.size(0)
+    block_size = k_cache.size(1)
+    head_dim = k_fp8.shape[-1]
+    num_blocks = k_cache.shape[0]
+    k_cache_flat = k_cache.view(num_blocks, -1)
+    fp8_dtype = current_platform.fp8_dtype()
+    k_cache_value = k_cache_flat[:, : block_size * head_dim].view(fp8_dtype)
+    k_cache_scale = k_cache_flat[:, block_size * head_dim :].view(torch.float32)
+    k_fp8_scale_view = k_fp8_scale.view(torch.float32)
+
+    for token_idx in range(num_tokens):
+        batch_id = int(token_to_seq[token_idx].item())
+        batch_start = int(cu_seqlen[batch_id].item())
+        batch_end = int(cu_seqlen[batch_id + 1].item())
+        if token_idx >= batch_end:
+            continue
+        batch_offset = token_idx - batch_start
+        block_table_id = batch_offset // block_size
+        block_offset = batch_offset % block_size
+        block_id = int(block_table[batch_id, block_table_id].item())
+        start = block_offset * head_dim
+        end = start + head_dim
+        k_fp8[token_idx].copy_(k_cache_value[block_id, start:end])
+        k_fp8_scale_view[token_idx] = k_cache_scale[block_id, block_offset]
 
 
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156

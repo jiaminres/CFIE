@@ -17,7 +17,7 @@ from cfie.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
 )
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.attention.backend import AttentionCGSupport, AttentionLayer, MultipleOf
 from cfie.v1.kv_cache_interface import AttentionSpec
 
@@ -153,13 +153,20 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.paged_kv_indices.fill_(-1)
-        _copy_page_indices_kernel[(num_reqs,)](
-            self.paged_kv_indices,
-            block_table_tensor,
-            block_table_tensor.stride(0),
-            paged_kv_indptr,
-            BLOCK_SIZE=1024,
-        )
+        if HAS_TRITON:
+            _copy_page_indices_kernel[(num_reqs,)](
+                self.paged_kv_indices,
+                block_table_tensor,
+                block_table_tensor.stride(0),
+                paged_kv_indptr,
+                BLOCK_SIZE=1024,
+            )
+        else:
+            _copy_page_indices_reference(
+                self.paged_kv_indices,
+                block_table_tensor,
+                paged_kv_indptr,
+            )
         paged_kv_indices = self.paged_kv_indices
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -225,6 +232,20 @@ def _copy_page_indices_kernel(
             block_ids,
             mask=i + offset < num_blocks,
         )
+
+
+def _copy_page_indices_reference(
+    page_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_num_blocks: torch.Tensor,
+) -> None:
+    num_reqs = cu_num_blocks.numel() - 1
+    for req_idx in range(num_reqs):
+        start_idx = int(cu_num_blocks[req_idx].item())
+        end_idx = int(cu_num_blocks[req_idx + 1].item())
+        num_blocks = end_idx - start_idx
+        if num_blocks > 0:
+            page_indices[start_idx:end_idx].copy_(block_table[req_idx, :num_blocks])
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):

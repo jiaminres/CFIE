@@ -5,6 +5,7 @@ import torch
 from cfie import _custom_ops as ops
 from cfie.distributed.parallel_state import GroupCoordinator
 from cfie.triton_utils import HAS_TRITON, tl, triton
+from cfie.utils.runtime_fallback_trace import record as record_runtime_fallback
 
 
 @triton.jit
@@ -242,6 +243,7 @@ def correct_attn_out(
         return out, lse
 
     if out.is_cuda and lses.is_cuda and ops.has_precompiled_correct_attn_out():
+        record_runtime_fallback("attention.common.correct_attn_out", "precompiled")
         lse = ops.correct_attn_out_precompiled(
             out,
             lses,
@@ -250,6 +252,7 @@ def correct_attn_out(
         )
         return out, lse
 
+    record_runtime_fallback("attention.common.correct_attn_out", "torch")
     return _correct_attn_out_torch(
         out,
         lses,
@@ -437,12 +440,14 @@ def pack_seq_triton(
             num_stages=2,
         )
     elif x_reshaped.is_cuda and ops.has_precompiled_pack_seq():
+        record_runtime_fallback("attention.common.pack_seq", "precompiled")
         out = ops.pack_seq_precompiled(
             x_reshaped,
             lengths.to(device=x_reshaped.device, dtype=torch.long),
             pad_value=float(pad_value),
         )
     else:
+        record_runtime_fallback("attention.common.pack_seq", "torch")
         out = _pack_seq_torch(x_reshaped, lengths, pad_value=float(pad_value))
 
     # Reshape output back to original dimensions (except first dimension)
@@ -545,11 +550,13 @@ def unpack_seq_triton(
             num_stages=2,
         )
     elif packed_reshaped.is_cuda and ops.has_precompiled_unpack_seq():
+        record_runtime_fallback("attention.common.unpack_seq", "precompiled")
         out = ops.unpack_seq_precompiled(
             packed_reshaped,
             lengths.to(device=packed_reshaped.device, dtype=torch.long),
         )
     else:
+        record_runtime_fallback("attention.common.unpack_seq", "torch")
         out = _unpack_seq_torch(packed_reshaped, lengths)
 
     # Reshape output back to original dimensions (except first dimension)

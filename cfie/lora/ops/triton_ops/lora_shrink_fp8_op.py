@@ -10,8 +10,16 @@ https://arxiv.org/abs/2310.18547
 import torch
 
 from cfie.lora.ops.triton_ops.fp8_kernel_utils import do_shrink_kernel_fp8
-from cfie.lora.ops.triton_ops.utils import _get_lora_a_ptr, get_lora_op_configs
-from cfie.triton_utils import tl, triton
+from cfie.lora.ops.triton_ops.utils import (
+    _get_lora_a_ptr,
+    get_lora_op_configs,
+    iter_lora_token_indices,
+    materialize_lora_token_scales,
+    materialize_lora_weight_scales,
+    normalize_lora_scale_dims,
+    normalize_lora_weight_dims,
+)
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.torch_utils import direct_register_custom_op
 
 _SHRINK_LORA_SCALE_PTR_DICT: dict[tuple[int, ...], tuple] = {}
@@ -46,9 +54,7 @@ def _get_shrink_lora_scale_ptr(
     scale_n_strides = []
     scale_k_strides = []
     for lora_scale_weight in lora_scale_weights:
-        if lora_scale_weight.ndim == 4:  # shape:(lora_num,1,size,rank)
-            assert lora_scale_weight.size(1) == 1
-            lora_scale_weight = lora_scale_weight.squeeze(dim=1)
+        lora_scale_weight = normalize_lora_scale_dims(lora_scale_weight)
         assert 1 <= lora_scale_weight.ndim <= 3
         assert lora_scale_weight.is_contiguous()
         tensor_ptrs.append(lora_scale_weight.data_ptr())
@@ -220,6 +226,69 @@ def _lora_shrink_kernel_fp8(
 
 
 @torch.inference_mode()
+def _lora_shrink_fp8_torch_fallback(
+    inputs: torch.Tensor,
+    lora_a_weights: list[torch.Tensor],
+    output_tensor: torch.Tensor,
+    token_indices_sorted_by_lora_ids: torch.Tensor,
+    num_tokens_per_lora: torch.Tensor,
+    lora_token_start_loc: torch.Tensor,
+    lora_ids: torch.Tensor,
+    num_active_loras: int,
+    scaling: float,
+    b_scale: list[torch.Tensor] | None,
+    a_scale: torch.Tensor | None,
+    group_k: int,
+    group_n: int,
+    use_fp8_w8a8: bool,
+    per_channel_quant: bool,
+) -> None:
+    for slice_idx, lora_a_weight in enumerate(lora_a_weights):
+        lora_a_weight = normalize_lora_weight_dims(lora_a_weight)
+        slice_weight_scale = b_scale[slice_idx] if b_scale is not None else None
+        slice_output = output_tensor[slice_idx]
+
+        for lora_id, token_indices in iter_lora_token_indices(
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            num_active_loras,
+        ):
+            token_indices = token_indices.to(device=inputs.device, dtype=torch.long)
+            selected_inputs = inputs.index_select(0, token_indices).to(torch.float32)
+            selected_weights = lora_a_weight[lora_id].to(torch.float32)
+
+            if use_fp8_w8a8:
+                input_scale = materialize_lora_token_scales(
+                    a_scale,
+                    token_indices,
+                    selected_inputs.size(1),
+                    group_k=group_k,
+                ).to(device=selected_inputs.device, dtype=torch.float32)
+                weight_scale = materialize_lora_weight_scales(
+                    slice_weight_scale,
+                    lora_id,
+                    selected_weights.size(0),
+                    selected_weights.size(1),
+                    group_n=group_n,
+                    group_k=group_k,
+                    per_channel_quant=per_channel_quant,
+                ).to(device=selected_weights.device, dtype=torch.float32)
+                selected_inputs = selected_inputs * input_scale
+                selected_weights = selected_weights * weight_scale
+
+            shrunken = (
+                torch.matmul(
+                    selected_inputs,
+                    selected_weights.transpose(0, 1),
+                )
+                * scaling
+            ).to(slice_output.dtype)
+            slice_output.index_copy_(0, token_indices, shrunken)
+
+
+@torch.inference_mode()
 def _lora_shrink_fp8(
     inputs: torch.Tensor,  # shape [num_tokens, hidden_size] - FP8 or FP16/BF16
     lora_a_weights: list[
@@ -276,6 +345,26 @@ def _lora_shrink_fp8(
     assert lora_token_start_loc.size(0) == lora_ids.size(0) + 1
 
     output_tensor.zero_()
+
+    if not HAS_TRITON:
+        _lora_shrink_fp8_torch_fallback(
+            inputs,
+            lora_a_weights,
+            output_tensor,
+            token_indices_sorted_by_lora_ids,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            lora_ids,
+            num_active_loras,
+            scaling,
+            b_scale,
+            a_scale,
+            group_k,
+            group_n,
+            use_fp8_w8a8,
+            per_channel_quant,
+        )
+        return
 
     # Get LoRA weight pointers
     (lora_ptr_tensor, lora_strides_d0, lora_strides_d1, lora_strides_d2) = (

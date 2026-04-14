@@ -5,11 +5,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from cfie import _custom_ops as ops
 from cfie.config import CfieConfig
 from cfie.config.compilation import CUDAGraphMode
 from cfie.forward_context import BatchDescriptor, set_forward_context
 from cfie.logger import init_logger
 from cfie.triton_utils import HAS_TRITON, tl, triton
+from cfie.utils.runtime_fallback_trace import record as record_runtime_fallback
 from cfie.v1.kv_cache_interface import KVCacheConfig
 from cfie.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -453,6 +455,41 @@ def prepare_eagle_inputs(
         device=num_sampled.device,
     )
     if not HAS_TRITON:
+        if (
+            ops.has_precompiled_prepare_eagle_inputs()
+            and all(
+                tensor.is_cuda
+                for tensor in (
+                    last_token_indices,
+                    input_buffers.input_ids,
+                    input_buffers.positions,
+                    input_batch.input_ids,
+                    input_batch.positions,
+                    input_batch.idx_mapping,
+                    last_sampled,
+                    next_prefill_tokens,
+                    num_sampled,
+                    num_rejected,
+                    input_batch.query_start_loc,
+                )
+            )
+        ):
+            record_runtime_fallback("spec_decode.eagle.prepare_inputs", "precompiled")
+            ops.prepare_eagle_inputs_precompiled(
+                last_token_indices,
+                input_buffers.input_ids,
+                input_buffers.positions,
+                input_batch.input_ids,
+                input_batch.positions,
+                input_batch.idx_mapping,
+                last_sampled,
+                next_prefill_tokens,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
+            return last_token_indices
+        record_runtime_fallback("spec_decode.eagle.prepare_inputs", "torch")
         logger.warning_once(
             "Eagle prepare_eagle_inputs is falling back to the PyTorch reference path because Triton runtime is unavailable."
         )
@@ -600,6 +637,41 @@ def prepare_eagle_decode(
     num_reqs = draft_tokens.shape[0]
     hidden_size = output_hidden_states.shape[-1]
     if not HAS_TRITON:
+        if (
+            ops.has_precompiled_prepare_eagle_decode()
+            and all(
+                tensor.is_cuda
+                for tensor in (
+                    draft_tokens,
+                    output_hidden_states,
+                    last_token_indices,
+                    target_seq_lens,
+                    num_rejected,
+                    input_buffers.input_ids,
+                    input_buffers.positions,
+                    input_buffers.query_start_loc,
+                    input_buffers.seq_lens,
+                    input_hidden_states,
+                )
+            )
+        ):
+            record_runtime_fallback("spec_decode.eagle.prepare_decode", "precompiled")
+            ops.prepare_eagle_decode_precompiled(
+                draft_tokens,
+                output_hidden_states,
+                last_token_indices,
+                target_seq_lens,
+                num_rejected,
+                input_buffers.input_ids,
+                input_buffers.positions,
+                input_buffers.query_start_loc,
+                input_buffers.seq_lens,
+                input_hidden_states,
+                max_model_len,
+                max_num_reqs,
+            )
+            return
+        record_runtime_fallback("spec_decode.eagle.prepare_decode", "torch")
         logger.warning_once(
             "Eagle prepare_eagle_decode is falling back to the PyTorch reference path because Triton runtime is unavailable."
         )
@@ -720,6 +792,32 @@ def update_eagle_inputs(
 ):
     num_reqs, hidden_size = output_hidden_states.shape
     if not HAS_TRITON:
+        if (
+            ops.has_precompiled_update_eagle_inputs()
+            and all(
+                tensor.is_cuda
+                for tensor in (
+                    draft_tokens,
+                    output_hidden_states,
+                    input_buffers.input_ids,
+                    input_buffers.positions,
+                    input_buffers.seq_lens,
+                    hidden_states,
+                )
+            )
+        ):
+            record_runtime_fallback("spec_decode.eagle.update_inputs", "precompiled")
+            ops.update_eagle_inputs_precompiled(
+                draft_tokens,
+                output_hidden_states,
+                input_buffers.input_ids,
+                input_buffers.positions,
+                input_buffers.seq_lens,
+                hidden_states,
+                max_model_len,
+            )
+            return
+        record_runtime_fallback("spec_decode.eagle.update_inputs", "torch")
         logger.warning_once(
             "Eagle update_eagle_inputs is falling back to the PyTorch reference path because Triton runtime is unavailable."
         )

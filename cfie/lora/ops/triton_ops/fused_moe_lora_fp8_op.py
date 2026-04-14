@@ -10,10 +10,10 @@ from cfie.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.utils.torch_utils import direct_register_custom_op
 
-from .utils import supports_pdl
+from .utils import iter_fused_moe_lora_assignments, materialize_lora_token_scales, supports_pdl
 
 
 @triton.jit
@@ -114,6 +114,65 @@ def _adjust_kernel_inputs(
         stride_el = expert_ids.stride(0)
         grid_lora_dim = num_active_loras
     return grid_lora_dim, stride_tl, stride_el
+
+
+def _materialize_selected_weight_scale(
+    scale: torch.Tensor,
+    output_width: int,
+    input_width: int,
+    *,
+    group_n: int = 0,
+    group_k: int = 0,
+    per_channel_quant: bool = False,
+) -> torch.Tensor:
+    scale = scale.to(torch.float32)
+    if scale.ndim == 0 or scale.numel() == 1:
+        return scale.reshape(1, 1).expand(output_width, input_width)
+
+    if group_n > 0 and group_k > 0:
+        if scale.ndim == 1:
+            if scale.numel() == (output_width + group_n - 1) // group_n:
+                n_groups = torch.div(
+                    torch.arange(output_width, device=scale.device),
+                    group_n,
+                    rounding_mode="floor",
+                ).clamp_max(scale.numel() - 1)
+                return scale.index_select(0, n_groups).reshape(-1, 1).expand(
+                    -1, input_width
+                )
+            if scale.numel() == (input_width + group_k - 1) // group_k:
+                k_groups = torch.div(
+                    torch.arange(input_width, device=scale.device),
+                    group_k,
+                    rounding_mode="floor",
+                ).clamp_max(scale.numel() - 1)
+                return scale.index_select(0, k_groups).reshape(1, -1).expand(
+                    output_width, -1
+                )
+        if scale.ndim == 1:
+            scale = scale.reshape(-1, 1)
+        n_groups = torch.div(
+            torch.arange(output_width, device=scale.device),
+            group_n,
+            rounding_mode="floor",
+        ).clamp_max(scale.size(0) - 1)
+        k_groups = torch.div(
+            torch.arange(input_width, device=scale.device),
+            group_k,
+            rounding_mode="floor",
+        ).clamp_max(scale.size(1) - 1)
+        return scale.index_select(0, n_groups).index_select(1, k_groups)
+
+    if per_channel_quant or (scale.ndim == 1 and scale.numel() >= output_width):
+        scale_vec = scale.reshape(-1)
+        channel_ids = torch.arange(output_width, device=scale.device).clamp_max(
+            scale_vec.numel() - 1
+        )
+        return scale_vec.index_select(0, channel_ids).reshape(-1, 1).expand(
+            -1, input_width
+        )
+
+    return scale.reshape(1, 1).expand(output_width, input_width)
 
 
 @triton.jit(
@@ -341,6 +400,71 @@ def _fused_moe_lora_kernel_fp8(
 
 
 @torch.inference_mode()
+def _fused_moe_lora_shrink_fp8_torch_fallback(
+    a_intermediate_cache1: torch.Tensor,
+    qcurr_hidden_states: torch.Tensor,
+    lora_a_stacked: list[torch.Tensor],
+    expert_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    num_tokens_post_padded: torch.Tensor | None,
+    token_lora_mapping: torch.Tensor,
+    top_k_num: int,
+    lora_ids: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    num_active_loras: int,
+    lora_a_scale_stacked: list[torch.Tensor] | None,
+    act_scale: torch.Tensor | None,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    per_channel_quant: bool,
+    block_shape: List[int] | None,
+) -> None:
+    group_n = 0 if block_shape is None else block_shape[0]
+    group_k = 0 if block_shape is None else block_shape[1]
+
+    for slice_idx, lora_a_weights in enumerate(lora_a_stacked):
+        scale_weights = (
+            lora_a_scale_stacked[slice_idx] if lora_a_scale_stacked is not None else None
+        )
+        for lora_id, token_idx, topk_idx, expert_id in iter_fused_moe_lora_assignments(
+            token_lora_mapping,
+            expert_ids,
+            top_k_num,
+            sorted_token_ids=sorted_token_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            lora_ids=lora_ids,
+            num_active_loras=num_active_loras,
+        ):
+            if adapter_enabled[lora_id].item() == 0:
+                continue
+            hidden_state = qcurr_hidden_states[token_idx].to(torch.float32)
+            if use_fp8_w8a8 or use_int8_w8a8:
+                token_scales = materialize_lora_token_scales(
+                    act_scale,
+                    torch.tensor([token_idx], device=qcurr_hidden_states.device),
+                    hidden_state.numel(),
+                    group_k=group_k,
+                )[0].to(hidden_state.device)
+                hidden_state = hidden_state * token_scales
+            lora_a = lora_a_weights[lora_id, expert_id].to(torch.float32)
+            if use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16:
+                assert scale_weights is not None
+                lora_a = lora_a * _materialize_selected_weight_scale(
+                    scale_weights[lora_id, expert_id],
+                    lora_a.size(0),
+                    lora_a.size(1),
+                    group_n=group_n,
+                    group_k=group_k,
+                    per_channel_quant=per_channel_quant,
+                ).to(lora_a.device)
+            shrink_out = torch.matmul(hidden_state, lora_a.transpose(0, 1)).to(
+                a_intermediate_cache1.dtype
+            )
+            a_intermediate_cache1[slice_idx, token_idx, topk_idx].copy_(shrink_out)
+
+
+@torch.inference_mode()
 def _fused_moe_lora_shrink_fp8(
     a_intermediate_cache1: torch.Tensor,
     # (num_slices, num_tokens, top_k_num, max_lora_rank)
@@ -441,6 +565,30 @@ def _fused_moe_lora_shrink_fp8(
         len(lora_a_stacked),
         grid_lora_dim,
     )
+
+    if not HAS_TRITON:
+        _fused_moe_lora_shrink_fp8_torch_fallback(
+            a_intermediate_cache1,
+            qcurr_hidden_states,
+            lora_a_stacked,
+            expert_ids,
+            sorted_token_ids,
+            num_tokens_post_padded,
+            token_lora_mapping,
+            top_k_num,
+            lora_ids,
+            adapter_enabled,
+            num_active_loras,
+            lora_a_scale_stacked,
+            act_scale,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            per_channel_quant,
+            block_shape,
+        )
+        return
+
     _fused_moe_lora_kernel_fp8[grid](
         qcurr_hidden_states,
         b_ptr,
@@ -503,6 +651,99 @@ def _fused_moe_lora_shrink_fp8(
         per_channel_quant=per_channel_quant,
         **shrink_config,
     )
+
+
+@torch.inference_mode()
+def _fused_moe_lora_expand_fp8_torch_fallback(
+    output: torch.Tensor,
+    a_intermediate_cache1: torch.Tensor,
+    lora_b_stacked: list[torch.Tensor],
+    topk_weights: torch.Tensor,
+    expert_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    num_tokens_post_padded: torch.Tensor | None,
+    token_lora_mapping: torch.Tensor,
+    top_k_num: int,
+    lora_ids: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    num_active_loras: int,
+    lora_b_scale_stacked: list[torch.Tensor] | None,
+    act_scale: torch.Tensor | None,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    per_channel_quant: bool,
+    block_shape: List[int] | None,
+    mul_routed_weight: bool,
+    offset: int,
+) -> None:
+    group_n = 0 if block_shape is None else block_shape[0]
+    group_k = 0 if block_shape is None else block_shape[1]
+    num_slices = len(lora_b_stacked)
+    slice_width = lora_b_stacked[0].size(2)
+    if a_intermediate_cache1.ndim == 2:
+        a_intermediate_cache1 = a_intermediate_cache1.view(
+            num_slices,
+            output.size(0),
+            top_k_num,
+            a_intermediate_cache1.size(-1),
+        )
+    out_view = output[:, :, offset : offset + num_slices * slice_width]
+
+    for slice_idx, lora_b_weights in enumerate(lora_b_stacked):
+        scale_weights = (
+            lora_b_scale_stacked[slice_idx] if lora_b_scale_stacked is not None else None
+        )
+        slice_out = out_view[
+            :,
+            :,
+            slice_idx * slice_width : (slice_idx + 1) * slice_width,
+        ]
+        for lora_id, token_idx, topk_idx, expert_id in iter_fused_moe_lora_assignments(
+            token_lora_mapping,
+            expert_ids,
+            top_k_num,
+            sorted_token_ids=sorted_token_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            lora_ids=lora_ids,
+            num_active_loras=num_active_loras,
+        ):
+            if adapter_enabled[lora_id].item() == 0:
+                continue
+            flat_scale_index = token_idx * top_k_num + topk_idx
+            scale_index = (
+                flat_scale_index
+                if act_scale is not None
+                and act_scale.ndim > 0
+                and act_scale.size(0) == output.size(0) * top_k_num
+                else token_idx
+            )
+            intermediate = a_intermediate_cache1[slice_idx, token_idx, topk_idx].to(
+                torch.float32
+            )
+            if use_fp8_w8a8 or use_int8_w8a8:
+                token_scales = materialize_lora_token_scales(
+                    act_scale,
+                    torch.tensor([scale_index], device=intermediate.device),
+                    intermediate.numel(),
+                    group_k=group_k,
+                )[0].to(intermediate.device)
+                intermediate = intermediate * token_scales
+            lora_b = lora_b_weights[lora_id, expert_id].to(torch.float32)
+            if use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16:
+                assert scale_weights is not None
+                lora_b = lora_b * _materialize_selected_weight_scale(
+                    scale_weights[lora_id, expert_id],
+                    lora_b.size(0),
+                    lora_b.size(1),
+                    group_n=group_n,
+                    group_k=group_k,
+                    per_channel_quant=per_channel_quant,
+                ).to(lora_b.device)
+            expanded = torch.matmul(intermediate, lora_b.transpose(0, 1))
+            if mul_routed_weight:
+                expanded = expanded * topk_weights[token_idx, topk_idx].to(torch.float32)
+            slice_out[token_idx, topk_idx].add_(expanded.to(slice_out.dtype))
 
 
 @torch.inference_mode()
@@ -613,6 +854,32 @@ def _fused_moe_lora_expand_fp8(
         len(lora_b_stacked),
         grid_lora_dim,
     )
+
+    if not HAS_TRITON:
+        _fused_moe_lora_expand_fp8_torch_fallback(
+            output,
+            a_intermediate_cache1,
+            lora_b_stacked,
+            topk_weights,
+            expert_ids,
+            sorted_token_ids,
+            num_tokens_post_padded,
+            token_lora_mapping,
+            top_k_num,
+            lora_ids,
+            adapter_enabled,
+            num_active_loras,
+            lora_b_scale_stacked,
+            act_scale,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            per_channel_quant,
+            block_shape,
+            mul_routed_weight,
+            offset,
+        )
+        return
 
     # Fast path: directly accumulate into the corresponding slice interval of output.
     out_view = output[:, :, offset : offset + num_slices * N]
@@ -772,7 +1039,7 @@ def _fused_moe_lora_fp8(
         device=device,
     )
 
-    use_gdc = supports_pdl(device) and not fully_sharded
+    use_gdc = HAS_TRITON and supports_pdl(device) and not fully_sharded
     _fused_moe_lora_shrink_fp8(
         a_intermediate_cache1,
         qcurr_hidden_states,

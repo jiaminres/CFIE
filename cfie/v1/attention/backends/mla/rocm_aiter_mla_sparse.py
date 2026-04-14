@@ -14,7 +14,7 @@ from cfie.logger import init_logger
 from cfie.model_executor.layers.attention.mla_attention import (
     get_mla_dims,
 )
-from cfie.triton_utils import tl, triton
+from cfie.triton_utils import HAS_TRITON, tl, triton
 from cfie.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -65,6 +65,10 @@ def fetch_id_to_ragged_kernel(
 def fetch_id_to_ragged_triton(
     in_tensor: torch.Tensor, cumsum: torch.Tensor, out_tensor: torch.Tensor, topk
 ):
+    if not HAS_TRITON:
+        fetch_id_to_ragged_reference(in_tensor, cumsum, out_tensor, topk)
+        return
+
     num_tokens = in_tensor.size(0)
     block_size = 64
     num_block_per_row = triton.cdiv(topk, block_size)
@@ -75,6 +79,21 @@ def fetch_id_to_ragged_triton(
     fetch_id_to_ragged_kernel[grid](
         in_tensor, cumsum, out_tensor, in_tensor.stride(0), topk, num_tokens, block_size
     )
+
+
+def fetch_id_to_ragged_reference(
+    in_tensor: torch.Tensor, cumsum: torch.Tensor, out_tensor: torch.Tensor, topk: int
+) -> None:
+    num_tokens = in_tensor.size(0)
+    for seq_id in range(num_tokens):
+        token_start = int(cumsum[seq_id].item())
+        token_end = int(cumsum[seq_id + 1].item())
+        token_num = max(token_end - token_start, 0)
+        copy_len = min(token_num, topk)
+        if copy_len > 0:
+            out_tensor[token_start : token_start + copy_len].copy_(
+                in_tensor[seq_id, :copy_len]
+            )
 
 
 class ROCMAiterMLASparseBackend(AttentionBackend):

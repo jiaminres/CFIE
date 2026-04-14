@@ -18,6 +18,7 @@ from cfie.v1.sample.ops.penalties import apply_all_penalties
 from cfie.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from cfie.v1.sample.sampler import Sampler
 from cfie.v1.spec_decode.metadata import SpecDecodeMetadata
+from cfie.utils.runtime_fallback_trace import record as record_runtime_fallback
 
 logger = init_logger(__name__)
 
@@ -407,6 +408,7 @@ def rejection_sample(
             device.type == "cuda"
             and _custom_ops.has_precompiled_rejection_greedy_sample()
         ):
+            record_runtime_fallback("sample.rejection.greedy", "precompiled")
             _custom_ops.rejection_greedy_sample_precompiled(
                 output_token_ids,
                 cu_num_draft_tokens.to(torch.int32),
@@ -417,6 +419,7 @@ def rejection_sample(
                 max_spec_len,
             )
         else:
+            record_runtime_fallback("sample.rejection.greedy", "torch")
             _rejection_greedy_sample_torch(
                 output_token_ids,
                 cu_num_draft_tokens,
@@ -475,6 +478,7 @@ def rejection_sample(
         device.type == "cuda"
         and _custom_ops.has_precompiled_rejection_random_sample()
     ):
+        record_runtime_fallback("sample.rejection.random", "precompiled")
         _custom_ops.rejection_random_sample_precompiled(
             output_token_ids,
             cu_num_draft_tokens.to(torch.int32),
@@ -488,6 +492,7 @@ def rejection_sample(
             max_spec_len,
         )
     else:
+        record_runtime_fallback("sample.rejection.random", "torch")
         _rejection_random_sample_torch(
             output_token_ids,
             cu_num_draft_tokens,
@@ -594,12 +599,14 @@ def expand_batch_to_tokens(
             x.is_cuda
             and _custom_ops.has_precompiled_expand_batch_to_tokens()
         ):
+            record_runtime_fallback("sample.rejection.expand_batch", "precompiled")
             return _custom_ops.expand_batch_to_tokens_precompiled(
                 x,
                 cu_num_tokens,
                 replace_from,
                 replace_to,
             )
+        record_runtime_fallback("sample.rejection.expand_batch", "torch")
         counts = cu_num_tokens.to(device=x.device)
         counts = torch.cat((counts[:1], counts[1:] - counts[:-1]))
         expanded_x = torch.repeat_interleave(x, counts)
@@ -715,6 +722,7 @@ def sample_recovered_tokens(
             device.type == "cuda"
             and _custom_ops.has_precompiled_sample_recovered_tokens()
         ):
+            record_runtime_fallback("sample.rejection.recovered_tokens", "precompiled")
             return _custom_ops.sample_recovered_tokens_precompiled(
                 cu_num_draft_tokens.to(torch.int32),
                 draft_token_ids.to(torch.int32),
@@ -722,6 +730,7 @@ def sample_recovered_tokens(
                 target_probs,
                 inv_q,
             )
+        record_runtime_fallback("sample.rejection.recovered_tokens", "torch")
         start_idx = 0
         for req_idx, num_req_draft_tokens in enumerate(num_draft_tokens):
             end_idx = start_idx + num_req_draft_tokens

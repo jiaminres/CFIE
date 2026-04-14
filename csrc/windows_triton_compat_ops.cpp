@@ -405,6 +405,48 @@ torch::Tensor expand_qk_heads(const torch::Tensor& x, int64_t target_heads) {
   return x.repeat_interleave(target_heads / x.size(2), 2);
 }
 
+torch::Tensor align_scale_tail_dims(const torch::Tensor& scale,
+                                    int64_t target_dim) {
+  auto aligned = scale;
+  while (aligned.dim() < target_dim) {
+    aligned = aligned.unsqueeze(-1);
+  }
+  return aligned;
+}
+
+torch::Tensor group_broadcast_reference(const torch::Tensor& scale,
+                                        c10::IntArrayRef target_shape) {
+  auto broadcasted = align_scale_tail_dims(scale, target_shape.size());
+  for (int64_t dim = 0; dim < static_cast<int64_t>(target_shape.size()); ++dim) {
+    const int64_t current = broadcasted.size(dim);
+    const int64_t target = target_shape[dim];
+    if (current == target || current == 1) {
+      continue;
+    }
+    TORCH_CHECK(target % current == 0,
+                "Scale cannot be group-broadcast to target shape");
+    broadcasted = broadcasted.repeat_interleave(target / current, dim);
+  }
+  return broadcasted;
+}
+
+torch::Tensor dequantize_batched_moe_tensor_reference(
+    const torch::Tensor& tensor, const std::optional<torch::Tensor>& scale,
+    bool per_act_token_quant) {
+  auto tensor_f = tensor.to(torch::kFloat32);
+  if (!scale.has_value()) {
+    return tensor_f;
+  }
+
+  auto scale_f =
+      scale.value().to(tensor.device(), torch::kFloat32, false, false)
+          .contiguous();
+  if (per_act_token_quant || scale_f.numel() == 1) {
+    return tensor_f * align_scale_tail_dims(scale_f, tensor.dim());
+  }
+  return tensor_f * group_broadcast_reference(scale_f, tensor.sizes());
+}
+
 }  // namespace
 
 torch::Tensor correct_attn_out_precompiled(torch::Tensor& out,
@@ -1389,6 +1431,500 @@ input_batch_expand_idx_mapping_precompiled(const torch::Tensor& idx_mapping,
   return std::make_tuple(expanded_idx_mapping, expanded_local_pos);
 }
 
+void eagle_step_update_slot_mapping_and_metadata_precompiled(
+    const torch::Tensor& positions_1d, const torch::Tensor& block_table_tensor,
+    torch::Tensor& seq_lens, int64_t block_size, int64_t max_model_len,
+    torch::Tensor& out_clamped_positions, torch::Tensor& out_slot_mapping,
+    int64_t input_batch_size) {
+  TORCH_CHECK(positions_1d.is_cuda(),
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "CUDA positions_1d");
+  TORCH_CHECK(block_table_tensor.is_cuda(),
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "CUDA block_table_tensor");
+  TORCH_CHECK(seq_lens.is_cuda(),
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "CUDA seq_lens");
+  TORCH_CHECK(out_clamped_positions.is_cuda(),
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "CUDA out_clamped_positions");
+  TORCH_CHECK(out_slot_mapping.is_cuda(),
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "CUDA out_slot_mapping");
+  TORCH_CHECK(positions_1d.dim() == 1,
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "1D positions_1d");
+  TORCH_CHECK(block_table_tensor.dim() == 2,
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "2D block_table_tensor");
+
+  const int64_t batch_size = positions_1d.size(0);
+  const int64_t n_blocks_per_req = block_table_tensor.size(1);
+  TORCH_CHECK(seq_lens.size(0) >= batch_size,
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "seq_lens to cover batch");
+  TORCH_CHECK(out_clamped_positions.size(0) >= batch_size,
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "out_clamped_positions to cover batch");
+  TORCH_CHECK(out_slot_mapping.size(0) >= input_batch_size,
+              "eagle_step_update_slot_mapping_and_metadata_precompiled expects "
+              "out_slot_mapping to cover input_batch_size");
+
+  if (batch_size == 0) {
+    if (input_batch_size > 0) {
+      out_slot_mapping.slice(0, 0, input_batch_size).fill_(-1);
+    }
+    return;
+  }
+
+  auto new_position = positions_1d + 1;
+  auto exceeds_max = new_position >= max_model_len;
+  auto clamped_position =
+      torch::where(exceeds_max, torch::zeros_like(new_position), new_position);
+  auto block_number =
+      torch::floor_divide(clamped_position, block_size)
+          .clamp(0, std::max<int64_t>(n_blocks_per_req - 1, 0))
+          .to(torch::kLong);
+  auto req_idx = torch::arange(
+      batch_size,
+      torch::TensorOptions().device(positions_1d.device()).dtype(torch::kLong));
+  auto block_id = block_table_tensor.index({req_idx, block_number});
+  auto slot_id = block_id * block_size + torch::remainder(clamped_position, block_size)
+                                           .to(block_id.scalar_type());
+  slot_id = torch::where(exceeds_max,
+                         torch::full_like(slot_id, -1),
+                         slot_id);
+
+  out_clamped_positions.slice(0, 0, batch_size)
+      .copy_(clamped_position.to(out_clamped_positions.scalar_type()));
+  out_slot_mapping.slice(0, 0, batch_size)
+      .copy_(slot_id.to(out_slot_mapping.scalar_type()));
+  if (input_batch_size > batch_size) {
+    out_slot_mapping.slice(0, batch_size, input_batch_size).fill_(-1);
+  }
+
+  auto next_seq_lens =
+      torch::where(exceeds_max, torch::ones_like(seq_lens.slice(0, 0, batch_size)),
+                   seq_lens.slice(0, 0, batch_size) + 1);
+  next_seq_lens =
+      torch::minimum(next_seq_lens,
+                     torch::full({}, max_model_len, next_seq_lens.options()));
+  seq_lens.slice(0, 0, batch_size)
+      .copy_(next_seq_lens.to(seq_lens.scalar_type()));
+}
+
+void eagle_prepare_inputs_padded_precompiled(
+    const torch::Tensor& cu_num_draft_tokens,
+    const torch::Tensor& valid_sampled_tokens_count,
+    const torch::Tensor& query_start_loc_gpu,
+    torch::Tensor& token_indices_to_sample,
+    torch::Tensor& num_rejected_tokens_gpu) {
+  TORCH_CHECK(cu_num_draft_tokens.is_cuda(),
+              "eagle_prepare_inputs_padded_precompiled expects CUDA "
+              "cu_num_draft_tokens");
+  TORCH_CHECK(valid_sampled_tokens_count.is_cuda(),
+              "eagle_prepare_inputs_padded_precompiled expects CUDA "
+              "valid_sampled_tokens_count");
+  TORCH_CHECK(query_start_loc_gpu.is_cuda(),
+              "eagle_prepare_inputs_padded_precompiled expects CUDA "
+              "query_start_loc_gpu");
+  TORCH_CHECK(token_indices_to_sample.is_cuda(),
+              "eagle_prepare_inputs_padded_precompiled expects CUDA "
+              "token_indices_to_sample");
+  TORCH_CHECK(num_rejected_tokens_gpu.is_cuda(),
+              "eagle_prepare_inputs_padded_precompiled expects CUDA "
+              "num_rejected_tokens_gpu");
+
+  const int64_t num_reqs = valid_sampled_tokens_count.size(0);
+  if (num_reqs == 0) {
+    return;
+  }
+  auto cu_i64 = cu_num_draft_tokens.to(torch::kLong);
+  auto num_draft_tokens = torch::empty_like(cu_i64);
+  num_draft_tokens.slice(0, 0, 1).copy_(cu_i64.slice(0, 0, 1));
+  if (num_reqs > 1) {
+    num_draft_tokens.slice(0, 1, num_reqs)
+        .copy_(cu_i64.slice(0, 1, num_reqs) - cu_i64.slice(0, 0, num_reqs - 1));
+  }
+
+  auto valid_i64 = valid_sampled_tokens_count.to(torch::kLong);
+  auto num_rejected_tokens = num_draft_tokens + 1 - valid_i64;
+  num_rejected_tokens =
+      torch::where(num_draft_tokens > 0, num_rejected_tokens,
+                   torch::zeros_like(num_rejected_tokens));
+  auto index_to_sample =
+      query_start_loc_gpu.to(torch::kLong).slice(0, 1, num_reqs + 1) - 1 -
+      num_rejected_tokens;
+
+  token_indices_to_sample.copy_(
+      index_to_sample.to(token_indices_to_sample.scalar_type()));
+  num_rejected_tokens_gpu.copy_(
+      num_rejected_tokens.to(num_rejected_tokens_gpu.scalar_type()));
+}
+
+void eagle_prepare_next_token_padded_precompiled(
+    const torch::Tensor& sampled_token_ids,
+    const torch::Tensor& discard_request_mask,
+    const torch::Tensor& backup_next_token_ids, torch::Tensor& next_token_ids,
+    torch::Tensor& valid_sampled_tokens_count, int64_t vocab_size) {
+  TORCH_CHECK(sampled_token_ids.is_cuda(),
+              "eagle_prepare_next_token_padded_precompiled expects CUDA "
+              "sampled_token_ids");
+  TORCH_CHECK(discard_request_mask.is_cuda(),
+              "eagle_prepare_next_token_padded_precompiled expects CUDA "
+              "discard_request_mask");
+  TORCH_CHECK(backup_next_token_ids.is_cuda(),
+              "eagle_prepare_next_token_padded_precompiled expects CUDA "
+              "backup_next_token_ids");
+  TORCH_CHECK(next_token_ids.is_cuda(),
+              "eagle_prepare_next_token_padded_precompiled expects CUDA "
+              "next_token_ids");
+  TORCH_CHECK(valid_sampled_tokens_count.is_cuda(),
+              "eagle_prepare_next_token_padded_precompiled expects CUDA "
+              "valid_sampled_tokens_count");
+  TORCH_CHECK(sampled_token_ids.dim() == 2,
+              "eagle_prepare_next_token_padded_precompiled expects 2D "
+              "sampled_token_ids");
+
+  const int64_t batch_size = sampled_token_ids.size(0);
+  const int64_t num_sampled_tokens_per_req = sampled_token_ids.size(1);
+  if (batch_size == 0) {
+    return;
+  }
+
+  auto valid_mask = (sampled_token_ids != -1) & (sampled_token_ids < vocab_size);
+  auto valid_count =
+      valid_mask.sum(1).to(valid_sampled_tokens_count.scalar_type());
+  auto offsets = torch::arange(
+                     num_sampled_tokens_per_req,
+                     torch::TensorOptions()
+                         .device(sampled_token_ids.device())
+                         .dtype(torch::kLong))
+                     .unsqueeze(0)
+                     .expand({batch_size, num_sampled_tokens_per_req});
+  auto last_valid_index =
+      torch::where(valid_mask, offsets, torch::full_like(offsets, -1))
+          .amax(1);
+  auto gather_index = last_valid_index.clamp_min(0).unsqueeze(1);
+  auto last_valid_token = sampled_token_ids.gather(1, gather_index).squeeze(1);
+  auto next_token =
+      torch::where(valid_count > 0,
+                   last_valid_token.to(backup_next_token_ids.scalar_type()),
+                   backup_next_token_ids);
+
+  auto discard_mask = discard_request_mask.to(torch::kBool);
+  next_token = torch::where(discard_mask, backup_next_token_ids, next_token);
+  valid_count =
+      torch::where(discard_mask, torch::zeros_like(valid_count), valid_count);
+
+  next_token_ids.copy_(next_token.to(next_token_ids.scalar_type()));
+  valid_sampled_tokens_count.copy_(
+      valid_count.to(valid_sampled_tokens_count.scalar_type()));
+}
+
+void copy_and_expand_eagle_inputs_precompiled(
+    const torch::Tensor& target_token_ids,
+    const torch::Tensor& target_positions, const torch::Tensor& next_token_ids,
+    torch::Tensor& out_input_ids, torch::Tensor& out_positions,
+    torch::Tensor& out_is_rejected_token_mask,
+    torch::Tensor& out_is_masked_token_mask,
+    torch::Tensor& out_new_token_indices,
+    torch::Tensor& out_hidden_state_mapping,
+    const torch::Tensor& query_start_loc, const torch::Tensor& query_end_loc,
+    int64_t padding_token_id, int64_t parallel_drafting_token_id,
+    int64_t total_input_tokens, int64_t num_padding_slots_per_request,
+    bool shift_input_ids) {
+  TORCH_CHECK(target_token_ids.is_cuda(),
+              "copy_and_expand_eagle_inputs_precompiled expects CUDA "
+              "target_token_ids");
+  TORCH_CHECK(target_positions.is_cuda(),
+              "copy_and_expand_eagle_inputs_precompiled expects CUDA "
+              "target_positions");
+  TORCH_CHECK(next_token_ids.is_cuda(),
+              "copy_and_expand_eagle_inputs_precompiled expects CUDA "
+              "next_token_ids");
+  TORCH_CHECK(out_input_ids.is_cuda() && out_positions.is_cuda() &&
+                  out_is_rejected_token_mask.is_cuda() &&
+                  out_is_masked_token_mask.is_cuda() &&
+                  out_new_token_indices.is_cuda() &&
+                  out_hidden_state_mapping.is_cuda(),
+              "copy_and_expand_eagle_inputs_precompiled expects CUDA outputs");
+  TORCH_CHECK(query_start_loc.is_cuda() && query_end_loc.is_cuda(),
+              "copy_and_expand_eagle_inputs_precompiled expects CUDA query "
+              "metadata");
+  TORCH_CHECK(total_input_tokens > 0,
+              "copy_and_expand_eagle_inputs_precompiled expects positive "
+              "total_input_tokens");
+
+  auto query_start_cpu = query_start_loc.to(torch::kCPU);
+  auto query_end_cpu = query_end_loc.to(torch::kCPU);
+  const int64_t batch_size = query_end_loc.size(0);
+  auto index_options = torch::TensorOptions()
+                           .device(target_token_ids.device())
+                           .dtype(torch::kLong);
+
+  for (int64_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    const int64_t query_start = query_start_cpu[request_idx].item<int64_t>();
+    const int64_t next_query_start =
+        query_start_cpu[request_idx + 1].item<int64_t>();
+    const int64_t query_end = query_end_cpu[request_idx].item<int64_t>();
+
+    int64_t num_valid_tokens;
+    int64_t input_offset;
+    int64_t output_start;
+    if (shift_input_ids) {
+      num_valid_tokens = query_end - query_start;
+      input_offset = 1;
+      output_start = query_start +
+                     request_idx * (num_padding_slots_per_request - 1);
+    } else {
+      num_valid_tokens = query_end - query_start + 1;
+      input_offset = 0;
+      output_start =
+          query_start + request_idx * num_padding_slots_per_request;
+    }
+
+    const int64_t num_rejected = next_query_start - query_end - 1;
+    const int64_t total_output_tokens =
+        num_valid_tokens + num_padding_slots_per_request + num_rejected;
+    if (total_output_tokens <= 0) {
+      continue;
+    }
+
+    auto j = torch::arange(total_output_tokens, index_options);
+    auto out_idx = output_start + j;
+    auto is_valid_region = j < num_valid_tokens;
+    auto is_bonus_region = j == num_valid_tokens;
+    auto is_parallel_draft_region =
+        (j > num_valid_tokens) &
+        (j < num_valid_tokens + num_padding_slots_per_request);
+    auto is_rejected_region =
+        j >= (num_valid_tokens + num_padding_slots_per_request);
+
+    auto in_idx = query_start + input_offset + j;
+    auto in_idx_clamped =
+        torch::clamp(in_idx, 0, total_input_tokens - 1);
+    auto source_tokens = target_token_ids.index({in_idx_clamped});
+    auto token_ids =
+        torch::where(is_valid_region, source_tokens, torch::zeros_like(source_tokens));
+    auto bonus_token =
+        next_token_ids.index({request_idx}).expand_as(token_ids).to(token_ids.scalar_type());
+    token_ids = torch::where(is_bonus_region, bonus_token, token_ids);
+    token_ids =
+        torch::where(is_parallel_draft_region,
+                     torch::full_like(token_ids, parallel_drafting_token_id),
+                     token_ids);
+    token_ids = torch::where(is_rejected_region,
+                             torch::full_like(token_ids, padding_token_id),
+                             token_ids);
+
+    torch::Tensor start_pos;
+    if (target_positions.dim() == 1) {
+      start_pos = target_positions.index({query_start});
+    } else {
+      start_pos = target_positions.index({0, query_start});
+    }
+    auto positions =
+        start_pos.to(out_positions.scalar_type()) + j.to(out_positions.scalar_type());
+    positions =
+        torch::where(is_rejected_region, torch::zeros_like(positions), positions);
+
+    out_input_ids.index_put_({out_idx}, token_ids.to(out_input_ids.scalar_type()));
+    out_positions.index_put_({out_idx}, positions.to(out_positions.scalar_type()));
+    out_is_rejected_token_mask.index_put_(
+        {out_idx}, is_rejected_region.to(out_is_rejected_token_mask.scalar_type()));
+    out_is_masked_token_mask.index_put_(
+        {out_idx}, is_parallel_draft_region.to(out_is_masked_token_mask.scalar_type()));
+
+    auto is_new_token_region =
+        (j >= num_valid_tokens) &
+        (j < num_valid_tokens + num_padding_slots_per_request);
+    auto new_token_local_idx =
+        (j - num_valid_tokens).masked_select(is_new_token_region);
+    if (new_token_local_idx.numel() > 0) {
+      auto new_token_out_idx =
+          request_idx * num_padding_slots_per_request + new_token_local_idx;
+      auto new_token_values = out_idx.masked_select(is_new_token_region);
+      out_new_token_indices.index_put_(
+          {new_token_out_idx},
+          new_token_values.to(out_new_token_indices.scalar_type()));
+    }
+
+    if (shift_input_ids) {
+      const int64_t num_input_tokens_this_request =
+          next_query_start - query_start;
+      if (num_input_tokens_this_request > 0) {
+        auto src_idx =
+            torch::arange(query_start, next_query_start, index_options);
+        auto mapped_out_idx = out_idx.slice(
+            0, 0, std::min<int64_t>(num_input_tokens_this_request,
+                                    out_idx.size(0)));
+        out_hidden_state_mapping.index_put_(
+            {src_idx.slice(0, 0, mapped_out_idx.size(0))},
+            mapped_out_idx.to(out_hidden_state_mapping.scalar_type()));
+      }
+    }
+  }
+}
+
+void prepare_eagle_inputs_precompiled(
+    torch::Tensor& last_token_indices, torch::Tensor& eagle_input_ids,
+    torch::Tensor& eagle_positions, const torch::Tensor& target_input_ids,
+    const torch::Tensor& target_positions, const torch::Tensor& idx_mapping,
+    const torch::Tensor& last_sampled,
+    const torch::Tensor& next_prefill_tokens, const torch::Tensor& num_sampled,
+    const torch::Tensor& num_rejected, const torch::Tensor& query_start_loc) {
+  TORCH_CHECK(last_token_indices.is_cuda(),
+              "prepare_eagle_inputs_precompiled expects CUDA "
+              "last_token_indices");
+  TORCH_CHECK(eagle_input_ids.is_cuda() && eagle_positions.is_cuda(),
+              "prepare_eagle_inputs_precompiled expects CUDA EAGLE buffers");
+  TORCH_CHECK(target_input_ids.is_cuda() && target_positions.is_cuda(),
+              "prepare_eagle_inputs_precompiled expects CUDA target buffers");
+  TORCH_CHECK(idx_mapping.is_cuda() && last_sampled.is_cuda() &&
+                  next_prefill_tokens.is_cuda() && num_sampled.is_cuda() &&
+                  num_rejected.is_cuda() && query_start_loc.is_cuda(),
+              "prepare_eagle_inputs_precompiled expects CUDA metadata");
+
+  auto idx_cpu = idx_mapping.to(torch::kCPU);
+  auto sampled_cpu = num_sampled.to(torch::kCPU);
+  auto rejected_cpu = num_rejected.to(torch::kCPU);
+  auto query_start_cpu = query_start_loc.to(torch::kCPU);
+  const int64_t num_reqs = idx_mapping.size(0);
+
+  for (int64_t batch_idx = 0; batch_idx < num_reqs; ++batch_idx) {
+    const int64_t req_state_idx = idx_cpu[batch_idx].item<int64_t>();
+    const int64_t query_start = query_start_cpu[batch_idx].item<int64_t>();
+    const int64_t query_end = query_start_cpu[batch_idx + 1].item<int64_t>();
+    const int64_t query_len =
+        query_end - query_start - rejected_cpu[batch_idx].item<int64_t>();
+    TORCH_CHECK(query_len > 0,
+                "prepare_eagle_inputs_precompiled expects positive query_len");
+
+    torch::Tensor next_token;
+    if (sampled_cpu[batch_idx].item<int64_t>() > 0) {
+      next_token = last_sampled.select(0, req_state_idx);
+    } else {
+      next_token = next_prefill_tokens.select(0, req_state_idx);
+    }
+
+    if (query_len > 1) {
+      eagle_input_ids.slice(0, query_start, query_start + query_len - 1)
+          .copy_(target_input_ids
+                     .slice(0, query_start + 1, query_start + query_len)
+                     .to(eagle_input_ids.scalar_type()));
+    }
+
+    const int64_t last_token_index = query_start + query_len - 1;
+    last_token_indices.select(0, batch_idx).fill_(last_token_index);
+    eagle_input_ids.select(0, last_token_index)
+        .copy_(next_token.to(eagle_input_ids.scalar_type()));
+    eagle_positions.slice(0, query_start, query_start + query_len)
+        .copy_(target_positions
+                   .slice(0, query_start, query_start + query_len)
+                   .to(eagle_positions.scalar_type()));
+  }
+}
+
+void prepare_eagle_decode_precompiled(
+    const torch::Tensor& draft_tokens, const torch::Tensor& output_hidden_states,
+    const torch::Tensor& last_token_indices,
+    const torch::Tensor& target_seq_lens, const torch::Tensor& num_rejected,
+    torch::Tensor& input_ids, torch::Tensor& positions,
+    torch::Tensor& query_start_loc, torch::Tensor& seq_lens,
+    torch::Tensor& input_hidden_states, int64_t max_model_len,
+    int64_t max_num_reqs) {
+  TORCH_CHECK(draft_tokens.is_cuda(),
+              "prepare_eagle_decode_precompiled expects CUDA draft_tokens");
+  TORCH_CHECK(output_hidden_states.is_cuda(),
+              "prepare_eagle_decode_precompiled expects CUDA "
+              "output_hidden_states");
+  TORCH_CHECK(last_token_indices.is_cuda() && target_seq_lens.is_cuda() &&
+                  num_rejected.is_cuda(),
+              "prepare_eagle_decode_precompiled expects CUDA metadata");
+  TORCH_CHECK(input_ids.is_cuda() && positions.is_cuda() &&
+                  query_start_loc.is_cuda() && seq_lens.is_cuda() &&
+                  input_hidden_states.is_cuda(),
+              "prepare_eagle_decode_precompiled expects CUDA output buffers");
+
+  const int64_t num_reqs = draft_tokens.size(0);
+  auto arange_options = torch::TensorOptions()
+                            .device(query_start_loc.device())
+                            .dtype(torch::kInt32);
+  query_start_loc.slice(0, 0, num_reqs + 1)
+      .copy_(torch::arange(0, num_reqs + 1, arange_options));
+  if (max_num_reqs > num_reqs) {
+    query_start_loc.slice(0, num_reqs + 1, max_num_reqs + 1).fill_(num_reqs);
+    seq_lens.slice(0, num_reqs, max_num_reqs).zero_();
+  }
+  if (num_reqs == 0) {
+    return;
+  }
+
+  input_ids.slice(0, 0, num_reqs)
+      .copy_(draft_tokens.to(input_ids.scalar_type()));
+  auto src_indices = last_token_indices.to(torch::kLong);
+  input_hidden_states.slice(0, 0, num_reqs)
+      .copy_(output_hidden_states.index_select(0, src_indices)
+                 .to(input_hidden_states.scalar_type()));
+
+  auto next_positions = positions.slice(0, 0, num_reqs) + 1;
+  next_positions =
+      torch::minimum(next_positions,
+                     torch::full({}, max_model_len - 1,
+                                 next_positions.options()));
+  positions.slice(0, 0, num_reqs)
+      .copy_(next_positions.to(positions.scalar_type()));
+
+  auto next_seq_lens =
+      target_seq_lens.slice(0, 0, num_reqs) -
+      num_rejected.slice(0, 0, num_reqs) + 1;
+  next_seq_lens =
+      torch::minimum(next_seq_lens,
+                     torch::full({}, max_model_len, next_seq_lens.options()));
+  seq_lens.slice(0, 0, num_reqs)
+      .copy_(next_seq_lens.to(seq_lens.scalar_type()));
+}
+
+void update_eagle_inputs_precompiled(
+    const torch::Tensor& draft_tokens, const torch::Tensor& output_hidden_states,
+    torch::Tensor& input_ids, torch::Tensor& positions,
+    torch::Tensor& seq_lens, torch::Tensor& hidden_states,
+    int64_t max_model_len) {
+  TORCH_CHECK(draft_tokens.is_cuda(),
+              "update_eagle_inputs_precompiled expects CUDA draft_tokens");
+  TORCH_CHECK(output_hidden_states.is_cuda(),
+              "update_eagle_inputs_precompiled expects CUDA "
+              "output_hidden_states");
+  TORCH_CHECK(input_ids.is_cuda() && positions.is_cuda() &&
+                  seq_lens.is_cuda() && hidden_states.is_cuda(),
+              "update_eagle_inputs_precompiled expects CUDA output buffers");
+
+  const int64_t num_reqs = draft_tokens.size(0);
+  if (num_reqs == 0) {
+    return;
+  }
+  input_ids.slice(0, 0, num_reqs)
+      .copy_(draft_tokens.to(input_ids.scalar_type()));
+  hidden_states.slice(0, 0, num_reqs)
+      .copy_(output_hidden_states.to(hidden_states.scalar_type()));
+
+  auto next_positions = positions.slice(0, 0, num_reqs) + 1;
+  next_positions =
+      torch::minimum(next_positions,
+                     torch::full({}, max_model_len - 1,
+                                 next_positions.options()));
+  positions.slice(0, 0, num_reqs)
+      .copy_(next_positions.to(positions.scalar_type()));
+
+  auto next_seq_lens = seq_lens.slice(0, 0, num_reqs) + 1;
+  next_seq_lens =
+      torch::minimum(next_seq_lens,
+                     torch::full({}, max_model_len, next_seq_lens.options()));
+  seq_lens.slice(0, 0, num_reqs)
+      .copy_(next_seq_lens.to(seq_lens.scalar_type()));
+}
+
 std::tuple<torch::Tensor, torch::Tensor> mrope_rotary_embedding(
     const torch::Tensor& query, const torch::Tensor& key,
     const torch::Tensor& cos, const torch::Tensor& sin, int64_t head_size,
@@ -1521,7 +2057,6 @@ fused_sigmoid_gating_delta_rule_update_precompiled(
 
   auto A_log_f32 = A_log.to(torch::kFloat32);
   auto dt_bias_f32 = dt_bias.to(torch::kFloat32);
-
   torch::Tensor q_tokens;
   torch::Tensor k_tokens;
   torch::Tensor v_tokens;
@@ -1564,24 +2099,24 @@ fused_sigmoid_gating_delta_rule_update_precompiled(
       continue;
     }
 
-    torch::Tensor h;
-    if (!initial_state.defined()) {
-      h = torch::zeros({HV, V, K},
-                       torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
-    } else if (ssm_state_indices.has_value()) {
-      int64_t accepted_offset = 0;
-      if (num_accepted_tokens.has_value()) {
-        accepted_offset = num_accepted_tokens.value()[seq_idx].item<int64_t>() - 1;
-      }
-      const int64_t state_idx =
-          resolve_state_index(ssm_state_indices, seq_idx, accepted_offset);
-      if (state_idx == -2) {
+      torch::Tensor h;
+      if (!initial_state.defined()) {
         h = torch::zeros({HV, V, K},
-                         torch::TensorOptions().dtype(torch::kFloat32)
-                             .device(q.device()));
-      } else if (state_idx < 0) {
-        out_tokens.slice(0, bos, eos).zero_();
-        continue;
+                         torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+      } else if (ssm_state_indices.has_value()) {
+        int64_t accepted_offset = 0;
+        if (num_accepted_tokens.has_value()) {
+          accepted_offset = num_accepted_tokens.value()[seq_idx].item<int64_t>() - 1;
+        }
+        const int64_t state_idx =
+            resolve_state_index(ssm_state_indices, seq_idx, accepted_offset);
+        if (state_idx == -2) {
+          h = torch::zeros({HV, V, K},
+                           torch::TensorOptions().dtype(torch::kFloat32)
+                               .device(q.device()));
+        } else if (state_idx < 0) {
+          out_tokens.slice(0, bos, eos).zero_();
+          continue;
       } else {
         h = initial_state[state_idx].to(torch::kFloat32).clone();
       }
@@ -2664,6 +3199,107 @@ torch::Tensor causal_conv1d_fn_precompiled(
   return out;
 }
 
+torch::Tensor count_expert_num_tokens_precompiled(
+    const torch::Tensor& topk_ids, int64_t num_local_experts,
+    const std::optional<torch::Tensor>& expert_map) {
+  TORCH_CHECK(topk_ids.is_cuda(),
+              "count_expert_num_tokens_precompiled expects CUDA topk_ids");
+  TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 ||
+                  topk_ids.scalar_type() == torch::kInt64,
+              "count_expert_num_tokens_precompiled expects signed int32/int64 "
+              "topk_ids");
+  TORCH_CHECK(num_local_experts >= 0,
+              "count_expert_num_tokens_precompiled expects non-negative "
+              "num_local_experts");
+
+  auto output = torch::zeros(
+      {num_local_experts},
+      topk_ids.options().dtype(torch::kInt32).memory_format(c10::MemoryFormat::Contiguous));
+  if (num_local_experts == 0 || topk_ids.numel() == 0) {
+    return output;
+  }
+
+  auto flat_ids = topk_ids.reshape({-1}).to(
+      torch::TensorOptions().device(topk_ids.device()).dtype(torch::kLong));
+  auto valid_mask = flat_ids.ge(0);
+  if (!valid_mask.any().item<bool>()) {
+    return output;
+  }
+
+  auto valid_ids = flat_ids.masked_select(valid_mask);
+  if (expert_map.has_value()) {
+    TORCH_CHECK(expert_map.value().is_cuda(),
+                "count_expert_num_tokens_precompiled expects CUDA expert_map");
+    auto expert_map_long = expert_map.value().to(
+        torch::TensorOptions().device(topk_ids.device()).dtype(torch::kLong));
+    valid_ids = expert_map_long.index_select(0, valid_ids);
+  }
+
+  auto in_range_mask = valid_ids.ge(0) & valid_ids.lt(num_local_experts);
+  if (!in_range_mask.any().item<bool>()) {
+    return output;
+  }
+
+  auto local_ids = valid_ids.masked_select(in_range_mask);
+  auto counts = torch::bincount(local_ids, /*weights=*/{}, num_local_experts);
+  return counts.to(output.options());
+}
+
+torch::Tensor zero_experts_compute_identity_precompiled(
+    torch::Tensor& expert_indices, torch::Tensor& expert_scales,
+    int64_t num_experts, const torch::Tensor& hidden_states) {
+  TORCH_CHECK(
+      expert_indices.is_cuda(),
+      "zero_experts_compute_identity_precompiled expects CUDA expert_indices");
+  TORCH_CHECK(
+      expert_scales.is_cuda(),
+      "zero_experts_compute_identity_precompiled expects CUDA expert_scales");
+  TORCH_CHECK(
+      hidden_states.is_cuda(),
+      "zero_experts_compute_identity_precompiled expects CUDA hidden_states");
+  TORCH_CHECK(
+      num_experts >= 0,
+      "zero_experts_compute_identity_precompiled expects non-negative "
+      "num_experts");
+  TORCH_CHECK(
+      expert_indices.sizes() == expert_scales.sizes(),
+      "zero_experts_compute_identity_precompiled expects expert_indices and "
+      "expert_scales to have matching shapes");
+  TORCH_CHECK(
+      expert_indices.size(0) == hidden_states.size(0),
+      "zero_experts_compute_identity_precompiled expects expert tensors and "
+      "hidden_states to agree on the token dimension");
+
+  auto zero_expert_mask = expert_indices.ge(num_experts);
+  auto zero_expert_scales =
+      expert_scales.masked_fill(zero_expert_mask.logical_not(), 0.0);
+
+  expert_indices.masked_fill_(zero_expert_mask, 0);
+  expert_scales.masked_fill_(zero_expert_mask, 0.0);
+
+  auto scale_sum =
+      zero_expert_scales.sum(-1, /*keepdim=*/true).to(hidden_states.scalar_type());
+  return hidden_states * scale_sum;
+}
+
+void swiglustep_and_mul(torch::Tensor& out, torch::Tensor& input,
+                        double limit) {
+  TORCH_CHECK(input.is_cuda(),
+              "swiglustep_and_mul expects CUDA input");
+  TORCH_CHECK(out.is_cuda(),
+              "swiglustep_and_mul expects CUDA output");
+  TORCH_CHECK(input.size(-1) % 2 == 0,
+              "swiglustep_and_mul expects the last dimension to be even");
+
+  const auto hidden_size = input.size(-1) / 2;
+  auto gate = input.slice(-1, 0, hidden_size);
+  auto up = input.slice(-1, hidden_size);
+  auto gate_silu = gate * torch::sigmoid(gate);
+  auto result = torch::clamp_max(gate_silu, limit) *
+                torch::clamp(up, -limit, limit);
+  out.copy_(result.to(out.scalar_type()));
+}
+
 void zero_kv_blocks_precompiled(const torch::Tensor& block_ids,
                                 c10::List<torch::Tensor> kv_tensors,
                                 c10::List<int64_t> block_dims,
@@ -2734,6 +3370,88 @@ void moe_batch_load_gptq_runtime_precompiled(
   batch_copy_into_slots_optional(slot_ids, w2_g_idx_sort_indices_src,
                                  w2_g_idx_sort_indices_dst,
                                  "w2_g_idx_sort_indices");
+}
+
+void moe_batched_mm_precompiled(
+    const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& C,
+    const torch::Tensor& expert_num_tokens,
+    const std::optional<torch::Tensor>& A_scale,
+    const std::optional<torch::Tensor>& B_scale, bool use_fp8_w8a8,
+    bool per_act_token_quant) {
+  TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda(),
+              "moe_batched_mm_precompiled expects CUDA tensors");
+  TORCH_CHECK(A.dim() == 3 && B.dim() == 3 && C.dim() == 3,
+              "moe_batched_mm_precompiled expects rank-3 A/B/C tensors");
+  TORCH_CHECK(expert_num_tokens.dim() == 1,
+              "moe_batched_mm_precompiled expects 1D expert_num_tokens");
+  TORCH_CHECK(A.size(0) == B.size(0) && A.size(0) == C.size(0) &&
+                  A.size(0) == expert_num_tokens.numel(),
+              "moe_batched_mm_precompiled expects expert dimension to match");
+  TORCH_CHECK(A.size(1) == C.size(1),
+              "moe_batched_mm_precompiled expects A/C token dimensions to "
+              "match");
+  TORCH_CHECK(B.size(1) == C.size(2),
+              "moe_batched_mm_precompiled expects B/C output dimensions to "
+              "match");
+  TORCH_CHECK(A.size(2) == B.size(2),
+              "moe_batched_mm_precompiled expects A/B K dimensions to match");
+
+  auto expert_num_tokens_cpu =
+      expert_num_tokens.to(torch::kCPU, torch::kLong, false, false)
+          .contiguous();
+
+  auto resolved_A_scale =
+      A_scale.has_value()
+          ? std::optional<torch::Tensor>(
+                A_scale.value().to(A.device(), A_scale.value().scalar_type(),
+                                   false, false)
+                    .contiguous())
+          : std::nullopt;
+  auto resolved_B_scale =
+      B_scale.has_value()
+          ? std::optional<torch::Tensor>(
+                B_scale.value().to(B.device(), B_scale.value().scalar_type(),
+                                   false, false)
+                    .contiguous())
+          : std::nullopt;
+
+  C.zero_();
+
+  for (int64_t expert_idx = 0; expert_idx < expert_num_tokens_cpu.numel();
+       ++expert_idx) {
+    const int64_t num_tokens = expert_num_tokens_cpu[expert_idx].item<int64_t>();
+    if (num_tokens <= 0) {
+      continue;
+    }
+
+    auto input_tensor = A[expert_idx].slice(0, 0, num_tokens);
+    auto weight_tensor = B[expert_idx];
+
+    torch::Tensor input_f;
+    torch::Tensor weight_f;
+    if (use_fp8_w8a8) {
+      input_f = dequantize_batched_moe_tensor_reference(
+          input_tensor,
+          resolved_A_scale.has_value()
+              ? std::optional<torch::Tensor>(
+                    resolved_A_scale.value()[expert_idx].slice(0, 0, num_tokens))
+              : std::nullopt,
+          per_act_token_quant);
+      weight_f = dequantize_batched_moe_tensor_reference(
+          weight_tensor,
+          resolved_B_scale.has_value()
+              ? std::optional<torch::Tensor>(resolved_B_scale.value()[expert_idx])
+              : std::nullopt,
+          false);
+    } else {
+      input_f = input_tensor.to(torch::kFloat32);
+      weight_f = weight_tensor.to(torch::kFloat32);
+    }
+
+    auto result =
+        torch::matmul(input_f, weight_f.transpose(0, 1)).to(C.scalar_type());
+    C[expert_idx].slice(0, 0, num_tokens).copy_(result);
+  }
 }
 
 torch::Tensor causal_conv1d_update_precompiled(
