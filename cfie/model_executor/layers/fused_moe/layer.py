@@ -51,7 +51,11 @@ from cfie.model_executor.layers.fused_moe.utils import (
 from cfie.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
-from cfie.offload.policy import get_moe_tiered_cache_plan
+from cfie.offload.policy import (
+    SUPPORTED_TIERED_CACHE_QUANTIZATIONS,
+    get_moe_tiered_cache_plan,
+    resolve_moe_tiered_cache_quantization,
+)
 from cfie.platforms import current_platform
 from cfie.utils.math_utils import round_up
 
@@ -192,51 +196,12 @@ def _should_enable_tiered_cache(
         layer: "FusedMoE",
         prefix: str,
 ) -> bool:
-    # -------------------- 当前 helper 不需要直接访问 layer 对象 --------------------
-    # 这里的判定暂时只依赖 quant_config 和层名前缀；
-    # `layer` 参数保留下来主要是为了后续扩展或保持调用接口一致。
-    del layer
+    # 当前 helper 只负责判断“这类 expert 权重格式是否已有 tiered cache 运行时支持”。
+    # 具体某层最终是量化还是回退成非量化 expert，由后续 quant_method 解析决定。
+    del layer, prefix
 
-    # -------------------- 先过滤掉明显不支持的量化配置 --------------------
-    # 未启用量化时，没有必要开启 tiered cache。
-    # 若量化配置带 desc_act，也直接关闭；当前这条路径只支持更窄的一组 GPTQ 场景。
-    if quant_config is None or bool(getattr(quant_config, "desc_act", False)):
-        return False
-
-    # -------------------- 只允许 GPTQ Marlin 路径启用该能力 --------------------
-    # 某些量化配置类会把量化方法名挂在类方法 `get_name()` 上，这里做一次安全读取。
-    quant_name_getter = getattr(quant_config.__class__, "get_name", None)
-    # 若类上确实有可调用的 `get_name`，就取其返回值；否则记为 None。
-    quant_name = quant_name_getter() if callable(quant_name_getter) else None
-    # 当前 tiered cache 仅在 gptq_marlin 量化路径下允许开启。
-    if quant_name != "gptq_marlin":
-        return False
-
-    # -------------------- 读取 dynamic override，处理按层排除的例外 --------------------
-    # 这里延迟导入，避免模块级循环依赖。
-    from cfie.model_executor.layers.quantization.utils.gptq_utils import (
-        get_dynamic_override,
-    )
-
-    # 查询当前层名前缀是否命中了 dynamic 规则。
-    dynamic_override = get_dynamic_override(
-        quant_config,
-        layer_name=prefix,
-    )
-    if dynamic_override is False:
-        # Qwen3.5 的 GPTQ checkpoint 往往会把 MTP 分支排除在 GPTQ 量化之外。
-        # 但这里仍希望给 MTP drafter 的 MoE 层开启 tiered cache，
-        # 否则这部分层会退回成整层 FP16 常驻，显存成本过高。
-        # 因此：若 dynamic 明确判定“当前层不量化”，但层名前缀属于 MTP 分支，
-        # 仍然返回 True，允许 tiered cache 继续生效。
-        return prefix.startswith("mtp.") or ".mtp." in prefix
-    # 走到这里说明：
-    # - 量化配置存在
-    # - 不是 desc_act
-    # - 量化方法是 gptq_marlin
-    # - 且没有命中必须禁用的 dynamic 排除规则
-    # 因此允许当前层启用 tiered cache。
-    return True
+    quant_name = resolve_moe_tiered_cache_quantization(quant_config=quant_config)
+    return quant_name in SUPPORTED_TIERED_CACHE_QUANTIZATIONS
 
 
 # TODO(rob): 后续把这段逻辑继续下沉到 kernel 内部。
@@ -618,7 +583,8 @@ class FusedMoE(CustomOp):
 
         # shared experts 需要提前初始化 top-k 元数据缓冲区。
         self._init_aiter_shared_experts_topK_buffer(
-            cfie_config=cfie_config, dp_size=dp_size_
+            cfie_config=cfie_config,
+            dp_size=dp_size_
         )
 
         # 若启用了 EP + AITER fused moe，则 expert_mask 必须严格是 0/1 mask。

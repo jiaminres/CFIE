@@ -41,6 +41,12 @@ DEFAULT_PREFILL_BURST_TOKENS_PER_GPU_SLOT = 4
 QWEN35_MOE_MODEL_TYPE = "qwen3_5_moe"
 QWEN35_MTP_MODEL_TYPE = "qwen3_5_mtp"
 QWEN35_MOE_MTP_ARCH = "Qwen3_5MoeMTP"
+SUPPORTED_TIERED_CACHE_QUANTIZATIONS = frozenset(
+    {
+        "gptq_marlin",
+        "unquantized",
+    }
+)
 
 _DTYPE_BYTES = {
     "BOOL": 1,
@@ -158,19 +164,14 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
 
     # 读取量化配置对象，用于判断当前权重格式是否适配该 planner。
     quant_config = getattr(cfie_config, "quant_config", None)
-    # 优先通过 quant_config.get_name() 读取量化后端名；否则退回 model_config.quantization。
-    quant_name = (
-        quant_config.get_name()
-        if quant_config is not None and hasattr(quant_config, "get_name")
-        else str(getattr(model_config, "quantization", ""))
+    # 统一把“无量化”和具体量化后端都规整成 tiered cache 可理解的名字。
+    quant_name = resolve_moe_tiered_cache_quantization(
+        quant_config=quant_config,
+        fallback_quantization=getattr(model_config, "quantization", ""),
     )
-    # 当前 planner 只支持 gptq_marlin；其他量化后端一律不启用。
-    if quant_name != "gptq_marlin":
+    # 当前运行时已支持 gptq_marlin 与非量化 expert offload；其余量化后端仍先禁用。
+    if quant_name not in SUPPORTED_TIERED_CACHE_QUANTIZATIONS:
         return MoeTieredCachePlan(enabled=False, reason="quantization_not_supported")
-
-    # desc_act=True 的 GPTQ 目前不在支持范围内。
-    if bool(getattr(quant_config, "desc_act", False)):
-        return MoeTieredCachePlan(enabled=False, reason="desc_act_not_supported")
 
     # 读取 Hugging Face 原始配置与文本子配置。
     hf_config = getattr(model_config, "hf_config", None)
@@ -919,6 +920,27 @@ def _estimate_dynamic_reserve_bytes(
         DEFAULT_DYNAMIC_RESERVE_BYTES,
         int(gpu_budget_bytes * 0.10),
     )
+
+
+def resolve_moe_tiered_cache_quantization(
+        *,
+        quant_config: Any | None,
+        fallback_quantization: Any = None,
+) -> str:
+    # 优先读取量化配置类暴露的逻辑量化名；这是运行时真实会走到的后端信息。
+    quant_name_getter = getattr(quant_config, "get_name", None)
+    if callable(quant_name_getter):
+        quant_name = str(quant_name_getter() or "")
+    else:
+        quant_name = str(fallback_quantization or "")
+
+    normalized_quant_name = quant_name.strip().lower()
+
+    # 未配置量化时，tiered cache 统一按“非量化 expert”路径处理。
+    if normalized_quant_name in {"", "none", "null"}:
+        return "unquantized"
+
+    return normalized_quant_name
 
 
 def _get_total_system_ram_bytes() -> int:

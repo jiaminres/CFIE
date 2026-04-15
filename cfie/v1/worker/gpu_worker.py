@@ -427,6 +427,14 @@ class Worker(WorkerBase):
 
         `available_kv_cache_memory_bytes = static_memory_budget - steady_non_kv_cache_memory`
 
+        在满足运行时峰值安全余量的前提下，还允许按需从未使用的
+        `runtime_headroom` 借一部分预算给 KV cache。借用只在以下条件同时
+        满足时触发：
+
+        - 当前静态预算下的 KV cache 无法覆盖 `max_model_len * max_num_seqs`
+          的目标容量；
+        - `runtime_headroom` 仍有剩余（`runtime_peak_memory` 未挤满）。
+
         同时还要校验：
 
         - `runtime_peak_memory <= runtime_memory_headroom`
@@ -569,6 +577,53 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.static_memory_budget - self.steady_non_kv_cache_memory
         )
+
+        # ------------------ 第 4.1 段：在不破坏运行时峰值安全余量前提下，按需借用 headroom 扩容 KV ------------------
+        # 只有当当前 KV 预算无法覆盖 max_model_len * max_num_seqs 时，才尝试借用。
+        # 借用上限同时受两条约束：
+        # 1) runtime headroom 剩余：runtime_memory_headroom - runtime_peak_memory
+        # 2) startup free memory 剩余：init_free_memory - (static_budget + runtime_peak_memory)
+        from cfie.v1.core.kv_cache_utils import max_memory_usage_bytes
+
+        # 读取当前 worker 持有层的 KV 规格，并估算“单请求满上下文”所需 KV 字节数。
+        worker_kv_cache_spec = self.model_runner.get_kv_cache_spec()
+        single_req_kv_bytes = max_memory_usage_bytes(
+            self.cfie_config, worker_kv_cache_spec.values()
+        )
+        required_req_count = max(1, self.scheduler_config.max_num_seqs)
+        required_kv_bytes = single_req_kv_bytes * required_req_count
+
+        # 当静态预算内的 KV 不足以覆盖 max_model_len * reqs 时，再尝试借用 headroom。
+        # 这里允许初始 KV 预算 <= 0 的场景也参与借用。
+        if (
+            single_req_kv_bytes > 0
+            and self.available_kv_cache_memory_bytes < required_kv_bytes
+        ):
+            headroom_spare = max(
+                0,
+                self.runtime_memory_headroom - self.runtime_peak_memory,
+            )
+            free_memory_spare = max(
+                0,
+                self.init_snapshot.free_memory
+                - (self.static_memory_budget + self.runtime_peak_memory),
+            )
+            expandable_kv_bytes = min(headroom_spare, free_memory_spare)
+
+            if expandable_kv_bytes > 0:
+                expand_delta = min(
+                    expandable_kv_bytes,
+                    required_kv_bytes - self.available_kv_cache_memory_bytes,
+                )
+                self.available_kv_cache_memory_bytes += expand_delta
+                logger.info_once(
+                    "Expanded KV cache budget by borrowing runtime headroom: "
+                    "delta=%s GiB, target=%s GiB, final=%s GiB.",
+                    format_gib(expand_delta),
+                    format_gib(required_kv_bytes),
+                    format_gib(self.available_kv_cache_memory_bytes),
+                    scope="local",
+                )
 
         logger.debug(
             "Initial free memory: %s GiB; Static budget: %f (util), %s GiB; "
