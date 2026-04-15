@@ -94,10 +94,21 @@ endif()
 #
 find_package(Torch REQUIRED)
 
+set(CFIE_USING_CUDA_TOOLKIT_ALIAS OFF)
 if(WIN32 AND DEFINED CFIE_CUDA_TOOLKIT_ALIAS AND EXISTS "${CFIE_CUDA_TOOLKIT_ALIAS}")
   file(TO_CMAKE_PATH "${CFIE_CUDA_TOOLKIT_ALIAS}" CFIE_CUDA_COMPILE_ROOT)
+  set(CFIE_USING_CUDA_TOOLKIT_ALIAS ON)
 else()
   set(CFIE_CUDA_COMPILE_ROOT "${CUDA_TOOLKIT_ROOT_DIR}")
+endif()
+
+if(CFIE_USING_CUDA_TOOLKIT_ALIAS)
+  # Keep toolkit-root based logic on the alias path to avoid space-splitting
+  # issues with raw compiler include flags.
+  set(CUDA_TOOLKIT_ROOT_DIR "${CFIE_CUDA_COMPILE_ROOT}" CACHE PATH
+      "CUDA toolkit root used by CFIE" FORCE)
+  set(CUDAToolkit_ROOT "${CFIE_CUDA_COMPILE_ROOT}" CACHE PATH
+      "CUDAToolkit root used by CFIE" FORCE)
 endif()
 
 set(CFIE_CUDA_INCLUDE_DIRS "")
@@ -106,7 +117,7 @@ if(CFIE_CUDA_COMPILE_ROOT)
   if(EXISTS "${CFIE_CUDA_COMPILE_ROOT}/include/cccl")
     list(APPEND CFIE_CUDA_INCLUDE_DIRS "${CFIE_CUDA_COMPILE_ROOT}/include/cccl")
   endif()
-  if(WIN32 AND DEFINED CFIE_CUDA_TOOLKIT_ALIAS AND EXISTS "${CFIE_CUDA_TOOLKIT_ALIAS}")
+  if(CFIE_USING_CUDA_TOOLKIT_ALIAS)
     set(CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES ${CFIE_CUDA_INCLUDE_DIRS})
     set(CUDAToolkit_INCLUDE_DIRS ${CFIE_CUDA_INCLUDE_DIRS})
     set(CUDA_INCLUDE_DIRS ${CFIE_CUDA_INCLUDE_DIRS})
@@ -239,10 +250,10 @@ endif()
 # Set CUDA include flags for CXX compiler.
 #
 if(VLLM_GPU_LANG STREQUAL "CUDA")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I${CUDA_TOOLKIT_ROOT_DIR}/include")
-  if(CUDA_VERSION VERSION_GREATER_EQUAL 13.0)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I${CUDA_TOOLKIT_ROOT_DIR}/include/cccl")
-  endif()
+  foreach(CFIE_CUDA_INCLUDE_DIR IN LISTS CFIE_CUDA_INCLUDE_DIRS)
+    set(CMAKE_CXX_FLAGS
+        "${CMAKE_CXX_FLAGS} -I\"${CFIE_CUDA_INCLUDE_DIR}\"")
+  endforeach()
 endif()
 
 #
@@ -1030,9 +1041,11 @@ if(WIN32)
   target_compile_options(_C PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/FI${CFIE_WINDOWS_FORCE_INCLUDE_HEADER}>
     $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CFIE_WINDOWS_FORCE_INCLUDE_HEADER_CMAKE}>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
   target_compile_definitions(_C PRIVATE
     CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING=1)
@@ -1226,9 +1239,11 @@ if(WIN32)
   target_compile_options(_moe_C PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/FI${CFIE_WINDOWS_FORCE_INCLUDE_HEADER}>
     $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CFIE_WINDOWS_FORCE_INCLUDE_HEADER_CMAKE}>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
   target_compile_definitions(_moe_C PRIVATE
     CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING=1)
