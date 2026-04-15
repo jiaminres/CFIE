@@ -402,39 +402,59 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # 中文注释：NOTE: hidden_states can have either 1D or 2D shape.
+        # ------------------------------- 规范化输入形状并记录原始布局 -------------------------------
+        # 先保存调用方传入的原始形状，函数返回前会按这个形状还原输出。
         orig_shape = hidden_states.shape
+        # 当前 MoE 路径按 [num_tokens, hidden_dim] 组织输入，这里取出两个核心维度。
         num_tokens, hidden_dim = hidden_states.shape
+        # 显式整理成二维张量，保证后续 gate 和 experts 使用统一输入格式。
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        # ------------------------------- 按需切分 sequence parallel 的本地 token 分片 -------------------------------
+        # 开启 sequence parallel 时，当前 rank 只处理自己负责的那部分 token。
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
+        # ------------------------------- 计算路由信息并执行专家前向 -------------------------------
+        # 如果 experts 内部自带 router，就直接把输入交给 experts，
+        # gate 计算会在 FusedMoE 内部完成。
         if self.experts.is_internal_router:
-            # 中文注释：In this case, the gate/router runs inside the FusedMoE class
             final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
+                hidden_states=hidden_states,
+                router_logits=hidden_states
             )
         else:
-            # 中文注释：router_logits: (num_tokens, n_experts)
+            # 如果 router 不在 experts 内部，就先用外部 gate 计算每个 token 的 router logits。
             router_logits, _ = self.gate(hidden_states)
+            # 再把 token 表示和对应的 router logits 一起交给 experts 执行 MoE 计算。
             final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
+                hidden_states=hidden_states,
+                router_logits=router_logits
             )
 
+        # ------------------------------- 合并 shared expert 与 routed experts 的输出 -------------------------------
+        # 开启 shared expert 时，experts 返回的是两个分支的输出，这里把它们逐元素相加。
         if self.shared_expert is not None:
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
+        # ------------------------------- 按并行策略恢复最终输出布局 -------------------------------
+        # 注意：sequence parallel 不是“不考虑 TP”，而是建立在 TP group 之上的另一种切分方式。
+        # 在这种模式下，各 TP rank 持有的是不同 token 分片，因此这里要沿 token 维做 all-gather，
+        # 把局部序列重新拼回完整序列，而不是像普通 TP 那样对各 rank 的部分结果做 all-reduce。
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
+            # gather 后可能带有补齐 token，这里裁回原始 token 数。
             final_hidden_states = final_hidden_states[:num_tokens]
         elif self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
+            # 非 sequence parallel 但存在 TP 时，各 rank 通常持有同一批 token 的部分贡献，
+            # 因此这里按需做 TP all-reduce，把这些部分结果规约成完整输出。
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
                 final_hidden_states
             )
 
+        # 按输入进入本函数前的形状还原输出，保持该层对外接口不变。
         return final_hidden_states.view(orig_shape)
 
 

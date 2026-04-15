@@ -67,7 +67,20 @@ def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> 
 
 
 class QuantizationConfig(ABC):
-    """Base class for quantization configs."""
+    """
+    量化配置接口的抽象基类。
+
+    这个接口用于统一描述一种量化方案在框架侧需要提供的配置能力。
+    具体量化实现都应继承这个基类，并补齐：
+    - 量化方法名称；
+    - 支持的激活 dtype；
+    - 最低硬件能力要求；
+    - 需要搜索的配置文件名；
+    - 从模型量化配置构造实例的逻辑。
+
+    它本身不直接执行量化计算，而是负责承载“如何识别、解析和约束
+    某种量化方案”的配置语义。
+    """
 
     def __init__(self):
         super().__init__()

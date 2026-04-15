@@ -361,101 +361,100 @@ class DynamicShapesConfig:
 
 @config
 class CompilationConfig:
-    """Configuration for compilation.
+    """编译相关配置。
 
-    You must pass CompilationConfig to VLLMConfig constructor.
-    VLLMConfig's post_init does further initialization. If used outside of the
-    VLLMConfig, some fields will be left in an improper state.
+    这个配置对象必须作为 `VLLMConfig` 的一部分传入构造函数。
+    `VLLMConfig.post_init()` 会继续补全这里的若干字段；如果脱离
+    `VLLMConfig` 单独使用，本类中的部分字段可能处于未完成初始化的状态。
 
-    It contains PassConfig, which controls the custom fusion/transformation passes.
-    The rest has three parts:
+    本类内部还包含 `PassConfig`，用于控制自定义 fusion / graph
+    transformation pass。除此之外，整体配置大致分为三部分：
 
-    - Top-level Compilation control:
-        - [`mode`][cfie.config.CompilationConfig.mode]
-        - [`debug_dump_path`][cfie.config.CompilationConfig.debug_dump_path]
-        - [`cache_dir`][cfie.config.CompilationConfig.cache_dir]
-        - [`backend`][cfie.config.CompilationConfig.backend]
-        - [`custom_ops`][cfie.config.CompilationConfig.custom_ops]
-        - [`splitting_ops`][cfie.config.CompilationConfig.splitting_ops]
-        - [`compile_mm_encoder`][cfie.config.CompilationConfig.compile_mm_encoder]
-    - CudaGraph capture:
-        - [`cudagraph_mode`][cfie.config.CompilationConfig.cudagraph_mode]
-        - [`cudagraph_capture_sizes`]
+    - 顶层编译控制：
+      - [`mode`][cfie.config.CompilationConfig.mode]
+      - [`debug_dump_path`][cfie.config.CompilationConfig.debug_dump_path]
+      - [`cache_dir`][cfie.config.CompilationConfig.cache_dir]
+      - [`backend`][cfie.config.CompilationConfig.backend]
+      - [`custom_ops`][cfie.config.CompilationConfig.custom_ops]
+      - [`splitting_ops`][cfie.config.CompilationConfig.splitting_ops]
+      - [`compile_mm_encoder`][cfie.config.CompilationConfig.compile_mm_encoder]
+    - CUDAGraph 捕获相关：
+      - [`cudagraph_mode`][cfie.config.CompilationConfig.cudagraph_mode]
+      - [`cudagraph_capture_sizes`]
         [cfie.config.CompilationConfig.cudagraph_capture_sizes]
-        - [`max_cudagraph_capture_size`]
+      - [`max_cudagraph_capture_size`]
         [cfie.config.CompilationConfig.max_cudagraph_capture_size]
-        - [`cudagraph_num_of_warmups`]
+      - [`cudagraph_num_of_warmups`]
         [cfie.config.CompilationConfig.cudagraph_num_of_warmups]
-        - [`cudagraph_copy_inputs`]
+      - [`cudagraph_copy_inputs`]
         [cfie.config.CompilationConfig.cudagraph_copy_inputs]
-    - Inductor compilation:
-        - [`compile_sizes`][cfie.config.CompilationConfig.compile_sizes]
-        - [`compile_ranges_endpoints`]
-            [cfie.config.CompilationConfig.compile_ranges_endpoints]
-        - [`inductor_compile_config`]
+    - Inductor 编译相关：
+      - [`compile_sizes`][cfie.config.CompilationConfig.compile_sizes]
+      - [`compile_ranges_endpoints`]
+        [cfie.config.CompilationConfig.compile_ranges_endpoints]
+      - [`inductor_compile_config`]
         [cfie.config.CompilationConfig.inductor_compile_config]
-        - [`inductor_passes`][cfie.config.CompilationConfig.inductor_passes]
-        - custom inductor passes
+      - [`inductor_passes`][cfie.config.CompilationConfig.inductor_passes]
+      - 自定义 inductor pass
 
-    Why we have different sizes for cudagraph and inductor:
-    - cudagraph: a cudagraph captured for a specific size can only be used
-        for the same size. We need to capture all the sizes we want to use.
-    - inductor: a graph compiled by inductor for a general shape can be used
-        for different sizes. Inductor can also compile for specific sizes,
-        where it can have more information to optimize the graph with fully
-        static shapes. However, we find the general shape compilation is
-        sufficient for most cases. It might be beneficial to compile for
-        certain small batchsizes, where inductor is good at optimizing.
+    之所以 `cudagraph` 和 `inductor` 分别维护不同的 size 配置，是因为：
+
+    - `cudagraph`：针对某个固定 size 捕获得到的图，只能复用于同样的 size，
+      因而需要把想支持的所有 size 都逐一捕获出来。
+    - `inductor`：针对一般形状编译出来的图，往往可以覆盖一段 shape 范围。
+      它当然也可以针对某个固定 size 做更激进的静态优化，但在大多数场景下，
+      通用 shape 编译已经足够；只有部分较小 batch size，定制编译可能更划算。
     """
 
-    # Top-level Compilation control
+    # 顶层编译控制
     mode: CompilationMode = Field(default=None)
-    """The compilation approach used for torch.compile-based compilation of the
-    model.
+    """控制模型采用哪种基于 `torch.compile` 的编译方式。
 
-    - None: If None, we will select the default compilation mode.
-      For V1 engine this is 3.
-    - 0: NONE: No torch.compile compilation is applied, model runs in fully
-         eager pytorch mode. The model runs as-is.
-    - 1: STOCK_TORCH_COMPILE: The standard `torch.compile` compilation pipeline.
-    - 2: DYNAMO_TRACE_ONCE: Single Dynamo trace through the model, avoiding
-         recompilation by removing guards.
-         Requires no dynamic-shape-dependent control-flow.
-    - 3: VLLM_COMPILE: Custom vLLM Inductor-based backend with caching,
-         piecewise compilation, shape specialization, and custom passes."""
+    - `None`：自动选择默认模式；对于 V1 engine，默认是 `3`
+    - `0 / NONE`：不做 `torch.compile`，模型完全以 eager PyTorch 方式运行
+    - `1 / STOCK_TORCH_COMPILE`：使用标准的 `torch.compile` 编译流水线
+    - `2 / DYNAMO_TRACE_ONCE`：只做一次 Dynamo trace，并通过去掉 guard
+      避免重复编译；要求模型里不能有依赖动态 shape 的控制流
+    - `3 / VLLM_COMPILE`：使用 vLLM 定制的 Inductor 后端，支持缓存、
+      分段编译、shape 特化和自定义 pass
+    """
     debug_dump_path: Path | None = None
-    """The path to dump the debug information."""
+    """调试信息导出目录。"""
     cache_dir: str = ""
-    """The directory to store the compiled graph, to accelerate Inductor
-    compilation. By default, it will use model-related information to generate
-    a cache directory."""
+    """编译图缓存目录。
+
+    该目录用于保存已编译的图，以加速后续 Inductor 编译。
+    默认会根据模型相关信息自动生成一个缓存目录。
+    """
     compile_cache_save_format: Literal["binary", "unpacked"] = field(
         default_factory=lambda: envs.VLLM_COMPILE_CACHE_SAVE_FORMAT
     )
-    """Format for saving torch compile cache:\n
-    - "binary": saves as binary file (multiprocess safe)\n
-    - "unpacked": saves as directory structure for inspection/debugging
-    (NOT multiprocess safe)\n
-    Defaults to `VLLM_COMPILE_CACHE_SAVE_FORMAT` if not specified.
+    """`torch.compile` 缓存的保存格式。
+
+    - `"binary"`：保存为单个二进制文件，支持多进程安全访问
+    - `"unpacked"`：保存为目录结构，便于排查和调试，但不具备多进程安全性
+
+    若未显式指定，则默认读取环境变量 `VLLM_COMPILE_CACHE_SAVE_FORMAT`。
     """
     backend: str = ""
-    """The backend for compilation. It needs to be a string:
+    """编译后端名称，必须以字符串形式给出。
 
-    - "" (empty string): use the default backend ("inductor" on CUDA-alike
-    platforms).
-    - "eager"/"openxla"/...: use the specified backend registered in PyTorch.
-    - "full.module.name": a qualified name which can be used to import the
+    可选写法包括：
 
-    backend function.
-    We use string to avoid serialization issues when using compilation in a
-    distributed setting. When the compilation mode is 1 or 2, the backend is
-    used for the compilation directly (it sees the whole graph). When the
-    compilation mode is 3, the backend supports both whole graph and piecewise
-    compilation, available backends include eager, inductor, and custom backends,
-    the latter of which can be defined via `get_compile_backend`. Furthermore,
-    compilation is only piecewise if splitting ops is set accordingly and
-    use_inductor_graph_partition is off. Note that the default options for
-    splitting ops are sufficient for piecewise compilation.
+    - `""`（空字符串）：使用默认后端；在 CUDA 类平台上通常是 `"inductor"`
+    - `"eager"` / `"openxla"` / ...：使用 PyTorch 中已注册的后端
+    - `"full.module.name"`：使用可导入的完整限定名来定位某个后端函数
+
+    这里使用字符串而不是直接传函数对象，主要是为了避免分布式场景下的序列化问题。
+
+    - 当 `mode` 为 `1` 或 `2` 时，`backend` 直接接收整张图并负责编译
+    - 当 `mode` 为 `3` 时，后端既可以支持整图编译，也可以支持分段编译；
+      可用后端包括 `eager`、`inductor` 以及通过 `get_compile_backend`
+      定义的自定义后端
+
+    另外，只有当 `splitting_ops` 配置为相应值、且 `use_inductor_graph_partition`
+    关闭时，才会真正启用分段编译。通常默认的 `splitting_ops` 设置已经足够支撑
+    piecewise compilation。
     """
     custom_ops: list[str] = field(default_factory=list)
     """对启用/禁用哪些自定义算子（custom ops）进行细粒度控制。
@@ -484,205 +483,235 @@ class CompilationConfig:
     对于被禁用的自定义算子，Inductor 会为它们生成（可能融合后的）Triton kernel。
     """
     splitting_ops: list[str] | None = None
-    """A list of ops to exclude from cudagraphs, used in piecewise compilation.
+    """在 piecewise compilation 中，用于把哪些算子排除出 cudagraph。
 
-    The behavior depends on use_inductor_graph_partition:
+    它的行为取决于 `use_inductor_graph_partition`：
 
-    - When use_inductor_graph_partition=False (default):
-        These ops are used for Dynamo FX-level graph splitting. The graph is
-        split at these ops before Inductor compilation, creating separate
-        subgraphs for cudagraph capture.
+    - 当 `use_inductor_graph_partition=False`（默认）时：
+      这些算子会被用作 Dynamo FX 层面的图切分点。Inductor 编译之前，
+      整张图会先在这些算子处切开，从而生成多个可用于 cudagraph 捕获的子图。
 
-    - When use_inductor_graph_partition=True:
-        These ops are used to register Inductor partition rules. The graph
-        partitioning happens at Inductor codegen time after all passes and
-        fusions are finished, allowing compilation and custom passes to operate
-        on the full graph while still excluding these ops from cudagraphs.
+    - 当 `use_inductor_graph_partition=True` 时：
+      这些算子会被注册成 Inductor 的 partition rule。真正的切分发生在
+      Inductor codegen 阶段、也就是所有 pass 和 fusion 都跑完之后；
+      这样编译和自定义 pass 仍然能基于完整图工作，同时这些算子依然可以被排除在
+      cudagraph 之外。
 
-    If None, defaults to attention ops for piecewise cudagraphs.
-    If empty list [], no ops are excluded (suitable for full cudagraphs)."""
+    - 若为 `None`：默认使用 attention 相关算子，适配 piecewise cudagraph
+    - 若为空列表 `[]`：表示不排除任何算子，更适合 full cudagraph
+    """
     compile_mm_encoder: bool = False
-    """Whether or not to compile the multimodal encoder.
-    Currently, this only works for `Qwen2_5_vl` and `mLLaMa4` models
-    on selected platforms. Disabled by default until more models
-    are supported/tested to work."""
+    """是否编译多模态编码器。
 
-    # Inductor capture
+    当前仅在部分平台上的 `Qwen2_5_vl` 和 `mLLaMa4` 模型中可用。
+    在更多模型经过验证之前，默认保持关闭。
+    """
+
+    # Inductor 编译 size 相关配置
     compile_sizes: list[int | str] | None = None
-    """Sizes to compile for inductor. In addition
-    to integers, it also supports "cudagraph_capture_sizes" to
-    specify the sizes for cudagraph capture."""
+    """指定要为 Inductor 编译哪些 size。
+
+    除了整数外，也支持使用 `"cudagraph_capture_sizes"`，
+    表示直接复用 cudagraph 的 capture size 列表。
+    """
 
     compile_ranges_endpoints: list[int] | None = None
-    """Endpoints for Inductor compile ranges.
-    The compile ranges are
-    [1, endpoints[0]],
-    [endpoints[0] + 1, endpoints[1]], ...,
-    [endpoints[-1] + 1, max_num_batched_tokens].
-    Compile sizes are also used single element ranges,
-    the range is represented as [compile_sizes[i], compile_sizes[i]].
+    """Inductor 编译区间的端点列表。
 
-    If a range overlaps with the compile size, graph for compile size
-    will be prioritized, i.e. if we have a range [1, 8] and a compile size 4,
-    graph for compile size 4 will be compiled and used instead of the graph
-    for range [1, 8].
+    这些端点会形成如下编译区间：
+
+    - `[1, endpoints[0]]`
+    - `[endpoints[0] + 1, endpoints[1]]`
+    - ...
+    - `[endpoints[-1] + 1, max_num_batched_tokens]`
+
+    `compile_sizes` 也会被视作单点区间，即：
+    `[compile_sizes[i], compile_sizes[i]]`
+
+    如果某个区间与某个 `compile_size` 重叠，则优先使用该 `compile_size`
+    对应的编译图。比如区间是 `[1, 8]`，而 `compile_size=4`，
+    那么 size=4 时优先使用为 4 单独编译的图，而不是 `[1, 8]` 区间图。
     """
 
     inductor_compile_config: dict = field(default_factory=dict)
-    """Additional configurations for inductor.
-    - None: use default configurations."""
+    """Inductor 的额外配置项。
+
+    - `None`：表示使用默认配置
+    """
 
     inductor_passes: dict[str, str] = field(default_factory=dict)
-    """Additional passes for inductor. It is a dictionary
-    from pass name to pass function qualified name. We use function
-    name because the config uses JSON format. If we pass the config
-    from Python, functions can also be passed directly via Python object
-    constructor, e.g. `CompilationConfig(inductor_passes={"a": func})`."""
+    """Inductor 的额外 pass 配置。
 
-    # CudaGraph compilation
-    cudagraph_mode: CUDAGraphMode = Field(default=None)
+    该字段是一个字典，键是 pass 名，值是 pass 函数的完整限定名。
+    之所以保存函数名而不是直接保存函数对象，是因为配置本身需要支持 JSON 形式。
+
+    如果是直接在 Python 里构造配置对象，也可以直接把函数对象传进来，例如：
+
+    `CompilationConfig(inductor_passes={"a": func})`
     """
-    The mode of the cudagraph:
 
-    - NONE, no cudagraph capture.
-    - PIECEWISE.
-    - FULL.
-    - FULL_DECODE_ONLY.
-    - FULL_AND_PIECEWISE. (v1 default)
+    # CUDAGraph 相关配置
+    cudagraph_mode: CUDAGraphMode = Field(default=None)
+    """CUDAGraph 模式。
 
-    PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
-    incompatible ops (i.e. some attention ops) outside the cudagraph
-    for general flexibility.
+    可选模式包括：
 
-    FULL mode: Capture full cudagraph for all batches. Can be good for small
-    models or workloads with small prompts; not supported by many backends.
-    Generally for performance FULL_AND_PIECEWISE is better.
+    - `NONE`：不做 cudagraph 捕获
+    - `PIECEWISE`
+    - `FULL`
+    - `FULL_DECODE_ONLY`
+    - `FULL_AND_PIECEWISE`（V1 默认）
 
-    FULL_DECODE_ONLY mode: Capture full cudagraph for decode batches only.
-    Mixed prefill-decode batches are run without cudagraphs. Can be good for
-    decode instances in a P/D setup where prefill is not as important so we
-    can save some memory.
+    各模式语义如下：
 
-    FULL_AND_PIECEWISE mode: Capture full cudagraph for decode batches and
-    piecewise cudagraph for prefill and mixed prefill-decode batches.
-    This is the most performant mode for most models and is the default.
+    - `PIECEWISE`：
+      只构建分段 cudagraph，把不兼容 cudagraph 的算子（例如部分 attention）
+      保留在图外，以换取更好的通用性。
 
-    Currently, the cudagraph mode is only used for the v1 engine.
-    Note that the cudagraph logic is generally orthogonal to the
-    compilation logic. While piecewise cudagraphs require piecewise
-    compilation (mode=VLLM_COMPILE and non-empty splitting_ops), full
-    cudagraphs are supported with and without compilation.
+    - `FULL`：
+      对所有 batch 直接捕获整张 cudagraph。它在小模型或小 prompt 工作负载下可能有利，
+      但许多 backend 并不支持；从整体性能看，通常 `FULL_AND_PIECEWISE` 更好。
 
-    Warning: This flag is new and subject to change in addition
-    more modes may be added.
+    - `FULL_DECODE_ONLY`：
+      只为 decode batch 捕获整图 cudagraph；mixed prefill-decode batch 不走
+      cudagraph。这个模式适合 P/D 分离场景下的 decode 实例：prefill 性能不那么关键，
+      但可以节省一部分显存。
+
+    - `FULL_AND_PIECEWISE`：
+      decode batch 走 full cudagraph；prefill 和 mixed prefill-decode batch
+      走 piecewise cudagraph。对大多数模型来说，这是当前默认且整体性能最好的模式。
+
+    目前 `cudagraph_mode` 只用于 V1 engine。
+
+    需要注意的是，cudagraph 逻辑与编译逻辑大体正交：
+
+    - piecewise cudagraph 需要 piecewise compilation
+      （即 `mode=VLLM_COMPILE` 且 `splitting_ops` 非空）
+    - full cudagraph 则既可以与编译结合，也可以独立使用
+
+    这是一个仍在演进中的新配置项，后续可能继续调整并增加新模式。
     """
     cudagraph_num_of_warmups: int = 0
-    """Number of warmup runs for cudagraph.
-    It means the first several runs will be treated as warmup runs.
-    Only after that, the execution will be recorded, and the recorded
-    cudagraph will be used for subsequent runs."""
+    """cudagraph 预热次数。
+
+    前若干次执行会被视为 warmup，不参与正式录制。
+    只有 warmup 结束后，系统才会开始录制并在后续复用录制好的 cudagraph。
+    """
     cudagraph_capture_sizes: list[int] | None = None
-    """Sizes to capture cudagraph.
-    - None (default): capture sizes are inferred from cfie config.
-    - list[int]: capture sizes are specified as given."""
+    """要捕获 cudagraph 的 size 列表。
+
+    - `None`（默认）：根据 cfie 配置自动推导 capture size
+    - `list[int]`：显式指定要捕获哪些 size
+    """
     cudagraph_copy_inputs: bool = False
-    """Whether to copy input tensors for
-    cudagraph. If the caller can guarantee that the same input buffers
-    are always used, it can set this to False. Otherwise, it should
-    set this to True, and the compiler will copy the input to an
-    internally managed buffer. Default is False.
-    Note that this flag is only effective when cudagraph_mode is PIECEWISE.
+    """是否为 cudagraph 复制输入张量。
+
+    如果调用方能够保证每次都复用同一块输入 buffer，可以设为 `False`；
+    否则应设为 `True`，这样编译器会先把输入拷贝到自己管理的内部 buffer。
+
+    默认值为 `False`。
+    该选项仅在 `cudagraph_mode=PIECEWISE` 时生效。
     """
     cudagraph_specialize_lora: bool = True
-    """Whether to create separate cuda graphs for cases with and without active
-    LoRA adapters. When set to False, the LoRA-enabled cuda graph will be used
-    for all cases, incurring the overhead of running LoRA ops even when no
-    adapters are active. Setting this to True will remove this overhead at the
-    cost of increased startup time and slightly higher memory usage.
-    When `enable_lora` is False, this option has no effect.
+    """是否为“启用 LoRA”和“未启用 LoRA”分别创建独立的 cuda graph。
+
+    若设为 `False`，则即使当前没有激活任何 LoRA adapter，也会统一复用
+    带 LoRA 的那份 cuda graph，从而额外承担执行 LoRA 相关算子的开销。
+
+    若设为 `True`，则可以消除这部分额外开销，但代价是启动时间更长、
+    显存占用也会略有增加。
+
+    当 `enable_lora=False` 时，该选项无效。
     """
 
     use_inductor_graph_partition: bool = Field(default=None)
-    """Use inductor graph partition to split the graph at cudagraph_unsafe ops.
-    This partition happens at inductor codegen time after all passes and fusions
-    are finished. It generates a single `call` function which wraps
-    cudagraph-safe ops into partition functions and leave cudagraph-unsafe ops
-    outside the partition functions. For a graph with N cudagraph-unsafe ops
-    (e.g., Attention), there would be N+1 partitions. To mark an op as
-    cudagraph unsafe, we can add `tags=(torch._C.Tag.cudagraph_unsafe)` when
-    register the custom op.
+    """是否使用 inductor graph partition 在 `cudagraph_unsafe` 算子处切图。
 
-    This config supports both full cudagraph and piecewise cudagraph without
-    compiling twice. For piecewise cudagraph, it applies vLLM CUDAGraph wrapper
-    to each partition. For N+1 partitions, there would be N+1
-    CUDAGraph wrapper instances.
+    这种切分发生在 Inductor codegen 阶段，也就是所有 pass 和 fusion 都执行完之后。
+    它会生成一个统一的 `call` 函数：把 cudagraph-safe 的算子包进若干 partition
+    function，而把 cudagraph-unsafe 的算子留在 partition 外面。
 
-    For full CUDAGraph, we always apply a single CUDAGraph wrapper outside the
-    inductor `call` function in the model runner. The top-level full cudagraph
-    capture ignores all partitioning.
+    如果一张图里有 `N` 个 cudagraph-unsafe 算子（例如 Attention），
+    最终就会得到 `N+1` 个 partition。若要把某个自定义算子标记为
+    cudagraph unsafe，可以在注册时添加：
+
+    `tags=(torch._C.Tag.cudagraph_unsafe)`
+
+    这个配置的好处是：无需编译两次，就能同时支持 full cudagraph 和
+    piecewise cudagraph。
+
+    - 对 piecewise cudagraph：
+      会给每个 partition 套一层 vLLM CUDAGraph wrapper；
+      如果有 `N+1` 个 partition，就会对应创建 `N+1` 个 wrapper 实例
+
+    - 对 full cudagraph：
+      始终是在 model runner 里，把一层总的 CUDAGraph wrapper 放在 inductor
+      `call` 函数外层；顶层 full cudagraph 捕获不会关心内部 partition
     """
 
     pass_config: PassConfig = field(default_factory=PassConfig)
-    """Custom inductor passes, see PassConfig for more details"""
+    """自定义 inductor pass 配置；更详细说明见 `PassConfig`。"""
 
     max_cudagraph_capture_size: int = field(default=None)
-    """The maximum cudagraph capture size.
+    """允许捕获的最大 cudagraph size。
 
-    If cudagraph_capture_sizes is specified, this will be set to the largest
-    size in that list (or checked for consistency if specified). If
-    cudagraph_capture_sizes is not specified, the list of sizes is generated
-    automatically following the pattern:
+    - 如果显式给了 `cudagraph_capture_sizes`，这里会被设置为其中最大的 size
+      （或者在用户也手动设置了本字段时，检查两者是否一致）
+    - 如果没有给 `cudagraph_capture_sizes`，系统会按以下模式自动生成 size 列表：
 
-        [1, 2, 4] + list(range(8, 256, 8)) + list(
-        range(256, max_cudagraph_capture_size + 1, 16))
+      `[1, 2, 4] + list(range(8, 256, 8)) + list(range(256, max_size + 1, 16))`
 
-    If not specified, max_cudagraph_capture_size is set to min(max_num_seqs*2,
-    512) by default. This voids OOM in tight memory scenarios with small
-    max_num_seqs, and prevents capture of many large graphs (>512) that would
-    greatly increase startup time with limited performance benefit.
+    若本字段也未指定，则默认取：
+
+    `min(max_num_seqs * 2, 512)`
+
+    这样做的目的是：
+
+    - 在显存紧张、`max_num_seqs` 又较小的情况下，避免 OOM
+    - 避免去捕获大量非常大的图（尤其是大于 512 的图），因为它们会显著拉长启动时间，
+      但收益通常有限
     """
 
     dynamic_shapes_config: DynamicShapesConfig = field(
         default_factory=DynamicShapesConfig
     )
-    """Configuration for dynamic shapes options"""
+    """动态 shape 相关配置。"""
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
-    """local cache dir for each rank"""
+    """每个 rank 自己的本地缓存目录。"""
 
     fast_moe_cold_start: bool | None = None
-    """Optimization for fast MOE cold start.
+    """加速 MoE 冷启动的优化开关。
 
-    This is a bit of a hack that assumes that:
-    1. the only decoder forward pass being run is the current model
-    2. the decoder forward pass runs all of the MOEs in the order in which they
-       are initialized
+    这是一个带有前提假设的优化，默认假设：
 
-    When the above two conditions hold, this option greatly decreases cold start
-    time for MOE models.
+    1. 当前正在执行的 decoder forward 只属于当前模型
+    2. decoder forward 会按初始化顺序依次跑过所有 MoE 层
 
-    The options are:
-    - True: optimization is always on
-    - False: optimization is always off
-    - None: optimization is on usually but off for speculative decoding
+    只有在这两个条件都成立时，该优化才能显著降低 MoE 模型的冷启动时间。
 
-    If conditions 1&2 don't hold then this option will lead to silent
-    incorrectness.
-    The only condition in which this doesn't hold is speculative
-    decoding, where there is a draft model that may have MOEs in them.
+    可选值含义如下：
 
-    NB: We're working on a longer-term solution that doesn't need these assumptions.
+    - `True`：始终开启
+    - `False`：始终关闭
+    - `None`：通常开启，但在 speculative decoding 时关闭
+
+    如果上述两个前提不成立，这个优化会产生静默错误。
+    当前最典型的不满足场景就是 speculative decoding，因为此时还会有一个
+    draft model，它本身也可能包含 MoE 层。
+
+    目前这只是一个过渡性方案；后续会有不依赖这些前提假设的长期解法。
     """
 
-    # keep track of enabled and disabled custom ops
+    # 记录哪些自定义算子最终被启用 / 禁用
     enabled_custom_ops: Counter[str] = field(default_factory=Counter, init=False)
-    """custom ops that are enabled"""
+    """实际被启用的自定义算子计数。"""
     disabled_custom_ops: Counter[str] = field(default_factory=Counter, init=False)
-    """custom ops that are disabled"""
+    """实际被禁用的自定义算子计数。"""
     traced_files: set[str] = field(default_factory=set, init=False)
-    """files that are traced for compilation"""
+    """参与编译 trace 的文件集合。"""
     compilation_time: float = field(default=0.0, init=False)
-    """time taken for compilation"""
+    """累计编译耗时。"""
 
     static_forward_context: dict[str, Any] = field(default_factory=dict, init=False)
     """每个模型实例对应的静态 forward 上下文。
@@ -692,11 +721,10 @@ class CompilationConfig:
     直接拿到 Attention、FusedMoE 等层对象。"""
 
     static_all_moe_layers: list[str] = field(default_factory=list, init=False)
-    """The names of all the MOE layers in the model
-    """
+    """模型中所有 MoE 层的层名列表。"""
 
-    # Attention ops; used for piecewise cudagraphs
-    # Use PyTorch operator format: "namespace::name"
+    # attention 相关算子；用于 piecewise cudagraph 切图
+    # 这里使用 PyTorch 运算符全名格式：`namespace::name`
     _attention_ops: ClassVar[list[str]] = [
         "cfie::unified_attention",
         "cfie::unified_attention_with_output",

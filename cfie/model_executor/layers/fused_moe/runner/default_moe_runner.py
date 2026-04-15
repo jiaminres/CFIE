@@ -195,11 +195,22 @@ direct_register_custom_op(
 
 
 class DefaultMoERunner(MoERunner):
-    # 默认的 MoE 执行器实现，负责串起一层 Mixture-of-Experts 的完整前向流程。
-    # 当前统一覆盖 expert routing、token dispatch、shared experts、DP chunking、
-    # TP / EP 并行、量化执行，以及 monolithic / decomposed 两类专家执行路径。
-    # 它的职责是把“路由 token -> 执行 experts -> 合并输出”这一整条链路跑通。
-    # 后续可再按 shared experts、gate 等配置差异继续拆成更细的专用 runner。
+    """
+    FusedMoE 的默认执行编排器。
+
+    这个类本身不持有专家权重；权重、kernel 配置和并行元数据仍属于外层
+    `FusedMoE` / `SharedFusedMoE` layer。`DefaultMoERunner` 的职责更像
+    “运行时调度器”：
+
+    - 接收上层传入的 `hidden_states`、`router_logits`
+    - 视配置决定 gate、router、shared experts 的执行顺序
+    - 在需要时接入 CFIE tiered cache、DP chunking、独立 shared stream
+    - 调用 quant method / monolithic kernel 完成 routed experts 主计算
+    - 在末尾完成 dispatch/combine、规约与输出裁剪
+
+    因而它统一覆盖了 routed experts、shared experts、TP/EP/SP 并行、
+    monolithic / decomposed kernel，以及 CFIE 特有 tiered cache 的组合路径。
+    """
 
     def __init__(
         self,
@@ -213,15 +224,25 @@ class DefaultMoERunner(MoERunner):
         reduce_results: bool,
         enable_dbo: bool,
     ):
+        # 先初始化抽象基类 `MoERunner`。
+        # 这里主要是让父类有机会建立自己的基础状态。
         super().__init__()
-        # 保存执行期所需的配置对象和子模块引用。
+
+        # 保存当前层对应的 MoE 静态配置，例如 hidden_dim、tp/ep/sp 拓扑等。
         self.moe_config = moe_config
+        # 保存 router 对象；后续非 monolithic 路径会用它把 router logits 转成 top-k experts。
         self.router = router
+        # 保存 routed experts 的可选输入变换模块，例如 latent MoE 的前置投影。
         self.routed_input_transform = routed_input_transform
+        # 保存可选的 gate 模块；若不为空，runner 会在内部先调用它产出 router logits。
         self.gate = gate
+        # 保存 shared experts 分支模块；若为空，说明当前层没有 shared expert。
         self.shared_experts = shared_experts
+        # 保存底层量化 / kernel 执行入口；真正的专家计算最终都会落到这里。
         self.quant_method = quant_method
+        # 记录当前层是否希望在更外层返回前完成规约。
         self.reduce_results = reduce_results
+        # 记录是否启用 DBO；它会影响 DP chunking staging buffer 的布局。
         self.enable_dbo = enable_dbo
 
         # -----------------
@@ -230,13 +251,17 @@ class DefaultMoERunner(MoERunner):
         # 出于调试目的，允许通过环境变量禁用 shared experts 的独立 stream。
         # TODO: 等 TP / DP 与其他执行模式验证更充分后，可移除这条调试开关。
         if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
+            # 若环境变量显式禁用，就完全不为 shared experts 单独分配辅助 stream。
             logger.debug_once("Disabling MoE shared_experts cuda stream", scope="local")
+            # 记为 None，后续分支会自然退化为“与主流串行执行”。
             self.shared_experts_stream = None
         else:
             # TODO(rob): 为非 cuda-alike 平台补上 shared expert overlap 支持。
             # 非 cuda-alike 平台上，aux_stream() 会直接返回 None。
+            # 尝试申请一条辅助 stream，供 shared experts 与 routed experts 并行执行。
             self.shared_experts_stream = aux_stream()
             if self.shared_experts_stream is not None:
+                # 只有真正拿到辅助 stream 时才打印启用日志。
                 logger.debug_once(
                     "Enabled separate cuda stream for MoE shared_experts", scope="local"
                 )
@@ -249,17 +274,23 @@ class DefaultMoERunner(MoERunner):
             # TODO: TPU 后端的 OOM 问题解决后，再切回 moe_forward custom op。
             # CPU 路径不需要额外包一层 forward_impl。
             if self.shared_experts is None:
+                # 没有 shared experts 时，绑定只返回 routed 输出的入口。
                 self.moe_forward = _moe_forward
             else:
+                # 有 shared experts 时，绑定会返回 `(shared, routed)` 的入口。
                 self.moe_forward = _moe_forward_shared
         else:
             if self.shared_experts is None:
+                # CUDA/自定义算子路径下，优先走注册好的 `torch.ops.cfie.moe_forward`。
                 self.moe_forward = torch.ops.cfie.moe_forward
             else:
+                # shared 版本的 custom op 会在内部转发到 runner 的 shared 路径。
                 self.moe_forward = torch.ops.cfie.moe_forward_shared
 
         # DP chunking 场景下会复用这两块 staging buffer，避免每个 chunk 重新分配显存。
+        # 这里先置空，等第一次真正需要 chunking 时再懒初始化。
         self.batched_hidden_states: torch.Tensor | None = None
+        # router logits 也对应维护一块 staging buffer，与 hidden_states 同步复用。
         self.batched_router_logits: torch.Tensor | None = None
 
     def _apply_with_tiered_cache(
@@ -270,11 +301,22 @@ class DefaultMoERunner(MoERunner):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # -----------------
+        # decomposed/top-k 路径下的 tiered cache 桥接。
+        # -----------------
+        # 这条路径对应“router 先选出 top-k experts，再调用 quant_method.apply(...)”
+        # 的执行方式。若当前层未挂 tiered cache controller，就直接把 top-k 结果交给
+        # quant_method；否则先根据本批 token 触达的 experts 集合决定：
+        # - 直接 prepare 后执行
+        # - 走 burst 执行区
+        # - 或拆成多个 token chunk 分批执行
         # 这是 CFIE tiered cache 的执行桥接层：
         # 若当前层没挂 controller，就直接走原始 quant_method.apply；
         # 否则先确保本次请求涉及的 experts 已经在 GPU resident slots 中。
+        # 尝试从层对象上拿到 CFIE tiered cache controller。
         controller = getattr(layer, "_cfie_tiered_cache_controller", None)
         if controller is None:
+            # 若当前层没有 tiered cache，就直接把 top-k 路由结果交给 quant method 执行。
             return self.quant_method.apply(
                 layer=layer,
                 x=x,
@@ -293,11 +335,15 @@ class DefaultMoERunner(MoERunner):
             chunk_shared_input: torch.Tensor | None,
         ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
             # 统计当前 chunk 一共触达多少个唯一 experts。
+            # `detach()` 只是为了避免这类统计逻辑意外进入 autograd 图。
             unique_requested = int(torch.unique(chunk_topk_ids.detach()).numel())
+            # 当前 chunk 的 token 数也会影响 burst 策略判断。
             num_chunk_tokens = int(chunk_topk_ids.shape[0])
             if unique_requested <= layer.local_num_experts:
                 # resident slots 足够时，先 prepare 把缺失 experts 换入，再正常执行。
+                # `prepare(...)` 会确保本 chunk 需要的 experts 已经驻留到可执行槽位。
                 controller.prepare(chunk_topk_ids)
+                # resident 容量足够时，后续执行与普通 quant_method.apply 完全一致。
                 return self.quant_method.apply(
                     layer=layer,
                     x=chunk_x,
@@ -308,6 +354,7 @@ class DefaultMoERunner(MoERunner):
 
             if controller.can_run_prefill_burst(unique_requested, num_chunk_tokens):
                 # 若主 resident slots 装不下，但 burst pool 能兜住，就走临时 burst 执行区。
+                # 这条路径不要求把 experts 全部换入常驻槽位，而是借助 burst 区临时执行。
                 return controller.run_prefill_burst(
                     x=chunk_x,
                     topk_weights=chunk_topk_weights,
@@ -324,8 +371,11 @@ class DefaultMoERunner(MoERunner):
         # -----------------
         # 先判断“整块输入”能否直接跑。
         # -----------------
+        # 统计整块输入一共会命中多少个不同 expert。
         full_unique_requested = int(torch.unique(topk_ids.detach()).numel())
+        # 统计整块输入的 token 总数。
         full_num_tokens = int(topk_ids.shape[0])
+        # 预先判断整块输入是否可以整体走 burst 路径。
         full_can_use_burst = controller.can_run_prefill_burst(
             full_unique_requested,
             full_num_tokens,
@@ -335,21 +385,27 @@ class DefaultMoERunner(MoERunner):
             or full_can_use_burst
         ):
             # 整块可直接执行时，不再额外切 token chunk。
+            # 这样可以避免不必要的 token 维拆分和后续再拼接。
             return apply_chunk(x, topk_weights, topk_ids, shared_experts_input)
 
         # -----------------
         # 整块超容量时，按 expert 容量重新切 token 范围。
         # -----------------
+        # 读取 burst 区最多还能额外承载多少个 experts。
         burst_capacity = getattr(controller, "prefill_burst_capacity", 0)
+        # 读取启用 burst 路径所要求的最小 token 数阈值。
         burst_min_tokens = getattr(controller, "prefill_burst_min_tokens", 0)
+        # 根据当前 batch 大小和 burst 配置，决定单个 token chunk 允许触达的最大 expert 数。
         capacity = (
             max(layer.local_num_experts, burst_capacity)
             if burst_capacity > 0 and full_num_tokens >= burst_min_tokens
             else layer.local_num_experts
         )
         # 每个切片都要保证其唯一 experts 数不超过可执行容量。
+        # 返回的是若干 `(start, end)` token 区间。
         token_ranges = _pack_token_ranges_by_expert_capacity(topk_ids, capacity)
 
+        # 依次收集各个 token chunk 的执行结果。
         outputs: list[torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = []
         for start, end in token_ranges:
             # shared experts 输入也必须同步切成相同 token 范围。
@@ -358,6 +414,7 @@ class DefaultMoERunner(MoERunner):
                 if shared_experts_input is not None
                 else None
             )
+            # 对当前 token 区间执行一次完整的 apply_chunk。
             outputs.append(
                 apply_chunk(
                     x[start:end],
@@ -370,10 +427,12 @@ class DefaultMoERunner(MoERunner):
         # 把所有子 chunk 的输出重新沿 token 维拼回完整结果。
         first_output = outputs[0]
         if isinstance(first_output, tuple):
+            # 若 quant method 返回 `(shared, routed)` 二元组，就需要分别拼接两个分支。
             return (
                 torch.cat([output[0] for output in outputs], dim=0),
                 torch.cat([output[1] for output in outputs], dim=0),
             )
+        # 普通 routed-only 路径则直接拼接单个输出张量。
         return torch.cat(outputs, dim=0)
 
     def _apply_monolithic_with_tiered_cache(
@@ -382,21 +441,33 @@ class DefaultMoERunner(MoERunner):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # -----------------
+        # monolithic kernel 路径下的 tiered cache 桥接。
+        # -----------------
+        # monolithic kernel 会把“router + experts”打成一个整体执行，因此正式计算时
+        # 不会显式经过 top-k prepare/finalize 流程；但 tiered cache 仍然需要事先知道
+        # 当前 batch 会触达哪些 experts，才能决定是否 prepare / 分 chunk。
+        # monolithic 路径同样先尝试取得 tiered cache controller。
         controller = getattr(layer, "_cfie_tiered_cache_controller", None)
         if controller is None:
+            # 若没有 tiered cache，就直接调用 monolithic kernel。
             return self.quant_method.apply_monolithic(
                 layer=layer,
                 x=x,
                 router_logits=router_logits,
             )
 
+        # monolithic kernel 虽然把 router + experts 合在一起执行，
+        # 但为了判断 tiered cache 容量，仍需先在 Python 侧做一次 expert 选择。
         _, topk_ids = self.router.select_experts(
             hidden_states=x,
             router_logits=router_logits,
         )
 
+        # 统计整块输入会触达多少个唯一 experts。
         full_unique_requested = int(torch.unique(topk_ids.detach()).numel())
         if full_unique_requested <= layer.local_num_experts:
+            # 若常驻槽位足够，就先 prepare 再整体执行 monolithic kernel。
             controller.prepare(topk_ids)
             return self.quant_method.apply_monolithic(
                 layer=layer,
@@ -404,13 +475,16 @@ class DefaultMoERunner(MoERunner):
                 router_logits=router_logits,
             )
 
+        # 若整块输入超出容量，就按 expert 容量重新切 token 区间。
         token_ranges = _pack_token_ranges_by_expert_capacity(
             topk_ids,
             layer.local_num_experts,
         )
 
+        # 逐个 token chunk 调 monolithic kernel，并收集各 chunk 输出。
         outputs: list[torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = []
         for start, end in token_ranges:
+            # 每个 chunk 执行前都要让 controller 先把这一段需要的 experts prepare 到位。
             controller.prepare(topk_ids[start:end])
             outputs.append(
                 self.quant_method.apply_monolithic(
@@ -422,15 +496,21 @@ class DefaultMoERunner(MoERunner):
 
         first_output = outputs[0]
         if isinstance(first_output, tuple):
+            # shared/routed 二元组输出时，两个分支分别沿 token 维拼接。
             return (
                 torch.cat([output[0] for output in outputs], dim=0),
                 torch.cat([output[1] for output in outputs], dim=0),
             )
+        # 纯 routed 输出则直接拼接。
         return torch.cat(outputs, dim=0)
 
     @property
     def use_dp_chunking(self) -> bool:
-        # 只有部分 all2all backend 支持 / 受益于 DP chunking，并且还要受环境变量开关控制。
+        # 返回当前 backend 是否应该启用 DP chunking。
+        # 只有部分 all2all kernel 支持 / 受益于把大 batch 切块执行，并且还要受
+        # 环境变量开关控制。
+        # 这里前半部分判断“当前 backend 能不能 / 要不要 chunk”，
+        # 最后的环境变量则是人工总开关。
         return (
             self.moe_config.moe_parallel_config.use_deepep_ll_kernels
             or self.moe_config.moe_parallel_config.use_mori_kernels
@@ -445,7 +525,17 @@ class DefaultMoERunner(MoERunner):
         has_separate_shared_experts: bool,
         use_chunked_impl: bool,
     ) -> tuple[bool, torch.Tensor | None]:
+        # 判断 shared experts 是否要放到独立 CUDA stream 上和 routed experts 并行。
+        # 返回值：
+        # - `use_shared_experts_stream`：本次 forward 是否真的启用独立 stream
+        # - `shared_experts_input`：若启用独立 stream，需要提前固定好它要消费的输入
         # 决定是否让 shared experts 在独立 CUDA stream 上和 routed experts 并行执行。
+        # 只有满足以下条件时，shared experts 才值得放到独立 CUDA stream：
+        # 1. 当前确实是 CUDA 平台；
+        # 2. shared experts 没被 monolithic kernel 接管；
+        # 3. 当前不走 chunked 路径；
+        # 4. 成功申请到了辅助 stream；
+        # 5. token 数没有超过环境变量给定阈值。
         use_shared_experts_stream = (
             current_platform.is_cuda()
             and has_separate_shared_experts
@@ -457,11 +547,16 @@ class DefaultMoERunner(MoERunner):
             )
         )
 
+        # 默认先记为 None；只有真的启用独立 stream 时才准备专门的输入张量引用。
         shared_experts_input: torch.Tensor | None = None
         if use_shared_experts_stream:
+            # 既然决定启用独立 stream，这里就要求辅助 stream 必须存在。
             assert self.shared_experts_stream is not None
+            # shared experts 和 routed experts 并行时，主路径不能原地覆写输入。
             assert self.moe_config.disable_inplace
 
+            # 若调用方已显式给了 shared_input，就沿用它；
+            # 否则 shared experts 默认直接消费当前的 hidden_states。
             shared_experts_input = (
                 shared_input if shared_input is not None else hidden_states
             )
@@ -479,13 +574,18 @@ class DefaultMoERunner(MoERunner):
         return use_shared_experts_stream, shared_experts_input
 
     def ensure_dp_chunking_init(self):
-        # 按需懒初始化 DP chunking 的 staging tensor，重复 forward 时直接复用。
+        # 按需分配 DP chunking 复用缓冲区。
+        # 这些 staging tensor 会在一次 forward 的多个 chunk 之间反复复用，
+        # 避免每个 chunk 都重新申请显存。
+        # 若当前 backend 不启用 DP chunking，或已经初始化过 staging buffer，就直接返回。
         if not self.use_dp_chunking or self.batched_hidden_states is not None:
             return
 
+        # 先声明好 hidden states / router logits 两块 staging buffer 的形状变量。
         states_shape: tuple[int, ...]
         logits_shape: tuple[int, ...]
 
+        # 简写当前 MoE 配置，后面多处都会用到。
         moe = self.moe_config
 
         if self.enable_dbo:
@@ -493,10 +593,12 @@ class DefaultMoERunner(MoERunner):
             states_shape = (2, moe.max_num_tokens, self.moe_config.hidden_dim)
             logits_shape = (2, moe.max_num_tokens, self.moe_config.num_logical_experts)
         else:
+            # 非 DBO 模式下，staging buffer 只有 `[tokens, hidden/logits]` 两维。
             states_shape = (moe.max_num_tokens, self.moe_config.hidden_dim)
             logits_shape = (moe.max_num_tokens, self.moe_config.num_logical_experts)
 
         # 在当前设备上一次性分配 chunk staging buffer。
+        # 后续所有 chunk 都会反复写入这两块张量。
         device = torch.accelerator.current_device_index()
         self.batched_hidden_states = torch.zeros(
             states_shape,
@@ -511,26 +613,38 @@ class DefaultMoERunner(MoERunner):
         )
 
     def must_reduce_shared_expert_outputs(self) -> bool:
+        # 这个历史接口名容易误解。
+        # 当前实现里，返回 True 更接近“shared expert 输出已经满足最终规约要求，
+        # 调用方无需再额外 all-reduce”；返回 False 才表示后面还要补一次 TP 规约。
         # shared experts 一般由 RowParallelLinear 计算。
         # 纯 TP 场景下可延后到 MoE 末尾再规约；
         # 但 EP + all2all 场景下，各 DP rank 会持有完整 hidden_states，
         # 因此需要尽早规约 shared experts 输出。
+        # 这里仍要求 quant_method 必须存在，因为判断逻辑依赖底层 kernel 能力。
         assert self.quant_method is not None
         # 某些 kernel 已经在内部完成规约，这时 shared experts 输出无需再额外 reduce。
         return (
+            # `moe_kernel is not None` 表示当前 quant method 已经挂上具体内核实现。
             self.quant_method.moe_kernel is not None
+            # 若内核声明输出已经规约完成，则这里返回 True，外层无需再补 all-reduce。
             and self.quant_method.moe_kernel.output_is_reduced()
         )
 
     def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
-        # 某些 combine kernel 默认已完成跨 GPU rank 的规约。
-        # 若当前 kernel 没有帮我们规约，就在这里补一次 TP all-reduce。
+        # 对外提供一个“按需规约”的统一入口。
+        # 若底层 kernel 已经保证输出满足最终规约要求，就原样返回；
+        # 否则这里补一次 TP all-reduce。
         if self.must_reduce_shared_expert_outputs():
+            # 若底层已经规约完，就直接把输入结果向外透传。
             return final_hidden_states
         else:
+            # 否则显式在 TP group 上做一次 all-reduce。
             return tensor_model_parallel_all_reduce(final_hidden_states)
 
     def apply_routed_input_transform(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # 对 routed experts 输入做可选的前置变换。
+        # 常见场景是 latent MoE：shared experts 继续消费原始 hidden_states，
+        # 但 routed experts 先投影到更小的 latent 维度再进入 MoE kernel。
         # 仅对 routed experts 输入做额外变换，例如 latent projection。
         # FusedMoE.forward_native 会保留原始 hidden_states 给 shared experts，
         # 而 routed experts 则使用变换后的 [S, moe_latent_size] 输入。
@@ -538,12 +652,15 @@ class DefaultMoERunner(MoERunner):
         # 下沉到 SharedFusedMoE 内部，在更小的 latent 维度上做 all-reduce。
         # routed experts 和 shared experts 的输入维可能不同，因此 routed 分支可单独变换。
         if self.routed_input_transform is not None:
+            # 若配置了 routed_input_transform，就先对 routed 分支输入做一次变换。
             result = self.routed_input_transform(hidden_states)
             # ReplicatedLinear 会返回 (output, extra_bias)；
             # 这里只需要真正的输出张量。
             if isinstance(result, tuple):
                 return result[0]
+            # 普通模块直接返回单个张量时，原样透传。
             return result
+        # 若未配置额外变换，就直接使用原始 hidden_states。
         return hidden_states
 
     def _reduce_output(
@@ -551,13 +668,17 @@ class DefaultMoERunner(MoERunner):
         states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         trunc_sizes: list[int],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # 这个函数统一处理两件事：
-        # 1. 必要时做 TP all-reduce；
-        # 2. 把对齐 / padding 后的 hidden_dim 裁回原始尺寸。
+        # 统一处理输出后收尾逻辑。
+        # 这里同时负责：
+        # - 必要时执行 TP all-reduce
+        # - 把为了适配 kernel 而 pad 的 hidden_dim 裁回真实维度
+        # - 同时兼容“仅 routed 输出”和“(shared, routed) 二元组输出”
         def trunc(x: torch.Tensor, trunc_size: int) -> torch.Tensor:
+            # 只保留真实 hidden 维，去掉为了适配 kernel 补出来的尾部维度。
             return x[..., :trunc_size]
 
         def reduce_and_trunc(x: torch.Tensor, trunc_size: int) -> torch.Tensor:
+            # 先按需做 TP all-reduce，再裁回真实 hidden 维。
             return trunc(self.maybe_all_reduce_tensor_model_parallel(x), trunc_size)
 
         if (
@@ -569,26 +690,34 @@ class DefaultMoERunner(MoERunner):
             # 满足条件时，说明当前输出仍需要额外跨 rank 规约。
             func = reduce_and_trunc
         else:
+            # 其余情况下只需要裁剪，不需要在这里补额外规约。
             func = trunc
 
         if isinstance(states, tuple):
+            # `(shared, routed)` 二元组输出时，对两个分支分别应用同一套后处理逻辑。
             return tuple(
                 [func(s, trunc_size) for s, trunc_size in zip(states, trunc_sizes)]
             )
         else:
+            # 单输出场景下，`trunc_sizes` 里只应有一个目标维度。
             assert len(trunc_sizes) == 1
             return func(states, trunc_sizes[0])
 
     def _encode_layer_name(self) -> str | ModuleName:
-        # 编码 layer_name，供 custom op 在 forward context 中反查真实层对象。
+        # 把 Python 层对象的 `layer_name` 编码成 custom op 可以识别的句柄。
+        # 某些路径下 custom op 只拿得到一个轻量标识，后面再通过 forward context
+        # 反查真实层对象。
         if HAS_OPAQUE_TYPE:
+            # 若当前运行环境支持 opaque 类型，就直接封装成 `ModuleName` 传给 custom op。
             return ModuleName(self.layer_name)
         # 单测环境里 forward context 可能不存在，或 all_moe_layers 为空。
         if (
             is_forward_context_available()
             and get_forward_context().all_moe_layers is not None
         ):
+            # 若 forward context 可用，就让 custom op 走“从上下文反查层对象”的分支。
             return "from_forward_context"
+        # 最后兜底返回普通字符串层名。
         return self.layer_name
 
     def forward(
@@ -597,14 +726,24 @@ class DefaultMoERunner(MoERunner):
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # -----------------
+        # runner 的公开前向入口。
+        # -----------------
+        # 这里主要负责两件事：
+        # 1. 准备 routed / shared 两条分支各自需要的输入形状
+        # 2. 调用注册好的 `moe_forward` custom op 或 Python fallback 入口，
+        #    再在末尾统一做规约与维度裁剪
+        # -----------------
         # 入口：准备 routed / shared experts 各自需要的输入。
         # -----------------
         # latent MoE 下先保留原始 hidden_states：
         # shared experts 仍用原始维度，routed experts 则走变换后的维度。
         if self.shared_experts is not None:
+            # shared experts 存在时，需要保留一份原始输入给 shared 分支使用。
             original_hidden_states = hidden_states
+            # 同时记录原始 hidden 维，后面给 shared 输出裁剪时会用到。
             original_hidden_dim = hidden_states.shape[-1]
         else:
+            # 没有 shared experts 时，这两个值后面都不会参与实际计算。
             original_hidden_states = None
 
         # 先对 routed experts 输入做可选变换，例如 latent projection。
@@ -614,6 +753,7 @@ class DefaultMoERunner(MoERunner):
         # 这里记录的是变换后的维度，后面裁剪 routed 输出时会用到。
         transformed_hidden_dim = hidden_states.shape[-1]
         if self.moe_config.hidden_dim != transformed_hidden_dim:
+            # 若变换后维度小于 kernel 期望维度，就在尾部补 0 对齐到 kernel 的 hidden_dim。
             hidden_states = F.pad(
                 hidden_states,
                 (0, self.moe_config.hidden_dim - transformed_hidden_dim),
@@ -622,6 +762,7 @@ class DefaultMoERunner(MoERunner):
             )
 
         # 真正执行 routed experts 的 forward；shared_experts_input 作为第三参数透传。
+        # 这里的 `self.moe_forward` 可能是 Python fallback，也可能是注册好的 custom op。
         fused_output = self.moe_forward(
             hidden_states,
             router_logits,
@@ -631,8 +772,10 @@ class DefaultMoERunner(MoERunner):
 
         # 根据是否存在 shared experts，准备最后的裁剪尺寸列表。
         if self.shared_experts is not None:
+            # shared/routed 双输出时，要分别把两个分支裁回各自真实维度。
             orig_hidden_dims = [original_hidden_dim, transformed_hidden_dim]
         else:
+            # 只有 routed 输出时，只需要保留一个目标维度。
             orig_hidden_dims = [transformed_hidden_dim]
 
         # 最终统一在这里做 reduce + trunc。
@@ -647,10 +790,15 @@ class DefaultMoERunner(MoERunner):
         has_separate_shared_experts: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # -----------------
-        # DP chunking 路径：把超大 token 批次切成多个 chunk，重复执行再拼回。
+        # DP chunking 专用执行路径。
         # -----------------
+        # 当单次 token 批次过大、backend 又支持 DP chunking 时，会把完整输入切成多个
+        # token chunk，重复执行“stage -> route -> experts -> write back”，最后再把所有
+        # chunk 的输出拼回完整张量。
+        # 进入这里前，外层已经决定当前 backend 需要 / 支持 DP chunking。
         assert self.batched_hidden_states is not None
         assert self.batched_router_logits is not None
+        # staging buffer 与当前输入必须使用同一 dtype，否则后续 copy_/kernel 调用会出错。
         assert self.batched_hidden_states.dtype == full_hidden_states.dtype, (
             f"{self.batched_hidden_states.dtype} == {full_hidden_states.dtype}"
         )
@@ -666,18 +814,22 @@ class DefaultMoERunner(MoERunner):
         #    "Routed input transform is not currently supported with DP chunking."
         # )
 
+        # 预先分配完整 routed 输出张量；每个 chunk 执行完后会把自己的结果写回对应区间。
         full_fused_final_hidden_states = torch.empty_like(full_hidden_states)
         if self.shared_experts is not None:
+            # 若存在 shared experts，也为 shared 分支单独预分配一块完整输出张量。
             full_shared_final_hidden_states = torch.empty_like(full_hidden_states)
 
         # -----------------
         # 单个 chunk 的处理函数。
         # -----------------
         def process_chunk(chunk_start, chunk_end, skip_result_store=False):
+            # 当前 chunk 覆盖的 token 数。
             chunk_size = chunk_end - chunk_start
             # 先从完整输入中切出当前 chunk。
             hidden_states = full_hidden_states[chunk_start:chunk_end, :]
             router_logits = full_router_logits[chunk_start:chunk_end, :]
+            # shared_input 若存在，也必须按同样的 token 区间切片。
             shared_input = (
                 full_shared_input[chunk_start:chunk_end, :]
                 if full_shared_input is not None
@@ -694,6 +846,7 @@ class DefaultMoERunner(MoERunner):
                 batched_hidden_states = self.batched_hidden_states[batch_buffer_idx, :]
                 batched_router_logits = self.batched_router_logits[batch_buffer_idx, :]
             else:
+                # 非 DBO 模式直接复用整块 staging buffer。
                 batched_hidden_states = self.batched_hidden_states
                 batched_router_logits = self.batched_router_logits
 
@@ -709,9 +862,11 @@ class DefaultMoERunner(MoERunner):
             staged_hidden_states = batched_hidden_states[:chunk_size, :]  # type: ignore
             staged_router_logits = batched_router_logits[:chunk_size, :]  # type: ignore
             # 把当前 chunk 拷进 staging buffer，后续 kernel 都直接读 staging tensor。
+            # 使用 `non_blocking=True` 允许在满足条件时走异步拷贝。
             staged_hidden_states.copy_(hidden_states, non_blocking=True)
             staged_router_logits.copy_(router_logits, non_blocking=True)
 
+            # shared 分支若没有单独输入，就默认直接使用 staged 后的 hidden_states。
             shared_input = (
                 shared_input if shared_input is not None else staged_hidden_states
             )
@@ -721,6 +876,7 @@ class DefaultMoERunner(MoERunner):
             # -----------------
             # 核心专家计算阶段。
             if self.quant_method.is_monolithic:
+                # monolithic kernel 会在一个入口里同时完成 router + experts 主计算。
                 assert has_separate_shared_experts or self.shared_experts is None
                 final_hidden_states = self._apply_monolithic_with_tiered_cache(
                     layer=layer,
@@ -734,6 +890,7 @@ class DefaultMoERunner(MoERunner):
                     router_logits=staged_router_logits,
                 )
 
+                # top-k 结果会决定 routed token 实际命中的 experts 以及后续 tiered cache prepare。
                 final_hidden_states = self._apply_with_tiered_cache(
                     layer=layer,
                     x=staged_hidden_states,
@@ -747,6 +904,7 @@ class DefaultMoERunner(MoERunner):
                 assert self.shared_experts is not None
 
                 # shared experts 单独跑完后，和 routed experts 输出打包成二元组。
+                # 这里 shared 分支和 routed 分支对齐在同一 token chunk 上。
                 shared_output = self.shared_experts(shared_input)
 
                 final_hidden_states = (
@@ -757,10 +915,12 @@ class DefaultMoERunner(MoERunner):
             if not skip_result_store:
                 # 把当前 chunk 的结果写回完整输出张量。
                 if self.shared_experts is None:
+                    # routed-only 场景下，直接写回 routed 输出。
                     full_fused_final_hidden_states[chunk_start:chunk_end, :].copy_(
                         final_hidden_states, non_blocking=True
                     )
                 else:
+                    # shared/routed 双输出场景下，两块完整输出张量分别写回。
                     full_shared_final_hidden_states[chunk_start:chunk_end, :].copy_(
                         final_hidden_states[0], non_blocking=True
                     )
@@ -771,9 +931,11 @@ class DefaultMoERunner(MoERunner):
         # -----------------
         # 计算 chunk 循环边界。
         # -----------------
+        # forward context 中会记录当前 DP dispatcher 在整个 batch 上看到的 token 上界。
         ctx = get_forward_context()
         # flashinfer_cutlass kernel 可同时覆盖可选的 DP 与 TP/EP 组合。
         max_tokens_across_dispatchers = ctx.dp_metadata.max_tokens_across_dp_cpu
+        # 单个 rank 每次最多处理多少 token，由 moe 配置里的 `max_num_tokens` 决定。
         moe_dp_chunk_size_per_rank = self.moe_config.max_num_tokens
 
         # 若输入本身走了 sequence parallel，需要先除以 sp_size，
@@ -783,29 +945,37 @@ class DefaultMoERunner(MoERunner):
                 max_tokens_across_dispatchers, self.moe_config.sp_size
             )
 
+        # 当前真实输入里实际包含多少 token。
         num_tokens = full_hidden_states.size(0)
         # 逐个 chunk 进入前面的 process_chunk。
         for chunk_idx, chunk_start_ in enumerate(
             range(0, max_tokens_across_dispatchers, moe_dp_chunk_size_per_rank)
         ):
+            # 初始 chunk 起点就是这轮循环对应的 token 偏移。
             chunk_start = chunk_start_
+            # 初始 chunk 终点受“chunk 大小”和“dispatcher 最大 token 上界”双重限制。
             chunk_end = min(
                 chunk_start + moe_dp_chunk_size_per_rank, max_tokens_across_dispatchers
             )
             # 再把 chunk 边界裁到当前真实 token 范围内。
             chunk_start = min(chunk_start, num_tokens - 1)
             chunk_end = min(chunk_end, num_tokens)
+            # 进入 `chunked_sizes(...)` 上下文后，下游 kernel / communicator 可以读取当前
+            # chunk 在 DP/SP 视角下的元信息。
             with ctx.dp_metadata.chunked_sizes(
                 self.moe_config.sp_size, moe_dp_chunk_size_per_rank, chunk_idx
             ):
+                # 若这轮循环的起点已经超出真实 token 范围，就只更新元信息而跳过结果写回。
                 process_chunk(
                     chunk_start, chunk_end, skip_result_store=chunk_start_ >= num_tokens
                 )
 
         # 所有 chunk 处理完后，按是否存在 shared experts 决定返回结构。
         if self.shared_experts is None:
+            # routed-only 场景直接返回完整 routed 输出。
             return full_fused_final_hidden_states
         else:
+            # shared/routed 双输出场景保持 `(shared, routed)` 返回结构。
             return (full_shared_final_hidden_states, full_fused_final_hidden_states)
 
     def forward_impl(
@@ -816,14 +986,25 @@ class DefaultMoERunner(MoERunner):
         shared_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # -----------------
-        # 这是 runner 真正的主执行函数，所有 moe_forward custom op 最终都落到这里。
+        # runner 的真实主执行函数。
         # -----------------
+        # 所有 `moe_forward` custom op / Python fallback 最终都会落到这里。
+        # 它负责把一层 MoE 前向拆成以下几个阶段：
+        # - gate / router 预处理
+        # - shared experts 预执行或独立 stream 启动
+        # - dispatch（必要时）
+        # - routed experts 主计算
+        # - combine（必要时）
+        # 这是整个 runner 中“最接近真实执行顺序”的主路径。
         assert self.quant_method is not None
 
         # 按需初始化 DP chunking 复用缓冲区。
         self.ensure_dp_chunking_init()
 
         # shared experts 若不由 MK 内部接管，就需要 runner 自己单独执行这条分支。
+        # 这里返回 True 表示：
+        # - 当前确实存在 shared experts
+        # - 并且它没有被 monolithic / modular kernel 内部融合掉
         has_separate_shared_experts = (
             not self.quant_method.mk_owns_shared_expert
             and self.shared_experts is not None
@@ -849,6 +1030,7 @@ class DefaultMoERunner(MoERunner):
         # 这段逻辑主要服务于 overlapped 模式，方便 shared experts 与 FusedMoE
         # 借助独立 CUDA stream 并行执行。
         if self.gate is not None:
+            # 这里会覆盖调用方传进来的 `router_logits`，以内部 gate 计算结果为准。
             router_logits, _ = self.gate(hidden_states)
 
         if use_chunked_impl:
@@ -870,7 +1052,10 @@ class DefaultMoERunner(MoERunner):
             self.moe_config.dp_size > 1 and not self.quant_method.supports_internal_mk
         )
 
+        # forward context 里挂着当前 prefill/decode 批次的 DP/SP 元信息。
         ctx = get_forward_context()
+        # 若存在 DP metadata，就进入它提供的 sequence-parallel 局部上下文；
+        # 否则用空上下文保持统一写法。
         sp_ctx = (
             ctx.dp_metadata.sp_local_sizes(self.moe_config.sp_size)
             if ctx.dp_metadata
@@ -885,9 +1070,11 @@ class DefaultMoERunner(MoERunner):
             # 避免后续矩阵计算修改 hidden_states。
             if has_separate_shared_experts and not use_shared_experts_stream:
                 assert self.shared_experts is not None
+                # 若调用方没有单独给 shared_input，就默认复用当前 hidden_states。
                 shared_input = (
                     shared_input if shared_input is not None else hidden_states
                 )
+                # 在主 stream 上同步执行 shared experts。
                 shared_output = self.shared_experts(shared_input)
 
             # -----------------
@@ -898,6 +1085,7 @@ class DefaultMoERunner(MoERunner):
             # TODO: 等所有 kernel 都迁移到 MoEKernel 框架后，这条分支可删除。
             if do_naive_dispatch_combine:
                 # DP+EP 的 naive 路径下，需要先把 token / logits 分发到 expert 所在 rank。
+                # 分发之后，当前 rank 只保留自己负责的那部分 token 及其 router logits。
                 hidden_states, router_logits = get_ep_group().dispatch_router_logits(
                     hidden_states,
                     router_logits,
@@ -909,10 +1097,12 @@ class DefaultMoERunner(MoERunner):
             # 当前为了简化实现，先单独给 PCP 接了一套 AgRsAll2All 路径，
             # 后续可再考虑把 All2AllManager 抽象扩展得更统一。
             if self.moe_config.pcp_size > 1:
+                # PCP 路径下，先把 hidden_states 沿 token 维 gather 成更完整的上下文视图。
                 hidden_states = get_pcp_group().all_gather(
                     hidden_states,
                     dim=0,
                 )
+                # router logits 也要保持与 hidden_states 完全对齐，因此同样做 gather。
                 router_logits = get_pcp_group().all_gather(
                     router_logits,
                     dim=0,
@@ -923,6 +1113,7 @@ class DefaultMoERunner(MoERunner):
             # -----------------
             # 核心专家计算阶段。
             if self.quant_method.is_monolithic:
+                # monolithic 路径把 router + experts +（可选）shared 融成一个内核入口。
                 final_hidden_states = self._apply_monolithic_with_tiered_cache(
                     layer=layer,
                     x=hidden_states,
@@ -935,6 +1126,7 @@ class DefaultMoERunner(MoERunner):
                     router_logits=router_logits,
                 )
 
+                # `topk_weights/topk_ids` 会驱动后续的 dispatch、kernel 执行和结果合并。
                 final_hidden_states = self._apply_with_tiered_cache(
                     layer=layer,
                     x=hidden_states,
@@ -951,8 +1143,9 @@ class DefaultMoERunner(MoERunner):
                     # 这里启动独立 stream，并在算完后立刻标记同步终点，
                     # 以免后续 cuda graph replay 过程中额外分配过多 stream。
                     with torch.cuda.stream(self.shared_experts_stream):
-                        # 这里必须 clone，避免与主 stream 发生读写冲突。
+                        # 这里让 shared experts 在辅助 stream 上读取前面固定好的输入张量。
                         shared_output = self.shared_experts(shared_experts_input)
+                    # 在使用 shared_output 之前，主 stream 必须等待辅助 stream 完成。
                     current_stream().wait_stream(self.shared_experts_stream)
 
                 # 输出统一组织成 (shared_output, routed_output)。
@@ -982,9 +1175,12 @@ class DefaultMoERunner(MoERunner):
 
             # shared experts 分支只 combine routed 输出；shared 输出由调用方决定何时规约。
             if self.shared_experts is not None:
+                # 返回结构保持 `(shared, routed)`；
+                # 其中 routed 输出已经过 combine，shared 输出则留给更外层决定何时规约/相加。
                 return (
                     final_hidden_states[0],
                     combine_output(final_hidden_states[1]),
                 )
             else:
+                # routed-only 场景直接返回 combine 后的单张量输出。
                 return combine_output(final_hidden_states)

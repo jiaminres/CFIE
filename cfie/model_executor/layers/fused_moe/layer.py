@@ -309,8 +309,6 @@ class FusedMoE(CustomOp):
     # 这里沿用 Mixtral 的 w1 / w2 / w3 命名习惯，模型侧若有不同命名，
     # 统一在各自的 load_weights 映射逻辑里处理。
 
-    # --8<-- [end:fused_moe]
-
     def __init__(
             self,
             num_experts: int,  # Global number of experts
@@ -362,11 +360,13 @@ class FusedMoE(CustomOp):
         if params_dtype is None:
             # 这里读取 PyTorch 当前默认 dtype，作为本层参数创建时的默认精度。
             params_dtype = torch.get_default_dtype()
+
         # 把最终确定的参数 dtype 保存到层对象上，后续创建权重时直接复用。
         self.params_dtype = params_dtype
 
         # 读取当前全局 CFIE 配置，后续并行、kernel、tiered cache 都从这里派生。
         cfie_config = get_current_cfie_config()
+
         # 保存当前层构造时绑定的 CFIE 全局配置。
         self.cfie_config = cfie_config
 
@@ -383,14 +383,16 @@ class FusedMoE(CustomOp):
         tp_size_ = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
+
         # DP 规模优先用显式传参，否则读取当前 DP group 的 world size。
         dp_size_ = dp_size if dp_size is not None else get_dp_group().world_size
+
         # PCP 规模优先用显式传参，否则读取当前 PCP group 的 world size。
         pcp_size_ = pcp_size if pcp_size is not None else get_pcp_group().world_size
 
-        # Sequence parallel 打开时，MoE 侧需要把 SP 规模写入并行配置。
         # 记录当前层是否启用了 sequence parallel。
         self.is_sequence_parallel = is_sequence_parallel
+
         # 若启用 SP，则 SP 规模与 TP 对齐；否则固定视为 1。
         self.sp_size = tp_size_ if is_sequence_parallel else 1
 
@@ -518,8 +520,10 @@ class FusedMoE(CustomOp):
 
             # 把 expert_mask 注册成 buffer，供 AITER fused moe 路径使用。
             self.register_buffer("expert_mask", expert_mask)
+
             # 若需要额外的路由索引表，则在这里一并初始化。
             self._maybe_init_expert_routing_tables()
+
             # 打一条一次性日志，把当前 rank 的 expert 放置结果打印出来。
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
@@ -534,8 +538,9 @@ class FusedMoE(CustomOp):
                 get_compressed_expert_map(self._expert_map),
             )
         else:
-            # CFIE 的 tiered cache 目前只在非 EP 路径下接管 expert 常驻布局。
-
+            """
+            CFIE 的 tiered cache 目前只在非 EP 路径下接管 expert 常驻布局。
+            """
             # 读取当前层可用的 tiered cache 规划结果。
             tiered_cache_plan = get_moe_tiered_cache_plan(cfie_config)
 
@@ -573,7 +578,7 @@ class FusedMoE(CustomOp):
 
                 # 只给启动期常驻的 experts 分配 slot；其余 experts 在 checkpoint 加载时会被跳过。
                 for slot, expert_id in enumerate(initial_gpu_experts[: self.local_num_experts]):
-                    # 把“全局 expert id -> 当前 GPU resident slot id”的映射写入表中。
+                    # “全局 expert id -> 当前 GPU resident slot id”
                     expert_map[expert_id] = slot
 
                 # 把 tiered cache 版本的 expert_map 注册成 buffer，供后续权重加载和运行时 controller 使用。

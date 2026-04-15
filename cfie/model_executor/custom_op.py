@@ -46,72 +46,109 @@ def get_oot_class_by_name(class_name: str) -> type | None:
 
 class PluggableLayer(nn.Module):
     """
-    Base class for pluggable layers.
+    可插拔层的基类。
 
-    A PluggableLayer is a *module-composing* abstraction: it may instantiate other
-    ``torch.nn.Module`` objects as sub-layers, and its functionality depends on
-    these sub-layers following a generalized invocation sequence. Also, it is stateful
-    and may hold parameters or buffers.
+    这个基类描述的是一种“按层组合模块”的抽象，而不是单一算子抽象。
+    子类通常会在初始化阶段继续构造其他 `torch.nn.Module` 子模块，
+    并依赖这些子模块按照约定的调用顺序共同完成整个层的功能。
 
-    Unlike :class:`CustomOp`, PluggableLayer does NOT provide per-platform
-    ``forward_*`` dispatch. Instead, it supports out-of-tree (OOT) replacement
-    of the entire layer class at instantiation time, allowing customized
-    initialization and submodule composition.
+    这类对象本身是有状态的：
+    - 可以持有参数；
+    - 可以持有 buffer；
+    - 可以在实例化阶段决定实际采用哪一个层实现。
+
+    它和 `CustomOp` 的核心区别是：
+    - `CustomOp` 更强调按平台分发 `forward_*` 实现；
+    - `PluggableLayer` 不做逐平台 forward 分发；
+    - `PluggableLayer` 支持在实例化时把整层替换为树外实现，
+      从而允许外部自定义完整的初始化逻辑和子模块组合方式。
     """
 
     def __new__(cls, *args, **kwargs):
+        # ------------------------------- 确定当前要实例化的层名 -------------------------------
+        # 先读取当前类名，后续会用这个名字去查询是否存在树外替换实现。
         try:
             layer_class_name = cls.__name__
         except AttributeError:
+            # 如果连类名都拿不到，说明当前对象不是一个正常注册过的可插拔层类，
+            # 或者调用方式本身就不合法，此时直接抛出更明确的错误信息。
             raise TypeError(
                 f"Cannot instantiate '{cls.__name__}': its 'name' attribute "
                 f"was not set, possibly because it was not decorated with "
                 f"@PluggableLayer.register, or it's the PluggableLayer itself."
             ) from None
 
+        # ------------------------------- 选择最终真正要实例化的类 -------------------------------
+        # 如果当前层名没有对应的树外实现，就按原始类本身实例化。
         if layer_class_name not in op_registry_oot:
             layer_cls_to_instantiate = cls
         else:
+            # 如果注册表里存在同名树外实现，就优先实例化树外类，
+            # 这样调用方写的仍然是原类名，但实际落地成可替换实现。
             layer_cls_to_instantiate = op_registry_oot[layer_class_name]
             logger.debug(
                 "Instantiating pluggable layer: %s using %s",
                 layer_class_name,
                 str(layer_cls_to_instantiate),
             )
+
+        # 这里真正创建对象时，传给父类的是“最终选定的实现类”，
+        # 而不是调用入口传进来的原始 cls。
         return super().__new__(layer_cls_to_instantiate)
 
-    # Decorator to register pluggable layers.
     @classmethod
     def register(cls, name: str):
+        # 返回一个装饰器，用来把类注册到框架内的可插拔层注册表。
         def decorator(op_cls):
+            # 注册名前必须唯一，避免同名层把旧定义覆盖掉。
             assert name not in op_registry, f"Duplicate op name: {name}"
+
+            # 把注册名挂到类对象上，方便后续按名字识别这个层。
             op_cls.name = name
+
+            # 把类放进框架内注册表，后续即可按名字找到它。
             op_registry[name] = op_cls
+
+            # 装饰器最终返回原类对象，让类定义流程保持不变。
             return op_cls
 
         return decorator
 
-    # Decorator to register out-of-tree(oot) pluggable layers.
-    # For OOT pluggable layers:
-    #   if in-tree layer class is registered with an oot_custom_layer,
-    #   the oot_custom_layer will be used instead.
     @classmethod
     def register_oot(cls, _decorated_layer_cls=None, name: str | None = None):
+        # 返回一个装饰器，用来把树外实现注册到 OOT 注册表。
         def decorator(layer_cls):
+            # 如果调用方显式传了 name，就使用指定名字；
+            # 否则使用默认名字作为注册键。
             reg_name = name if name is not None else cls.__name__
+
+            # OOT 注册名同样必须唯一，避免多个替换实现冲突。
             assert reg_name not in op_registry_oot, f"Duplicate layer name: {reg_name}"
+
+            # 把注册名写回类对象，便于调试和统一识别。
             layer_cls.name = reg_name
+
+            # 把树外层实现登记到 OOT 注册表中，
+            # 后续 `__new__` 会优先从这里选择真正实例化的类。
             op_registry_oot[reg_name] = layer_cls
+
+            # 返回原类对象，保持装饰器语义一致。
             return layer_cls
 
+        # ------------------------------- 兼容不同装饰器调用写法 -------------------------------
         if _decorated_layer_cls is None:
-            # Called with parentheses: @PluggableLayer.register_oot()
-            # or @PluggableLayer.register_oot(name="...")
+            # 这里对应带括号的写法：
+            # - @PluggableLayer.register_oot()
+            # - @PluggableLayer.register_oot(name="...")
+            # 此时先返回装饰器本身，等真正修饰类时再执行。
             return decorator
         elif isinstance(_decorated_layer_cls, type):  # Check if it's a class
-            # Called without parentheses: @PluggableLayer.register_oot
+            # 这里对应不带括号的写法：
+            # - @PluggableLayer.register_oot
+            # 此时被修饰的类已经直接传进来了，所以立即完成注册。
             return decorator(_decorated_layer_cls)
         else:
+            # 如果装饰目标不是类，说明用法不合法，直接报错。
             raise TypeError("Decorator can only be applied to classes.")
 
 

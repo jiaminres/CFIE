@@ -261,21 +261,29 @@ class LinearBase(PluggableLayer):
         # -------------------- 记录基础线性层超参数 --------------------
         # 保存输入维度。
         self.input_size = input_size
+
         # 保存输出维度。
         self.output_size = output_size
+
         # 保存“是否跳过 bias 加法”的行为开关。
         self.skip_bias_add = skip_bias_add
+
         # 若外部未显式指定参数 dtype，则退化到当前默认浮点类型。
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
+
         # 记录最终生效的参数 dtype。
         self.params_dtype = params_dtype
+
         # 保存量化配置对象，后续具体线性层实现会据此选择 quant_method。
         self.quant_config = quant_config
+
         # 保存参数名前缀。
         self.prefix = prefix
+
         # 默认不允许 FP8 block shape mismatch，某些子类会按需改成 True。
         self.allow_fp8_block_shape_mismatch = False
+
         # -------------------- 决定当前层使用的 quant_method --------------------
         # 未开启量化时，默认走非量化线性方法。
         if quant_config is None:
@@ -283,13 +291,18 @@ class LinearBase(PluggableLayer):
         else:
             # 开启量化时，从 quant_config 中为当前层选择具体量化实现。
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+
         # 保存前向是否返回 bias 的行为开关。
         self.return_bias = return_bias
+
         # 保存是否禁用 TP 的开关。
         self.disable_tp = disable_tp
+
         # -------------------- 解析当前层看到的 TP rank / TP size --------------------
+
         # 若未禁用 TP，则从全局并行状态读取当前 TP rank；否则退化成单 rank 视角。
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+
         # 若未禁用 TP，则读取 TP world size；否则视为 1。
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
 
@@ -310,17 +323,10 @@ class ReplicatedLinear(LinearBase):
     """
     复制式线性层。
 
-    参数说明：
-        input_size: 线性层输入维度。
-        output_size: 线性层输出维度。
-        bias: 是否创建 bias 参数。
-        skip_bias_add: 若为 True，则前向中不把 bias 加到输出上，而是单独返回。
-        params_dtype: 参数数据类型。
-        quant_config: 量化配置对象。
-        prefix: 该层在 state dict 中的完整路径前缀，
-            例如 `model.layers.0.qkv_proj`。
-        return_bias: 前向时是否把 bias 一并返回。
-        disable_tp: 对 replicated linear 无实际作用，仅为接口兼容保留。
+    “Replicated” 表示这层参数在每个 TP rank 上都保留完整副本，
+    不会像 column / row parallel 那样按输入维或输出维切分。
+    因此每个 rank 都能独立执行完整的线性变换，
+    通常适合 router / gate 这类需要完整输出维的场景。
     """
 
     # --8<-- [end:replicated_linear]
@@ -389,7 +395,7 @@ class ReplicatedLinear(LinearBase):
             set_weight_attrs(
                 self.bias,
                 {
-                    "output_dim": 0,
+                    "output_dim": 0,  # 表示第0轴是
                     "weight_loader": self.weight_loader,
                 },
             )
@@ -435,6 +441,7 @@ class ReplicatedLinear(LinearBase):
         # -------------------- 先根据 skip_bias_add 决定本轮是否在算子内加 bias --------------------
         # 若 skip_bias_add=True，则把 bias 置空，交给调用方后处理；否则在 quant_method.apply 内直接加上。
         bias = self.bias if not self.skip_bias_add else None
+
         # ReplicatedLinear 的前向一定依赖 quant_method 统一执行 GEMM/量化路径。
         assert self.quant_method is not None
 
@@ -446,8 +453,10 @@ class ReplicatedLinear(LinearBase):
         # 若调用方不需要 bias，则直接返回输出张量本身。
         if not self.return_bias:
             return output
+
         # 只有 skip_bias_add=True 时，才需要把原始 bias 单独返回给上游手动相加。
         output_bias = self.bias if self.skip_bias_add else None
+
         # 返回 (output, output_bias) 二元组，保持与 LinearBase 家族其它实现一致。
         return output, output_bias
 
@@ -498,17 +507,17 @@ class ColumnParallelLinear(LinearBase):
 
     def __init__(
             self,
-            input_size: int,                      # 输入维，记作 C_in
-            output_size: int,                     # 全局逻辑输出维，记作 C_out_global
+            input_size: int,  # 输入维，记作 C_in
+            output_size: int,  # 全局逻辑输出维，记作 C_out_global
             bias: bool = True,
-            gather_output: bool = False,          # 是否把各 rank 的局部输出 all-gather 成完整输出
-            skip_bias_add: bool = False,          # 若为 True，forward 不把 bias 加到输出里，而是单独返回 bias
+            gather_output: bool = False,  # 是否把各 rank 的局部输出 all-gather 成完整输出
+            skip_bias_add: bool = False,  # 若为 True，forward 不把 bias 加到输出里，而是单独返回 bias
             params_dtype: torch.dtype | None = None,
             quant_config: QuantizationConfig | None = None,
             prefix: str = "",
             *,
-            return_bias: bool = True,             # forward 是否返回 bias（常与 skip_bias_add 配合）
-            disable_tp: bool = False,             # 若为 True，则不做 TP 切分
+            return_bias: bool = True,  # forward 是否返回 bias（常与 skip_bias_add 配合）
+            disable_tp: bool = False,  # 若为 True，则不做 TP 切分
     ):
         # ------------------------------------------------------------
         # 1) 确定当前 TP rank 和 TP world size
@@ -637,7 +646,7 @@ class ColumnParallelLinear(LinearBase):
             set_weight_attrs(
                 self.bias,
                 {
-                    "output_dim": 0,                  # bias 的切分维就是它唯一那一维
+                    "output_dim": 0,  # bias 的切分维就是它唯一那一维
                     "weight_loader": self.weight_loader,
                 },
             )
@@ -770,7 +779,7 @@ class ColumnParallelLinear(LinearBase):
 
     def forward(
             self,
-            input_,   # 输入张量，常见 shape: [..., input_size]
+            input_,  # 输入张量，常见 shape: [..., input_size]
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         # ------------------------------------------------------------
         # 1) 决定是否把 bias 直接传给 quant_method.apply
@@ -1614,7 +1623,6 @@ class QKVParallelLinear(ColumnParallelLinear):
 
     def weight_loader(
             self,
-            
             param: Parameter,
             loaded_weight: torch.Tensor,
             loaded_shard_id: str | None = None,

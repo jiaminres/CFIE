@@ -785,7 +785,8 @@ def supports_xpu_graph() -> bool:
     return is_torch_equal_or_newer("2.11.0.dev")
 
 
-# create a library to hold the custom op
+# `cfie` 命名空间下的自定义算子都注册到这个 Torch Library 上。
+# 后续通过 `torch.ops.cfie.xxx(...)` 调用时，会在这里找到对应实现。
 cfie_lib = Library("cfie", "FRAGMENT")  # noqa
 
 
@@ -799,32 +800,39 @@ def direct_register_custom_op(
     tags: tuple[torch.Tag, ...] = (),
 ):
     """
-    `torch.library.custom_op` can have significant overhead because it
-    needs to consider complicated dispatching logic. This function
-    directly registers a custom op and dispatches it to the CUDA backend.
-    See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
-    for more details.
+    直接把 Python 函数注册成 Torch 自定义算子。
 
-    By default, the custom op is registered to the vLLM library. If you
-    want to register it to a different library, you can pass the library
-    object to the `target_lib` argument.
+    这里不走 `torch.library.custom_op(...)` 的高层封装，而是直接基于
+    `torch.library.Library` 做底层注册，以减少额外分发开销。
 
-    IMPORTANT: the lifetime of the operator is tied to the lifetime of the
-    library object. If you want to bind the operator to a different library,
-    make sure the library object is alive when the operator is used.
+    默认注册到全局 `cfie_lib`，因此上层可以通过
+    `torch.ops.cfie.<op_name>(...)` 调用；若传入 `target_lib`，
+    则改为注册到指定的 `Library` 实例。
+
+    注意：算子的生命周期依赖于对应的 `Library` 对象；若绑定到自定义
+    `target_lib`，需要确保该对象在算子使用期间始终存活。
     """
     if mutates_args is None:
+        # 未显式声明时，默认视为不修改任何输入参数。
         mutates_args = []
 
     if dispatch_key is None:
         from cfie.platforms import current_platform
 
+        # 默认按当前平台选择后端分发键，例如 CUDA / CPU / XPU。
         dispatch_key = current_platform.dispatch_key
 
+    # 根据 Python 函数签名自动推导 Torch schema，避免手写 schema 字符串。
     schema_str = infer_schema(op_func, mutates_args=mutates_args)
 
+    # 未指定目标库时，默认挂到 `cfie` 命名空间。
     my_lib = target_lib or cfie_lib
+
+    # 先定义算子的 schema 和附加标签。
     my_lib.define(op_name + schema_str, tags=tags)
+
+    # 再把该算子的真实实现绑定到目标后端。
     my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
     if fake_impl is not None:
+        # fake 实现主要给 fake tensor、torch.compile、shape propagation 使用。
         my_lib._register_fake(op_name, fake_impl)

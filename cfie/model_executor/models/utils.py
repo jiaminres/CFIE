@@ -1044,19 +1044,24 @@ def fast_topk(
         return torch.topk(values, topk, dim=dim)
 
 
-# Chunk x along the num_tokens axis for sequence parallelism
-# NOTE: This is wrapped in a torch custom op to work around the following issue:
-# The output tensor can have a sequence length 0 at small input sequence lengths
-# even though we explicitly pad to avoid this.
+# 沿 num_tokens 这一维把输入切成当前 rank 负责的 sequence parallel 本地分片。
+# 这里包一层 torch custom op，而不是直接用普通 Python / PyTorch 逻辑切分，
+# 是为了规避一个已知问题：在输入序列较短时，即使前面已经显式做过 padding，
+# 输出张量的序列长度仍然可能意外变成 0。
 def sequence_parallel_chunk(x: torch.Tensor) -> torch.Tensor:
+    # 调用注册在 `torch.ops.cfie` 命名空间下的自定义算子。
+    # 这一层只保留统一入口，真正的切分逻辑在 `sequence_parallel_chunk_impl` 中。
     return torch.ops.cfie.sequence_parallel_chunk_impl(x)
 
 
+
 def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
+    # 读取当前 tensor parallel 组大小，以及当前 rank 在组内的编号。
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tensor_model_parallel_rank()
 
-    # all_gather needs the sequence length to be divisible by tp_size
+    # 后续 sequence parallel / all-gather 相关逻辑要求 token 维能被 tp_size 整除。
+    # 因此这里会先把第 0 维补齐到 tp_size 的整数倍。
     seq_len = x.size(0)
     remainder = seq_len % tp_size
     if remainder != 0:
@@ -1065,24 +1070,46 @@ def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
     else:
         y = x
 
+    # 补齐后，把序列平均切成 tp_size 份。
     chunk = y.shape[0] // tp_size
+    # 当前 rank 只保留属于自己的那一段连续 token 分片。
     start = tp_rank * chunk
     return torch.narrow(y, 0, start, chunk)
 
 
 def sequence_parallel_chunk_impl_fake(x: torch.Tensor) -> torch.Tensor:
+    # fake 实现不做真实切分，只返回一个形状正确的占位张量。
+    # 它主要服务于 fake tensor、torch.compile 和形状传播阶段。
     tp_size = get_tensor_model_parallel_world_size()
+
+    # 第 0 维原本是全局 token 数；fake 路径里按 sequence parallel 的切分结果，
+    # 这里只保留单个 TP rank 应看到的本地 token 数，即 ceil(num_tokens / tp_size)。
     seq_len = cdiv(x.size(0), tp_size)
+
+    # 先拷贝输入张量的原始形状，例如 `[num_tokens, hidden_dim]`。
     shape = list(x.shape)
+
+    # 再把第 0 维从全局 token 数改成当前 rank 的本地 token 数；
+    # 其余维度保持不变，因此形状会从 `[num_tokens, ...]`
+    # 变成 `[ceil(num_tokens / tp_size), ...]`。
     shape[0] = seq_len
+
+    # 构造一个仅用于描述输出形状/类型/设备的占位张量，不承载真实数据。
     out = torch.empty(shape, dtype=x.dtype, device=x.device)
     return out
 
 
+# 把 Python 实现直接注册为 Torch 自定义算子。
+# 注册完成后，上层即可通过 `torch.ops.cfie.sequence_parallel_chunk_impl(...)`
+# 调用它；同时也为编译/trace 场景提供 fake 实现。
 direct_register_custom_op(
+    # 算子在 `torch.ops.cfie` 下暴露的名字。
     op_name="sequence_parallel_chunk_impl",
+    # 真实执行 token 分片逻辑的实现函数。
     op_func=sequence_parallel_chunk_impl,
+    # fake tensor / compile 场景下使用的形状推导实现。
     fake_impl=sequence_parallel_chunk_impl_fake,
+    # 声明该算子依赖固定 stride 顺序，避免布局假设被破坏。
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
