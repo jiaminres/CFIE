@@ -283,6 +283,27 @@ def _iter_layer_name_aliases(layer_name: str) -> tuple[str, ...]:
         # 补出 language_model.* 形式的候选层名。
         add(f"language_model.{suffix}")
 
+        # predictor/text-only 封装下，运行时层名也可能直接落在 model.* 命名空间。
+        add(f"model.{suffix}")
+
+    # 当层名以 model.layers. 开头时，补出 predictor 包裹后的
+    # model.language_model.layers.* 形式。
+    if layer_name.startswith("model.layers."):
+        add(f"model.language_model.{layer_name.removeprefix('model.')}")
+
+    # 当层名以 layers. 开头时，同时补出带 model. 与
+    # model.language_model. 前缀的两种形式。
+    if layer_name.startswith("layers."):
+        add(f"model.{layer_name}")
+        add(f"model.language_model.{layer_name}")
+
+    # 当层名以 language_model.layers. 开头时，补出 predictor 常见的
+    # model.language_model.* 与 model.* 两种命名。
+    if layer_name.startswith("language_model.layers."):
+        suffix = layer_name.removeprefix("language_model.")
+        add(f"model.language_model.{suffix}")
+        add(f"model.{suffix}")
+
     # ------------------------------- 处理 mtp 层在带或不带 model 前缀下的命名变体 -------------------------------
     # 当层名以 mtp. 开头时，补出带 model. 前缀的候选形式。
     if layer_name.startswith("mtp."):

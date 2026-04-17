@@ -68,6 +68,7 @@ from .interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -724,8 +725,10 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    IsHybrid,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
 ):
     # 纯文本版 Qwen3.5 CausalLM 的公共基类
@@ -859,6 +862,25 @@ class Qwen3_5ForCausalLMBase(
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
 
+    def get_mrope_input_positions(
+            self,
+            input_tokens: list[int],
+            mm_features: list["MultiModalFeatureSpec"],
+    ) -> tuple[torch.Tensor, int]:
+        # Qwen3.5 文本模型虽然使用 M-RoPE 的三通道位置格式，但纯文本场景下
+        # 三个通道的位置信息完全一致，等价于把 1D 位置复制到 T/H/W 三路。
+        if mm_features:
+            raise ValueError(
+                "Qwen3.5 text models do not accept multimodal features when "
+                "computing M-RoPE positions."
+            )
+
+        seq_len = len(input_tokens)
+        llm_positions = (
+            torch.arange(seq_len, dtype=torch.long).view(1, -1).expand(3, -1)
+        )
+        return llm_positions.clone(), 0
+
     def forward(
             self,
             input_ids: torch.Tensor,  # 输入 token ids
@@ -894,6 +916,39 @@ class Qwen3_5ForCausalLMBase(
 
         # 按当前模型结构自动加载权重
         return loader.load_weights(weights)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+            cls,
+            cfie_config: "CfieConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            cfie_config.model_config.dtype,
+            cfie_config.cache_config.mamba_cache_dtype,
+            cfie_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+            cls, cfie_config: "CfieConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = cfie_config.parallel_config
+        hf_config = cfie_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            cfie_config.speculative_config.num_speculative_tokens
+            if cfie_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):

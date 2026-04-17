@@ -132,16 +132,16 @@ class FusedTopKRouter(BaseRouter):
     ):
         # 先初始化 BaseRouter 负责的共享路由状态。
         super().__init__(
-            top_k=top_k,
-            global_num_experts=global_num_experts,
+            top_k=top_k,  # 8
+            global_num_experts=global_num_experts, # 256
             eplb_state=eplb_state,
             enable_eplb=enable_eplb,
             indices_type_getter=indices_type_getter,
         )
         # 保存是否需要对 top-k 权重重新归一化。
-        self.renormalize = renormalize
+        self.renormalize = renormalize  # True
         # 保存本 router 使用的打分函数类型。
-        self.scoring_func = scoring_func
+        self.scoring_func = scoring_func # softmax
 
     @property
     def routing_method_type(self) -> RoutingMethodType:

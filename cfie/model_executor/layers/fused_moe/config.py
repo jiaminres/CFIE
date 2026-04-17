@@ -1195,110 +1195,151 @@ class FusedMoEParallelConfig:
 # Adapted from pplx-kernels tests/all_to_all_utils.py
 @dataclass
 class FusedMoEConfig:
+    # ------------------------------- 结构与路由参数 -------------------------------
+    # 全局 expert 总数（所有 rank 的总和）。
     num_experts: int
+    # 每个 token 最终路由到的 expert 数（top-k）。
     experts_per_token: int
+    # 输入 hidden 维度（通常已按 kernel 约束做过对齐）。
     hidden_dim: int
+    # TP 切分后当前分区的 intermediate 维度。
     intermediate_size_per_partition: int
+    # 当前 rank 真正持有的本地 expert 数。
     num_local_experts: int
+    # 逻辑 expert 数（可与物理本地 expert 映射不同）。
     num_logical_experts: int
+    # MoE 激活函数类型。
     activation: MoEActivation
+    # 当前设备（cuda/rocm/cpu 等）。
     device: torch.device | str
+    # 路由方法类型（softmax/topk、grouped topk 等）。
     routing_method: RoutingMethodType
+    # MoE 并行拓扑配置（TP/DP/EP/SP/PCP 与 all2all backend 选择）。
     moe_parallel_config: FusedMoEParallelConfig
 
-    # The activation type.
+    # ------------------------------- dtype 与后端参数 -------------------------------
+    # routed experts 输入激活 dtype。
     in_dtype: torch.dtype
 
-    # Defaults to in_dtype if not specified.
+    # router logits 的 dtype；若未显式指定，则在 __post_init__ 中回落到 in_dtype。
     router_logits_dtype: torch.dtype | None = None
 
+    # MoE backend 选择（auto/triton/flashinfer/...）。
     moe_backend: str = "auto"
+    # DP chunking 单次前向允许处理的最大 token 数。
     max_num_tokens: int = envs.VLLM_MOE_DP_CHUNK_SIZE
+    # expert 线性层是否包含 bias。
     has_bias: bool = False
+    # 是否走 act-and-mul 融合路径。
     is_act_and_mul: bool = True
+    # 是否启用 LoRA（部分 kernel/量化路径会据此切换实现）。
     is_lora_enabled: bool = False
 
-    # This flag is used to disable the inplace optimization
-    # in MoE kernels. If this flag is True then the kernel
-    # should not be using inplace. If the flag is false, the
-    # kernel is free to use inplace or not.
+    # ------------------------------- kernel 行为开关 -------------------------------
+    # 该开关用于禁止 MoE kernel 使用 inplace 优化：
+    # - True：强制禁止 inplace；
+    # - False：kernel 可按实现自由选择是否 inplace。
     disable_inplace: bool = True
 
     def __post_init__(self):
+        # DP>1 时打印一次 max_num_tokens，便于确认分块上限是否符合预期。
         if self.dp_size > 1:
             logger.debug_once(
                 "Using FusedMoEConfig::max_num_tokens=%d", self.max_num_tokens
             )
 
+        # max_num_tokens 必须为正值，否则 chunking 调度无效。
         assert self.max_num_tokens > 0
 
+        # 若未单独设置 router logits dtype，则默认与输入激活 dtype 对齐。
         if self.router_logits_dtype is None:
             self.router_logits_dtype = self.in_dtype
 
+    # ------------------------------- 并行规模访问器 -------------------------------
     @property
     def tp_size(self):
+        # Tensor Parallel 规模。
         return self.moe_parallel_config.tp_size
 
     @property
     def dp_size(self):
+        # Data Parallel 规模。
         return self.moe_parallel_config.dp_size
 
     @property
     def pcp_size(self):
+        # Prefill Context Parallel 规模。
         return self.moe_parallel_config.pcp_size
 
     @property
     def ep_size(self):
+        # Expert Parallel 规模。
         return self.moe_parallel_config.ep_size
 
     @property
     def sp_size(self):
+        # Sequence Parallel 规模。
         return self.moe_parallel_config.sp_size
 
+    # ------------------------------- 并行模式访问器 -------------------------------
     @property
     def is_sequence_parallel(self):
+        # 当前 MoE 是否处于 Sequence Parallel 模式。
         return self.moe_parallel_config.is_sequence_parallel
 
+    # ------------------------------- 并行 rank 访问器 -------------------------------
     @property
     def tp_rank(self):
+        # 当前 TP rank。
         return self.moe_parallel_config.tp_rank
 
     @property
     def dp_rank(self):
+        # 当前 DP rank。
         return self.moe_parallel_config.dp_rank
 
     @property
     def pcp_rank(self):
+        # 当前 PCP rank。
         return self.moe_parallel_config.pcp_rank
 
     @property
     def ep_rank(self):
+        # 当前 EP rank。
         return self.moe_parallel_config.ep_rank
 
+    # ------------------------------- 后端开关访问器 -------------------------------
     @property
     def use_ep(self):
+        # 是否启用 EP 路径。
         return self.moe_parallel_config.use_ep
 
     @property
     def use_deepep_ht_kernels(self):
+        # 是否启用 DeepEP HT kernel 路径。
         return self.moe_parallel_config.use_deepep_ht_kernels
 
     @property
     def use_deepep_ll_kernels(self):
+        # 是否启用 DeepEP LL kernel 路径。
         return self.moe_parallel_config.use_deepep_ll_kernels
 
     @property
     def use_mori_kernels(self):
+        # 是否启用 Mori kernel 路径。
         return self.moe_parallel_config.use_mori_kernels
 
     @property
     def use_fi_all2allv_kernels(self):
+        # 是否启用 FlashInfer all2allv kernel 路径。
         return self.moe_parallel_config.use_fi_all2allv_kernels
 
     @property
     def use_naive_all2all_kernels(self):
+        # 是否启用 naive all2all kernel 路径。
         return self.moe_parallel_config.use_naive_all2all_kernels
 
     @property
     def use_nixl_ep_kernels(self):
+        # 是否启用 NIXL EP kernel 路径。
         return self.moe_parallel_config.use_nixl_ep_kernels

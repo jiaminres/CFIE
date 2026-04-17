@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Predictor-isolated Qwen3.5-MoE runtime classes."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
@@ -47,10 +48,13 @@ from .qwen3_5 import (
     Qwen3VLMultiModalProcessor,
 )
 from .qwen3_next import Qwen3NextSparseMoeBlock
+from .utils import AutoWeightsLoader
+from .utils import extract_layer_index
+from .utils import WeightsMapper
 
 PREDICTOR_PENDING_LAYER_PLANS_KEY = "__cfie_predictor_pending_layer_plans__"
 SUPPORTED_PREDICTOR_SUMMARY_SOURCES = frozenset(
-    {"representative_runtime", "synthetic_formula"}
+    {"representative_runtime", "synthetic_formula", "forward_hidden_state"}
 )
 SUPPORTED_PREDICTOR_SELECTION_MODES = frozenset({"masked_candidate_topk"})
 SUPPORTED_PREDICTOR_ONLINE_EXPERT_SOURCES = frozenset(
@@ -230,6 +234,7 @@ class Qwen3_5PredictorSparseMoeBlock(Qwen3NextSparseMoeBlock):
 
     def __init__(self, cfie_config: CfieConfig, prefix: str = ""):
         super().__init__(cfie_config=cfie_config, prefix=prefix)
+        self.layer_idx = extract_layer_index(prefix)
         self.predictor_runtime: PredictorRuntimeState | None = None
         self.active_layer_plan: PredictorLayerRoutingState | None = None
         self.active_online_expert_state: PredictorOnlineExpertState | None = None
@@ -286,7 +291,7 @@ class Qwen3_5PredictorSparseMoeBlock(Qwen3NextSparseMoeBlock):
         if runtime_state is None:
             return
         runtime_state.observe_routed_experts(
-            layer_index=self.layer_id,
+            layer_index=self.layer_idx,
             expert_ids=routed_expert_ids,
         )
 
@@ -763,6 +768,7 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
             residual: torch.Tensor | None,
             positions: torch.Tensor,
     ) -> None:
+        del positions
         runtime_state = self.predictor_runtime
         if runtime_state is None:
             return
@@ -770,14 +776,11 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
         if layer_idx % stride_layers != 0:
             return
 
-        hidden_summary = self._build_hidden_summary(
-            hidden_states=hidden_states,
-            residual=residual,
-            positions=positions,
-            insertion_layer_index=layer_idx,
+        predictor_hidden_state = (
+            hidden_states + residual if residual is not None else hidden_states
         )
         window_plan = runtime_state.planner.plan_window(
-            hidden_summary,
+            predictor_hidden_state,
             insertion_layer_index=layer_idx,
             total_layers=self.config.num_hidden_layers,
         )
@@ -889,6 +892,17 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
 
 
 class Qwen3_5MoePredictorForCausalLM(Qwen3_5MoeForCausalLM):
+    # 显式挂出 hybrid 标记，避免 registry 基于本模块单独缓存 modelinfo 时
+    # 丢失 attention + linear_attention 混合模型的能力声明。
+    is_hybrid = True
+
+    hf_to_cfie_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.visual.": None,
+            "model.language_model.": "model.",
+        }
+    )
+
     def __init__(self, *, cfie_config: CfieConfig, prefix: str = ""):
         super().__init__(cfie_config=cfie_config, prefix=prefix)
         self.predictor_runtime: PredictorRuntimeState | None = None
@@ -983,6 +997,13 @@ class Qwen3_5MoePredictorForCausalLM(Qwen3_5MoeForCausalLM):
         self.predictor_runtime = None
         if isinstance(self.model, Qwen3_5PredictorModel):
             self.model.bind_predictor_runtime(None)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["mtp."],
+        )
+        return loader.load_weights(weights, mapper=self.hf_to_cfie_mapper)
 
 
 @MULTIMODAL_REGISTRY.register_processor(

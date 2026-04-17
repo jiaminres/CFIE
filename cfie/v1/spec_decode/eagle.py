@@ -845,6 +845,9 @@ class SpecDecodeBaseProposer:
         assert discard_request_mask.dtype == torch.bool
         assert backup_tokens_gpu.dtype == torch.int32
 
+        backup_tokens_gpu = backup_tokens_gpu[:batch_size]
+        discard_request_mask = discard_request_mask[:batch_size]
+
         next_token_ids = torch.empty(batch_size, dtype=torch.int32, device=device)
         valid_sampled_tokens_count = next_token_ids.new_empty(batch_size)
 

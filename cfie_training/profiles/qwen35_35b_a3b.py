@@ -248,7 +248,6 @@ def build_qwen35_35b_a3b_config() -> TrainingProjectConfig:
             # 每一步默认构造的样本数。
             examples_per_step=4,
             # 合成轨迹噪声幅度。
-            synthetic_trace_noise_scale=0.05,
             # 随机种子。
             seed=0,
         ),

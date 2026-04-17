@@ -152,8 +152,8 @@ def create_fused_moe_router(
 
     # 其余场景统一走默认 fused top-k router。
     return FusedTopKRouter( # 默认
-        top_k=top_k,
-        global_num_experts=global_num_experts,
+        top_k=top_k, # 8
+        global_num_experts=global_num_experts, # 256
         eplb_state=eplb_state,
         renormalize=renormalize, # True
         scoring_func=scoring_func, # softmax

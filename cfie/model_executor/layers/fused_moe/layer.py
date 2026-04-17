@@ -640,19 +640,33 @@ class FusedMoE(CustomOp):
         # -------------------- 构造路由器 --------------------
         # 路由器负责根据 router logits 为每个 token 产出 top-k experts。
         self.router = create_fused_moe_router(
+            # 每个 token 最终要选出的 routed experts 数量。
             top_k=top_k,
+            # 全局视角下的 expert 总数，供路由器按完整 expert 空间做选择。
             global_num_experts=self.global_num_experts,
+            # EPLB 的运行时状态，路由阶段若启用负载均衡会读写这里的统计信息。
             eplb_state=self.eplb_state,
+            # 若 top-k 分数后续需要重新归一化，则由路由器在输出前统一处理。
             renormalize=renormalize,
+            # 是否走 grouped top-k 路由路径；开启后 expert 会先按组再在组内筛选。
             use_grouped_topk=use_grouped_topk,
+            # expert 分组总数，仅在 grouped top-k 路由下参与分组边界计算。
             num_expert_group=num_expert_group,
+            # 每个 token 允许进入 top-k 竞争的 expert 组数量，用于先做组级裁剪。
             topk_group=topk_group,
+            # 若上层提供了自定义路由函数，则优先交给它覆盖默认 top-k 逻辑。
             custom_routing_function=custom_routing_function,
+            # 指定 router logits 的打分函数形式，例如 softmax/sigmoid 等变换策略。
             scoring_func=scoring_func,
+            # routed experts 输出的整体缩放因子，供路由权重与专家输出对齐数值尺度。
             routed_scaling_factor=routed_scaling_factor,
+            # e-score 校正偏置，主要用于某些带 score correction 的路由变体。
             e_score_correction_bias=e_score_correction_bias,
+            # 当前层融合进 routed 路由流程中的 shared expert 数量。
             num_fused_shared_experts=self.num_fused_shared_experts,
+            # 是否在该路由器实例上真正启用 EPLB 负载均衡逻辑。
             enable_eplb=enable_eplb,
+            # 延迟读取 top-k 索引 dtype，使路由器与当前量化方法要求的索引类型保持一致。
             indices_type_getter=lambda: self.quant_method.topk_indices_dtype,
         )
         # 保存当前路由器最终采用的 routing method 类型。
@@ -662,48 +676,76 @@ class FusedMoE(CustomOp):
         # 某些 kernel / 量化路径要求 hidden_size 对齐，这里先做一次规整。
         # 先保留未补齐前的原始 hidden_size，后面创建量化权重时仍会用到。
         unpadded_hidden_size = hidden_size
+
         # 若模型配置存在，则读取 HF config 里的 model_type，供 kernel 决策使用。
         self.model_type = (
             self.cfie_config.model_config.hf_config.model_type
             if self.cfie_config.model_config is not None
             else None
         )
+
         # 根据 dtype、并行配置、LoRA、量化方式等条件，对 hidden_size 做必要的向上对齐。
         hidden_size = maybe_roundup_hidden_size(
+            # 当前层原始 hidden_size（对齐前）。
             hidden_size=hidden_size,
+            # 当前 MoE 激活 dtype，部分后端会据此决定对齐粒度。
             act_dtype=moe_in_dtype,
+            # 当前层 DP/EP/SP 并行配置，all2all 路径会用到。
             moe_parallel_config=self.moe_parallel_config,
+            # 是否启用了 LoRA；mxfp4 某些后端会依赖该信息选实现。
             is_lora_enabled=cfie_config.lora_config is not None,
+            # HF model_type，用于识别 gpt_oss 等需要额外对齐规则的模型族。
             model_type=self.model_type,
+            # 当前层是否命中 mxfp4 量化路径。
             is_mxfp4_quant=(
                     quant_config is not None and quant_config.is_mxfp4_quant(prefix, self)
             ),  # False
-        )
+        ) # 当前不操作
+
         # 保存最终用于 kernel / 权重布局的 hidden_size。
         self.hidden_size = hidden_size
 
         # moe_config 汇总 fused moe 执行所需的结构、并行、dtype 和 backend 信息。
         self.moe_config: FusedMoEConfig = FusedMoEConfig(
+            # 全局 expert 总数（所有 rank 合并视角）。
             num_experts=self.global_num_experts,
+            # 每个 token 最终路由到的 expert 数（top-k）。
             experts_per_token=top_k,
+            # 实际参与 kernel 布局的 hidden 维（已对齐）。
             hidden_dim=hidden_size,
+            # TP 切分后当前分区的 intermediate 维度。
             intermediate_size_per_partition=self.intermediate_size_per_partition,
+            # 当前 rank 真正持有的本地 expert 数。
             num_local_experts=self.local_num_experts,
+            # 逻辑 expert 数（用于某些映射/路由场景）。
             num_logical_experts=self.logical_num_experts,
+            # MoE 并行拓扑配置（DP/EP/SP/PCP）。
             moe_parallel_config=self.moe_parallel_config,
+            # routed experts 输入激活 dtype。
             in_dtype=moe_in_dtype,
+            # 当前层选定的 MoE backend（如 triton / flashinfer / marlin 等）。
             moe_backend=cfie_config.kernel_config.moe_backend,
+            # router logits 的计算与存储 dtype。
             router_logits_dtype=router_logits_dtype,
+            # DP chunking 单次最大 token 数上限。
             max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
+            # 当前层是否存在 expert bias。
             has_bias=has_bias,
+            # expert 前向是否采用 act-and-mul 融合路径。
             is_act_and_mul=is_act_and_mul,
+            # 是否启用 LoRA；部分 kernel/量化路径会据此切换实现。
             is_lora_enabled=cfie_config.lora_config is not None,
+            # experts 激活函数类型（如 silu/geglu 等）。
             activation=self.activation,
+            # 当前设备（cuda/rocm/cpu 等）。
             device=cfie_config.device_config.device,
+            # 当前层最终路由方法类型（由 router 解析得到）。
             routing_method=self.routing_method_type,
             # TODO: in_dtype == out_dtype?
+            # 需要关闭 inplace 时禁用原地写回（共享 expert 场景也强制关闭）。
             disable_inplace=disable_inplace() or self._shared_experts is not None,
         )
+
         # Mori kernel 目前依赖 ROCm AITER fused moe，并且不支持 fusion shared experts。
         if self.moe_config.use_mori_kernels:
             assert self.rocm_aiter_fmoe_enabled, (
@@ -766,6 +808,7 @@ class FusedMoE(CustomOp):
             # 全局 expert 总数，供量化方法做全局到本地的映射判断。
             "global_num_experts": self.global_num_experts,
         }
+
         # need full intermediate size pre-sharding for WNA16 act order
         if self.quant_method.__class__.__name__ in (
                 "GPTQMarlinMoEMethod",
@@ -775,26 +818,16 @@ class FusedMoE(CustomOp):
             # 某些 WNA16 / Marlin 量化路径在切分前仍需要完整 intermediate_size。
             moe_quant_params["intermediate_size_full"] = intermediate_size
 
-        # 当前 Qwen3.5-122B-A10B-GPTQ-Int4 routed experts 通常会在这里走：
-        # self.quant_method = GPTQMarlinMoEMethod
-        #
-        # 当前关键参数上下文：
-        # - hidden_size = 3072
-        # - intermediate_size = 1024
-        # - num_experts(逻辑) = 256
-        # - top_k = 8
-        #
-        # 但这里传给 create_weights 的 num_experts 不是全局 256，
-        # 而是 self.local_num_experts，即“当前层当前设备上真实创建多少 expert slots”。
-        # 在 tiered cache 打开时，它会显著小于 256，从而避免一层一次性把全部专家塞进显存。
         # 真正按当前量化方法创建专家权重和量化附属张量。
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+
         # base_quant_method 保留最初的量化方法，后续 modular kernel 包装时还会用到。
         self.base_quant_method = self.quant_method
 
         # -------------------- 计算 shared expert overlap 策略并初始化 runner --------------------
         # 读取当前 all2all backend，后面判断 shared expert overlap 是否安全启用。
         backend = self.moe_parallel_config.all2all_backend
+
         # 只有后端允许、当前存在 shared experts 时，才启用 overlap。
         self.use_overlapped = (
                 not (

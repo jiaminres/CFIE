@@ -39,6 +39,8 @@ DEFAULT_PREFILL_BURST_MIN_TOKENS = 8
 DEFAULT_PREFILL_BURST_TOKENS_PER_GPU_SLOT = 4
 
 QWEN35_MOE_MODEL_TYPE = "qwen3_5_moe"
+QWEN35_MOE_PREDICTOR_MODEL_TYPE = "qwen3_5_moe_predictor"
+QWEN35_MOE_PREDICTOR_TEXT_MODEL_TYPE = "qwen3_5_moe_predictor_text"
 QWEN35_MTP_MODEL_TYPE = "qwen3_5_mtp"
 QWEN35_MOE_MTP_ARCH = "Qwen3_5MoeMTP"
 SUPPORTED_TIERED_CACHE_QUANTIZATIONS = frozenset(
@@ -589,7 +591,11 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
 def _resolve_qwen35_moe_planning_mode(hf_config: Any) -> str | None:
     # 先读取原始 HF config 中声明的 model_type。
     model_type = str(getattr(hf_config, "model_type", ""))
-    if model_type == QWEN35_MOE_MODEL_TYPE:
+    if model_type in {
+        QWEN35_MOE_MODEL_TYPE,
+        QWEN35_MOE_PREDICTOR_MODEL_TYPE,
+        QWEN35_MOE_PREDICTOR_TEXT_MODEL_TYPE,
+    }:
         # 命中主干 target 变体时，返回 target 规划模式。
         return "target"
 

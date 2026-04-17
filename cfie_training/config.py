@@ -476,7 +476,6 @@ class PredictorTrainerConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     examples_per_step: int = 4
-    synthetic_trace_noise_scale: float = 0.05
     seed: int = 0
 
     # 校验 predictor trainer 的训练超参数。
@@ -488,10 +487,6 @@ class PredictorTrainerConfig:
         _require_positive_float("learning_rate", self.learning_rate)
         _require_non_negative_float("weight_decay", self.weight_decay)
         _require_positive_int("examples_per_step", self.examples_per_step)
-        _require_non_negative_float(
-            "synthetic_trace_noise_scale",
-            self.synthetic_trace_noise_scale,
-        )
         _require_non_negative_int("seed", self.seed)
         return self
 

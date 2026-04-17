@@ -12,6 +12,18 @@ from cfie.transformers_utils.configs.qwen3_5_moe import (
 class Qwen3_5MoePredictorTextConfig(Qwen3_5MoeTextConfig):
     model_type = "qwen3_5_moe_predictor_text"
 
+    def __init__(
+        self,
+        predictor_bundle_path: str | None = None,
+        predictor_map_location: str = "cpu",
+        predictor_device: str = "cpu",
+        **kwargs,
+    ):
+        self.predictor_bundle_path = predictor_bundle_path
+        self.predictor_map_location = predictor_map_location
+        self.predictor_device = predictor_device
+        super().__init__(**kwargs)
+
 
 class Qwen3_5MoePredictorVisionConfig(Qwen3_5MoeVisionConfig):
     model_type = "qwen3_5_moe_predictor"

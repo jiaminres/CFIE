@@ -123,13 +123,13 @@ class BaseRouter(FusedMoERouter):
         # 初始化父类基础状态。
         super().__init__()
         # 保存每个 token 要选取的 expert 数。
-        self.top_k = top_k
+        self.top_k = top_k # 8
         # 保存模型全局 expert 总数。
-        self.global_num_experts = global_num_experts
+        self.global_num_experts = global_num_experts # 256
         # 保存 EPLB 运行时状态。
         self.eplb_state = eplb_state
         # 记录当前是否启用 EPLB 逻辑。
-        self.enable_eplb = enable_eplb
+        self.enable_eplb = enable_eplb # False
         # 保存 expert index dtype 的运行时查询回调。
         self.indices_type_getter = indices_type_getter
         # 可选地捕获 EPLB 映射前的逻辑 expert id。
@@ -213,13 +213,6 @@ class BaseRouter(FusedMoERouter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         根据 router logits 把输入 token 路由到 top-k experts。
-
-        这里实现统一模板流程：
-        1. 校验 EPLB 状态
-        2. 获取 expert index dtype
-        3. 调用子类 `_compute_routing()` 计算 topk_weights 和 topk_ids
-        4. 若启用 EPLB，则把逻辑 expert id 映射成物理 expert id
-        5. 按需转换 index dtype
 
         返回：
         - `(topk_weights, topk_ids)`

@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from cfie import _custom_ops as ops
 from cfie.logger import init_logger
 from cfie.config import CacheConfig
 from cfie.model_executor.layers.mamba.mamba_utils import (
@@ -23,6 +24,7 @@ from cfie.v1.worker.gpu_input_batch import CachedRequestState
 from cfie.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
 logger = init_logger(__name__)
+_SINGLE_BLOCK_MAPPING_CPU = torch.tensor([[0, 0]], dtype=torch.int64, device="cpu")
 
 
 @triton.jit
@@ -148,6 +150,38 @@ def _copy_mamba_state_torch_fallback(
         dst_flat[:num_elements].copy_(src_flat, non_blocking=True)
 
 
+def _copy_mamba_state_swap_blocks_precompiled(
+    copy_bufs: MambaCopyBuffers,
+    n: int,
+) -> bool:
+    if not hasattr(torch.ops, "_C_cache_ops") or not hasattr(
+        torch.ops._C_cache_ops, "swap_blocks"
+    ):
+        return False
+
+    logger.info_once(
+        "Using `_C_cache_ops.swap_blocks` for Mamba state block copy because "
+        "Triton runtime is unavailable."
+    )
+
+    for src_tensor, dst_tensor, num_elements in copy_bufs.python_copies[:n]:
+        if num_elements == 0:
+            continue
+        if not src_tensor.is_cuda or not dst_tensor.is_cuda:
+            return False
+
+        copy_num_bytes = int(num_elements * src_tensor.element_size())
+        src_byte_view = src_tensor.reshape(-1).view(torch.uint8)
+        dst_byte_view = dst_tensor.view(-1).view(torch.uint8)
+        ops.swap_blocks(
+            src_byte_view,
+            dst_byte_view,
+            copy_num_bytes,
+            _SINGLE_BLOCK_MAPPING_CPU,
+        )
+    return True
+
+
 def collect_mamba_copy_meta(
     copy_bufs: MambaCopyBuffers,
     kv_cache_config: KVCacheConfig,
@@ -205,7 +239,8 @@ def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
     if n == 0:
         return
     if not HAS_TRITON:
-        _copy_mamba_state_torch_fallback(copy_bufs, n)
+        if not _copy_mamba_state_swap_blocks_precompiled(copy_bufs, n):
+            _copy_mamba_state_torch_fallback(copy_bufs, n)
         copy_bufs.python_copies.clear()
         return
     batch_memcpy(

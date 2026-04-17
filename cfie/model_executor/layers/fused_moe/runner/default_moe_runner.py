@@ -985,35 +985,28 @@ class DefaultMoERunner(MoERunner):
         router_logits: torch.Tensor,
         shared_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # -----------------
-        # runner 的真实主执行函数。
-        # -----------------
-        # 所有 `moe_forward` custom op / Python fallback 最终都会落到这里。
-        # 它负责把一层 MoE 前向拆成以下几个阶段：
-        # - gate / router 预处理
-        # - shared experts 预执行或独立 stream 启动
-        # - dispatch（必要时）
-        # - routed experts 主计算
-        # - combine（必要时）
-        # 这是整个 runner 中“最接近真实执行顺序”的主路径。
+        # ------------------------------- 主流程入口 -------------------------------
+        # 执行单层 MoE 的完整前向主线：
+        # 先准备路由输入与 shared 分支状态，再执行 routed 主计算，
+        # 最后按并行拓扑规约输出并返回。
         assert self.quant_method is not None
 
-        # 按需初始化 DP chunking 复用缓冲区。
+        # 若当前后端可能走 DP chunking，这里先确保 staging buffer 已就绪。
+        # 这样后续无论是否真正进入 chunked 分支，都不会访问未初始化状态。
         self.ensure_dp_chunking_init()
 
-        # shared experts 若不由 MK 内部接管，就需要 runner 自己单独执行这条分支。
-        # 这里返回 True 表示：
-        # - 当前确实存在 shared experts
-        # - 并且它没有被 monolithic / modular kernel 内部融合掉
+        # 只有 shared experts 未被内核内部融合接管时，
+        # runner 才需要显式调 shared 分支并管理其执行时机。
         has_separate_shared_experts = (
             not self.quant_method.mk_owns_shared_expert
             and self.shared_experts is not None
         )
 
-        # 某些 all2all backend 会强制启用 chunked 实现。
+        # 根据并行后端能力判断本次是否走 chunked 专用实现。
         use_chunked_impl = self.use_dp_chunking
 
-        # 决定 shared experts 是否启用独立 stream 并准备其输入。
+        # 决定 shared experts 是否放到独立 CUDA stream 异步执行，
+        # 并提前确定 shared 分支要消费的输入张量。
         use_shared_experts_stream, shared_experts_input = (
             self._maybe_setup_shared_experts_stream(
                 hidden_states,
@@ -1023,18 +1016,15 @@ class DefaultMoERunner(MoERunner):
             )
         )
 
-        # -----------------
-        # gate / router 预处理。
-        # -----------------
-        # 若当前层显式提供了 gate / router，就在这里先产出 router_logits。
-        # 这段逻辑主要服务于 overlapped 模式，方便 shared experts 与 FusedMoE
-        # 借助独立 CUDA stream 并行执行。
+        # ------------------------------- gate/router 预处理 -------------------------------
+        # 若当前层内置了 gate，就以层内 gate 的结果为准覆盖外部 logits，
+        # 让后续 shared/routed 两条路径读取同一份路由信息。
         if self.gate is not None:
-            # 这里会覆盖调用方传进来的 `router_logits`，以内部 gate 计算结果为准。
             router_logits, _ = self.gate(hidden_states)
 
+        # ------------------------------- chunked 快速分支 -------------------------------
+        # chunked 模式下直接切到专用实现，避免与非 chunked 逻辑交叉。
         if use_chunked_impl:
-            # chunked 模式下，后续逻辑全部转交给专门的 chunked 实现。
             return self.forward_impl_chunked(
                 layer,
                 hidden_states,
@@ -1043,19 +1033,17 @@ class DefaultMoERunner(MoERunner):
                 has_separate_shared_experts,
             )
 
-        # -----------------
-        # 非 chunked 主路径。
-        # -----------------
-        # TODO(rob): 等所有 quant method 都迁移到 MK 后，
-        # 这里的 naive dispatch/combine 分支可以删除。
+        # ------------------------------- 非 chunked 主路径 -------------------------------
+        # 仅在 DP>1 且量化实现不支持内核内部分发时，才启用 naive dispatch/combine。
+        # TODO(rob): 等所有 quant method 迁移到 MK 后，可删除该兼容分支。
         do_naive_dispatch_combine = (
             self.moe_config.dp_size > 1 and not self.quant_method.supports_internal_mk
         )
 
-        # forward context 里挂着当前 prefill/decode 批次的 DP/SP 元信息。
+        # 读取当前 forward 的并行上下文元数据。
         ctx = get_forward_context()
-        # 若存在 DP metadata，就进入它提供的 sequence-parallel 局部上下文；
-        # 否则用空上下文保持统一写法。
+        # 若存在 DP metadata，则按 SP 口径设置本地 token 视图；
+        # 若不存在，则用空上下文保持后续写法一致。
         sp_ctx = (
             ctx.dp_metadata.sp_local_sizes(self.moe_config.sp_size)
             if ctx.dp_metadata
@@ -1063,70 +1051,58 @@ class DefaultMoERunner(MoERunner):
         )
 
         with sp_ctx:
-            # -----------------
-            # shared experts 预执行路径。
-            # -----------------
-            # 若 shared experts 不走独立 stream，就先于主专家计算执行，
-            # 避免后续矩阵计算修改 hidden_states。
+            # ------------------------------- shared experts 预执行 -------------------------------
+            # 若 shared 分支不走独立 stream，则先在主 stream 同步执行。
+            # 这样可以在 routed 路径改写输入前拿到稳定的 shared 输出。
             if has_separate_shared_experts and not use_shared_experts_stream:
                 assert self.shared_experts is not None
-                # 若调用方没有单独给 shared_input，就默认复用当前 hidden_states。
+                # 若未显式提供 shared_input，则默认复用当前 hidden_states。
                 shared_input = (
                     shared_input if shared_input is not None else hidden_states
                 )
-                # 在主 stream 上同步执行 shared experts。
                 shared_output = self.shared_experts(shared_input)
 
-            # -----------------
-            # dispatch 阶段。
-            # -----------------
-            # naive DP/EP 路径下，需要先把 hidden states 与 router logits
-            # 分发到对应的 expert rank。
-            # TODO: 等所有 kernel 都迁移到 MoEKernel 框架后，这条分支可删除。
+            # ------------------------------- dispatch 阶段 -------------------------------
+            # naive 路径下先把 token 与路由 logits 分发到目标 expert rank，
+            # 让本 rank 只处理自己负责的专家输入。
+            # TODO: 等所有 kernel 迁移到 MoEKernel 框架后，可删除该分支。
             if do_naive_dispatch_combine:
-                # DP+EP 的 naive 路径下，需要先把 token / logits 分发到 expert 所在 rank。
-                # 分发之后，当前 rank 只保留自己负责的那部分 token 及其 router logits。
                 hidden_states, router_logits = get_ep_group().dispatch_router_logits(
                     hidden_states,
                     router_logits,
                     self.moe_config.is_sequence_parallel,
                 )
 
-            # PCP 打开时，还要额外在 prefill context 维上做一次 gather。
-            # PCP 与 DP 类似，同样需要 dispatch / combine；
-            # 当前为了简化实现，先单独给 PCP 接了一套 AgRsAll2All 路径，
-            # 后续可再考虑把 All2AllManager 抽象扩展得更统一。
+            # ------------------------------- PCP gather 阶段 -------------------------------
+            # PCP 开启时，在 token 维收集各 rank 分片，
+            # 让后续 routed 计算基于完整上下文视图执行。
             if self.moe_config.pcp_size > 1:
-                # PCP 路径下，先把 hidden_states 沿 token 维 gather 成更完整的上下文视图。
                 hidden_states = get_pcp_group().all_gather(
                     hidden_states,
                     dim=0,
                 )
-                # router logits 也要保持与 hidden_states 完全对齐，因此同样做 gather。
                 router_logits = get_pcp_group().all_gather(
                     router_logits,
                     dim=0,
                 )
 
-            # -----------------
-            # expert 主计算阶段。
-            # -----------------
-            # 核心专家计算阶段。
+            # ------------------------------- routed experts 主计算 -------------------------------
+            # 核心专家计算阶段：
+            # monolithic 路径由统一入口完成路由与专家计算；
+            # 非 monolithic 路径先选 top-k，再按 top-k 执行专家前向。
             if self.quant_method.is_monolithic:
-                # monolithic 路径把 router + experts +（可选）shared 融成一个内核入口。
                 final_hidden_states = self._apply_monolithic_with_tiered_cache(
                     layer=layer,
                     x=hidden_states,
                     router_logits=router_logits,
                 )
             else:
-                # 非 monolithic 路径统一先由 router 产出 topk，再进入执行逻辑。
                 topk_weights, topk_ids = self.router.select_experts(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                 )
 
-                # `topk_weights/topk_ids` 会驱动后续的 dispatch、kernel 执行和结果合并。
+                # top-k 结果会作为 routed 路径后续计算与合并的驱动信号。
                 final_hidden_states = self._apply_with_tiered_cache(
                     layer=layer,
                     x=hidden_states,
@@ -1135,37 +1111,35 @@ class DefaultMoERunner(MoERunner):
                     shared_experts_input=shared_input,
                 )
 
+            # ------------------------------- shared experts 并行收敛 -------------------------------
+            # 若存在独立 shared 分支，这里把 shared 与 routed 两路结果对齐并组织成统一结构。
             if has_separate_shared_experts:
                 assert self.shared_experts is not None
 
                 if use_shared_experts_stream:
-                    # shared experts 在独立 stream 上与 routed experts 并行计算。
-                    # 这里启动独立 stream，并在算完后立刻标记同步终点，
-                    # 以免后续 cuda graph replay 过程中额外分配过多 stream。
+                    # shared experts 在辅助 stream 上执行，与 routed 计算并行。
                     with torch.cuda.stream(self.shared_experts_stream):
-                        # 这里让 shared experts 在辅助 stream 上读取前面固定好的输入张量。
                         shared_output = self.shared_experts(shared_experts_input)
-                    # 在使用 shared_output 之前，主 stream 必须等待辅助 stream 完成。
+                    # 在读取 shared_output 前，主 stream 必须等待辅助 stream 完成。
                     current_stream().wait_stream(self.shared_experts_stream)
 
-                # 输出统一组织成 (shared_output, routed_output)。
+                # 输出统一组织为 (shared_output, routed_output)。
                 final_hidden_states = (
                     shared_output,
                     final_hidden_states,
                 )
 
-            # -----------------
-            # combine 阶段。
-            # -----------------
+            # ------------------------------- combine 阶段 -------------------------------
+            # 按并行拓扑把 routed 输出规约回当前 rank 的最终布局。
             def combine_output(states: torch.Tensor) -> torch.Tensor:
+                # naive 路径下先做 EP 侧 combine，把分发后的 routed 输出拼回原 token 视图。
                 if do_naive_dispatch_combine:
-                    # naive 路径下，把各 expert rank 的结果重新合并回原 token 顺序。
                     states = get_ep_group().combine(
                         states, self.moe_config.is_sequence_parallel
                     )
 
+                # PCP 路径下再做 reduce_scatter，把上下文维聚合结果切回本 rank。
                 if self.moe_config.pcp_size > 1:
-                    # PCP 路径下，再把 gather 过的结果通过 reduce_scatter 收回到本 rank。
                     states = get_pcp_group().reduce_scatter(
                         states,
                         dim=0,
@@ -1173,14 +1147,13 @@ class DefaultMoERunner(MoERunner):
 
                 return states
 
-            # shared experts 分支只 combine routed 输出；shared 输出由调用方决定何时规约。
+            # shared+routed 模式下，仅 routed 分支在此处 combine；
+            # shared 分支保留给外层决定规约/相加时机。
             if self.shared_experts is not None:
-                # 返回结构保持 `(shared, routed)`；
-                # 其中 routed 输出已经过 combine，shared 输出则留给更外层决定何时规约/相加。
                 return (
                     final_hidden_states[0],
                     combine_output(final_hidden_states[1]),
                 )
             else:
-                # routed-only 场景直接返回 combine 后的单张量输出。
+                # routed-only 模式下，直接返回 combine 后的单张量输出。
                 return combine_output(final_hidden_states)

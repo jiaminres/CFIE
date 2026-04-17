@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +32,7 @@ logger = init_logger(__name__)
 
 DEFAULT_PREFILL_BURST_MIN_TOKENS = 8
 DEFAULT_PREFILL_BURST_TOKENS_PER_GPU_SLOT = 4
+DEFAULT_CPU_STATIC_PIN_LIMIT_BYTES = 8 * (1 << 30)
 
 
 @dataclass(slots=True)
@@ -510,6 +512,31 @@ class LayerTieredExpertCacheController:
         # ------------------------------- 初始化 CPU 侧缓存与缓冲区状态 -------------------------------
         # 若平台支持 pinned memory，则优先使用 pinned CPU memory 以加快 H2D 传输。
         self._use_pinned_cpu = is_pin_memory_available()
+        # 大体积 CPU static mirror 长期 pin 住的收益有限，却容易占满 host-pinned
+        # 预算并干扰后续 CUDA 预处理，因此对 static mirror 单独设置更保守的 pinning
+        # 策略；短生命周期的 raw/staging buffer 仍沿用 self._use_pinned_cpu。
+        self._cpu_static_pin_limit_bytes = int(
+            self.plan.get(
+                "cpu_static_pin_limit_bytes",
+                DEFAULT_CPU_STATIC_PIN_LIMIT_BYTES,
+            )
+        )
+        planned_cpu_static_bytes = int(self.plan.get("cpu_static_bytes", 0) or 0)
+        self._use_pinned_cpu_static = self._should_pin_cpu_static_bundles(
+            planned_cpu_static_bytes
+        )
+        if (
+            self._use_pinned_cpu
+            and not self._use_pinned_cpu_static
+            and planned_cpu_static_bytes > 0
+        ):
+            logger.info_once(
+                "Disabling pinned CPU static expert mirror: layer=%s "
+                "cpu_static=%.2f GiB limit=%.2f GiB",
+                self.layer_key,
+                planned_cpu_static_bytes / (1 << 30),
+                self._cpu_static_pin_limit_bytes / (1 << 30),
+            )
 
         # 保存已物化到 CPU 常驻内存中的静态 expert bundle。
         self._cpu_static_bundles: dict[int, ExpertBundle] = {}
@@ -626,6 +653,28 @@ class LayerTieredExpertCacheController:
     def slot_to_global(self) -> tuple[int, ...]:
         # 对外暴露只读视图，避免调用方直接改写内部 resident 映射。
         return tuple(self._slot_to_global)
+
+    def _should_pin_cpu_static_bundles(
+            self,
+            planned_cpu_static_bytes: int,
+    ) -> bool:
+        # 平台不支持 pinned memory 时，CPU static mirror 自然也不能走该路径。
+        if not getattr(self, "_use_pinned_cpu", False):
+            return False
+
+        # 未声明 CPU static mirror 预算时，退回到普通 pinned CPU 策略。
+        if planned_cpu_static_bytes <= 0:
+            return True
+
+        # 对长期驻留的大体积 static mirror 使用 pageable CPU 内存，避免把大量
+        # host-pinned 预算锁死在静态镜像上，影响后续 GPU 预处理与 DMA 资源。
+        return planned_cpu_static_bytes <= int(
+            getattr(
+                self,
+                "_cpu_static_pin_limit_bytes",
+                DEFAULT_CPU_STATIC_PIN_LIMIT_BYTES,
+            )
+        )
 
     @property
     def prefill_burst_capacity(self) -> int:
@@ -845,126 +894,147 @@ class LayerTieredExpertCacheController:
         # ------------------------------- 将量化 CPU 静态 bundle 预处理为 GPTQ Marlin runtime 格式 -------------------------------
         # 先将 checkpoint 形态的 gate、up、down 张量拼装成单 expert 原始 w13 与 w2 结构。
         raw = self._assemble_raw_weights(bundle)
+        raw_gpu = None
+        repacked_w13 = None
+        repacked_w2 = None
+        permuted_w13_scales = None
+        permuted_w2_scales = None
+        w13_g_idx_sort_indices = None
+        w2_g_idx_sort_indices = None
+        w13_sorted_g_idx = None
+        w2_sorted_g_idx = None
 
-        # 将拼装后的原始权重移动到目标 GPU 设备，以便后续在设备侧执行 repack 与 permute。
-        raw_gpu = self._move_raw_weights_to_device(raw)
+        try:
+            # 将拼装后的原始权重移动到目标 GPU 设备，以便后续在设备侧执行 repack 与 permute。
+            raw_gpu = self._move_raw_weights_to_device(raw)
 
-        # ------------------------------- 按 desc_act 配置准备 g_idx 及其排序索引 -------------------------------
-        # 当启用了 GPTQ desc_act 时，需要显式构造排序后的 g_idx 与对应排序索引。
-        if self._gptq_desc_act:
-            if raw_gpu.w13_g_idx is None or raw_gpu.w2_g_idx is None:
-                raise RuntimeError(
-                    f"{self.layer_key}: desc_act=True requires g_idx tensors "
-                    "during CPU static preprocessing"
+            # ------------------------------- 按 desc_act 配置准备 g_idx 及其排序索引 -------------------------------
+            # 当启用了 GPTQ desc_act 时，需要显式构造排序后的 g_idx 与对应排序索引。
+            if self._gptq_desc_act:
+                if raw_gpu.w13_g_idx is None or raw_gpu.w2_g_idx is None:
+                    raise RuntimeError(
+                        f"{self.layer_key}: desc_act=True requires g_idx tensors "
+                        "during CPU static preprocessing"
+                    )
+
+                # 计算 w13 的 g_idx 排序索引。
+                w13_g_idx_sort_indices = torch.argsort(raw_gpu.w13_g_idx, dim=-1).to(
+                    torch.int32
                 )
 
-            # 计算 w13 的 g_idx 排序索引。
-            w13_g_idx_sort_indices = torch.argsort(raw_gpu.w13_g_idx, dim=-1).to(
-                torch.int32
+                # 计算 w2 的 g_idx 排序索引。
+                w2_g_idx_sort_indices = torch.argsort(raw_gpu.w2_g_idx, dim=-1).to(
+                    torch.int32
+                )
+
+                # 根据排序索引生成排序后的 w13 g_idx。
+                w13_sorted_g_idx = torch.gather(
+                    raw_gpu.w13_g_idx, -1, w13_g_idx_sort_indices
+                )
+
+                # 根据排序索引生成排序后的 w2 g_idx。
+                w2_sorted_g_idx = torch.gather(
+                    raw_gpu.w2_g_idx, -1, w2_g_idx_sort_indices
+                )
+            else:
+                # 当未启用 desc_act 时，g_idx 与排序索引都使用空占位张量或 None。
+                w13_g_idx_sort_indices = self._empty_perm(raw_gpu.w13_qweight.device)
+                w2_g_idx_sort_indices = self._empty_perm(raw_gpu.w2_qweight.device)
+
+            # ------------------------------- 对量化权重执行 Marlin runtime 预处理 -------------------------------
+            # 将 w13 qweight repack 为 Marlin MoE kernel 可直接消费的布局。
+            repacked_w13 = ops.gptq_marlin_moe_repack(
+                raw_gpu.w13_qweight,
+                w13_g_idx_sort_indices,
+                raw_gpu.w13_qweight.shape[1] * self.pack_factor,
+                raw_gpu.w13_qweight.shape[2],
+                self.num_bits,
+                is_a_8bit=self.is_a_8bit,
             )
 
-            # 计算 w2 的 g_idx 排序索引。
-            w2_g_idx_sort_indices = torch.argsort(raw_gpu.w2_g_idx, dim=-1).to(
-                torch.int32
+            # 将 w2 qweight repack 为 Marlin MoE kernel 可直接消费的布局。
+            repacked_w2 = ops.gptq_marlin_moe_repack(
+                raw_gpu.w2_qweight,
+                w2_g_idx_sort_indices,
+                raw_gpu.w2_qweight.shape[1] * self.pack_factor,
+                raw_gpu.w2_qweight.shape[2],
+                self.num_bits,
+                is_a_8bit=self.is_a_8bit,
             )
 
-            # 根据排序索引生成排序后的 w13 g_idx。
-            w13_sorted_g_idx = torch.gather(
-                raw_gpu.w13_g_idx, -1, w13_g_idx_sort_indices
+            # 对 w13 scales 按 Marlin MoE 需要的访存布局执行 permute。
+            permuted_w13_scales = marlin_moe_permute_scales(
+                s=raw_gpu.w13_scales,
+                size_k=self.layer.intermediate_size_per_partition,
+                size_n=raw_gpu.w13_scales.shape[2],
+                group_size=self.group_size,
+                is_a_8bit=self.is_a_8bit,
             )
 
-            # 根据排序索引生成排序后的 w2 g_idx。
-            w2_sorted_g_idx = torch.gather(
-                raw_gpu.w2_g_idx, -1, w2_g_idx_sort_indices
-            )
-        else:
-            # 当未启用 desc_act 时，g_idx 与排序索引都使用空占位张量或 None。
-            w13_g_idx_sort_indices = self._empty_perm(raw_gpu.w13_qweight.device)
-            w2_g_idx_sort_indices = self._empty_perm(raw_gpu.w2_qweight.device)
-            w13_sorted_g_idx = None
-            w2_sorted_g_idx = None
-
-        # ------------------------------- 对量化权重执行 Marlin runtime 预处理 -------------------------------
-        # 将 w13 qweight repack 为 Marlin MoE kernel 可直接消费的布局。
-        repacked_w13 = ops.gptq_marlin_moe_repack(
-            raw_gpu.w13_qweight,
-            w13_g_idx_sort_indices,
-            raw_gpu.w13_qweight.shape[1] * self.pack_factor,
-            raw_gpu.w13_qweight.shape[2],
-            self.num_bits,
-            is_a_8bit=self.is_a_8bit,
-        )
-
-        # 将 w2 qweight repack 为 Marlin MoE kernel 可直接消费的布局。
-        repacked_w2 = ops.gptq_marlin_moe_repack(
-            raw_gpu.w2_qweight,
-            w2_g_idx_sort_indices,
-            raw_gpu.w2_qweight.shape[1] * self.pack_factor,
-            raw_gpu.w2_qweight.shape[2],
-            self.num_bits,
-            is_a_8bit=self.is_a_8bit,
-        )
-
-        # 对 w13 scales 按 Marlin MoE 需要的访存布局执行 permute。
-        permuted_w13_scales = marlin_moe_permute_scales(
-            s=raw_gpu.w13_scales,
-            size_k=self.layer.intermediate_size_per_partition,
-            size_n=raw_gpu.w13_scales.shape[2],
-            group_size=self.group_size,
-            is_a_8bit=self.is_a_8bit,
-        )
-
-        # 对 w2 scales 按 Marlin MoE 需要的访存布局执行 permute。
-        permuted_w2_scales = marlin_moe_permute_scales(
-            s=raw_gpu.w2_scales,
-            size_k=raw_gpu.w2_scales.shape[1]
-                   * (self.group_size if self.group_size != -1 else self.pack_factor),
-            size_n=raw_gpu.w2_scales.shape[2],
-            group_size=self.group_size,
-            is_a_8bit=self.is_a_8bit,
-        )
-
-        # ------------------------------- 构造 runtime-ready 的 CPU 静态张量字典 -------------------------------
-        # 将设备侧预处理后的运行时张量转回 CPU 静态镜像格式。
-        tensors = {
-            "runtime.w13_qweight": self._to_cpu_static_tensor(repacked_w13[0]),
-            "runtime.w2_qweight": self._to_cpu_static_tensor(repacked_w2[0]),
-            "runtime.w13_scales": self._to_cpu_static_tensor(permuted_w13_scales[0]),
-            "runtime.w2_scales": self._to_cpu_static_tensor(permuted_w2_scales[0]),
-            "runtime.w13_qzeros": self._to_cpu_static_tensor(raw_gpu.w13_qzeros[0]),
-            "runtime.w2_qzeros": self._to_cpu_static_tensor(raw_gpu.w2_qzeros[0]),
-        }
-
-        # 当 desc_act 路径下同时具备排序后的 g_idx 及其排序索引时，一并写入 runtime-ready 张量字典。
-        if (
-                w13_sorted_g_idx is not None
-                and w2_sorted_g_idx is not None
-                and self._gptq_desc_act
-        ):
-            tensors.update(
-                {
-                    "runtime.w13_g_idx": self._to_cpu_static_tensor(
-                        w13_sorted_g_idx[0]
-                    ),
-                    "runtime.w2_g_idx": self._to_cpu_static_tensor(
-                        w2_sorted_g_idx[0]
-                    ),
-                    "runtime.w13_g_idx_sort_indices": self._to_cpu_static_tensor(
-                        w13_g_idx_sort_indices[0]
-                    ),
-                    "runtime.w2_g_idx_sort_indices": self._to_cpu_static_tensor(
-                        w2_g_idx_sort_indices[0]
-                    ),
-                }
+            # 对 w2 scales 按 Marlin MoE 需要的访存布局执行 permute。
+            permuted_w2_scales = marlin_moe_permute_scales(
+                s=raw_gpu.w2_scales,
+                size_k=raw_gpu.w2_scales.shape[1]
+                       * (self.group_size if self.group_size != -1 else self.pack_factor),
+                size_n=raw_gpu.w2_scales.shape[2],
+                group_size=self.group_size,
+                is_a_8bit=self.is_a_8bit,
             )
 
-        # 返回预处理完成的 runtime-ready ExpertBundle。
-        return ExpertBundle(
-            tensors=tensors,
-            nbytes=bundle_nbytes(tensors),
-            pinned=all(tensor.is_pinned() for tensor in tensors.values()),
-            runtime_ready=True,
-        )
+            # ------------------------------- 构造 runtime-ready 的 CPU 静态张量字典 -------------------------------
+            # 将设备侧预处理后的运行时张量转回 CPU 静态镜像格式。
+            tensors = {
+                "runtime.w13_qweight": self._to_cpu_static_tensor(repacked_w13[0]),
+                "runtime.w2_qweight": self._to_cpu_static_tensor(repacked_w2[0]),
+                "runtime.w13_scales": self._to_cpu_static_tensor(permuted_w13_scales[0]),
+                "runtime.w2_scales": self._to_cpu_static_tensor(permuted_w2_scales[0]),
+                "runtime.w13_qzeros": self._to_cpu_static_tensor(raw_gpu.w13_qzeros[0]),
+                "runtime.w2_qzeros": self._to_cpu_static_tensor(raw_gpu.w2_qzeros[0]),
+            }
+
+            # 当 desc_act 路径下同时具备排序后的 g_idx 及其排序索引时，一并写入 runtime-ready 张量字典。
+            if (
+                    w13_sorted_g_idx is not None
+                    and w2_sorted_g_idx is not None
+                    and self._gptq_desc_act
+            ):
+                tensors.update(
+                    {
+                        "runtime.w13_g_idx": self._to_cpu_static_tensor(
+                            w13_sorted_g_idx[0]
+                        ),
+                        "runtime.w2_g_idx": self._to_cpu_static_tensor(
+                            w2_sorted_g_idx[0]
+                        ),
+                        "runtime.w13_g_idx_sort_indices": self._to_cpu_static_tensor(
+                            w13_g_idx_sort_indices[0]
+                        ),
+                        "runtime.w2_g_idx_sort_indices": self._to_cpu_static_tensor(
+                            w2_g_idx_sort_indices[0]
+                        ),
+                    }
+                )
+
+            # 返回预处理完成的 runtime-ready ExpertBundle。
+            return ExpertBundle(
+                tensors=tensors,
+                nbytes=bundle_nbytes(tensors),
+                pinned=all(tensor.is_pinned() for tensor in tensors.values()),
+                runtime_ready=True,
+            )
+        finally:
+            del raw
+            del raw_gpu
+            del repacked_w13
+            del repacked_w2
+            del permuted_w13_scales
+            del permuted_w2_scales
+            del w13_g_idx_sort_indices
+            del w2_g_idx_sort_indices
+            del w13_sorted_g_idx
+            del w2_sorted_g_idx
+            gc.collect()
+            torch.accelerator.empty_cache()
 
     def _preprocess_unquantized_static_bundle(
             self, bundle: ExpertBundle
@@ -988,7 +1058,14 @@ class LayerTieredExpertCacheController:
 
         # ------------------------------- 在无需 pin 或已经是 pinned memory 时直接返回 -------------------------------
         # 当当前控制器未启用 pinned CPU memory，或者该张量本身已经处于 pinned 状态时，直接返回。
-        if not self._use_pinned_cpu or cpu_tensor.is_pinned():
+        use_pinned_cpu_static = bool(
+            getattr(
+                self,
+                "_use_pinned_cpu_static",
+                getattr(self, "_use_pinned_cpu", False),
+            )
+        )
+        if not use_pinned_cpu_static or cpu_tensor.is_pinned():
             return cpu_tensor
 
         # ------------------------------- 在允许时尝试将 CPU 张量转换为 pinned memory -------------------------------

@@ -6260,10 +6260,8 @@ class GPUModelRunner(
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
         ):
-            assert self.offload_config.uva.cpu_offload_gb == 0, (
-                "Cannot re-initialize the input batch when CPU weight "
-                "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
-                "for more details."
+            self._ensure_input_batch_reinit_allowed(
+                block_sizes, kernel_block_sizes
             )
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
@@ -6290,6 +6288,32 @@ class GPUModelRunner(
         assert self._init_kernel_block_sizes == kernel_block_sizes, (
             f"InputBatch kernel_block_sizes {self._init_kernel_block_sizes} "
             f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
+        )
+
+    def _ensure_input_batch_reinit_allowed(
+        self,
+        block_sizes: list[int],
+        kernel_block_sizes: list[int],
+    ) -> None:
+        if self.offload_config.uva.cpu_offload_gb == 0:
+            return
+
+        if getattr(self, "requests", {}):
+            raise AssertionError(
+                "Cannot re-initialize the input batch when CPU weight "
+                "offloading is enabled after requests have already been "
+                "registered. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
+                "for more details."
+            )
+
+        logger.warning_once(
+            "Re-initializing InputBatch during startup with CPU weight "
+            "offloading enabled because KV layout changed: "
+            "block_sizes=%s -> %s kernel_block_sizes=%s -> %s",
+            tuple(self._init_block_sizes),
+            tuple(block_sizes),
+            tuple(self._init_kernel_block_sizes),
+            tuple(kernel_block_sizes),
         )
 
     def _allocate_kv_cache_tensors(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Any, Protocol
 
 import torch
@@ -13,10 +14,6 @@ import torch.nn.functional as F
 
 from cfie_training.config import TrainingProjectConfig
 from cfie_training.runtime.data import TokenizedDatasetBatchPlanner
-from cfie_training.runtime.executor import RepresentativeBucketExecutor
-from cfie_training.runtime.planner import ExpertRotationScheduler, LayerBucketPlanner
-from cfie_training.runtime.session import SyntheticBatchPlanner
-from cfie_training.runtime.source import LocalWeightManifest
 from cfie_training.runtime.types import BatchShape
 
 
@@ -27,23 +24,199 @@ class PredictorBatchPlanner(Protocol):
 
 
 @dataclass(slots=True, frozen=True)
+class CapturedForwardBatch:
+    layer_hidden_states: tuple[torch.Tensor, ...]
+    layer_router_logits: tuple[torch.Tensor, ...]
+
+
+class PredictorTeacherModelBackend(Protocol):
+    teacher_source: str
+    summary_source: str
+
+    def capture_batch(self, batch: BatchShape) -> CapturedForwardBatch:
+        ...
+
+
+class TransformersRouterTeacherModelBackend:
+    teacher_source = "forward_router"
+    summary_source = "forward_hidden_state"
+
+    def __init__(self, config: TrainingProjectConfig) -> None:
+        from transformers import AutoModelForCausalLM
+
+        self._config = config
+        self._model_path = str(config.model_source.model_path).strip()
+        if not self._model_path:
+            raise ValueError(
+                "model_source.model_path is required for forward-capture traces"
+            )
+        self._device = self._resolve_device()
+        model_kwargs: dict[str, Any] = {
+            "trust_remote_code": True,
+            "torch_dtype": "auto",
+        }
+        if self._device.type == "cuda":
+            model_kwargs["device_map"] = "auto"
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self._model_path,
+            **model_kwargs,
+        )
+        if self._device.type != "cuda":
+            self._model.to(self._device)
+        self._model.eval()
+        self._captured_hidden_states: dict[int, torch.Tensor] = {}
+        self._captured_router_logits: dict[int, torch.Tensor] = {}
+        self._capture_enabled = False
+        self._hook_handles = [
+            module.register_forward_hook(self._build_capture_hook(layer_index))
+            for layer_index, _, module in self._discover_router_modules()
+        ]
+
+    def _resolve_device(self) -> torch.device:
+        if (
+            self._config.execution.compute_device == "gpu"
+            and torch.cuda.is_available()
+        ):
+            return torch.device("cuda")
+        return torch.device("cpu")
+
+    def _discover_router_modules(
+        self,
+    ) -> tuple[tuple[int, str, nn.Module], ...]:
+        router_modules: dict[int, tuple[str, nn.Module]] = {}
+        layer_pattern = re.compile(r"(?:^|\\.)layers\\.(\\d+)(?:\\.|$)")
+        for name, module in self._model.named_modules():
+            if ".gate" not in name:
+                continue
+            layer_match = layer_pattern.search(name)
+            if layer_match is None:
+                continue
+            output_dim = self._module_output_dim(module)
+            if output_dim != self._config.model_spec.num_experts:
+                continue
+            layer_index = int(layer_match.group(1))
+            router_modules[layer_index] = (name, module)
+        if not router_modules:
+            raise ValueError(
+                "could not discover any router gate modules from the teacher model"
+            )
+        return tuple(
+            (layer_index, *router_modules[layer_index])
+            for layer_index in sorted(router_modules)
+        )
+
+    @staticmethod
+    def _module_output_dim(module: nn.Module) -> int | None:
+        out_features = getattr(module, "out_features", None)
+        if isinstance(out_features, int):
+            return out_features
+        weight = getattr(module, "weight", None)
+        if torch.is_tensor(weight) and weight.ndim >= 2:
+            return int(weight.shape[0])
+        return None
+
+    @staticmethod
+    def _flatten_token_rows(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 1:
+            return tensor.unsqueeze(0)
+        if tensor.ndim >= 2:
+            return tensor.reshape(-1, tensor.shape[-1])
+        raise ValueError("captured router tensors must have rank >= 1")
+
+    def _build_capture_hook(self, layer_index: int):
+        def hook(
+            module: nn.Module,
+            inputs: tuple[torch.Tensor, ...],
+            output: torch.Tensor | tuple[torch.Tensor, ...],
+        ) -> None:
+            del module
+            if not self._capture_enabled:
+                return
+            if not inputs:
+                raise ValueError(
+                    f"router module for layer {layer_index} did not receive inputs"
+                )
+            hidden_states = self._flatten_token_rows(inputs[0]).detach()
+            router_logits = output[0] if isinstance(output, tuple) else output
+            router_logits = self._flatten_token_rows(router_logits).detach()
+            self._captured_hidden_states[layer_index] = hidden_states.to(
+                device="cpu",
+                dtype=torch.float32,
+            )
+            self._captured_router_logits[layer_index] = router_logits.to(
+                device="cpu",
+                dtype=torch.float32,
+            )
+
+        return hook
+
+    def capture_batch(self, batch: BatchShape) -> CapturedForwardBatch:
+        if not batch.has_token_rows:
+            raise ValueError(
+                "forward-capture traces require BatchShape.token_rows to be populated"
+            )
+        input_ids = torch.tensor(
+            batch.token_rows,
+            dtype=torch.long,
+            device=self._device,
+        )
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        self._captured_hidden_states.clear()
+        self._captured_router_logits.clear()
+        self._capture_enabled = True
+        try:
+            with torch.no_grad():
+                self._model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                )
+        finally:
+            self._capture_enabled = False
+        num_layers = self._config.model_spec.num_hidden_layers
+        missing_layers = [
+            layer_index
+            for layer_index in range(num_layers)
+            if layer_index not in self._captured_hidden_states
+            or layer_index not in self._captured_router_logits
+        ]
+        if missing_layers:
+            raise ValueError(
+                "teacher model forward capture missed router layers: "
+                + ", ".join(str(layer_index) for layer_index in missing_layers[:8])
+            )
+        return CapturedForwardBatch(
+            layer_hidden_states=tuple(
+                self._captured_hidden_states[layer_index]
+                for layer_index in range(num_layers)
+            ),
+            layer_router_logits=tuple(
+                self._captured_router_logits[layer_index]
+                for layer_index in range(num_layers)
+            ),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class PredictorTraceExample:
     example_index: int
     step_index: int
+    token_index: int
     insertion_layer_index: int
     future_layer_indices: tuple[int, ...]
-    hidden_summary: tuple[float, ...]
+    hidden_state: tuple[float, ...]
     future_teacher_topk_ids: tuple[tuple[int, ...], ...]
 
     # 将单条 predictor trace 样本序列化为字典。
     def to_dict(self) -> dict[str, Any]:
-        # 输出样本编号、插入层、hidden summary 和未来 teacher top-k 标签。
+        # 输出样本编号、插入层、hidden_state 和未来 teacher top-k 标签。
         return {
             "example_index": self.example_index,
             "step_index": self.step_index,
+            "token_index": self.token_index,
             "insertion_layer_index": self.insertion_layer_index,
             "future_layer_indices": list(self.future_layer_indices),
-            "hidden_summary": list(self.hidden_summary),
+            "hidden_state": list(self.hidden_state),
             "future_teacher_topk_ids": [
                 list(expert_ids) for expert_ids in self.future_teacher_topk_ids
             ],
@@ -52,16 +225,22 @@ class PredictorTraceExample:
     @classmethod
     # 从字典恢复单条 predictor trace 样本。
     def from_dict(cls, payload: dict[str, Any]) -> "PredictorTraceExample":
-        # 逐字段恢复样本索引、未来层索引、hidden summary 和 top-k 标签。
+        # 逐字段恢复样本索引、未来层索引、hidden_state 和 top-k 标签；
+        # 同时兼容旧版数据里的 hidden_summary 字段。
         return cls(
             example_index=int(payload["example_index"]),
             step_index=int(payload["step_index"]),
+            token_index=int(payload.get("token_index", 0)),
             insertion_layer_index=int(payload["insertion_layer_index"]),
             future_layer_indices=tuple(
                 int(layer_index) for layer_index in payload["future_layer_indices"]
             ),
-            hidden_summary=tuple(
-                float(value) for value in payload["hidden_summary"]
+            hidden_state=tuple(
+                float(value)
+                for value in payload.get(
+                    "hidden_state",
+                    payload.get("hidden_summary", ()),
+                )
             ),
             future_teacher_topk_ids=tuple(
                 tuple(int(expert_id) for expert_id in expert_ids)
@@ -116,9 +295,9 @@ class PredictorTraceDataset:
         # 再恢复数据集元信息和 examples 元组。
         return cls(
             profile_name=str(payload["profile_name"]),
-            teacher_source=str(payload.get("teacher_source", "synthetic")),
+            teacher_source=str(payload.get("teacher_source", "forward_router")),
             summary_source=str(
-                payload.get("summary_source", "synthetic_formula")
+                payload.get("summary_source", "forward_hidden_state")
             ),
             example_count=int(payload.get("example_count", len(examples))),
             window_layers=int(payload["window_layers"]),
@@ -608,374 +787,177 @@ class FutureExpertPredictor(nn.Module):
         window_layers: int,
         num_experts: int,
     ) -> None:
-        # 先初始化 PyTorch 模块基类。
         super().__init__()
-        # 缓存输出窗口层数。
         self.window_layers = window_layers
-        # 缓存每层 expert 数。
         self.num_experts = num_experts
-        # 构造一个轻量 MLP，用于把 hidden summary 映射成未来 expert logits。
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.layer_proj = nn.Sequential(
+            nn.Linear(6, hidden_dim),
+            nn.SiLU(),
+        )
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, window_layers * num_experts),
         )
 
-    # 前向返回 [batch, window_layers, num_experts] logits。
-    def forward(self, hidden_summary: torch.Tensor) -> torch.Tensor:
-        # 先经由 MLP 得到展平的 logits。
-        logits = self.net(hidden_summary)
-        # 再恢复成“未来层窗口 x expert”二维结构。
+    @staticmethod
+    def _normalize_hidden_state(hidden_state: torch.Tensor) -> torch.Tensor:
+        if hidden_state.ndim == 1:
+            return hidden_state.unsqueeze(0)
+        if hidden_state.ndim != 2:
+            raise ValueError("hidden_state must be rank-1 or rank-2")
+        return hidden_state
+
+    @staticmethod
+    def _normalize_layer_index(
+        layer_index: int | torch.Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if isinstance(layer_index, int):
+            return torch.full(
+                (batch_size,),
+                int(layer_index),
+                dtype=torch.float32,
+                device=device,
+            )
+        if layer_index.ndim == 0:
+            return torch.full(
+                (batch_size,),
+                int(layer_index.item()),
+                dtype=torch.float32,
+                device=device,
+            )
+        if layer_index.ndim != 1 or int(layer_index.shape[0]) != batch_size:
+            raise ValueError("layer_index must be scalar or match batch size")
+        return layer_index.to(device=device, dtype=torch.float32)
+
+    @staticmethod
+    def _layer_features(layer_index: torch.Tensor) -> torch.Tensor:
+        layer_index = layer_index.unsqueeze(-1)
+        return torch.cat(
+            (
+                layer_index,
+                layer_index.square(),
+                torch.sin(layer_index * 0.1),
+                torch.cos(layer_index * 0.1),
+                torch.sin(layer_index * 0.01),
+                torch.cos(layer_index * 0.01),
+            ),
+            dim=-1,
+        )
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        layer_index: int | torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_state = self._normalize_hidden_state(hidden_state)
+        layer_index = self._normalize_layer_index(
+            layer_index,
+            batch_size=int(hidden_state.shape[0]),
+            device=hidden_state.device,
+        )
+        fused_hidden = self.input_proj(hidden_state) + self.layer_proj(
+            self._layer_features(layer_index)
+        )
+        logits = self.net(fused_hidden)
         return logits.view(-1, self.window_layers, self.num_experts)
 
 
-class SyntheticTeacherTraceBuilder:
-    teacher_source = "synthetic"
-    summary_source = "synthetic_formula"
+HiddenStateFutureExpertPredictor = FutureExpertPredictor
+
+
+class PredictorTraceBuilderBase:
+    teacher_source = "forward_router"
+    summary_source = "forward_hidden_state"
 
     def __init__(self, config: TrainingProjectConfig) -> None:
-        # 缓存配置，并先执行一次配置校验。
-        self.config = config
-        self.config.validate()
-        # predictor trace 生成必须建立在完整 model_spec 之上。
+        self.config = config.validate()
         if not self.config.model_spec.is_defined():
             raise ValueError(
                 "predictor trace generation requires a defined model_spec"
             )
-        # 读取 predictor trace 构造所需的核心超参数。
-        self._summary_dim = self.config.predictor_trainer.input_summary_dim
-        self._num_experts = self.config.model_spec.num_experts
+        self._hidden_dim = self.config.model_spec.hidden_size
         self._num_layers = self.config.model_spec.num_hidden_layers
         self._window_layers = self.config.predictor_routing.window_layers
-        self._executed_experts = self.config.predictor_routing.executed_experts_per_layer
+        self._executed_experts = (
+            self.config.predictor_routing.executed_experts_per_layer
+        )
         self._stride_layers = self.config.predictor_routing.stride_layers
-        self._noise_scale = self.config.predictor_trainer.synthetic_trace_noise_scale
-        self._seed = self.config.predictor_trainer.seed
-        # 预构造 feature 索引，用于后续合成 hidden summary。
-        self._feature_ids = torch.arange(
-            1, self._summary_dim + 1, dtype=torch.float32, device="cpu"
-        )
-        # 预构造 expert basis 和 layer basis，避免重复计算。
-        self._expert_basis = self._build_expert_basis()
-        self._layer_basis = self._build_layer_basis()
-
-    def _build_expert_basis(self) -> torch.Tensor:
-        # 构造 expert 维索引。
-        expert_ids = torch.arange(
-            1, self._num_experts + 1, dtype=torch.float32, device="cpu"
-        ).unsqueeze(1)
-        # 构造 feature 维索引。
-        feature_ids = self._feature_ids.unsqueeze(0)
-        # 用 sin/cos 组合构造 expert basis。
-        basis = torch.sin(expert_ids * 0.017 + feature_ids * 0.071)
-        basis = basis + 0.5 * torch.cos(expert_ids * 0.031 + feature_ids * 0.043)
-        # 统一缩放到稳定范围。
-        return basis / 1.5
-
-    def _build_layer_basis(self) -> torch.Tensor:
-        # 构造层号索引。
-        layer_ids = torch.arange(
-            1, self._num_layers + 1, dtype=torch.float32, device="cpu"
-        ).unsqueeze(1)
-        # 复用 feature 维索引。
-        feature_ids = self._feature_ids.unsqueeze(0)
-        # 用 sin/cos 组合构造 layer basis。
-        basis = torch.cos(layer_ids * 0.13 + feature_ids * 0.051)
-        basis = basis + 0.35 * torch.sin(layer_ids * 0.07 + feature_ids * 0.029)
-        # 统一缩放到稳定范围。
-        return basis / 1.35
-
-    def _build_hidden_summary(
-        self,
-        *,
-        step_index: int,
-        example_offset: int,
-        insertion_layer_index: int,
-    ) -> torch.Tensor:
-        # step 和 example offset 共同决定当前样本的基础相位。
-        phase = 0.19 * float(step_index + 1) + 0.11 * float(example_offset + 1)
-        # 先生成基础 summary 波形。
-        summary = torch.sin(self._feature_ids * 0.097 + phase)
-        # 再叠加 insertion layer 驱动的调制项。
-        summary = summary + 0.45 * torch.cos(
-            self._feature_ids * 0.053 + 0.09 * float(insertion_layer_index + 1)
-        )
-        # 若开启噪声，则再注入一项可复现的轻量噪声。
-        if self._noise_scale > 0:
-            noise_phase = torch.sin(
-                self._feature_ids * 0.211
-                + 0.23 * float(step_index + example_offset + self._seed + 1)
+        self._insertion_layer_indices = tuple(
+            range(
+                0,
+                max(self._num_layers - self._window_layers, 0),
+                self._stride_layers,
             )
-            summary = summary + self._noise_scale * noise_phase
-        # 统一缩放后返回 summary。
-        return summary / 1.6
-
-    def _teacher_scores(
-        self,
-        *,
-        hidden_summary: torch.Tensor,
-        future_layer_index: int,
-    ) -> torch.Tensor:
-        # 取出未来层对应的 layer basis。
-        layer_basis = self._layer_basis[future_layer_index]
-        # 用 layer basis 对 hidden summary 做轻量调制。
-        mixed = hidden_summary * (1.0 + 0.25 * layer_basis)
-        # 与 expert basis 做乘法得到每个 expert 的分数。
-        scores = self._expert_basis @ mixed
-        # 叠加一项与 expert id / layer id 相关的扰动，拉开分数差异。
-        expert_ids = torch.arange(
-            0, self._num_experts, dtype=torch.float32, device="cpu"
         )
-        scores = scores + 0.3 * torch.sin(
-            expert_ids * 0.019 + 0.07 * float(future_layer_index + 1)
-        )
-        # 返回最终 teacher 分数。
-        return scores
 
-    def build_examples(
+    def _resolve_examples_per_step(
         self,
-        *,
-        steps: int,
-        examples_per_step: int | None = None,
-        batch_planner: PredictorBatchPlanner | None = None,
-    ) -> tuple[PredictorTraceExample, ...]:
-        # 训练步数至少为 1。
-        if steps < 1:
-            raise ValueError("steps must be >= 1")
-        # 未显式给 examples_per_step 时，退回配置中的默认值。
-        examples_per_step = (
+        examples_per_step: int | None,
+    ) -> int:
+        resolved = (
             self.config.predictor_trainer.examples_per_step
             if examples_per_step is None
             else int(examples_per_step)
         )
-        # 每步样本数至少为 1。
-        if examples_per_step < 1:
+        if resolved < 1:
             raise ValueError("examples_per_step must be >= 1")
+        return resolved
 
-        # 用列表累积全部 trace 样本。
-        examples: list[PredictorTraceExample] = []
-        for step_index in range(steps):
-            for example_offset in range(examples_per_step):
-                # 当前插入层按 stride 在全层范围内循环推进。
-                insertion_layer_index = (
-                    step_index * self._stride_layers
-                    + example_offset * self._stride_layers
-                ) % self._num_layers
-                # 先生成该插入层的 hidden summary。
-                hidden_summary = self._build_hidden_summary(
-                    step_index=step_index,
-                    example_offset=example_offset,
-                    insertion_layer_index=insertion_layer_index,
-                )
-                # 计算未来窗口内的层索引列表。
-                future_layer_indices = tuple(
-                    (insertion_layer_index + offset + 1) % self._num_layers
-                    for offset in range(self._window_layers)
-                )
-                # 用列表累积每个未来层的 teacher top-k experts。
-                future_teacher_topk_ids = []
-                for future_layer_index in future_layer_indices:
-                    # 先计算当前未来层的 teacher scores。
-                    teacher_scores = self._teacher_scores(
-                        hidden_summary=hidden_summary,
-                        future_layer_index=future_layer_index,
-                    )
-                    # 再取 executed_experts 预算下的 top-k experts。
-                    teacher_topk = torch.topk(
-                        teacher_scores,
-                        k=self._executed_experts,
-                        dim=0,
-                    ).indices
-                    # 转成 Python 元组，便于后续 JSON 序列化。
-                    future_teacher_topk_ids.append(
-                        tuple(int(expert_id) for expert_id in teacher_topk.tolist())
-                    )
-                # 将当前样本写入 examples 列表。
-                examples.append(
-                    PredictorTraceExample(
-                        example_index=len(examples),
-                        step_index=step_index,
-                        insertion_layer_index=insertion_layer_index,
-                        future_layer_indices=future_layer_indices,
-                        hidden_summary=tuple(float(value) for value in hidden_summary.tolist()),
-                        future_teacher_topk_ids=tuple(future_teacher_topk_ids),
-                    )
-                )
-        # 返回不可变样本元组。
-        return tuple(examples)
-
-
-class ManifestRouterTeacherTraceBuilder(SyntheticTeacherTraceBuilder):
-    teacher_source = "manifest_router"
-
-    def __init__(
-        self,
-        config: TrainingProjectConfig,
-        manifest: LocalWeightManifest,
-    ) -> None:
-        # 先初始化父类中的通用 synthetic trace 构造逻辑。
-        super().__init__(config)
-        # 缓存本地权重 manifest。
-        self._manifest = manifest
-        # 缓存模型 hidden_size，供 router gate 投影使用。
-        self._hidden_size = self.config.model_spec.hidden_size
-        # 预构造 hidden_summary -> hidden_state 的投影 basis。
-        self._projection_basis = self._build_projection_basis()
-        # 为 router gate 张量建立按层缓存。
-        self._router_gate_cache: dict[int, torch.Tensor] = {}
-
-    def _build_projection_basis(self) -> torch.Tensor:
-        # feature 维作为输入轴。
-        feature_ids = self._feature_ids.unsqueeze(1)
-        # hidden 维作为输出轴。
-        hidden_ids = torch.arange(
-            1,
-            self._hidden_size + 1,
-            dtype=torch.float32,
-            device="cpu",
-        ).unsqueeze(0)
-        # 用 sin/cos 组合构造 summary->hidden 的投影 basis。
-        basis = torch.sin(feature_ids * 0.031 + hidden_ids * 0.017)
-        basis = basis + 0.5 * torch.cos(feature_ids * 0.047 + hidden_ids * 0.023)
-        # 统一缩放到稳定范围。
-        return basis / 1.5
-
-    def _project_hidden_state(self, hidden_summary: torch.Tensor) -> torch.Tensor:
-        # 先把 hidden summary 投影到模型 hidden 维。
-        projected = hidden_summary @ self._projection_basis
-        # 再用 tanh 压缩动态范围。
-        return torch.tanh(projected / max(self._summary_dim, 1) ** 0.5)
-
-    def _router_gate_tensor(self, layer_index: int) -> torch.Tensor:
-        # 先查按层缓存，避免重复从 manifest 读取。
-        cached = self._router_gate_cache.get(layer_index)
-        if cached is not None:
-            return cached
-        # 从 manifest 加载当前层的 router gate 权重。
-        tensor = self._manifest.load_router_gate_tensor(
-            layer_index,
-            dtype=torch.float32,
-        )
-        # 缺失权重时直接报错。
-        if tensor is None:
-            raise ValueError(
-                "missing router gate tensor for "
-                f"model.language_model.layers.{layer_index}.mlp.gate.weight"
-            )
-        # router gate 必须是二维矩阵。
-        if tensor.ndim != 2:
-            raise ValueError(
-                "router gate tensor must be rank-2, got "
-                f"shape={tuple(tensor.shape)} for layer {layer_index}"
-            )
-        # 两个轴里必须有一个轴对应 expert 维。
-        if self._num_experts not in tensor.shape:
-            raise ValueError(
-                "router gate tensor must expose the expert axis, got "
-                f"shape={tuple(tensor.shape)} for layer {layer_index}"
-            )
-        # 缓存并返回当前层的 router gate 张量。
-        self._router_gate_cache[layer_index] = tensor
-        return tensor
-
-    def _teacher_scores(
-        self,
-        *,
-        hidden_summary: torch.Tensor,
-        future_layer_index: int,
-    ) -> torch.Tensor:
-        # 先把 hidden summary 投影到近似 hidden state。
-        hidden_state = self._project_hidden_state(hidden_summary)
-        # 读取未来层对应的 router gate 张量。
-        router_gate = self._router_gate_tensor(future_layer_index)
-        if (
-            router_gate.shape[0] == self._num_experts
-            and router_gate.shape[1] == hidden_state.numel()
-        ):
-            # [expert, hidden] 形状时，直接做矩阵乘。
-            scores = router_gate @ hidden_state
-        elif (
-            router_gate.shape[1] == self._num_experts
-            and router_gate.shape[0] == hidden_state.numel()
-        ):
-            # [hidden, expert] 形状时，改走右乘路径。
-            scores = hidden_state @ router_gate
-        else:
-            # 两种常见形状都不匹配时，视为 manifest 权重不兼容。
-            raise ValueError(
-                "router gate tensor shape does not match predictor hidden state: "
-                f"shape={tuple(router_gate.shape)} hidden={hidden_state.numel()}"
-            )
-        # 再加一项极小扰动，避免完全同分。
-        expert_ids = torch.arange(
-            0,
-            self._num_experts,
-            dtype=torch.float32,
-            device="cpu",
-        )
-        return scores + 1e-4 * torch.sin(
-            expert_ids * 0.019 + 0.07 * float(future_layer_index + 1)
-        )
-
-
-class ManifestRouterRuntimeTraceBuilder(ManifestRouterTeacherTraceBuilder):
-    summary_source = "representative_runtime"
-
-    def __init__(
-        self,
-        config: TrainingProjectConfig,
-        manifest: LocalWeightManifest,
-        executor: RepresentativeBucketExecutor,
-        layer_buckets,
-        rotation: ExpertRotationScheduler,
-    ) -> None:
-        # 先初始化 manifest router teacher trace 构造基类。
-        super().__init__(config, manifest)
-        # 缓存代表性执行器、layer buckets 和 expert rotation 调度器。
-        self._executor = executor
-        self._layer_buckets = tuple(layer_buckets)
-        self._rotation = rotation
-        # 预构造可选 insertion layer 列表。
-        self._insertion_layer_indices = tuple(
-            range(0, self._num_layers, self._stride_layers)
-        )
-        # 建立“插入层 -> bucket”反向索引。
-        self._bucket_for_insertion_layer = {
-            layer_index: bucket
-            for bucket in self._layer_buckets
-            for layer_index in bucket.layer_indices
-        }
-
-    def _selected_insertion_layers(
+    def _selected_example_specs(
         self,
         *,
         step_index: int,
-        examples_per_step: int | None,
-    ) -> tuple[int, ...]:
-        # 没有 insertion layer 候选时直接返回空元组。
+        examples_per_step: int,
+        token_count: int,
+    ) -> tuple[tuple[int, int, int], ...]:
         if not self._insertion_layer_indices:
-            return ()
-        # 未显式限制样本数时，直接返回全部 insertion layer。
-        if examples_per_step is None:
-            return self._insertion_layer_indices
-        # 显式给定样本数时，先转成整数。
-        example_count = int(examples_per_step)
-        # 每步样本数至少为 1。
-        if example_count < 1:
-            raise ValueError("examples_per_step must be >= 1")
-        # 每步样本数不能超过 insertion layer 总数。
-        example_count = min(example_count, len(self._insertion_layer_indices))
-        # 按 step 驱动起点滑动，实现轮转采样。
-        start = (step_index * example_count) % len(self._insertion_layer_indices)
-        # 返回本 step 选中的 insertion layer 元组。
+            raise ValueError(
+                "predictor trace generation requires at least one eligible insertion layer"
+            )
+        token_count = max(int(token_count), 1)
+        total_slots = len(self._insertion_layer_indices) * token_count
+        example_count = min(examples_per_step, total_slots)
+        start = (step_index * example_count) % total_slots
+        specs: list[tuple[int, int, int]] = []
+        for example_offset in range(example_count):
+            flat_index = (start + example_offset) % total_slots
+            token_index = flat_index // len(self._insertion_layer_indices)
+            insertion_index = flat_index % len(self._insertion_layer_indices)
+            specs.append(
+                (
+                    example_offset,
+                    self._insertion_layer_indices[insertion_index],
+                    token_index,
+                )
+            )
+        return tuple(specs)
+
+    def _future_layer_indices(
+        self,
+        insertion_layer_index: int,
+    ) -> tuple[int, ...]:
         return tuple(
-            self._insertion_layer_indices[
-                (start + example_offset) % len(self._insertion_layer_indices)
-            ]
-            for example_offset in range(example_count)
+            insertion_layer_index + offset + 1
+            for offset in range(self._window_layers)
         )
+
+
+class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
+    def __init__(
+        self,
+        config: TrainingProjectConfig,
+        teacher_model_backend: PredictorTeacherModelBackend,
+    ) -> None:
+        super().__init__(config)
+        self.teacher_source = teacher_model_backend.teacher_source
+        self.summary_source = teacher_model_backend.summary_source
+        self._teacher_model_backend = teacher_model_backend
 
     def build_examples(
         self,
@@ -984,127 +966,115 @@ class ManifestRouterRuntimeTraceBuilder(ManifestRouterTeacherTraceBuilder):
         examples_per_step: int | None = None,
         batch_planner: PredictorBatchPlanner | None = None,
     ) -> tuple[PredictorTraceExample, ...]:
-        # 训练步数至少为 1。
         if steps < 1:
             raise ValueError("steps must be >= 1")
-        # 运行时代表性 trace 必须依赖 batch planner。
         if batch_planner is None:
             raise ValueError(
-                "runtime-backed predictor traces require a batch planner"
+                "forward-capture predictor traces require a batch planner"
             )
-        # 用列表累积全部 trace 样本。
+        resolved_examples_per_step = self._resolve_examples_per_step(
+            examples_per_step
+        )
         examples: list[PredictorTraceExample] = []
         for step_index in range(steps):
-            # 先取当前 step 的 batch。
             batch = batch_planner.batch_for_step(step_index)
-            # 再根据当前 batch 规划 active expert window。
-            active_expert_ids = self._rotation.plan_window(
+            captured = self._teacher_model_backend.capture_batch(batch)
+            if len(captured.layer_hidden_states) != self._num_layers:
+                raise ValueError(
+                    "captured hidden-state layer count does not match model_spec.num_hidden_layers"
+                )
+            if len(captured.layer_router_logits) != self._num_layers:
+                raise ValueError(
+                    "captured router-logit layer count does not match model_spec.num_hidden_layers"
+                )
+            token_count = int(captured.layer_hidden_states[0].shape[0])
+            for _, insertion_layer_index, token_index in self._selected_example_specs(
                 step_index=step_index,
-                batch=batch,
-                layer_buckets=self._layer_buckets,
-                next_batch=batch,
-            ).active_expert_ids
-            for insertion_layer_index in self._selected_insertion_layers(
-                step_index=step_index,
-                examples_per_step=examples_per_step,
+                examples_per_step=resolved_examples_per_step,
+                token_count=token_count,
             ):
-                # 通过 insertion layer 找到所属 bucket。
-                bucket = self._bucket_for_insertion_layer[insertion_layer_index]
-                # 用代表性执行器生成 runtime-backed hidden summary。
-                hidden_summary = self._executor.build_predictor_hidden_summary(
-                    step_index=step_index,
-                    batch=batch,
-                    bucket=bucket,
-                    insertion_layer_index=insertion_layer_index,
-                    active_expert_ids=active_expert_ids,
-                    summary_dim=self._summary_dim,
+                hidden_state = captured.layer_hidden_states[insertion_layer_index][
+                    token_index
+                ]
+                if hidden_state.numel() != self._hidden_dim:
+                    raise ValueError(
+                        "captured hidden_state size does not match model_spec.hidden_size"
+                    )
+                future_layer_indices = self._future_layer_indices(
+                    insertion_layer_index
                 )
-                # 计算未来窗口内的层索引列表。
-                future_layer_indices = tuple(
-                    (insertion_layer_index + offset + 1) % self._num_layers
-                    for offset in range(self._window_layers)
-                )
-                # 用列表累积每个未来层的 teacher top-k experts。
                 future_teacher_topk_ids = []
                 for future_layer_index in future_layer_indices:
-                    # 先计算当前未来层的 teacher scores。
-                    teacher_scores = self._teacher_scores(
-                        hidden_summary=hidden_summary,
-                        future_layer_index=future_layer_index,
-                    )
-                    # 再取 executed_experts 预算下的 top-k experts。
                     teacher_topk = torch.topk(
-                        teacher_scores,
+                        captured.layer_router_logits[future_layer_index][token_index],
                         k=self._executed_experts,
                         dim=0,
                     ).indices
-                    # 转成 Python 元组，便于后续 JSON 序列化。
                     future_teacher_topk_ids.append(
                         tuple(int(expert_id) for expert_id in teacher_topk.tolist())
                     )
-                # 将当前样本写入 examples 列表。
                 examples.append(
                     PredictorTraceExample(
                         example_index=len(examples),
                         step_index=step_index,
+                        token_index=token_index,
                         insertion_layer_index=insertion_layer_index,
                         future_layer_indices=future_layer_indices,
-                        hidden_summary=tuple(
-                            float(value) for value in hidden_summary.tolist()
+                        hidden_state=tuple(
+                            float(value) for value in hidden_state.tolist()
                         ),
                         future_teacher_topk_ids=tuple(future_teacher_topk_ids),
                     )
                 )
-        # 返回不可变样本元组。
         return tuple(examples)
 
 
 class PredictorTrainer:
-    def __init__(self, config: TrainingProjectConfig) -> None:
-        # 先校验并缓存训练配置。
+    def __init__(
+        self,
+        config: TrainingProjectConfig,
+        *,
+        teacher_model_backend: PredictorTeacherModelBackend | None = None,
+    ) -> None:
+        # -------------------- 校验并缓存训练配置 --------------------
+        # 训练器构造完成后会立即依赖 model_spec、routing 与 trainer 超参，
+        # 因此这里先做一次全量配置校验，避免带着不完整配置进入后续流程。
         self.config = config.validate()
-        # predictor 训练必须建立在完整 model_spec 之上。
+
+        # predictor 训练需要明确知道层数、expert 数和 hidden 维度；
+        # 若 model_spec 未定义，就无法构造样本与模型结构。
         if not self.config.model_spec.is_defined():
             raise ValueError("predictor training requires a defined model_spec")
-        # 初始化 manifest、bucket planner、expert rotation 和代表性执行器。
-        self._manifest = LocalWeightManifest(self.config)
-        self._layer_buckets = LayerBucketPlanner(self.config).build()
-        self._rotation = ExpertRotationScheduler(self.config)
-        self._executor = RepresentativeBucketExecutor(self.config)
-        # 根据本地条件选择合适的 teacher trace 构造器。
-        self._trace_builder = self._build_trace_builder()
+
+        self._teacher_model_backend = teacher_model_backend
+        self._trace_builder: ForwardCaptureTraceBuilder | None = None
 
     @property
     # 返回当前训练器使用的 teacher source。
     def teacher_source(self) -> str:
-        return self._trace_builder.teacher_source
+        return self._resolve_trace_builder().teacher_source
 
     @property
     # 返回当前训练器使用的 summary source。
     def summary_source(self) -> str:
-        return self._trace_builder.summary_source
+        return self._resolve_trace_builder().summary_source
 
-    def _build_trace_builder(
+    def _resolve_teacher_model_backend(
         self,
-    ) -> (
-        SyntheticTeacherTraceBuilder
-        | ManifestRouterTeacherTraceBuilder
-        | ManifestRouterRuntimeTraceBuilder
-    ):
-        # manifest 可用且所有层都能找到 router gate 时，优先走 runtime-backed trace。
-        if self._manifest.available and all(
-            self._manifest.router_gate_ref(layer_index) is not None
-            for layer_index in range(self.config.model_spec.num_hidden_layers)
-        ):
-            return ManifestRouterRuntimeTraceBuilder(
-                self.config,
-                self._manifest,
-                self._executor,
-                self._layer_buckets,
-                self._rotation,
+    ) -> PredictorTeacherModelBackend:
+        if self._teacher_model_backend is None:
+            self._teacher_model_backend = TransformersRouterTeacherModelBackend(
+                self.config
             )
-        # 否则退回纯 synthetic trace 构造器。
-        return SyntheticTeacherTraceBuilder(self.config)
+        return self._teacher_model_backend
+
+    def _resolve_trace_builder(self) -> ForwardCaptureTraceBuilder:
+        if self._trace_builder is None:
+            self._trace_builder = ForwardCaptureTraceBuilder(
+                self.config,
+                self._resolve_teacher_model_backend(),
+            )
+        return self._trace_builder
 
     def _build_batch_planner(
         self,
@@ -1116,30 +1086,33 @@ class PredictorTrainer:
         dataset_format: str = "auto",
         dataset_text_key: str = "text",
     ) -> PredictorBatchPlanner:
-        # 提供数据集路径时，构造 tokenizer-backed batch planner。
-        if dataset_path is not None:
-            return TokenizedDatasetBatchPlanner(
-                config=self.config,
-                dataset_path=dataset_path,
-                base_samples=samples,
-                tokens_per_sample=tokens_per_sample,
-                tokenizer_path=tokenizer_path,
-                dataset_format=dataset_format,
-                dataset_text_key=dataset_text_key,
+        if dataset_path is None:
+            raise ValueError(
+                "predictor trace generation requires a dataset-backed batch planner; "
+                "pass dataset_path/--dataset"
             )
-        # 否则退回 synthetic batch planner。
-        return SyntheticBatchPlanner(
+        return TokenizedDatasetBatchPlanner(
+            config=self.config,
+            dataset_path=dataset_path,
             base_samples=samples,
-            base_tokens_per_sample=tokens_per_sample,
+            tokens_per_sample=tokens_per_sample,
+            tokenizer_path=tokenizer_path,
+            dataset_format=dataset_format,
+            dataset_text_key=dataset_text_key,
         )
 
     def build_model(self) -> FutureExpertPredictor:
-        # 读取 predictor trainer 与 routing 配置。
+        # -------------------- 读取决定 predictor 形状的关键配置 --------------------
+        # trainer 配置决定隐藏层宽度；
+        # 输入维度当前直接取 model hidden_size。
         trainer_cfg = self.config.predictor_trainer
+        # routing 配置决定未来窗口层数，也就决定输出张量的第二维大小。
         routing_cfg = self.config.predictor_routing
-        # 根据配置构造 predictor 模型。
+
+        # model_spec 里的 num_experts 决定每个未来层要预测多少个 expert logit。
+        # 这里三类配置共同决定 predictor 的完整张量形状。
         return FutureExpertPredictor(
-            input_dim=trainer_cfg.input_summary_dim,
+            input_dim=self.config.model_spec.hidden_size,
             hidden_dim=trainer_cfg.hidden_dim,
             window_layers=routing_cfg.window_layers,
             num_experts=self.config.model_spec.num_experts,
@@ -1164,7 +1137,7 @@ class PredictorTrainer:
             summary_source=(
                 self.summary_source if summary_source is None else summary_source
             ),
-            input_summary_dim=trainer_cfg.input_summary_dim,
+            input_summary_dim=self.config.model_spec.hidden_size,
             predictor_hidden_dim=trainer_cfg.hidden_dim,
             window_layers=routing_cfg.window_layers,
             stride_layers=routing_cfg.stride_layers,
@@ -1235,7 +1208,7 @@ class PredictorTrainer:
             profile_name=run_trace.profile_name,
             teacher_source=run_trace.teacher_source,
             summary_source=run_trace.summary_source,
-            input_summary_dim=trainer_cfg.input_summary_dim,
+            input_summary_dim=self.config.model_spec.hidden_size,
             hidden_dim=trainer_cfg.hidden_dim,
             window_layers=routing_cfg.window_layers,
             stride_layers=routing_cfg.stride_layers,
@@ -1265,7 +1238,7 @@ class PredictorTrainer:
         routing_cfg = self.config.predictor_routing
         # 用列表累积所有不兼容字段。
         mismatches = []
-        if metadata.input_summary_dim != trainer_cfg.input_summary_dim:
+        if metadata.input_summary_dim != self.config.model_spec.hidden_size:
             mismatches.append("input_summary_dim")
         if metadata.hidden_dim != trainer_cfg.hidden_dim:
             mismatches.append("hidden_dim")
@@ -1498,7 +1471,9 @@ class PredictorTrainer:
         dataset_format: str = "auto",
         dataset_text_key: str = "text",
     ) -> PredictorTraceDataset:
-        # 先构造 batch planner。
+        # -------------------- 构造样本批规划器 --------------------
+        # batch planner 负责给每个训练 step 产出带真实 token rows 的抽象 batch 形状；
+        # forward-capture trace 会消费这些 token rows 直接运行 teacher forward。
         batch_planner = self._build_batch_planner(
             samples=samples,
             tokens_per_sample=tokens_per_sample,
@@ -1507,17 +1482,24 @@ class PredictorTrainer:
             dataset_format=dataset_format,
             dataset_text_key=dataset_text_key,
         )
-        # 再让 trace builder 生成样本。
-        examples = self._trace_builder.build_examples(
+
+        # -------------------- 生成 predictor 监督样本 --------------------
+        # trace builder 会产出每条样本的 hidden_state，
+        # 以及对应 future window 的 teacher top-k experts。
+        trace_builder = self._resolve_trace_builder()
+        examples = trace_builder.build_examples(
             steps=steps,
             examples_per_step=examples_per_step,
             batch_planner=batch_planner,
         )
-        # 组装 predictor trace 数据集对象。
+
+        # -------------------- 打包为数据集对象 --------------------
+        # 除了样本本身，还把 teacher/source、窗口长度和预算元信息一起固化下来，
+        # 便于后续训练、评估和 checkpoint 兼容性校验。
         return PredictorTraceDataset(
             profile_name=self.config.profile_name,
-            teacher_source=self.teacher_source,
-            summary_source=self.summary_source,
+            teacher_source=trace_builder.teacher_source,
+            summary_source=trace_builder.summary_source,
             example_count=len(examples),
             window_layers=self.config.predictor_routing.window_layers,
             candidate_experts_per_layer=(
@@ -1532,14 +1514,24 @@ class PredictorTrainer:
     def _dataset_tensors(
         self,
         dataset: PredictorTraceDataset,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 先把 hidden_summary 堆成特征张量。
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # -------------------- 物化特征张量 --------------------
+        # 每条样本里的 hidden_state 都是定长 tuple；
+        # 这里把它们堆成 [example_count, hidden_size] 的 CPU 浮点张量。
         features = torch.tensor(
-            [example.hidden_summary for example in dataset.examples],
+            [example.hidden_state for example in dataset.examples],
             dtype=torch.float32,
             device="cpu",
         )
-        # 再按 [example, future_layer, expert] 形状创建多热标签张量。
+        layer_indices = torch.tensor(
+            [example.insertion_layer_index for example in dataset.examples],
+            dtype=torch.float32,
+            device="cpu",
+        )
+
+        # -------------------- 物化多标签目标张量 --------------------
+        # predictor 要同时预测“未来多层 x 每层多个 expert”，
+        # 因此目标不是单类别标签，而是 [example, future_layer, expert] 的多热张量。
         targets = torch.zeros(
             (
                 dataset.example_count,
@@ -1553,10 +1545,12 @@ class PredictorTrainer:
             for future_index, teacher_topk_ids in enumerate(
                 example.future_teacher_topk_ids
             ):
-                # teacher top-k expert 位置置为 1，形成多标签监督。
+                # teacher 选中的 top-k experts 位置置为 1；
+                # 这样后续 BCEWithLogitsLoss 就能把它当作多标签监督来训练。
                 targets[example_index, future_index, list(teacher_topk_ids)] = 1.0
-        # 返回特征和标签张量。
-        return features, targets
+
+        # 返回训练和评估都会复用的特征/标签张量对。
+        return features, layer_indices, targets
 
     def _mean_recall_at_budget(
         self,
@@ -1583,15 +1577,15 @@ class PredictorTrainer:
         # 数据集至少要有 1 条样本。
         if dataset.example_count < 1:
             raise ValueError("predictor trace dataset must contain at least 1 example")
-        # 取第一条样本检查 hidden summary 维度。
+        # 取第一条样本检查 hidden_state 维度。
         first_example = dataset.examples[0]
         if (
-            len(first_example.hidden_summary)
-            != self.config.predictor_trainer.input_summary_dim
+            len(first_example.hidden_state)
+            != self.config.model_spec.hidden_size
         ):
             raise ValueError(
-                "predictor trace dataset hidden summary size does not match "
-                "predictor_trainer.input_summary_dim"
+                "predictor trace dataset hidden_state size does not match "
+                "model_spec.hidden_size"
             )
         if dataset.window_layers != self.config.predictor_routing.window_layers:
             raise ValueError(
@@ -1606,36 +1600,41 @@ class PredictorTrainer:
         model: FutureExpertPredictor | None = None,
         checkpoint_metadata: PredictorCheckpointMetadata | None = None,
     ) -> PredictorEvaluationTrace:
-        # 先校验数据集兼容性。
+        # -------------------- 校验输入并准备评估对象 --------------------
+        # 评估前先确认数据集维度与当前 trainer 配置兼容，避免 silent mismatch。
         self._validate_dataset_compatibility(dataset)
-        # 读取 routing 配置。
+        # routing 配置里的候选预算和执行预算会直接决定 recall 指标的取值口径。
         routing_cfg = self.config.predictor_routing
-        # 未显式给模型时，按当前配置重建模型。
+        # 若调用方未传入模型，就按当前配置构造一个新 predictor 实例。
         model = self.build_model() if model is None else model
-        # 准备特征和标签张量。
-        features, targets = self._dataset_tensors(dataset)
+        # 把 trace 数据集转换成可直接前向的张量形式。
+        features, layer_indices, targets = self._dataset_tensors(dataset)
+
+        # -------------------- 关闭梯度并执行前向评估 --------------------
         with torch.no_grad():
-            # 评估前切到 eval 模式。
+            # 评估阶段不需要 dropout/batchnorm 等训练时行为，因此切到 eval 模式。
             model.eval()
-            # 前向得到 logits。
-            logits = model(features)
-            # 计算二元交叉熵损失。
+            # 前向得到每个 future layer、每个 expert 的原始 logits。
+            logits = model(features, layer_indices)
+            # 标签是多热而不是单类别，因此这里使用 BCEWithLogitsLoss 而不是 softmax CE。
             mean_loss = float(
                 F.binary_cross_entropy_with_logits(logits, targets).item()
             )
-            # 计算 candidate budget recall。
+            # 按候选预算统计 recall，用来度量“给推理侧预热多少 experts”时的覆盖能力。
             candidate_recall = self._mean_recall_at_budget(
                 logits=logits,
                 targets=targets,
                 budget=routing_cfg.candidate_experts_per_layer,
             )
-            # 计算 executed budget recall。
+            # 按执行预算统计 recall，用来度量“最终真正会执行的 experts”覆盖得如何。
             executed_recall = self._mean_recall_at_budget(
                 logits=logits,
                 targets=targets,
                 budget=routing_cfg.executed_experts_per_layer,
             )
-        # 组装评估结果对象。
+
+        # -------------------- 打包评估结果 --------------------
+        # 把本次评估的 loss、recall 和可选 checkpoint 元信息固化为 trace，供日志和导出使用。
         return PredictorEvaluationTrace(
             profile_name=self.config.profile_name,
             teacher_source=dataset.teacher_source,
@@ -1670,7 +1669,8 @@ class PredictorTrainer:
         *,
         epochs: int | None = None,
     ) -> PredictorTrainingRunTrace:
-        # 复用 fit_dataset 训练，并只返回 run_trace。
+        # train_dataset 是 fit_dataset 的轻包装：
+        # 调用方若只关心训练轨迹而不关心模型对象和优化器状态，就走这里。
         _, run_trace, _ = self.fit_dataset(
             dataset,
             epochs=epochs,
@@ -1685,97 +1685,108 @@ class PredictorTrainer:
         model: FutureExpertPredictor | None = None,
         optimizer_state_dict: dict[str, Any] | None = None,
         initial_run_trace: PredictorTrainingRunTrace | None = None,
-    ) -> tuple[
+        ) -> tuple[
         FutureExpertPredictor,
         PredictorTrainingRunTrace,
         dict[str, Any],
     ]:
-        # 先校验数据集兼容性。
+        # -------------------- 校验训练输入并解析超参数 --------------------
+        # 训练前先做数据集维度校验，避免把不匹配的 summary 或窗口长度送进模型。
         self._validate_dataset_compatibility(dataset)
-        # 若提供了历史 run_trace，则校验其与当前数据集可续接。
+        # 若当前是续训，还要确认历史 run_trace 与新数据集来源一致，避免接错 checkpoint。
         if initial_run_trace is not None:
             self._validate_resume_dataset(dataset, initial_run_trace)
-        # 读取 trainer 与 routing 配置。
+        # trainer 配置负责优化超参，routing 配置负责 recall 预算口径。
         trainer_cfg = self.config.predictor_trainer
         routing_cfg = self.config.predictor_routing
-        # 未显式给 epochs 时，退回配置中的默认值。
+        # 若调用方未显式给 epochs，就沿用配置默认值。
         epochs = trainer_cfg.epochs if epochs is None else int(epochs)
-        # epoch 数至少为 1。
+        # 训练轮数至少为 1；0 轮训练没有意义，也无法产出新的 run_trace。
         if epochs < 1:
             raise ValueError("epochs must be >= 1")
-        # 准备训练特征和标签张量。
-        features, targets = self._dataset_tensors(dataset)
-        # 固定随机种子，保证初始化和训练顺序可复现。
+
+        # -------------------- 物化张量并初始化训练对象 --------------------
+        # 先把 trace 数据集物化成 CPU 张量，后续训练循环直接复用，避免重复构造。
+        features, layer_indices, targets = self._dataset_tensors(dataset)
+        # 固定随机种子，保证模型初始化和 epoch 内打乱顺序可复现。
         torch.manual_seed(trainer_cfg.seed)
-        # 未显式给模型时，按当前配置重建模型。
+        # 若调用方未传入模型，就按当前 trainer 配置构造一个新 predictor。
         model = self.build_model() if model is None else model
-        # 使用 AdamW 作为优化器。
+        # 训练目前使用 AdamW；这里只优化 predictor 自身参数，不涉及主模型参数。
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=trainer_cfg.learning_rate,
             weight_decay=trainer_cfg.weight_decay,
         )
-        # 若 checkpoint 里带有优化器状态，则在这里恢复。
+        # 若本次是从 checkpoint 续训，就把优化器状态一并恢复，保持动量连续。
         if optimizer_state_dict is not None:
             optimizer.load_state_dict(optimizer_state_dict)
-        # batch_size 不能超过样本总数。
+        # batch_size 不能超过样本总数，避免最后构造空 batch。
         batch_size = min(trainer_cfg.batch_size, dataset.example_count)
-        # 用列表累积逐 epoch 汇总，并接上历史 run_trace。
+        # epoch_summaries 既承载本轮训练结果，也在续训场景下承接历史轨迹。
         epoch_summaries: list[PredictorEpochSummary] = (
             []
             if initial_run_trace is None
             else list(initial_run_trace.epoch_summaries)
         )
-        # 续训时从历史已完成 epoch 数继续编号。
+        # 续训时，新的 epoch 编号要接在历史已完成 epoch 之后。
         completed_epochs = 0 if initial_run_trace is None else initial_run_trace.epochs
 
+        # -------------------- 执行逐 epoch 的训练循环 --------------------
         for epoch_offset in range(epochs):
-            # 当前 epoch 编号需要接在历史 run_trace 之后。
+            # 当前 epoch 的逻辑编号需要考虑续训场景下的历史偏移量。
             epoch_index = completed_epochs + epoch_offset
-            # 每个 epoch 用独立 generator 构造确定性的打乱顺序。
+            # 每个 epoch 使用独立 generator 打乱顺序；
+            # 这样既保证可复现，又能让不同 epoch 的样本顺序不同。
             generator = torch.Generator(device="cpu")
             generator.manual_seed(trainer_cfg.seed + epoch_index)
             order = torch.randperm(dataset.example_count, generator=generator)
-            # 用于累计当前 epoch 的平均损失。
+            # 累积当前 epoch 的样本加权损失，后面再除以总样本数得到 mean_loss。
             total_loss = 0.0
             total_examples = 0
+
+            # -------------------- 执行逐 mini-batch 的前向、反向与更新 --------------------
             for start in range(0, dataset.example_count, batch_size):
-                # 取当前 mini-batch 的样本索引。
+                # 根据打乱后的顺序切出当前 mini-batch 的样本索引。
                 batch_indices = order[start : start + batch_size]
-                # 选出当前 batch 的特征和标签。
+                # 从全量张量中抽取当前 batch 的特征和标签。
                 batch_features = features.index_select(0, batch_indices)
+                batch_layer_indices = layer_indices.index_select(0, batch_indices)
                 batch_targets = targets.index_select(0, batch_indices)
-                # 前向得到 logits 并计算 BCE loss。
-                logits = model(batch_features)
+                # 前向得到每个 future layer / expert 的 logits。
+                logits = model(batch_features, batch_layer_indices)
+                # 目标是多标签预测，因此这里按多热标签计算 BCEWithLogitsLoss。
                 loss = F.binary_cross_entropy_with_logits(logits, batch_targets)
-                # 标准训练三步：清梯度、反向、更新。
+                # 标准训练三步：清梯度、反向传播、参数更新。
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
-                # 以样本数加权累计当前 batch 的损失。
+                # 用样本数加权累计 batch loss，避免最后一个不满 batch 时均值失真。
                 batch_count = int(batch_features.shape[0])
                 total_loss += float(loss.item()) * batch_count
                 total_examples += batch_count
 
+            # -------------------- 在全量数据上计算 epoch 级指标 --------------------
             with torch.no_grad():
-                # 每个 epoch 结束后在全量数据上做一次评估。
+                # 训练完一个 epoch 后，在全量数据上做一次统一评估，记录可比较的指标。
                 model.eval()
-                all_logits = model(features)
-                # 计算 candidate budget recall。
+                all_logits = model(features, layer_indices)
+                # candidate recall 衡量“给推理侧准备的候选 experts”覆盖了多少 teacher experts。
                 candidate_recall = self._mean_recall_at_budget(
                     logits=all_logits,
                     targets=targets,
                     budget=routing_cfg.candidate_experts_per_layer,
                 )
-                # 计算 executed budget recall。
+                # executed recall 衡量“最终真正允许执行的 experts”能覆盖多少 teacher experts。
                 executed_recall = self._mean_recall_at_budget(
                     logits=all_logits,
                     targets=targets,
                     budget=routing_cfg.executed_experts_per_layer,
                 )
-                # 评估完成后切回 train 模式。
+                # 评估完成后切回 train 模式，保证下一个 epoch 继续按训练模式运行。
                 model.train()
-            # 记录当前 epoch 的汇总结果。
+
+            # 把本轮 epoch 的损失和 recall 汇总成一条稳定记录，供日志、导出与续训使用。
             epoch_summaries.append(
                 PredictorEpochSummary(
                     epoch_index=epoch_index,
@@ -1785,7 +1796,11 @@ class PredictorTrainer:
                 )
             )
 
-        # 返回训练后的模型和完整训练 run_trace。
+        # -------------------- 返回训练产物 --------------------
+        # fit_dataset 会同时返回：
+        # 1) 训练后的 predictor 模型
+        # 2) 完整训练轨迹 run_trace
+        # 3) 优化器状态，便于后续继续续训
         return (
             model,
             PredictorTrainingRunTrace(
@@ -1805,19 +1820,6 @@ class PredictorTrainer:
             optimizer.state_dict(),
         )
 
-    def train_synthetic(
-        self,
-        *,
-        steps: int,
-        examples_per_step: int | None = None,
-        epochs: int | None = None,
-    ) -> PredictorTrainingRunTrace:
-        # 兼容旧调用名，直接复用通用 train()。
-        return self.train(
-            steps=steps,
-            examples_per_step=examples_per_step,
-            epochs=epochs,
-        )
 
     def train(
         self,
@@ -1832,7 +1834,8 @@ class PredictorTrainer:
         dataset_format: str = "auto",
         dataset_text_key: str = "text",
     ) -> PredictorTrainingRunTrace:
-        # 先构造 predictor trace 数据集。
+        # -------------------- 先构造训练数据集 --------------------
+        # train() 是最上层入口：它先根据 step 数和数据源参数生成 predictor trace 数据集。
         dataset = self.build_trace_dataset(
             steps=steps,
             examples_per_step=examples_per_step,
@@ -1843,7 +1846,10 @@ class PredictorTrainer:
             dataset_format=dataset_format,
             dataset_text_key=dataset_text_key,
         )
-        # 再对该数据集执行训练。
+
+        # -------------------- 再委托给数据集训练主链 --------------------
+        # 数据集构造和参数更新解耦后，调用方既可以走 train() 一步到位，
+        # 也可以先单独生成 dataset，再调用 train_dataset()/fit_dataset()。
         return self.train_dataset(
             dataset,
             epochs=epochs,

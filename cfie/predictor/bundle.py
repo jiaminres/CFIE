@@ -388,27 +388,99 @@ class FutureExpertPredictor(nn.Module):
         window_layers: int,
         num_experts: int,
     ) -> None:
-        # 先初始化 PyTorch 模块基类。
         super().__init__()
-        # 缓存输出窗口层数。
         self.window_layers = window_layers
-        # 缓存每层的 expert 数。
         self.num_experts = num_experts
-        # 构造与训练侧完全一致的轻量 MLP 结构。
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.layer_proj = nn.Sequential(
+            nn.Linear(6, hidden_dim),
+            nn.SiLU(),
+        )
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, window_layers * num_experts),
         )
 
-    # 前向返回 [batch, window_layers, num_experts] logits。
-    def forward(self, hidden_summary: torch.Tensor) -> torch.Tensor:
-        # 先经由 MLP 得到展平 logits。
-        logits = self.net(hidden_summary)
-        # 再恢复成“未来层窗口 x expert”结构。
+    @staticmethod
+    def _normalize_hidden_state(hidden_state: torch.Tensor) -> torch.Tensor:
+        if hidden_state.ndim == 1:
+            return hidden_state.unsqueeze(0)
+        if hidden_state.ndim != 2:
+            raise ValueError("hidden_state must be rank-1 or rank-2")
+        return hidden_state
+
+    @staticmethod
+    def _normalize_layer_index(
+        layer_index: int | torch.Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if isinstance(layer_index, int):
+            return torch.full(
+                (batch_size,),
+                int(layer_index),
+                dtype=torch.float32,
+                device=device,
+            )
+        if layer_index.ndim == 0:
+            return torch.full(
+                (batch_size,),
+                int(layer_index.item()),
+                dtype=torch.float32,
+                device=device,
+            )
+        if layer_index.ndim != 1 or int(layer_index.shape[0]) != batch_size:
+            raise ValueError("layer_index must be scalar or match batch size")
+        return layer_index.to(device=device, dtype=torch.float32)
+
+    @staticmethod
+    def _layer_features(layer_index: torch.Tensor) -> torch.Tensor:
+        layer_index = layer_index.unsqueeze(-1)
+        return torch.cat(
+            (
+                layer_index,
+                layer_index.square(),
+                torch.sin(layer_index * 0.1),
+                torch.cos(layer_index * 0.1),
+                torch.sin(layer_index * 0.01),
+                torch.cos(layer_index * 0.01),
+            ),
+            dim=-1,
+        )
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        layer_index: int | torch.Tensor,
+    ) -> torch.Tensor:
+        reference_param = next(self.parameters(), None)
+        target_device = (
+            hidden_state.device if reference_param is None else reference_param.device
+        )
+        target_dtype = (
+            hidden_state.dtype if reference_param is None else reference_param.dtype
+        )
+        hidden_state = self._normalize_hidden_state(hidden_state).to(
+            device=target_device,
+            dtype=target_dtype,
+        )
+        layer_index = self._normalize_layer_index(
+            layer_index,
+            batch_size=int(hidden_state.shape[0]),
+            device=target_device,
+        )
+        layer_index = layer_index.to(dtype=target_dtype)
+        fused_hidden = self.input_proj(hidden_state) + self.layer_proj(
+            self._layer_features(layer_index)
+        )
+        logits = self.net(fused_hidden)
         return logits.view(-1, self.window_layers, self.num_experts)
+
+
+HiddenStateFutureExpertPredictor = FutureExpertPredictor
 
 
 @dataclass(slots=True, frozen=True)
@@ -423,6 +495,7 @@ class LoadedPredictorBundle:
 
     # 根据 runtime schema 重建 predictor 模块并加载权重。
     def build_model(self, *, device: str | torch.device = "cpu") -> FutureExpertPredictor:
+        model_dtype = next(iter(self.state_dict.values())).dtype
         # 先按 schema 恢复与训练侧同构的模型。
         model = FutureExpertPredictor(
             input_dim=self.schema.input_summary_dim,
@@ -430,10 +503,11 @@ class LoadedPredictorBundle:
             window_layers=self.schema.window_layers,
             num_experts=self.schema.num_experts,
         )
+        model.to(dtype=model_dtype)
         # 再把导出的 state_dict 严格加载回模型。
         model.load_state_dict(self.state_dict, strict=True)
         # 最后切到目标设备并设为 eval 模式。
-        model.to(device)
+        model.to(device=device, dtype=model_dtype)
         model.eval()
         return model
 

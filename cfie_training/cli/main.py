@@ -34,60 +34,6 @@ def build_parser() -> argparse.ArgumentParser:
     # 创建子命令解析器容器，用于挂载不同功能模块对应的命令。
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # ------------------------------- 注册训练蓝图规划相关命令 -------------------------------
-    # 注册默认训练蓝图渲染命令，用于生成资源优先的训练规划结果。
-    plan_parser = subparsers.add_parser(
-        "plan",
-        help="Render the default resource-first training blueprint.",
-    )
-    # 添加配置文件路径参数，用于从外部 JSON 文件加载训练配置。
-    plan_parser.add_argument("--config", type=Path, help="Optional JSON config file.")
-    # 添加训练档位参数，在未提供配置文件时使用内置训练档位。
-    plan_parser.add_argument(
-        "--profile",
-        choices=SUPPORTED_TRAINING_PROFILES,
-        default=DEFAULT_TRAINING_PROFILE,
-        help="Training profile to use when --config is not provided.",
-    )
-    # 添加模型名称覆盖参数，用于覆盖开发阶段默认模型标签。
-    plan_parser.add_argument("--model", help="Override the development model label.")
-    # 添加目标模型名称覆盖参数，用于覆盖目标模型标签。
-    plan_parser.add_argument(
-        "--target-model",
-        help="Override the target model label.",
-    )
-    # 添加 JSON 输出开关，用于控制是否以 JSON 形式输出训练蓝图。
-    plan_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit the plan as JSON.",
-    )
-
-    # 注册 predictor 路由式 MoE 蓝图渲染命令，用于输出对应设计方案。
-    predictor_parser = subparsers.add_parser(
-        "predictor-plan",
-        help="Render the predictor-routed MoE design blueprint.",
-    )
-    # 添加配置文件路径参数，用于从外部 JSON 文件加载 predictor 规划配置。
-    predictor_parser.add_argument(
-        "--config",
-        type=Path,
-        help="Optional JSON config file.",
-    )
-    # 添加训练档位参数，在未提供配置文件时选择内置训练档位。
-    predictor_parser.add_argument(
-        "--profile",
-        choices=SUPPORTED_TRAINING_PROFILES,
-        default=DEFAULT_TRAINING_PROFILE,
-        help="Training profile to use when --config is not provided.",
-    )
-    # 添加 JSON 输出开关，用于控制是否以 JSON 形式输出 predictor 蓝图。
-    predictor_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit the predictor plan as JSON.",
-    )
-
     # ------------------------------- 注册 predictor trace、训练、检查、评估与导出命令 -------------------------------
     # 注册 predictor 教师轨迹采样命令，用于构造 predictor 训练所需的教师轨迹样本。
     predictor_trace_parser = subparsers.add_parser(
@@ -139,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     predictor_trace_parser.add_argument(
         "--dataset",
         type=Path,
-        help="Optional text or JSONL dataset file used to build tokenized trace batches.",
+        help="Text or JSONL dataset file used to build tokenized trace batches.",
     )
     # 添加 tokenizer 路径参数，未指定时默认使用训练档位对应的模型路径。
     predictor_trace_parser.add_argument(
@@ -223,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     predictor_train_parser.add_argument(
         "--dataset",
         type=Path,
-        help="Optional text or JSONL dataset file used to build tokenized trace batches.",
+        help="Text or JSONL dataset file used to build tokenized trace batches.",
     )
     # 添加 tokenizer 路径参数，未指定时默认使用训练档位对应的模型路径。
     predictor_train_parser.add_argument(
@@ -374,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     predictor_eval_parser.add_argument(
         "--dataset",
         type=Path,
-        help="Optional text or JSONL dataset file used to build tokenized evaluation batches.",
+        help="Text or JSONL dataset file used to build tokenized evaluation batches.",
     )
     # 添加 tokenizer 路径参数，未指定时默认使用训练档位对应的模型路径。
     predictor_eval_parser.add_argument(
@@ -578,7 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 注册多步训练会话命令，用于执行完整训练过程，可使用合成数据或真实数据集。
     train_parser = subparsers.add_parser(
         "train",
-        help="Run a multi-step training session with synthetic or dataset-backed batches.",
+        help="Run a multi-step training session with dataset-backed batches.",
     )
     # 添加配置文件路径参数，用于从外部 JSON 文件加载训练配置。
     train_parser.add_argument(
@@ -605,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--samples",
         type=int,
         default=2,
-        help="Base samples per synthetic batch.",
+        help="Base samples per training batch.",
     )
     # 添加每个训练样本的 token 数参数，用于控制序列长度。
     train_parser.add_argument(
@@ -637,7 +583,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--dataset",
         type=Path,
-        help="Optional text or JSONL dataset file used to build tokenizer-backed batches.",
+        help="Text or JSONL dataset file used to build tokenizer-backed batches.",
     )
     # 添加 tokenizer 路径参数，未指定时默认使用训练档位对应的模型路径。
     train_parser.add_argument(
@@ -663,19 +609,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Emit the session trace as JSON.",
-    )
-
-    # ------------------------------- 注册固定 Qwen3.5 档位的快捷蓝图命令 -------------------------------
-    # 注册专用的 Qwen3.5-35B-A3B 蓝图命令，用于快速输出该模型对应的训练蓝图。
-    qwen35_parser = subparsers.add_parser(
-        "qwen35-plan",
-        help="Render the dedicated Qwen3.5-35B-A3B training blueprint.",
-    )
-    # 添加 JSON 输出开关，用于控制是否以 JSON 形式输出 Qwen3.5 蓝图。
-    qwen35_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit the Qwen3.5 blueprint as JSON.",
     )
 
     # ------------------------------- 返回构造完成的命令行解析器 -------------------------------
@@ -784,26 +717,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     # 解析外部传入的命令行参数；当 argv 为空时，默认直接读取进程命令行参数。
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    # ------------------------------- 处理独立于通用配置加载的快捷蓝图命令 -------------------------------
-    # 当命令为 qwen35-plan 时，走固定 profile 的快捷蓝图生成路径。
-    if args.command == "qwen35-plan":
-        # 构造固定的 Qwen3.5-35B-A3B 训练档位配置。
-        config = build_profile_config("qwen35-35b-a3b")
-        # 基于配置创建训练项目对象。
-        project = TrainingProject(config)
-        # 构造该训练项目对应的训练蓝图。
-        blueprint = project.build_blueprint()
-
-        # 根据用户是否指定 --json，选择 JSON 或文本方式输出蓝图内容。
-        if args.json:
-            # 输出 JSON 格式的蓝图结果。
-            print(blueprint.to_json())
-        else:
-            # 输出人类可读的文本格式蓝图结果。
-            print(blueprint.render_text())
-
-        # 当前命令执行成功，返回 0。
-        return 0
+    if args.command == "predictor-trace" and args.dataset is None:
+        parser.error("predictor-trace requires --dataset")
+    if (
+        args.command in {"predictor-train", "predictor-eval"}
+        and args.trace_input is None
+        and args.dataset is None
+    ):
+        parser.error(f"{args.command} requires --trace-input or --dataset")
+    if (
+        args.command == "train"
+        and args.dataset is None
+        and getattr(args, "resume_from", None) is None
+    ):
+        parser.error(
+            "train requires --dataset unless --resume-from points to a "
+            "dataset-backed session checkpoint"
+        )
 
     # ------------------------------- 处理独立于通用配置加载的 predictor checkpoint 检查命令 -------------------------------
     # 当命令为 predictor-inspect 时，直接读取 checkpoint 元信息，而不走通用配置加载流程。
@@ -879,43 +809,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     # ------------------------------- 加载其余命令共享的通用训练配置 -------------------------------
     # 对除独立命令外的其余命令，统一按标准方式加载训练配置。
     config = _load_config(args)
-
-    # ------------------------------- 处理训练蓝图与 predictor 蓝图生成命令 -------------------------------
-    # 当命令为 plan 时，生成默认训练蓝图。
-    if args.command == "plan":
-        # 基于当前配置创建训练项目对象。
-        project = TrainingProject(config)
-        # 构造默认训练蓝图。
-        blueprint = project.build_blueprint()
-
-        # 根据用户是否指定 --json，选择 JSON 或文本方式输出蓝图。
-        if args.json:
-            # 输出 JSON 格式蓝图。
-            print(blueprint.to_json())
-        else:
-            # 输出文本格式蓝图。
-            print(blueprint.render_text())
-
-        # 当前命令执行成功，返回 0。
-        return 0
-
-    # 当命令为 predictor-plan 时，生成 predictor 相关蓝图。
-    if args.command == "predictor-plan":
-        # 基于当前配置创建训练项目对象。
-        project = TrainingProject(config)
-        # 构造 predictor 蓝图。
-        blueprint = project.build_predictor_blueprint()
-
-        # 根据用户是否指定 --json，选择 JSON 或文本方式输出 predictor 蓝图。
-        if args.json:
-            # 输出 JSON 格式 predictor 蓝图。
-            print(blueprint.to_json())
-        else:
-            # 输出文本格式 predictor 蓝图。
-            print(blueprint.render_text())
-
-        # 当前命令执行成功，返回 0。
-        return 0
 
     # ------------------------------- 处理 predictor trace 数据集构造命令 -------------------------------
     # 当命令为 predictor-trace 时，构造教师轨迹数据集。
@@ -1418,7 +1311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(session_trace.to_dict(), indent=2, sort_keys=True))
         else:
             # 当提供数据集路径时，说明当前 batch 为基于 tokenizer 的真实数据批次。
-            batch_source = "tokenizer-backed" if args.dataset is not None else "synthetic"
+            batch_source = "dataset-backed"
             # 输出训练完成信息、步数、profile 与执行设备。
             print(
                 f"Trained {session_trace.total_steps} {batch_source} step(s) for profile "
