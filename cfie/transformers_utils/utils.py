@@ -107,8 +107,10 @@ def parse_safetensors_file_metadata(path: str | PathLike) -> dict[str, Any]:
     with open(path, "rb") as f:
         # 先读取文件头前 8 个字节，它按小端 uint64 存的是 metadata JSON 的字节长度。
         length_of_metadata = struct.unpack("<Q", f.read(8))[0]
+
         # 再按这个长度读取 metadata 区域，并把 UTF-8 JSON 反序列化成 Python 字典。
         metadata = json.loads(f.read(length_of_metadata).decode("utf-8"))
+
         # 返回该 safetensors 文件头部携带的完整元数据映射。
         return metadata
 

@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Literal
 import uuid
 
-ProjectStage = Literal["development", "target"]
 BucketUnit = Literal["expert", "layer", "hybrid"]
 ActivationPolicy = Literal["minimal_cache", "recompute"]
 Placement = Literal["cpu", "gpu"]
@@ -137,25 +136,6 @@ class ModelSpecConfig:
         return self
 
     # dataclass 初始化后立即校验模型结构配置。
-    def __post_init__(self) -> None:
-        self.validate()
-
-
-@dataclass(slots=True)
-class ModelTargets:
-    development_model: str = "Qwen3.5-35B-A3B"
-    target_model: str = "Qwen3.5-122B-class-MoE"
-    family: str = "qwen3.5_moe"
-    stage: ProjectStage = "development"
-
-    # 校验项目目标模型与家族标识。
-    def validate(self) -> "ModelTargets":
-        _require_non_empty("development_model", self.development_model)
-        _require_non_empty("target_model", self.target_model)
-        _require_non_empty("family", self.family)
-        return self
-
-    # dataclass 初始化后立即校验目标配置。
     def __post_init__(self) -> None:
         self.validate()
 
@@ -497,11 +477,30 @@ class PredictorTrainerConfig:
 
 @dataclass(slots=True)
 class MemoryBudgetConfig:
+    """
+    描述训练侧分层参数驻留的容量预算。
+
+    这个配置只表达规划阶段可使用的资源上限，不代表运行时实时剩余容量。
+    memory planner 会先从每个层级预算中扣除对应 safety margin，
+    再决定参数 bucket 应该放在 GPU hot、CPU hot 还是 NVMe cold。
+    """
+
+    # GPU hot tier 的总预算，主要用于放置当前训练 step 最频繁访问的热参数。
     gpu_hot_budget_gb: float = 8.0
+
+    # CPU hot tier 的总预算，用于承接 GPU 放不下但仍希望保持较快访问的参数。
     cpu_hot_budget_gb: float = 32.0
+
+    # NVMe cold tier 的总预算，用于存放低频访问或可延迟加载的冷参数。
     nvme_cold_budget_gb: float = 512.0
+
+    # GPU 侧保留的安全余量，避免 planner 把显存预算打满导致运行期 OOM。
     gpu_safety_margin_gb: float = 1.0
+
+    # CPU 侧保留的安全余量，避免热参数缓存挤占系统运行所需内存。
     cpu_safety_margin_gb: float = 4.0
+
+    # NVMe 侧保留的安全余量，避免冷参数缓存占满磁盘影响写入和临时文件。
     nvme_safety_margin_gb: float = 16.0
 
     # 校验 GPU / CPU / NVMe 预算与安全边界。
@@ -572,28 +571,54 @@ class StateBytesConfig:
 
 @dataclass(slots=True)
 class TrainingProjectConfig:
+    # ------------------------------- 项目身份与档位 -------------------------------
+    # 训练包名称，用于序列化、日志与导出信息中的项目标识。
     package_name: str = "cfie_training"
+    # 当前配置所属的训练档位名称，用于区分不同 profile 的默认参数集合。
     profile_name: str = "generic"
-    model_targets: ModelTargets = field(default_factory=ModelTargets)
+
+    # ------------------------------- 模型结构与模型来源 -------------------------------
+    # 模型结构规格配置，定义层数、hidden 维度、专家数等训练核心形状参数。
     model_spec: ModelSpecConfig = field(default_factory=ModelSpecConfig)
+    # 模型来源配置，定义模型权重目录与加载来源信息。
     model_source: ModelSourceConfig = field(default_factory=ModelSourceConfig)
+
+    # ------------------------------- 调度与执行主线配置 -------------------------------
+    # 专家轮换配置，控制每步激活专家集合与轮换策略。
     expert_rotation: ExpertRotationConfig = field(default_factory=ExpertRotationConfig)
+    # bucket 调度配置，控制 micro-bucket 切分、并发与预取行为。
     bucket_schedule: BucketScheduleConfig = field(default_factory=BucketScheduleConfig)
+    # 执行配置，定义设备类型、执行模式及运行期调度开关。
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    # 优化器配置，定义学习率、权重衰减等训练超参数。
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    # 资源策略配置，定义资源分层、放置与回收策略。
     resource_policy: ResourcePolicyConfig = field(default_factory=ResourcePolicyConfig)
+    # 传输配置，定义分片搬运、缓存与文件分发参数。
     transport: TransportConfig = field(default_factory=TransportConfig)
+
+    # ------------------------------- 量化与 predictor 配置 -------------------------------
+    # 运行时量化配置，定义训练运行过程中可用的量化策略与位宽约束。
     runtime_quantization: RuntimeQuantizationConfig = field(
         default_factory=RuntimeQuantizationConfig
     )
+    # predictor 路由配置，定义窗口层数、候选预算与执行预算等路由参数。
     predictor_routing: PredictorRoutingConfig = field(
         default_factory=PredictorRoutingConfig
     )
+    # predictor 训练配置，定义 predictor 网络宽度、轮数与优化超参。
     predictor_trainer: PredictorTrainerConfig = field(
         default_factory=PredictorTrainerConfig
     )
+
+    # ------------------------------- 显存预算与状态字节配置 -------------------------------
+    # 分层内存预算配置，定义 GPU-hot/CPU-hot/NVMe-cold 各层可用容量。
     memory_budget: MemoryBudgetConfig = field(default_factory=MemoryBudgetConfig)
+    # 状态字节配置，定义权重、梯度、优化器状态与激活的字节口径。
     state_bytes: StateBytesConfig = field(default_factory=StateBytesConfig)
+
+    # ------------------------------- 设计说明备注 -------------------------------
+    # 训练侧架构约束说明，用于强调训练与推理解耦、调度优先级与资源取舍原则。
     notes: tuple[str, ...] = (
         "Keep training code separate from the inference-only cfie package.",
         "Treat bucket, expert, and phase boundaries as first-class scheduling units.",
@@ -606,7 +631,6 @@ class TrainingProjectConfig:
         # 先逐个校验子配置对象自身是否合法。
         _require_non_empty("package_name", self.package_name)
         _require_non_empty("profile_name", self.profile_name)
-        self.model_targets.validate()
         self.model_spec.validate()
         self.model_source.validate()
         self.expert_rotation.validate()
@@ -681,7 +705,7 @@ class TrainingProjectConfig:
         # -----------------
         # 先解包各个子配置对象，并为运行时量化补默认值。
         data = dict(raw)
-        model_targets = ModelTargets(**data.pop("model_targets", {}))
+        data.pop("model_targets", None)
         model_spec = ModelSpecConfig(**data.pop("model_spec", {}))
         model_source = ModelSourceConfig(**data.pop("model_source", {}))
         expert_rotation = ExpertRotationConfig(**data.pop("expert_rotation", {}))
@@ -717,7 +741,6 @@ class TrainingProjectConfig:
         # -----------------
         # 回填剩余顶层字段，并构造最终配置对象。
         return cls(
-            model_targets=model_targets,
             model_spec=model_spec,
             model_source=model_source,
             expert_rotation=expert_rotation,

@@ -1,4 +1,4 @@
-"""Serializable runtime types for the first CFIE training engine."""
+﻿"""Serializable runtime types for the first CFIE training engine."""
 
 from __future__ import annotations
 
@@ -52,6 +52,8 @@ class BatchShape:
     loss_token_count: int = 0
     token_rows: tuple[tuple[int, ...], ...] = ()
     target_rows: tuple[tuple[int, ...], ...] = ()
+    attention_mask_rows: tuple[tuple[int, ...], ...] = ()
+    target_attention_mask_rows: tuple[tuple[int, ...], ...] = ()
 
     # 校验 batch 形状与显式 token 行是否一致。
     def __post_init__(self) -> None:
@@ -67,6 +69,19 @@ class BatchShape:
         # 如果显式给了 target_rows，则其行数同样必须和样本数一致。
         if self.target_rows and len(self.target_rows) != self.samples:
             raise ValueError("target_rows length must match samples when provided")
+        # 如果显式给了 attention_mask_rows，则其行数同样必须和样本数一致。
+        if self.attention_mask_rows and len(self.attention_mask_rows) != self.samples:
+            raise ValueError(
+                "attention_mask_rows length must match samples when provided"
+            )
+        # 如果显式给了 target_attention_mask_rows，则其行数同样必须和样本数一致。
+        if (
+            self.target_attention_mask_rows
+            and len(self.target_attention_mask_rows) != self.samples
+        ):
+            raise ValueError(
+                "target_attention_mask_rows length must match samples when provided"
+            )
         # 逐行校验 token_rows 中每一行的长度。
         for row in self.token_rows:
             # 每个 token 行都必须覆盖完整的 tokens_per_sample。
@@ -81,6 +96,41 @@ class BatchShape:
                 raise ValueError(
                     "each target_rows entry must match tokens_per_sample"
                 )
+        # 逐行校验 attention_mask_rows 中每一行的长度和取值。
+        for row in self.attention_mask_rows:
+            # 每个 attention mask 行都必须覆盖完整的 tokens_per_sample。
+            if len(row) != self.tokens_per_sample:
+                raise ValueError(
+                    "each attention_mask_rows entry must match tokens_per_sample"
+                )
+            # mask 只允许 0/1，避免上层把 token id 或权重误传进来。
+            if any(value not in (0, 1, False, True) for value in row):
+                raise ValueError("attention_mask_rows entries must be 0 or 1")
+        # 逐行校验 target_attention_mask_rows 中每一行的长度和取值。
+        for row in self.target_attention_mask_rows:
+            # target mask 与 target_rows 一样按 tokens_per_sample 对齐。
+            if len(row) != self.tokens_per_sample:
+                raise ValueError(
+                    "each target_attention_mask_rows entry must match "
+                    "tokens_per_sample"
+                )
+            # mask 只允许 0/1，保持 loss token 统计口径清晰。
+            if any(value not in (0, 1, False, True) for value in row):
+                raise ValueError("target_attention_mask_rows entries must be 0 or 1")
+        # attention mask 只能依附于显式 token_rows 使用。
+        if self.attention_mask_rows and not self.token_rows:
+            raise ValueError("attention_mask_rows requires token_rows")
+        # target attention mask 只能依附于显式 target_rows 使用。
+        if self.target_attention_mask_rows and not self.target_rows:
+            raise ValueError("target_attention_mask_rows requires target_rows")
+        # 当前数据规划器只生成尾部 padding，因此 mask 中不能出现 0 后又出现 1。
+        for row in self.attention_mask_rows:
+            if tuple(row) != tuple(sorted(row, reverse=True)):
+                raise ValueError("attention_mask_rows must use tail padding")
+        # target mask 同样保持尾部 padding 约束，便于 loss 侧按前缀有效长度处理。
+        for row in self.target_attention_mask_rows:
+            if tuple(row) != tuple(sorted(row, reverse=True)):
+                raise ValueError("target_attention_mask_rows must use tail padding")
         # 如果显式给了 sample_indices，则其长度也必须和样本数一致。
         if self.sample_indices and len(self.sample_indices) != self.samples:
             raise ValueError("sample_indices length must match samples when provided")
@@ -97,6 +147,38 @@ class BatchShape:
         # 只要 token_rows 非空，就视为携带了显式 token 行。
         return bool(self.token_rows)
 
+    # 判断 batch 是否携带输入 attention mask。
+    @property
+    def has_attention_mask_rows(self) -> bool:
+        # 只要 attention_mask_rows 非空，就说明 token_rows 中存在显式 padding 语义。
+        return bool(self.attention_mask_rows)
+
+    # 判断 batch 是否携带目标 attention mask。
+    @property
+    def has_target_attention_mask_rows(self) -> bool:
+        # 只要 target_attention_mask_rows 非空，就说明 target_rows 中存在显式 loss mask。
+        return bool(self.target_attention_mask_rows)
+
+    # 返回输入侧真实 token 数量。
+    @property
+    def valid_token_count(self) -> int:
+        # 有 attention mask 时按 mask 求和；否则所有形状 token 都视为有效。
+        if self.attention_mask_rows:
+            return sum(int(value) for row in self.attention_mask_rows for value in row)
+        return self.total_tokens
+
+    # 返回目标侧真实 loss token 数量。
+    @property
+    def valid_loss_token_count(self) -> int:
+        # 有 target mask 时按 mask 求和；否则回退到显式 loss_token_count 或总 token 数。
+        if self.target_attention_mask_rows:
+            return sum(
+                int(value)
+                for row in self.target_attention_mask_rows
+                for value in row
+            )
+        return self.loss_token_count or self.total_tokens
+
     # 将 batch 形状序列化为字典。
     def to_dict(self) -> dict[str, Any]:
         # 统一把 batch 的核心统计字段序列化成 JSON 友好的结构。
@@ -109,6 +191,10 @@ class BatchShape:
             "sample_indices": list(self.sample_indices),
             "loss_token_count": self.loss_token_count,
             "has_token_rows": self.has_token_rows,
+            "has_attention_mask_rows": self.has_attention_mask_rows,
+            "has_target_attention_mask_rows": self.has_target_attention_mask_rows,
+            "valid_token_count": self.valid_token_count,
+            "valid_loss_token_count": self.valid_loss_token_count,
         }
 
 

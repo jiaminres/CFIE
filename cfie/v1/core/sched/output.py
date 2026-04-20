@@ -31,6 +31,7 @@ else:
 class NewRequestData:
     # worker 首次见到某个请求时，需要这份全量初始化数据来建立本地缓存状态。
     req_id: str
+    external_req_id: str | None
     prompt_token_ids: list[int] | None
     mm_features: list[MultiModalFeatureSpec]
     sampling_params: SamplingParams | None
@@ -53,6 +54,7 @@ class NewRequestData:
         # 从调度器内部 Request 快照提取出 worker 首次建态所需的最小完整载荷。
         return cls(
             req_id=request.request_id,
+            external_req_id=getattr(request, "external_req_id", None),
             prompt_token_ids=request.prompt_token_ids,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
@@ -71,6 +73,7 @@ class NewRequestData:
         return (
             f"NewRequestData("
             f"req_id={self.req_id},"
+            f"external_req_id={self.external_req_id},"
             f"prompt_token_ids={self.prompt_token_ids},"
             f"prefill_token_ids={self.prefill_token_ids},"
             f"mm_features={self.mm_features},"

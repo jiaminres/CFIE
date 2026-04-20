@@ -940,6 +940,29 @@ class Worker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
+    # ------------------------------- 打开 predictor trace 捕获 -------------------------------
+    def enable_predictor_capture(self, layer_ids: tuple[int, ...]) -> None:
+        enable_fn = getattr(self.model_runner, "enable_predictor_capture", None)
+        if not callable(enable_fn):
+            raise RuntimeError("current model runner does not support predictor capture")
+        enable_fn(layer_ids)
+
+    # ------------------------------- 关闭 predictor trace 捕获 -------------------------------
+    def disable_predictor_capture(self) -> None:
+        disable_fn = getattr(self.model_runner, "disable_predictor_capture", None)
+        if callable(disable_fn):
+            disable_fn()
+
+    # ------------------------------- 取走已完成的 predictor hidden states -------------------------------
+    def take_predictor_hidden_states(
+        self,
+        request_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, tuple[torch.Tensor, ...]]:
+        take_fn = getattr(self.model_runner, "take_predictor_hidden_states", None)
+        if not callable(take_fn):
+            raise RuntimeError("current model runner does not support predictor capture")
+        return take_fn(request_ids)
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 

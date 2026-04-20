@@ -9,7 +9,6 @@ from cfie_training.config import (
     MemoryBudgetConfig,
     ModelSpecConfig,
     ModelSourceConfig,
-    ModelTargets,
     OptimizerConfig,
     PredictorTrainerConfig,
     ResourcePolicyConfig,
@@ -18,6 +17,7 @@ from cfie_training.config import (
     TransportConfig,
     TrainingProjectConfig,
 )
+from cfie_training.profiles._hf_cache import resolve_local_snapshot_path
 
 QWEN35_35B_A3B_PROFILE = "qwen35-35b-a3b"
 
@@ -29,19 +29,6 @@ def build_qwen35_35b_a3b_config() -> TrainingProjectConfig:
     return TrainingProjectConfig(
         # 当前训练档位名称，用于标识该配置属于 Qwen3.5-35B-A3B 专用档位。
         profile_name=QWEN35_35B_A3B_PROFILE,
-
-        # ------------------------------- 配置训练目标模型与模型族信息 -------------------------------
-        # 配置开发阶段模型、目标模型、模型家族与当前阶段标识。
-        model_targets=ModelTargets(
-            # 当前开发与验证阶段实际使用的模型名称。
-            development_model="Qwen3.5-35B-A3B",
-            # 训练方案最终对齐或服务的目标模型名称。
-            target_model="Qwen3.5-122B-class-MoE",
-            # 当前模型所属的模型家族标识。
-            family="qwen3.5_moe",
-            # 当前配置所处的阶段，这里标记为开发阶段。
-            stage="development",
-        ),
 
         # ------------------------------- 配置模型结构与量化规格 -------------------------------
         # 配置模型架构、层数、注意力结构、专家结构与静态量化参数。
@@ -102,10 +89,9 @@ def build_qwen35_35b_a3b_config() -> TrainingProjectConfig:
         # 配置模型在本地文件系统中的来源路径与权重索引方式。
         model_source=ModelSourceConfig(
             # 本地 HuggingFace 缓存中的模型快照路径。
-            model_path=(
-                "/home/gaojiamin/.cache/huggingface/hub/"
-                "models--Qwen--Qwen3.5-35B-A3B/snapshots/"
-                "ec2d4ece1ffb563322cbee9a48fe0e3fcbce0307"
+            model_path=resolve_local_snapshot_path(
+                repo_dir_name="models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4",
+                snapshot_name="33f4e5e615e1f29a7b218906555ea6fe2d09c741",
             ),
             # 权重索引文件名称。
             index_filename="model.safetensors.index.json",

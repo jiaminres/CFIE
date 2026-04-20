@@ -185,15 +185,43 @@ class TrainingMemoryPlan:
 
 @dataclass(slots=True, frozen=True)
 class StartupParameterEstimate:
+    """
+    记录训练启动阶段的一组参数驻留估算结果。
+
+    这个对象不是运行时真实显存快照，而是 memory planner 在正式启动前
+    根据模型结构、batch 形状、专家活跃度与分层存储策略推导出的候选规划。
+    调用方可以用它判断当前启动参数是否能放进 GPU hot tier 预算，
+    也可以把估算结果导出到日志或诊断报告里辅助调参。
+    """
+
+    # 用户或配置侧给 GPU hot tier 预留的显存预算，单位是 GB。
     gpu_hot_budget_gb: float
+
+    # 按预算折算后的 GPU hot tier 可用字节数，是后续 fits 判定的直接上限。
     gpu_hot_available_bytes: int
+
+    # 单个训练 step 中预计会同时被访问或保持活跃的专家数量。
     active_experts_per_step: int
+
+    # GPU hot tier 中允许同时驻留的最大 bucket 数，用于限制专家热缓存规模。
     max_live_buckets: int
+
+    # 允许提前预取到热层级的 bucket 数，用于估算 overlap/prefetch 额外占用。
     prefetch_buckets: int
+
+    # 当前估算绑定的 batch 形状，包含 micro-batch、序列长度等训练输入规模信息。
     batch: BatchShape
+
+    # 当前候选规划是否能放进 GPU hot tier 预算内。
     fits_within_budget: bool
+
+    # 规划后需要常驻或临时驻留在 GPU hot tier 的参数字节数。
     planned_gpu_hot_bytes: int
+
+    # 规划后放入 CPU hot tier 的参数字节数，通常用于承接 GPU 放不下但仍需快速访问的部分。
     planned_cpu_hot_bytes: int
+
+    # 规划后落到 NVMe cold tier 的参数字节数，通常代表最低频或冷启动可延迟加载的部分。
     planned_nvme_cold_bytes: int
 
     # 返回规划后 GPU hot 占用的 GiB 值。

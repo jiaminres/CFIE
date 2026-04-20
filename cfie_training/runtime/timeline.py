@@ -53,6 +53,15 @@ class MicroBatchPlanner:
             micro_batch_samples = min(max_samples, remaining_samples)
             # 计算当前 micro-batch 在原 batch 中的结束位置。
             batch_end = batch_start + micro_batch_samples
+            # 有目标 mask 时按真实 loss token 计数；否则保持旧的形状计数口径。
+            if batch.target_attention_mask_rows:
+                loss_token_count = sum(
+                    int(value)
+                    for row in batch.target_attention_mask_rows[batch_start:batch_end]
+                    for value in row
+                )
+            else:
+                loss_token_count = micro_batch_samples * batch.tokens_per_sample
             # 用原 batch 的局部切片构造当前 micro-batch。
             micro_batches.append(
                 BatchShape(
@@ -61,9 +70,15 @@ class MicroBatchPlanner:
                     source_kind=batch.source_kind,
                     dataset_name=batch.dataset_name,
                     sample_indices=batch.sample_indices[batch_start:batch_end],
-                    loss_token_count=micro_batch_samples * batch.tokens_per_sample,
+                    loss_token_count=loss_token_count,
                     token_rows=batch.token_rows[batch_start:batch_end],
                     target_rows=batch.target_rows[batch_start:batch_end],
+                    attention_mask_rows=(
+                        batch.attention_mask_rows[batch_start:batch_end]
+                    ),
+                    target_attention_mask_rows=(
+                        batch.target_attention_mask_rows[batch_start:batch_end]
+                    ),
                 )
             )
             # 扣减已经分配出去的样本数。

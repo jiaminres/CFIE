@@ -81,8 +81,6 @@ def _resolve_manifest_path(bundle_path: str | Path) -> Path:
 class PredictorRuntimeSchema:
     schema_kind: str
     profile_name: str
-    teacher_source: str
-    summary_source: str
     input_summary_dim: int
     predictor_hidden_dim: int
     window_layers: int
@@ -103,8 +101,6 @@ class PredictorRuntimeSchema:
             )
         # 关键来源字段必须非空，便于后续做跨文件一致性校验。
         _require_non_empty_string("profile_name", self.profile_name)
-        _require_non_empty_string("teacher_source", self.teacher_source)
-        _require_non_empty_string("summary_source", self.summary_source)
         _require_non_empty_string("selection_mode", self.selection_mode)
         _require_non_empty_string("online_expert_source", self.online_expert_source)
         # 维度与窗口字段都必须为正。
@@ -139,8 +135,6 @@ class PredictorRuntimeSchema:
         return {
             "schema_kind": self.schema_kind,
             "profile_name": self.profile_name,
-            "teacher_source": self.teacher_source,
-            "summary_source": self.summary_source,
             "input_summary_dim": self.input_summary_dim,
             "predictor_hidden_dim": self.predictor_hidden_dim,
             "window_layers": self.window_layers,
@@ -160,8 +154,6 @@ class PredictorRuntimeSchema:
         schema = cls(
             schema_kind=str(payload.get("schema_kind", _SCHEMA_KIND)),
             profile_name=str(payload["profile_name"]),
-            teacher_source=str(payload["teacher_source"]),
-            summary_source=str(payload["summary_source"]),
             input_summary_dim=int(payload["input_summary_dim"]),
             predictor_hidden_dim=int(payload["predictor_hidden_dim"]),
             window_layers=int(payload["window_layers"]),
@@ -195,8 +187,6 @@ class PredictorRuntimeSchema:
 class PredictorMetricsSummary:
     metrics_kind: str
     profile_name: str
-    teacher_source: str
-    summary_source: str
     example_count: int
     epochs: int
     final_mean_loss: float
@@ -212,8 +202,6 @@ class PredictorMetricsSummary:
             )
         # 关键来源字段必须可用于跨文件对齐。
         _require_non_empty_string("profile_name", self.profile_name)
-        _require_non_empty_string("teacher_source", self.teacher_source)
-        _require_non_empty_string("summary_source", self.summary_source)
         # 样本数与 epoch 数允许为 0，但不能为负。
         _require_int("example_count", self.example_count, allow_zero=True)
         _require_int("epochs", self.epochs, allow_zero=True)
@@ -237,8 +225,6 @@ class PredictorMetricsSummary:
         return {
             "metrics_kind": self.metrics_kind,
             "profile_name": self.profile_name,
-            "teacher_source": self.teacher_source,
-            "summary_source": self.summary_source,
             "example_count": self.example_count,
             "epochs": self.epochs,
             "final_mean_loss": self.final_mean_loss,
@@ -257,8 +243,6 @@ class PredictorMetricsSummary:
         summary = cls(
             metrics_kind=str(payload.get("metrics_kind", _METRICS_KIND)),
             profile_name=str(payload["profile_name"]),
-            teacher_source=str(payload["teacher_source"]),
-            summary_source=str(payload["summary_source"]),
             example_count=int(payload["example_count"]),
             epochs=int(payload["epochs"]),
             final_mean_loss=float(payload["final_mean_loss"]),
@@ -285,8 +269,6 @@ class PredictorMetricsSummary:
 class PredictorDeploymentManifest:
     bundle_kind: str
     profile_name: str
-    teacher_source: str
-    summary_source: str
     source_checkpoint: str
     weights_kind: str
     weights_format: str
@@ -305,8 +287,6 @@ class PredictorDeploymentManifest:
             )
         # 顶层来源字段必须非空。
         _require_non_empty_string("profile_name", self.profile_name)
-        _require_non_empty_string("teacher_source", self.teacher_source)
-        _require_non_empty_string("summary_source", self.summary_source)
         _require_non_empty_string("source_checkpoint", self.source_checkpoint)
         # 每个子文件及其语义标签都必须完整。
         if self.weights_kind != _WEIGHTS_KIND:
@@ -337,8 +317,6 @@ class PredictorDeploymentManifest:
         return {
             "bundle_kind": self.bundle_kind,
             "profile_name": self.profile_name,
-            "teacher_source": self.teacher_source,
-            "summary_source": self.summary_source,
             "source_checkpoint": self.source_checkpoint,
             "weights_kind": self.weights_kind,
             "weights_format": self.weights_format,
@@ -356,8 +334,6 @@ class PredictorDeploymentManifest:
         manifest = cls(
             bundle_kind=str(payload.get("bundle_kind", _BUNDLE_KIND)),
             profile_name=str(payload["profile_name"]),
-            teacher_source=str(payload["teacher_source"]),
-            summary_source=str(payload["summary_source"]),
             source_checkpoint=str(payload["source_checkpoint"]),
             weights_kind=str(payload["weights_kind"]),
             weights_format=str(payload["weights_format"]),
@@ -593,14 +569,6 @@ def load_predictor_bundle(
         raise ValueError("predictor bundle profile_name mismatch between manifest and schema")
     if metrics.profile_name != manifest.profile_name:
         raise ValueError("predictor bundle profile_name mismatch between manifest and metrics")
-    if schema.teacher_source != manifest.teacher_source:
-        raise ValueError("predictor bundle teacher_source mismatch between manifest and schema")
-    if metrics.teacher_source != manifest.teacher_source:
-        raise ValueError("predictor bundle teacher_source mismatch between manifest and metrics")
-    if schema.summary_source != manifest.summary_source:
-        raise ValueError("predictor bundle summary_source mismatch between manifest and schema")
-    if metrics.summary_source != manifest.summary_source:
-        raise ValueError("predictor bundle summary_source mismatch between manifest and metrics")
 
     # -----------------
     # 最后读取权重载荷并返回完整 bundle。

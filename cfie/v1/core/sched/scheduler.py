@@ -29,6 +29,8 @@ from cfie.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from cfie.logger import init_logger
 from cfie.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,
+    get_routed_experts_attention_group_index,
+    get_routed_experts_buffer_num_slots,
 )
 from cfie.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from cfie.multimodal.encoder_budget import MultiModalBudget
@@ -258,26 +260,12 @@ class Scheduler(SchedulerInterface):
             assert len(kv_cache_config.kv_cache_groups) > 0, (
                 "enable_return_routed_experts requires at least one kv cache group"
             )
-            # Find the attention group for routed experts indexing.
-            self.routed_experts_attn_gid = 0
-            for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-                if isinstance(group.kv_cache_spec, AttentionSpec):
-                    self.routed_experts_attn_gid = gid
-                    break
-            min_block_size = min(
-                [
-                    group.kv_cache_spec.block_size
-                    for group in kv_cache_config.kv_cache_groups
-                ]
+            self.routed_experts_attn_gid = get_routed_experts_attention_group_index(
+                kv_cache_config
             )
-            num_groups = len(kv_cache_config.kv_cache_groups)
-            self.max_num_kv_tokens = (
-                kv_cache_config.num_blocks // num_groups
-            ) * min_block_size
-            dcp_size = self.cfie_config.parallel_config.decode_context_parallel_size
-            pcp_size = self.cfie_config.parallel_config.prefill_context_parallel_size
-            if pcp_size * dcp_size > 1:
-                self.max_num_kv_tokens *= pcp_size * dcp_size
+            self.max_num_kv_tokens = get_routed_experts_buffer_num_slots(
+                kv_cache_config
+            )
 
             self.routed_experts_reader.attach_buffer(
                 max_num_kv_tokens=self.max_num_kv_tokens,

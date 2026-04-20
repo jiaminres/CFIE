@@ -55,6 +55,8 @@ from cfie.model_executor.layers.attention import Attention, MLAAttention
 from cfie.model_executor.layers.attention_layer_base import AttentionLayerBase
 from cfie.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    get_routed_experts_attention_group_index,
+    get_routed_experts_buffer_num_slots,
 )
 from cfie.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
@@ -67,6 +69,7 @@ from cfie.model_executor.model_loader.reload import (
 )
 from cfie.model_executor.models.interfaces import (
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsMRoPE,
     SupportsMultiModal,
     SupportsXDRoPE,
@@ -495,6 +498,15 @@ class GPUModelRunner(
         self.late_interaction_runner = LateInteractionRunner()
 
         self.use_aux_hidden_state_outputs = False
+        # ----------------- predictor trace 捕获状态 -----------------
+        # predictor 训练轨迹需要在真实推理前向里抓取每层 hidden states。
+        # 这里维护两级缓存：
+        # 1. in-progress：用于 chunked prefill 场景下按块累积整段 prompt 的 hidden states。
+        # 2. ready：请求完成捕获后等待上层通过 RPC 取走。
+        self.predictor_capture_enabled = False
+        self.predictor_capture_layer_ids: tuple[int, ...] = ()
+        self._in_progress_predictor_hidden_states: dict[str, list[torch.Tensor]] = {}
+        self._ready_predictor_hidden_states: dict[str, tuple[torch.Tensor, ...]] = {}
         # ----------------- speculative drafter 初始化入口 -----------------
         # drafter 统一在最后一个 PP rank 上构造。
         # mtp 不走 draft_model 分支，而是会落到 use_eagle() 分支，由 EagleProposer 承接。
@@ -1093,6 +1105,7 @@ class GPUModelRunner(
 
             req_state = CachedRequestState(
                 req_id=req_id,
+                external_req_id=new_req_data.external_req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
                 mm_features=new_req_data.mm_features,
@@ -1358,6 +1371,7 @@ class GPUModelRunner(
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features
         req_state.prompt_embeds = new_req_data.prompt_embeds
+        req_state.external_req_id = new_req_data.external_req_id
         req_state.sampling_params = new_req_data.sampling_params
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
@@ -1377,7 +1391,7 @@ class GPUModelRunner(
         return req_state
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
-        model = self.get_model()
+        model = self._resolve_predictor_capture_model()
         assert supports_mrope(model), "M-RoPE support is not implemented."
         assert req_state.prompt_token_ids is not None, (
             "M-RoPE requires prompt_token_ids to be available."
@@ -1392,7 +1406,7 @@ class GPUModelRunner(
         )
 
     def _init_xdrope_positions(self, req_state: CachedRequestState):
-        model = self.get_model()
+        model = self._resolve_predictor_capture_model()
         xdrope_model = cast(SupportsXDRoPE, model)
         assert req_state.prompt_token_ids is not None, (
             "XD-RoPE requires prompt_token_ids to be available."
@@ -2743,6 +2757,106 @@ class GPUModelRunner(
             return self.model.unwrap()
         return self.model
 
+    # ------------------------------- 解析 predictor capture 应写入的模型对象 -------------------------------
+    def _resolve_predictor_capture_model(self):
+        # predictor 训练侧复用推理引擎时，外层模型可能是多模态封装或 wrapper；
+        # 真正实现 aux hidden-state 开关的，往往是更内层的文本 language model。
+        # 这里递归下钻常见包装层，并优先返回“显式 override 了
+        # set_aux_hidden_state_layers”的真实实现对象，避免误落到
+        # SupportsEagle3 协议里的默认实现。
+        root_model = self.get_model()
+        queue = [root_model]
+        visited_ids: set[int] = set()
+        fallback_model = root_model
+
+        while queue:
+            model = queue.pop(0)
+            model_id = id(model)
+            if model_id in visited_ids:
+                continue
+            visited_ids.add(model_id)
+
+            if supports_eagle3(model):
+                fallback_model = model
+                set_aux_fn = getattr(type(model), "set_aux_hidden_state_layers", None)
+                if (
+                    callable(set_aux_fn)
+                    and set_aux_fn is not SupportsEagle3.set_aux_hidden_state_layers
+                ):
+                    return model
+
+            for attr_name in ("language_model", "model", "get_language_model"):
+                nested_ref = getattr(model, attr_name, None)
+                nested_model = (
+                    nested_ref()
+                    if attr_name.startswith("get_") and callable(nested_ref)
+                    else nested_ref
+                )
+                if nested_model is not None:
+                    queue.append(nested_model)
+
+        return fallback_model
+
+    # ------------------------------- 打开 predictor hidden-state 捕获 -------------------------------
+    def enable_predictor_capture(self, layer_ids: tuple[int, ...]) -> None:
+        # predictor trace 只依赖目标模型真实前向，因此这里直接在已加载模型上打开
+        # aux hidden state 输出，不再另起一套 HF teacher 模型。
+        model = self._resolve_predictor_capture_model()
+        if not supports_eagle3(model):
+            raise RuntimeError(
+                "predictor capture requires a model that supports auxiliary "
+                "hidden-state outputs"
+            )
+
+        # 记录当前捕获层集合，并清空历史缓存，避免跨批次串数据。
+        self.predictor_capture_enabled = True
+        self.predictor_capture_layer_ids = layer_ids
+        self._in_progress_predictor_hidden_states.clear()
+        self._ready_predictor_hidden_states.clear()
+
+        # 打开 model runner 侧的 aux 输出开关，并把需要导出的层号写回模型。
+        self.use_aux_hidden_state_outputs = True
+        model.set_aux_hidden_state_layers(layer_ids)
+
+    # ------------------------------- 关闭 predictor hidden-state 捕获 -------------------------------
+    def disable_predictor_capture(self) -> None:
+        self.predictor_capture_enabled = False
+        self.predictor_capture_layer_ids = ()
+        self._in_progress_predictor_hidden_states.clear()
+        self._ready_predictor_hidden_states.clear()
+        self.use_aux_hidden_state_outputs = False
+        model = self._resolve_predictor_capture_model()
+        if supports_eagle3(model):
+            model.set_aux_hidden_state_layers(())
+
+    # ------------------------------- 取走已完成的 predictor hidden states -------------------------------
+    def take_predictor_hidden_states(
+        self,
+        request_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, tuple[torch.Tensor, ...]]:
+        if request_ids is None:
+            request_ids = tuple(self._ready_predictor_hidden_states.keys())
+
+        captured: dict[str, tuple[torch.Tensor, ...]] = {}
+        for request_id in request_ids:
+            resolved_request_id = request_id
+            if resolved_request_id not in self._ready_predictor_hidden_states:
+                matched_request_ids = [
+                    candidate_request_id
+                    for candidate_request_id in self._ready_predictor_hidden_states
+                    if candidate_request_id == request_id
+                    or candidate_request_id.startswith(f"{request_id}-")
+                ]
+                if len(matched_request_ids) == 1:
+                    resolved_request_id = matched_request_ids[0]
+
+            hidden_states = self._ready_predictor_hidden_states.pop(
+                resolved_request_id, None
+            )
+            if hidden_states is not None:
+                captured[str(request_id)] = hidden_states
+        return captured
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -3102,6 +3216,7 @@ class GPUModelRunner(
         sampler_output: SamplerOutput,
         logits: torch.Tensor | None,
         hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
         num_scheduled_tokens: int,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> tuple[
@@ -3210,6 +3325,10 @@ class GPUModelRunner(
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
+            scheduler_output.num_scheduled_tokens,
+        )
+        self._capture_predictor_hidden_states(
+            aux_hidden_states,
             scheduler_output.num_scheduled_tokens,
         )
 
@@ -4020,6 +4139,7 @@ class GPUModelRunner(
                 sampler_output,
                 logits,
                 hidden_states,
+                aux_hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
@@ -4867,6 +4987,78 @@ class GPUModelRunner(
             self._sync_device()
 
         return prompt_logprobs_dict
+
+    def _capture_predictor_hidden_states(
+        self,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_scheduled_tokens: dict[str, int],
+    ) -> None:
+        # predictor trace 未开启时直接跳过，不给常规推理引入额外开销。
+        if not self.predictor_capture_enabled:
+            return
+
+        if not self.use_aux_hidden_state_outputs or aux_hidden_states is None:
+            raise ValueError(
+                "predictor capture requires aux_hidden_states to be enabled"
+            )
+
+        # chunked prefill 下同一请求可能分多轮把 prompt 跑完；
+        # 这里按请求逐块拼回完整 prompt 的每层 hidden states。
+        completed_prefill_reqs: list[str] = []
+        for req_id in self.input_batch.req_ids:
+            num_tokens = num_scheduled_tokens.get(req_id)
+            if num_tokens is None:
+                continue
+
+            request = self.requests[req_id]
+            capture_req_id = str(getattr(request, "external_req_id", None) or req_id)
+            if request.prompt_token_ids is None:
+                continue
+
+            num_prompt_tokens = len(request.prompt_token_ids)
+            start_idx = request.num_computed_tokens
+            num_remaining_prompt_tokens = num_prompt_tokens - start_idx
+            if num_remaining_prompt_tokens <= 0:
+                continue
+
+            # 若本轮还带上了 decode token，只截取属于 prompt 的那一段。
+            num_capture_tokens = min(num_tokens, num_remaining_prompt_tokens)
+            if num_capture_tokens <= 0:
+                continue
+
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            offset = int(self.query_start_loc.np[req_idx].item())
+
+            buffered_layers = self._in_progress_predictor_hidden_states.get(capture_req_id)
+            if buffered_layers is None:
+                buffered_layers = [
+                    torch.empty(
+                        (num_prompt_tokens, layer_hidden_states.shape[-1]),
+                        dtype=torch.float32,
+                        device="cpu",
+                    )
+                    for layer_hidden_states in aux_hidden_states
+                ]
+                self._in_progress_predictor_hidden_states[capture_req_id] = buffered_layers
+
+            # 逐层复制当前 chunk 对应的 hidden states 到 CPU 拼接缓冲区。
+            chunk_slice = slice(start_idx, start_idx + num_capture_tokens)
+            for layer_index, layer_hidden_states in enumerate(aux_hidden_states):
+                buffered_layers[layer_index][chunk_slice].copy_(
+                    layer_hidden_states[offset : offset + num_capture_tokens].to(
+                        device="cpu",
+                        dtype=torch.float32,
+                    )
+                )
+
+            if start_idx + num_capture_tokens >= num_prompt_tokens:
+                self._ready_predictor_hidden_states[capture_req_id] = tuple(
+                    buffered_layers
+                )
+                completed_prefill_reqs.append(capture_req_id)
+
+        for req_id in completed_prefill_reqs:
+            self._in_progress_predictor_hidden_states.pop(req_id, None)
 
     def _get_nans_in_logits(
         self,
@@ -6681,21 +6873,12 @@ class GPUModelRunner(
             self.model_config.enable_return_routed_experts,
         )
         routed_experts_capturer = RoutedExpertsCapturer.create()
-        self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
-        min_block_size = min(
-            [
-                group.kv_cache_spec.block_size
-                for group in self.kv_cache_config.kv_cache_groups
-            ]
+        self.routed_experts_attn_gid = get_routed_experts_attention_group_index(
+            self.kv_cache_config
         )
-        num_groups = len(self.kv_cache_config.kv_cache_groups)
-        self.max_num_kv_tokens = (
-            self.kv_cache_config.num_blocks // num_groups
-        ) * min_block_size
-        dcp_size = self.cfie_config.parallel_config.decode_context_parallel_size
-        pcp_size = self.cfie_config.parallel_config.prefill_context_parallel_size
-        if pcp_size * dcp_size > 1:
-            self.max_num_kv_tokens *= pcp_size * dcp_size
+        self.max_num_kv_tokens = get_routed_experts_buffer_num_slots(
+            self.kv_cache_config
+        )
 
         routed_experts_capturer.init_buffer(
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,

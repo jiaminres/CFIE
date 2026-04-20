@@ -8,7 +8,6 @@ from itertools import islice
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from cfie.config.cfie import CfieConfig
@@ -53,9 +52,6 @@ from .utils import extract_layer_index
 from .utils import WeightsMapper
 
 PREDICTOR_PENDING_LAYER_PLANS_KEY = "__cfie_predictor_pending_layer_plans__"
-SUPPORTED_PREDICTOR_SUMMARY_SOURCES = frozenset(
-    {"representative_runtime", "synthetic_formula", "forward_hidden_state"}
-)
 SUPPORTED_PREDICTOR_SELECTION_MODES = frozenset({"masked_candidate_topk"})
 SUPPORTED_PREDICTOR_ONLINE_EXPERT_SOURCES = frozenset(
     {"cpu_hot_only", "cpu_or_nvme"}
@@ -83,11 +79,6 @@ class PredictorRuntimeState:
         return self.bundle.schema
 
     def validate_runtime_support(self) -> "PredictorRuntimeState":
-        if self.schema.summary_source not in SUPPORTED_PREDICTOR_SUMMARY_SOURCES:
-            raise ValueError(
-                "unsupported predictor summary_source for inference runtime: "
-                f"{self.schema.summary_source!r}"
-            )
         if self.schema.selection_mode not in SUPPORTED_PREDICTOR_SELECTION_MODES:
             raise ValueError(
                 "unsupported predictor selection_mode for inference runtime: "
@@ -482,65 +473,6 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
         )
         self.predictor_forward_state.restore_pending_layer_plans(restored_plans)
 
-    @staticmethod
-    def _resize_summary_vector(
-            features: torch.Tensor,
-            *,
-            size: int,
-    ) -> torch.Tensor:
-        if size < 1:
-            raise ValueError("predictor summary size must be >= 1")
-        if features.numel() == size:
-            return features
-        pooled = F.adaptive_avg_pool1d(
-            features.reshape(1, 1, -1).to(dtype=torch.float32),
-            size,
-        )
-        return pooled.reshape(size)
-
-    @staticmethod
-    def _position_signal(
-            positions: torch.Tensor,
-            *,
-            num_tokens: int,
-    ) -> torch.Tensor:
-        if num_tokens < 1:
-            raise ValueError("predictor summary requires at least one token")
-        position_source = positions[..., :num_tokens].to(dtype=torch.float32)
-        if position_source.ndim == 1:
-            return position_source
-        return position_source.reshape(-1, num_tokens).mean(dim=0)
-
-    def _future_window_attention_counts(
-            self,
-            *,
-            insertion_layer_index: int,
-    ) -> tuple[float, float]:
-        layer_types = getattr(self.config, "layer_types", None)
-        if not layer_types:
-            return 0.0, 0.0
-        schema = self.predictor_runtime.schema
-        future_window_start = insertion_layer_index + 1
-        future_window_end = min(
-            self.config.num_hidden_layers,
-            future_window_start + int(schema.window_layers),
-        )
-        future_layer_types = layer_types[future_window_start:future_window_end]
-        return (
-            float(
-                sum(
-                    1 for layer_type in future_layer_types
-                    if layer_type == "full_attention"
-                )
-            ),
-            float(
-                sum(
-                    1 for layer_type in future_layer_types
-                    if layer_type == "linear_attention"
-                )
-            ),
-        )
-
     def _predictor_decoder_layer(
             self,
             *,
@@ -584,171 +516,6 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
                 logical_replica_count,
             ),
             "eplb_logical_replica_count",
-        )
-
-    def _current_layer_online_expert_summary(
-            self,
-            *,
-            insertion_layer_index: int,
-    ) -> tuple[float, ...]:
-        online_expert_state, online_state_source = (
-            self._resolve_online_expert_state(
-                insertion_layer_index=insertion_layer_index
-            )
-        )
-        if online_expert_state is None:
-            return (0.0,) * 23
-        return (
-            float(online_state_source == "explicit_runtime_state"),
-            float(online_state_source == "observed_runtime_state"),
-            float(online_state_source == "eplb_logical_replica_count"),
-            *online_expert_state.summary_stats(),
-        )
-
-    def _build_representative_runtime_hidden_summary(
-            self,
-            *,
-            hidden_states: torch.Tensor,
-            residual: torch.Tensor | None,
-            positions: torch.Tensor,
-            insertion_layer_index: int,
-    ) -> torch.Tensor:
-        assert self.predictor_runtime is not None
-        summary_source = (
-            hidden_states + residual if residual is not None else hidden_states
-        ).to(dtype=torch.float32)
-        num_tokens = int(summary_source.shape[0])
-        position_signal = self._position_signal(positions, num_tokens=num_tokens)
-        full_attention_count, linear_attention_count = (
-            self._future_window_attention_counts(
-                insertion_layer_index=insertion_layer_index,
-            )
-        )
-        online_expert_summary = self._current_layer_online_expert_summary(
-            insertion_layer_index=insertion_layer_index,
-        )
-        layer_offset = insertion_layer_index - self.start_layer
-        current_layer_type = None
-        layer_types = getattr(self.config, "layer_types", None)
-        if layer_types and 0 <= insertion_layer_index < len(layer_types):
-            current_layer_type = layer_types[insertion_layer_index]
-
-        pooled_features = torch.cat(
-            (
-                summary_source.mean(dim=0),
-                summary_source.std(dim=0, unbiased=False),
-                summary_source[0],
-                summary_source[-1],
-                torch.tensor(
-                    (
-                        float(num_tokens),
-                        float(summary_source.shape[-1]),
-                        float(self.start_layer),
-                        float(self.end_layer),
-                        float(insertion_layer_index),
-                        float(layer_offset),
-                        float(current_layer_type == "full_attention"),
-                        float(current_layer_type == "linear_attention"),
-                        full_attention_count,
-                        linear_attention_count,
-                        *online_expert_summary,
-                        float(self.predictor_runtime.schema.window_layers),
-                        float(self.predictor_runtime.schema.stride_layers),
-                        float(
-                            self.predictor_runtime.schema.candidate_experts_per_layer
-                        ),
-                        float(
-                            self.predictor_runtime.schema.executed_experts_per_layer
-                        ),
-                        float(position_signal.mean().item()),
-                        float(position_signal.std(unbiased=False).item()),
-                        float(position_signal[0].item()),
-                        float(position_signal[-1].item()),
-                    ),
-                    dtype=torch.float32,
-                    device=summary_source.device,
-                ),
-            ),
-            dim=0,
-        )
-        summary = self._resize_summary_vector(
-            pooled_features,
-            size=self.predictor_runtime.schema.input_summary_dim,
-        )
-        summary_feature_ids = torch.arange(
-            1,
-            self.predictor_runtime.schema.input_summary_dim + 1,
-            dtype=torch.float32,
-            device=summary_source.device,
-        )
-        summary = 0.85 * summary + 0.15 * torch.sin(
-            summary_feature_ids * 0.17
-            + 0.09 * float(num_tokens)
-            + 0.05 * float(insertion_layer_index + 1)
-        )
-        return torch.tanh(summary / 2.5)
-
-    def _build_legacy_hidden_summary(
-            self,
-            *,
-            hidden_states: torch.Tensor,
-            residual: torch.Tensor | None,
-            insertion_layer_index: int,
-    ) -> torch.Tensor:
-        assert self.predictor_runtime is not None
-        summary_source = (
-            hidden_states + residual if residual is not None else hidden_states
-        ).to(dtype=torch.float32)
-        num_tokens = int(summary_source.shape[0])
-        token_norms = torch.linalg.vector_norm(summary_source, dim=-1)
-        pooled = torch.cat(
-            (
-                summary_source.mean(dim=0),
-                summary_source.std(dim=0, unbiased=False),
-                summary_source[0],
-                summary_source[-1],
-                torch.tensor(
-                    (
-                        float(num_tokens),
-                        float(summary_source.shape[-1]),
-                        float(insertion_layer_index),
-                        float(self.start_layer),
-                        float(self.end_layer),
-                        float(token_norms.mean().item()),
-                        float(token_norms.std(unbiased=False).item()),
-                        float(token_norms.max().item()),
-                    ),
-                    dtype=torch.float32,
-                    device=summary_source.device,
-                ),
-            ),
-            dim=0,
-        )
-        return self._resize_summary_vector(
-            pooled,
-            size=self.predictor_runtime.schema.input_summary_dim,
-        )
-
-    def _build_hidden_summary(
-            self,
-            *,
-            hidden_states: torch.Tensor,
-            residual: torch.Tensor | None,
-            positions: torch.Tensor,
-            insertion_layer_index: int,
-    ) -> torch.Tensor:
-        assert self.predictor_runtime is not None
-        if self.predictor_runtime.schema.summary_source == "representative_runtime":
-            return self._build_representative_runtime_hidden_summary(
-                hidden_states=hidden_states,
-                residual=residual,
-                positions=positions,
-                insertion_layer_index=insertion_layer_index,
-            )
-        return self._build_legacy_hidden_summary(
-            hidden_states=hidden_states,
-            residual=residual,
-            insertion_layer_index=insertion_layer_index,
         )
 
     def reset_predictor_forward_state(self) -> None:

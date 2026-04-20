@@ -229,10 +229,27 @@ class ExpertRotationScheduler:
         self,
         batch: BatchShape,
     ) -> tuple[float, float, float, float]:
-        # 显式 token 行存在时，直接把所有 token 展平成一维张量。
+        # 显式 token 行存在时，按 mask 只统计真实 token，避免 padding 改写 probe 特征。
         if batch.has_token_rows:
+            if batch.attention_mask_rows:
+                flattened_tokens = [
+                    token_id
+                    for row, mask_row in zip(
+                        batch.token_rows,
+                        batch.attention_mask_rows,
+                        strict=True,
+                    )
+                    for token_id, keep in zip(row, mask_row, strict=True)
+                    if keep
+                ]
+            else:
+                flattened_tokens = [
+                    token_id for row in batch.token_rows for token_id in row
+                ]
+            if not flattened_tokens:
+                flattened_tokens = [0]
             token_values = torch.tensor(
-                [token_id for row in batch.token_rows for token_id in row],
+                flattened_tokens,
                 dtype=torch.float32,
                 device="cpu",
             )

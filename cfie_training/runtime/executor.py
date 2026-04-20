@@ -199,18 +199,21 @@ class RepresentativeBucketExecutor:
         return self._bind_weight_slice(stabilized, binding=binding)
 
     def _bounded_sequence_length(self, batch: BatchShape) -> int:
+        # 有 mask 时优先使用真实 token 数；否则沿用形状 token 数作为估算规模。
+        effective_tokens = max(1, batch.valid_token_count)
+
         # full_bucket logical CUDA 模式下，优先用真实 token 规模，但受 micro-batch 和位置编码上限约束。
         if self._full_bucket_logical_cuda_enabled():
             return max(
                 2,
                 min(
-                    batch.total_tokens,
+                    effective_tokens,
                     self.config.execution.max_tokens_per_micro_batch,
                     self.config.model_spec.max_position_embeddings,
                 ),
             )
         # 轻量代表性模式下，把序列长度压到更小范围以控制计算规模。
-        return max(2, min(8, max(batch.samples * 2, min(batch.total_tokens, 8))))
+        return max(2, min(8, max(batch.samples * 2, min(effective_tokens, 8))))
 
     def _reset_quantized_bindings(self) -> None:
         # 每次 bucket 执行前都清空上一轮残留的 packed 绑定缓存。
@@ -862,10 +865,11 @@ class RepresentativeBucketExecutor:
         )
         # 基础 hidden 由 base 与 modulation 叠加而成。
         hidden_states = base + modulation
-        # 若 batch 自带显式 token 行，则把 token id 注入 hidden 模式。
+        # 若 batch 自带显式 token 行，则把真实 token id 注入 hidden 模式。
         if batch.has_token_rows:
             token_values = self._sequence_token_values(
                 batch.token_rows,
+                mask_rows=batch.attention_mask_rows,
                 sequence_length=sequence_length,
                 device=device,
             )
@@ -888,18 +892,28 @@ class RepresentativeBucketExecutor:
         self,
         rows: tuple[tuple[int, ...], ...],
         *,
+        mask_rows: tuple[tuple[int, ...], ...] = (),
         sequence_length: int,
         device: torch.device,
     ) -> torch.Tensor:
-        # 先把二维 token_rows 展平成一维 token 序列。
-        flattened = [token_id for row in rows for token_id in row]
+        # ------------------------------- 展平真实 token 序列 -------------------------------
+        # 有 mask 时只保留真实 token，尾部 padding 不参与代表性特征构造。
+        if mask_rows:
+            flattened = [
+                token_id
+                for row, mask_row in zip(rows, mask_rows, strict=True)
+                for token_id, keep in zip(row, mask_row, strict=True)
+                if keep
+            ]
+        else:
+            # 没有 mask 时保持旧语义：所有 token_rows 位置都视为有效。
+            flattened = [token_id for row in rows for token_id in row]
         # 没有显式 token 时，退回简单的位置序列。
         if not flattened:
             return torch.arange(sequence_length, dtype=torch.float32, device=device)
-        # token 序列不足时循环重复到目标长度。
+        # token 序列不足时，用最后一个真实 token 延展到目标长度，避免复制整段上下文制造周期模式。
         if len(flattened) < sequence_length:
-            repeats = (sequence_length + len(flattened) - 1) // len(flattened)
-            flattened = (flattened * repeats)[:sequence_length]
+            flattened = flattened + [flattened[-1]] * (sequence_length - len(flattened))
         else:
             # token 序列过长时只保留前 sequence_length 个。
             flattened = flattened[:sequence_length]
@@ -926,6 +940,7 @@ class RepresentativeBucketExecutor:
         # 把目标 token 行映射成一维 token 序列。
         target_values = self._sequence_token_values(
             batch.target_rows,
+            mask_rows=batch.target_attention_mask_rows,
             sequence_length=sequence_length,
             device=device,
         )
@@ -987,6 +1002,7 @@ class RepresentativeBucketExecutor:
         # 再取出序列 token 值。
         token_values = self._sequence_token_values(
             batch.token_rows,
+            mask_rows=batch.attention_mask_rows,
             sequence_length=sequence_length,
             device=summary_device,
         )

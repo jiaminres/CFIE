@@ -36,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ------------------------------- 注册 predictor trace、训练、检查、评估与导出命令 -------------------------------
     # 注册 predictor 教师轨迹采样命令，用于构造 predictor 训练所需的教师轨迹样本。
+    # ------------------------------- 注册 predictor 子命令族 -------------------------------
+    #
+    # predictor-trace -> predictor-train -> predictor-eval -> predictor-export。
+    # predictor-inspect 作为 checkpoint 元信息检查辅助命令。
+    #
+    # ------------------------------- 注册 predictor-trace 子命令 -------------------------------
     predictor_trace_parser = subparsers.add_parser(
         "predictor-trace",
         help="Build teacher-trace samples for predictor training.",
@@ -120,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # 注册 predictor 训练命令，用于基于教师轨迹训练受限 predictor 模型。
+    # ------------------------------- 注册 predictor-train 子命令 -------------------------------
     predictor_train_parser = subparsers.add_parser(
         "predictor-train",
         help="Train the bounded predictor model on teacher traces.",
@@ -239,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # 注册 predictor checkpoint 元信息检查命令，用于查看 checkpoint 中保存的基础元数据。
+    # ------------------------------- 注册 predictor-inspect 辅助子命令 -------------------------------
     predictor_inspect_parser = subparsers.add_parser(
         "predictor-inspect",
         help="Inspect predictor checkpoint metadata.",
@@ -258,6 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # 注册 predictor 评估命令，用于在教师轨迹上评估指定 predictor checkpoint。
+    # ------------------------------- 注册 predictor-eval 子命令 -------------------------------
     predictor_eval_parser = subparsers.add_parser(
         "predictor-eval",
         help="Evaluate a predictor checkpoint on teacher traces.",
@@ -349,6 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # 注册 predictor bundle 导出命令，用于将 predictor checkpoint 导出为部署包。
+    # ------------------------------- 注册 predictor-export 子命令 -------------------------------
     predictor_export_parser = subparsers.add_parser(
         "predictor-export",
         help="Export a predictor checkpoint as a deployment bundle.",
@@ -628,18 +638,6 @@ def _load_config(args: argparse.Namespace) -> TrainingProjectConfig:
         # 基于训练档位名称构造内置训练配置对象。
         config = build_profile_config(profile_name)
 
-    # ------------------------------- 处理命令行对 development model 的显式覆盖 -------------------------------
-    # 当命令行参数中显式提供开发阶段模型名称时，用该值覆盖配置中的 development_model。
-    if getattr(args, "model", None):
-        # 将命令行指定的开发阶段模型名称写回配置对象。
-        config.model_targets.development_model = args.model
-
-    # ------------------------------- 处理命令行对 target model 的显式覆盖 -------------------------------
-    # 当命令行参数中显式提供目标模型名称时，用该值覆盖配置中的 target_model。
-    if getattr(args, "target_model", None):
-        # 将命令行指定的目标模型名称写回配置对象。
-        config.model_targets.target_model = args.target_model
-
     # ------------------------------- 对最终配置执行统一校验并返回 -------------------------------
     # 对组合完成的训练配置执行合法性校验，并返回校验后的配置对象。
     return config.validate()
@@ -749,9 +747,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # 输出 checkpoint 的基础身份信息与来源信息。
             print(
                 f"checkpoint_kind={metadata.checkpoint_kind} "
-                f"profile={metadata.profile_name} "
-                f"teacher_source={metadata.teacher_source} "
-                f"summary_source={metadata.summary_source}"
+                f"profile={metadata.profile_name}"
             )
             # 输出模型结构相关元信息。
             print(
@@ -794,8 +790,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             # 输出 bundle 中各关键文件的路径与来源信息。
             print(
-                f"teacher_source={manifest.teacher_source} "
-                f"summary_source={manifest.summary_source} "
                 f"weights={manifest.weights_file} "
                 f"schema={manifest.schema_file} "
                 f"metrics={manifest.metrics_file}"
@@ -846,8 +840,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             # 输出教师来源、摘要来源以及专家窗口等关键信息。
             print(
-                f"teacher_source={dataset.teacher_source} "
-                f"summary_source={dataset.summary_source} "
                 f"window={dataset.window_layers} "
                 f"candidate={dataset.candidate_experts_per_layer} "
                 f"executed={dataset.executed_experts_per_layer}"
@@ -935,10 +927,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 当用户指定 schema 输出路径时，导出运行时 schema。
         if args.schema_output is not None:
             # 基于训练轨迹中的来源信息构造运行时 schema，并写入目标文件。
-            trainer.build_runtime_schema(
-                teacher_source=run_trace.teacher_source,
-                summary_source=run_trace.summary_source,
-            ).write_json(args.schema_output)
+            trainer.build_runtime_schema().write_json(args.schema_output)
 
         # ------------------------------- 输出 predictor 训练结果 -------------------------------
         # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出训练结果。
@@ -953,8 +942,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             # 输出关键训练指标，如 epochs、最终损失与召回率。
             print(
-                f"teacher_source={run_trace.teacher_source} "
-                f"summary_source={run_trace.summary_source} "
                 f"epochs={run_trace.epochs} "
                 f"final_loss={run_trace.final_mean_loss:.6f} "
                 f"recall@candidate={run_trace.final_recall_at_candidate_budget:.4f}"
@@ -1015,8 +1002,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             # 输出平均损失与不同预算下的召回率指标。
             print(
-                f"teacher_source={evaluation.teacher_source} "
-                f"summary_source={evaluation.summary_source} "
                 f"loss={evaluation.mean_loss:.6f} "
                 f"recall@candidate={evaluation.recall_at_candidate_budget:.4f} "
                 f"recall@executed={evaluation.recall_at_executed_budget:.4f}"

@@ -25,6 +25,7 @@ from cfie.config import CfieConfig
 from cfie.distributed import get_tensor_model_parallel_rank
 from cfie.forward_context import get_forward_context
 from cfie.platforms import current_platform
+from cfie.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,38 @@ def _create_or_attach_shared_memory(
                 logger.info("Linked to existing shared memory %s", name)
 
     return shm
+
+
+def get_routed_experts_attention_group_index(
+    kv_cache_config: KVCacheConfig,
+) -> int:
+    """Return the attention KV-cache group used by routed-experts capture."""
+    for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+        if isinstance(group.kv_cache_spec, AttentionSpec):
+            return gid
+    return 0
+
+
+def get_routed_experts_buffer_num_slots(
+    kv_cache_config: KVCacheConfig,
+) -> int:
+    """
+    Return the routed-experts shared-buffer length in raw slot units.
+
+    The shared-memory buffer is indexed directly by ``slot_mapping`` values,
+    where each token slot is addressed as ``block_id * block_size + offset``.
+    Therefore the buffer must span the full address space of the selected
+    attention KV pool instead of the aggregate schedulable-token lower bound.
+    """
+    if not kv_cache_config.kv_cache_groups:
+        raise ValueError("routed experts capture requires at least one kv cache group")
+
+    attn_gid = get_routed_experts_attention_group_index(kv_cache_config)
+    attn_group = kv_cache_config.kv_cache_groups[attn_gid]
+    if not isinstance(attn_group.kv_cache_spec, AttentionSpec):
+        raise ValueError("routed experts capture requires an attention kv cache group")
+
+    return kv_cache_config.num_blocks * attn_group.kv_cache_spec.block_size
 
 
 class RoutedExpertsCapturer:
@@ -225,6 +258,14 @@ class RoutedExpertsCapturer:
         if self._device_buffer is None:
             raise RuntimeError("Device buffer not initialized.")
 
+        if indices.size:
+            max_index = int(indices.max())
+            if max_index >= self._host_buffer_view.shape[0]:
+                raise IndexError(
+                    "Routed experts buffer is too small for slot_mapping: "
+                    f"max_index={max_index}, buffer_size={self._host_buffer_view.shape[0]}"
+                )
+
         num_tokens = len(indices)
         data = self._device_buffer[:num_tokens, :, :].cpu().numpy()
 
@@ -333,6 +374,14 @@ class RoutedExpertsReader:
             raise RuntimeError("Buffer not attached. Call attach_buffer() first.")
         if self._lock_file is None:
             raise RuntimeError("Lock file not initialized.")
+
+        if indices.size:
+            max_index = int(indices.max())
+            if max_index >= self._host_buffer_view.shape[0]:
+                raise IndexError(
+                    "Routed experts buffer is too small for slot_mapping: "
+                    f"max_index={max_index}, buffer_size={self._host_buffer_view.shape[0]}"
+                )
 
         with _file_lock(self._lock_file, mode="rb+"):
             return self._host_buffer_view[indices, :, :].copy()

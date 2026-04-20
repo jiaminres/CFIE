@@ -29,6 +29,7 @@ from cfie.v1.worker.block_table import MultiGroupBlockTable
 @dataclass
 class CachedRequestState:
     req_id: str
+    external_req_id: str | None
     prompt_token_ids: list[int] | None
     mm_features: list[MultiModalFeatureSpec]
     sampling_params: SamplingParams | None

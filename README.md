@@ -20,13 +20,15 @@ Training code now lives in a separate top-level Python package:
 Bootstrap the training subproject with:
 
 ```bash
-PYTHONPATH=CFIE .venv/bin/python -m cfie_training.cli.main plan --json
+PYTHONPATH=CFIE .venv/bin/python -m cfie_training.cli.main validate --json
 ```
 
-Dedicated Qwen3.5-35B-A3B training blueprint:
+Inspect the built-in Qwen3.5-35B-A3B training profile:
 
 ```bash
-PYTHONPATH=CFIE .venv/bin/python -m cfie_training.cli.main qwen35-plan --json
+PYTHONPATH=CFIE .venv/bin/python -m cfie_training.cli.main validate \
+  --profile qwen35-35b-a3b \
+  --json
 ```
 
 First-version Qwen3.5 training runtime simulation:
@@ -70,11 +72,12 @@ PYTHONPATH=CFIE .venv/bin/python -m cfie_training.cli.main simulate \
   --resume-from /tmp/cfie_training_state.json
 ```
 
-Run a synthetic training session with periodic checkpoints:
+Run a dataset-backed training session with periodic checkpoints:
 
 ```bash
 PYTHONPATH=CFIE .venv/bin/python -m cfie_training.cli.main train \
   --steps 3 \
+  --dataset /tmp/train.jsonl \
   --checkpoint-dir /tmp/cfie_training_ckpts \
   --checkpoint-interval 2
 ```
