@@ -424,6 +424,7 @@ class EngineRouterTeacherModelBackend:
         # worker 通过 `layer_ids` 明确说明当前 payload 覆盖的层集合；
         # trainer 不再根据返回位置猜测层号，避免 PP 场景下误把分片当完整模型。
         layer_ids = tuple(int(layer_id) for layer_id in payload["layer_ids"])
+
         # 多进程 RPC 可能把 CPU tensor 序列化成 Python 数组；
         # 这里统一转回 tensor，后续合并和 torch.cat 都只处理一种张量类型。
         hidden_states = tuple(
@@ -489,8 +490,7 @@ class EngineRouterTeacherModelBackend:
                 )
 
         # ------------------------------- 按稳定顺序整理待合并条目 -------------------------------
-        # 这里先按 request_id 分组，再按 PP rank、TP rank 排序，
-        # 目的是固定分片写入顺序，避免 worker 返回先后变化时影响合并结果。
+        # 这里先按 request_id 分组，再按 PP rank、TP rank 排序，。
         normalized_entries.sort(
             key=lambda entry: (entry.request_id, entry.pp_rank, entry.tp_rank)
         )
@@ -499,9 +499,11 @@ class EngineRouterTeacherModelBackend:
         # `merged` 只保存本轮已经收齐全部目标层的 request；
         # 没有收齐的 request 不会提前返回，而是继续留在暂存桶中等待补齐。
         merged: dict[str, tuple[torch.Tensor, ...]] = {}
+
         # 这里取出调用方要求捕获的目标层顺序；
         # 最终返回结果必须严格按这个顺序组织 tuple，不能依赖 worker 的返回顺序。
         expected_layer_ids = self._capture_layer_ids
+
         # 这里额外构造集合版本，后面做层号合法性校验和“是否收齐”判断时会更直接。
         expected_layer_id_set = set(expected_layer_ids)
 
