@@ -27,7 +27,19 @@ class PredictorBatchPlanner(Protocol):
 
 @dataclass(slots=True, frozen=True)
 class CapturedForwardBatch:
+    """一次真实 teacher 前向捕获后的按层监督数据。
+
+    设：
+    - L = 模型层数
+    - T = 当前 batch 内所有 request 的有效 prompt token 总数
+    - H = hidden size
+    - K = routed top-k 专家数
+    """
+
+    # 按层保存 hidden state；tuple 长度为 L，每个 tensor 形状为 [T, H]。
     layer_hidden_states: tuple[torch.Tensor, ...]
+
+    # 按层保存 teacher router top-k 专家 id；tuple 长度为 L，每个 tensor 形状为 [T, K]。
     layer_teacher_topk_ids: tuple[torch.Tensor, ...]
 
 
@@ -40,11 +52,38 @@ class CapturedHiddenStatePayload:
     根据返回位置猜测层号或 rank 语义。
     """
 
+    # 当前 payload 对应的请求 id，用于把多 worker 返回结果归并回同一个 request。
     request_id: str
+
+    # 当前 worker 实际返回的层号集合；tuple 长度必须与 hidden_states 一致。
     layer_ids: tuple[int, ...]
+
+    # 当前 worker 对应层段捕获到的 hidden states；
+    # tuple 长度等于 len(layer_ids)，每个 tensor 通常形状为 [request_token_count, hidden_size]。
     hidden_states: tuple[torch.Tensor, ...]
+
+    # pipeline parallel rank，用于区分不同 PP stage 返回的不同层段。
     pp_rank: int
+
+    # tensor parallel rank，用于稳定处理同一层的 TP 重复副本。
     tp_rank: int
+
+
+@dataclass(slots=True)
+class PredictorCaptureRequest:
+    """一次 teacher capture 请求在 trainer 侧的本地状态。
+
+    capture_batch 同时需要跟踪 request_id、真实 prompt、最终输出对象和按层
+    hidden states。如果这些信息分散在多个 `dict[str, ...]` 里，后续维护时很
+    难判断哪些字段必须同时存在。这里用具名对象把同一个 request 的状态收拢
+    到一起，让提交、step 回收、hidden-state 合并和最终校验都围绕同一份状态。
+    """
+
+    request_id: str
+    row_index: int
+    prompt_row: tuple[int, ...]
+    output: Any | None = None
+    hidden_states: tuple[torch.Tensor, ...] | None = None
 
 
 class PredictorTeacherModelBackend(Protocol):
@@ -592,7 +631,11 @@ class EngineRouterTeacherModelBackend:
         prompt_rows = self._effective_prompt_rows(batch)
 
         # ------------------------------- 提交逐行 prompt 请求 -------------------------------
-        # 每一行 prompt 都拆成独立 request，便于后续按 request_id 精确回收
+        # 每一行 prompt 都拆成独立 request，便于后续按 request_id 精确回收。
+        request_records: list[PredictorCaptureRequest] = []
+        # 这里仍保留一层 request_id -> request 状态索引；
+        # 它不再承载业务数据，只负责把引擎输出快速归还到对应的请求对象上。
+        request_by_id: dict[str, PredictorCaptureRequest] = {}
         request_ids: list[str] = []
         for row_index, prompt_row in enumerate(prompt_rows):
             # 用递增序号加行号构造 request_id，保证同一次训练进程内不会冲突。
@@ -600,6 +643,15 @@ class EngineRouterTeacherModelBackend:
 
             self._request_serial += 1
 
+            # 创建当前 request 的本地状态对象；
+            # 后续 output 和 hidden states 都会回填到同一个对象中，不再拆成多个平行字典。
+            request_record = PredictorCaptureRequest(
+                request_id=request_id,
+                row_index=row_index,
+                prompt_row=prompt_row,
+            )
+            request_records.append(request_record)
+            request_by_id[request_id] = request_record
             request_ids.append(request_id)
 
             engine.add_request(
@@ -616,12 +668,6 @@ class EngineRouterTeacherModelBackend:
                     output_kind=RequestOutputKind.FINAL_ONLY,
                 ),
             )
-
-        # `request_outputs` 保存最终输出对象，后面从中读取 routed experts。
-        request_outputs: dict[str, Any] = {}
-
-        # `hidden_states_by_request` 保存每个请求按层捕获的 hidden states。
-        hidden_states_by_request: dict[str, tuple[torch.Tensor, ...]] = {}
         try:
             # ------------------------------- 驱动真实引擎 step 并持续收割捕获结果 -------------------------------
             # 与真实推理链路保持一致
@@ -630,19 +676,30 @@ class EngineRouterTeacherModelBackend:
                     # 每个 step 可能返回多个请求的阶段性或最终结果；
                     # 这里只保留属于本批请求的输出对象。
                     request_id = getattr(output, "request_id", None)
-                    if request_id in request_ids:
-                        request_outputs[str(request_id)] = output
+                    request_record = request_by_id.get(str(request_id))
+                    if request_record is not None:
+                        request_record.output = output
 
                 # 有些请求的 prompt capture 会在中途 step 就先写入 worker 缓存；
                 # 这里每轮都尝试取走一次，避免全部结束后部分结果已被后续流程清理。
-                hidden_states_by_request.update(
-                    self._take_captured_hidden_states(engine, request_ids)
+                captured_hidden_states = self._take_captured_hidden_states(
+                    engine,
+                    request_ids,
                 )
+                for request_id, hidden_states in captured_hidden_states.items():
+                    request_record = request_by_id.get(request_id)
+                    if request_record is not None:
+                        request_record.hidden_states = hidden_states
 
             # 全部请求结束后再补取一次，确保最后一批已完成捕获也被收回来。
-            hidden_states_by_request.update(
-                self._take_captured_hidden_states(engine, request_ids)
+            captured_hidden_states = self._take_captured_hidden_states(
+                engine,
+                request_ids,
             )
+            for request_id, hidden_states in captured_hidden_states.items():
+                request_record = request_by_id.get(request_id)
+                if request_record is not None:
+                    request_record.hidden_states = hidden_states
         except Exception:
             # 一旦 teacher 前向中途失败，直接销毁当前引擎，
             # 避免残留半失效 capture 状态影响下一批训练。
@@ -653,12 +710,16 @@ class EngineRouterTeacherModelBackend:
         num_layers = self._config.model_spec.num_hidden_layers
 
         # 先为每一层准备一个收集桶，后面逐请求追加，再按层拼接。
+
+        # layer_id --> 不同req的hidden_states
         layer_hidden_states: list[list[torch.Tensor]] = [[] for _ in range(num_layers)]
+        # layer_id --> 不同req的topk
         layer_teacher_topk_ids: list[list[torch.Tensor]] = [[] for _ in range(num_layers)]
 
-        for row_index, request_id in enumerate(request_ids):
+        for request_record in request_records:
             # 先校验当前请求确实拿到了按层 hidden state。
-            hidden_states = hidden_states_by_request.get(request_id)
+            request_id = request_record.request_id
+            hidden_states = request_record.hidden_states
             if hidden_states is None:
                 raise ValueError(
                     f"predictor capture missing hidden states for request {request_id}"
@@ -670,7 +731,7 @@ class EngineRouterTeacherModelBackend:
                 )
 
             # 再校验最终输出对象存在，以便从中读取 routed experts 标签。
-            request_output = request_outputs.get(request_id)
+            request_output = request_record.output
             if request_output is None or not getattr(request_output, "outputs", None):
                 raise ValueError(
                     f"predictor capture missing final output for request {request_id}"
@@ -703,7 +764,7 @@ class EngineRouterTeacherModelBackend:
 
             # teacher 标签的 token 维必须与真实 prompt 长度严格一致，
             # 否则说明 capture 结果和提交请求已经失配。
-            expected_num_tokens = len(prompt_rows[row_index])
+            expected_num_tokens = len(request_record.prompt_row)
             if routed_experts_tensor.shape[0] != expected_num_tokens:
                 raise ValueError(
                     "captured routed experts token count does not match prompt length"
@@ -720,6 +781,14 @@ class EngineRouterTeacherModelBackend:
         # ------------------------------- 拼接层级监督结果并返回 -------------------------------
         # 每层把来自不同请求的 token 维结果顺序拼接，
         # 输出给后续 predictor 数据集构造与训练流程直接消费。
+        # 设：
+        # - L = num_layers
+        # - T = 当前 batch 内所有 request 的有效 prompt token 总数
+        # - H = hidden size
+        # - K = routed top-k 专家数
+        # 则：
+        # - layer_hidden_states 是长度为 L 的 tuple，每个 tensor 形状为 [T, H]
+        # - layer_teacher_topk_ids 是长度为 L 的 tuple，每个 tensor 形状为 [T, K]
         return CapturedForwardBatch(
             layer_hidden_states=tuple(
                 torch.cat(layer_hidden_states[layer_index], dim=0)
@@ -735,6 +804,25 @@ class EngineRouterTeacherModelBackend:
     def __del__(self) -> None:
         # 即使调用方忘记显式关闭，这里也尽力把捕获状态与引擎资源回收掉。
         self._shutdown_engine()
+
+
+@dataclass(slots=True, frozen=True)
+class PredictorExampleSpec:
+    """单个 predictor 监督样本的轻量级选点规格。
+
+    该对象只描述“后续应该从哪里取数据”，不直接保存 hidden state 或 teacher
+    标签。trace builder 会先在 token 与插入层组成的二维槽位空间中生成这些
+    规格，再根据规格去 `CapturedForwardBatch` 中读取真实前向捕获结果。
+    """
+
+    # 当前 step 内的局部样本序号，用来稳定保留本轮采样顺序。
+    example_offset: int
+
+    # predictor 插入层号；后续会读取该层、该 token 的 hidden state 作为输入特征。
+    insertion_layer_index: int
+
+    # 当前捕获 batch 内的展平 token 序号；后续会用它对齐 hidden state 与 teacher 标签。
+    token_index: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -1370,32 +1458,56 @@ HiddenStateFutureExpertPredictor = FutureExpertPredictor
 
 
 class PredictorTraceBuilderBase:
-    # ------------------------------- 初始化 trace 构建公共上下文 -------------------------------
+
     def __init__(self, config: TrainingProjectConfig) -> None:
+        """
+        初始化 predictor trace 构建器的公共运行上下文。
+
+        该基类不直接执行 teacher 前向，也不直接写出训练样本；它只负责把
+        trace 构建过程中所有实现都会复用的模型几何、future window、专家预算
+        和可插入层集合预先解析好。后续 forward-capture builder 会基于这些字段
+        把真实前向捕获到的 hidden state 与 router top-k 标签组装成监督样本。
+        """
+
+        # ------------------------------- 校验并缓存训练配置 -------------------------------
         # 先校验并缓存训练配置，确保后续字段读取都基于合法配置。
         self.config = config.validate()
-        # predictor trace 生成必须依赖明确的模型几何信息。
+        # predictor 样本需要按层号、hidden 维度和专家标签对齐；
+        # 如果模型几何信息缺失，继续构造 trace 会在更深层才暴露形状错误。
         if not self.config.model_spec.is_defined():
             raise ValueError(
                 "predictor trace generation requires a defined model_spec"
             )
+
+        # ------------------------------- 缓存模型几何信息 -------------------------------
         # 缓存 hidden 维度，后续会用于校验捕获到的 hidden_state 形状。
         self._hidden_dim = self.config.model_spec.hidden_size
-        # 缓存模型层数，后续用于校验按层捕获结果是否完整。
+        # 缓存 transformer 层数，后续会用它限制可插入层范围并校验捕获结果完整性。
         self._num_layers = self.config.model_spec.num_hidden_layers
-        # 未来窗口层数决定每个样本需要收集多少个 future layer 标签。
+
+        # ------------------------------- 缓存 predictor 路由训练参数 -------------------------------
+        # future window 表示 predictor 在某个插入层拿到 hidden state 后，
+        # 需要向后预测多少层的 routed experts。
         self._window_layers = self.config.predictor_routing.window_layers
-        # 执行预算决定每个未来层取多少个 teacher top-k experts。
+        # 每个 future layer 的监督标签只保留 teacher 实际执行预算内的 top-k experts；
+        # 这个值决定标签 tensor 最后一维的专家 id 数量。
         self._executed_experts = (
             self.config.predictor_routing.executed_experts_per_layer
         )
-        # stride 控制可作为插入层的采样步长。
+        # stride 控制可插入层的稀疏采样间隔，用来降低 trace 规模并覆盖不同深度。
         self._stride_layers = self.config.predictor_routing.stride_layers
+
+        # ------------------------------- 预计算可插入层索引集合 -------------------------------
         # 预先生成可选插入层索引集合，避免每步重复计算。
+        # 结束位置使用 num_layers - window_layers，确保每个插入层后面都有完整的
+        # future window 可用于构造监督标签。
         self._insertion_layer_indices = tuple(
             range(
+                # 从第 0 层开始允许插入 predictor，表示使用该层输出的 hidden state 做预测。
                 0,
+                # 当模型层数不足以容纳 future window 时，上界截断为 0，后续采样阶段会报错。
                 max(self._num_layers - self._window_layers, 0),
+                # 按配置 stride 跳层采样，避免每层都生成监督点造成数据膨胀。
                 self._stride_layers,
             )
         )
@@ -1416,41 +1528,71 @@ class PredictorTraceBuilderBase:
             raise ValueError("examples_per_step must be >= 1")
         return resolved
 
-    # ------------------------------- 生成当前 step 的样本选点规格 -------------------------------
     def _selected_example_specs(
             self,
             *,
             step_index: int,
             examples_per_step: int,
             token_count: int,
-    ) -> tuple[tuple[int, int, int], ...]:
+    ) -> tuple[PredictorExampleSpec, ...]:
+        """
+        为当前训练 step 生成 predictor 监督样本的选点规格。
+
+        这里不会直接构造 tensor，而是在“token 位置 × 可插入层”组成的二维槽位
+        空间中挑选样本点。返回的每一项都是 `PredictorExampleSpec`，用具名字段
+        明确表达样本序号、插入层号与 token 位置，避免三元组解包时读者猜测字段
+        顺序。
+        """
+
+        # ------------------------------- 校验可采样层集合 -------------------------------
         # 若没有任何可用插入层，则无法构造监督样本。
         if not self._insertion_layer_indices:
             raise ValueError(
                 "predictor trace generation requires at least one eligible insertion layer"
             )
+
+        # ------------------------------- 计算当前 step 的采样槽位 -------------------------------
         # token 数量至少按 1 处理，避免异常输入导致除零或空槽位。
         token_count = max(int(token_count), 1)
-        # 总槽位 = 可用插入层数 × token 行数。
+
+        # 每个 token 都可以和每个可插入层组合成一个监督候选点。
+        # 因此总槽位 = token 数量 × 可插入层数量。
         total_slots = len(self._insertion_layer_indices) * token_count
-        # 实际样本数不超过总槽位，避免越界选点。
+
+        # 当前 step 实际采样数不能超过候选槽位总数，避免后续映射时越界。
         example_count = min(examples_per_step, total_slots)
-        # 通过 step 偏移实现跨 step 的轮转采样，提升覆盖率。
+
+        # 通过 step 维度的起点偏移做轮转采样，避免每个 step 都从第 0 个
+        # token 和第 0 个插入层开始取样，从而提升长序列与多层组合的覆盖率。
         start = (step_index * example_count) % total_slots
-        # 每条规格格式为 (example_offset, insertion_layer_index, token_index)。
-        specs: list[tuple[int, int, int]] = []
+
+        # ------------------------------- 映射线性槽位到 token 与层索引 -------------------------------
+        # 每条规格最终只记录轻量级索引，后续构造样本时再按这些索引读取
+        # hidden state 与对应 future layers 的 teacher top-k 标签。
+        specs: list[PredictorExampleSpec] = []
         for example_offset in range(example_count):
-            # 先在线性槽位空间中定位当前位置，再映射回 (token, layer) 二维索引。
+            # 在一维槽位空间中取得当前样本点，并用取模保证轮转越界后回到开头。
             flat_index = (start + example_offset) % total_slots
+
+            # 槽位排列约定为：同一个 token 下依次枚举所有可插入层。
+            # 整除可插入层数量即可还原当前槽位属于哪个 token。
             token_index = flat_index // len(self._insertion_layer_indices)
+
+            # 取余得到当前 token 内部的第几个插入层候选。
             insertion_index = flat_index % len(self._insertion_layer_indices)
             specs.append(
-                (
-                    example_offset,
-                    self._insertion_layer_indices[insertion_index],
-                    token_index,
+                PredictorExampleSpec(
+                    # 保留 step 内样本序号，便于后续按输出样本顺序稳定组装结果。
+                    example_offset=example_offset,
+                    # 将插入层候选序号转换为真实模型层号。
+                    insertion_layer_index=(
+                        self._insertion_layer_indices[insertion_index]
+                    ),
+                    # 记录 token 位置，后续用它索引对应 token 的 hidden state 和路由标签。
+                    token_index=token_index,
                 )
             )
+        # 返回不可变 tuple，避免调用方意外修改当前 step 已确定的采样计划。
         return tuple(specs)
 
     # ------------------------------- 计算插入层对应的 future 窗口层 -------------------------------
@@ -1458,7 +1600,7 @@ class PredictorTraceBuilderBase:
             self,
             insertion_layer_index: int,
     ) -> tuple[int, ...]:
-        # 从插入层下一层开始，连续取 window_layers 个 future 层索引。
+        # 从插入层<下一层>开始，连续取 window_layers 个 future 层索引。
         return tuple(
             insertion_layer_index + offset + 1
             for offset in range(self._window_layers)
@@ -1509,7 +1651,7 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
             batch = batch_planner.batch_for_step(step_index)
 
             # 执行 teacher 前向捕获，得到各层 hidden_state 与 teacher top-k experts。
-            captured = self._teacher_model_backend.capture_batch(batch)
+            captured: CapturedForwardBatch = self._teacher_model_backend.capture_batch(batch)
 
             # hidden_state 层数必须与配置层数一致，避免样本与模型形状错配。
             if len(captured.layer_hidden_states) != self._num_layers:
@@ -1528,34 +1670,38 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
             token_count = int(captured.layer_hidden_states[0].shape[0])
 
             # ------------------------------- 选择插入点并提取单条样本 -------------------------------
-            # _selected_example_specs 返回 (example_offset, insertion_layer_index, token_index)。
-            # 这里 example_offset 不参与最终样本字段，因此用 "_" 丢弃。
-            for _, insertion_layer_index, token_index in self._selected_example_specs(
+            # _selected_example_specs 返回具名选点对象；
+            example_spec: PredictorExampleSpec
+            for example_spec in self._selected_example_specs(
                     step_index=step_index,
                     examples_per_step=resolved_examples_per_step,
                     token_count=token_count,
             ):
                 # 读取插入层在指定 token 上的 hidden_state，作为 predictor 输入特征。
-                hidden_state = captured.layer_hidden_states[insertion_layer_index][
-                    token_index
-                ]
+                hidden_state = captured.layer_hidden_states[
+                    example_spec.insertion_layer_index
+                ][example_spec.token_index]
+
                 # 输入特征维度必须与配置 hidden_size 一致。
                 if hidden_state.numel() != self._hidden_dim:
                     raise ValueError(
                         "captured hidden_state size does not match model_spec.hidden_size"
                     )
+
                 # 根据插入层位置推导未来窗口层索引集合。
                 future_layer_indices = self._future_layer_indices(
-                    insertion_layer_index
+                    example_spec.insertion_layer_index
                 )
+
                 # 收集未来每层 teacher top-k experts，作为多标签监督目标。
+                #[[layer0_cur_token_topks], [layer1_cur_token_topks]...]
                 future_teacher_topk_ids = []
                 for future_layer_index in future_layer_indices:
                     # teacher 后端已经返回真实前向里的执行专家 top-k，
                     # 这里直接读取即可，避免再从全量 logits 二次推导。
                     teacher_topk = captured.layer_teacher_topk_ids[
                         future_layer_index
-                    ][token_index]
+                    ][example_spec.token_index]
                     future_teacher_topk_ids.append(
                         tuple(int(expert_id) for expert_id in teacher_topk.tolist())
                     )
@@ -1566,8 +1712,8 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
                     PredictorTraceExample(
                         example_index=len(examples),
                         step_index=step_index,
-                        token_index=token_index,
-                        insertion_layer_index=insertion_layer_index,
+                        token_index=example_spec.token_index,
+                        insertion_layer_index=example_spec.insertion_layer_index,
                         future_layer_indices=future_layer_indices,
                         # hidden_state 统一转为 float 元组，保持序列化与训练读回一致。
                         hidden_state=tuple(
