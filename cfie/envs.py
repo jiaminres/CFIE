@@ -117,7 +117,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
-    VLLM_ENABLE_V1_MULTIPROCESSING: bool = os.name != "nt"
+    VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     Q_SCALE_CONSTANT: int = 200
@@ -1028,7 +1028,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "V_SCALE_CONSTANT": lambda: int(os.getenv("V_SCALE_CONSTANT", "100")),
     # If set, enable multiprocessing in LLM for the V1 code path.
     "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0" if os.name == "nt" else "1"))
+        int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))
     ),
     "VLLM_LOG_BATCHSIZE_INTERVAL": lambda: float(
         os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")

@@ -701,86 +701,95 @@ def allocate_stateless_group_ports(parallel_config, new_data_parallel_size: int)
 
 # 多进程 EngineCore client 的公共基类。
 class MPClient(EngineCoreClient):
+    """多进程 `EngineCore` 的基础客户端。
+
+    该类负责把前端 `LLMEngine` 与后台 `EngineCore` 进程串起来：
+
+    - 前端通过 `input_socket` 把 `EngineCoreRequest` 送到后台
+    - 后台通过 `output_socket` 把 `EngineCoreOutputs` 回传给前端
+    - 若当前 client 处于自托管模式，还会在初始化阶段负责拉起
+      `EngineCoreProc` / DP coordinator，并完成启动握手
+
+    该基类只负责多进程通信、资源托管与启动握手，不直接区分同步或异步 API：
+
+    - `SyncMPClient` 用于 `LLMEngine.step()` 这类同步调用链
+    - `AsyncMPClient` 用于 `AsyncLLM` 这类 asyncio 调用链
     """
-       MPClient：多进程 EngineCore 的基础客户端。
-       EngineCore 运行在后台进程中的忙轮询循环里，
-       负责持续接收新的 EngineCoreRequest，
-       并返回对应的 EngineCoreOutput。
 
-       * 通过 input_socket 推送 EngineCoreRequest
-       * 通过 output_socket 拉取 EngineCoreOutput
-
-       * AsyncMPClient 子类用于 AsyncLLM 场景
-       * SyncMPClient 子类用于 LLM 场景
-    """
-
-    # 初始化多进程 client，负责拉起 engine core 进程并建立 ZMQ 通道。
+    # ------------------------------- 初始化多进程 EngineCore 客户端 -------------------------------
     def __init__(
             self,
             asyncio_mode: bool,
             cfie_config: CfieConfig,
             executor_class: type[Executor],
             log_stats: bool,
-            # 从外部注入给当前 client 的连接配置。
-            # 它不是强类型的 Engine 地址对象，而是“当前 client 应该连接到哪里”的配置字典；
-            # 若提供该参数，则表示 engine 已由外部创建好，当前 client 只负责连接和通信，
-            # 不负责这些 engine 的拉起与生命周期管理。
+            # 若上层已经把 engine 地址准备好，则通过该字典把地址注入进来。
+            # 传入后表示当前 client 只负责“连接已有 engine”，
+            # 不再负责分配地址、拉起进程或管理底层 engine 生命周期。
             client_addresses: dict[str, str] | None = None,
     ):
-        # 保存最上层 CFIE 配置，后续多处会直接读取并行与模型参数。
+        # ------------------------------- 固化配置并准备通信编解码器 -------------------------------
+        # 先保存顶层配置对象，后续并行规模、地址规划和启动逻辑都会频繁读取它。
         self.cfie_config = cfie_config
 
-        # 创建请求/响应消息的 msgpack 编码器。
+        # 前端发给后台的请求统一走 msgpack 编码，保证普通 Python 对象能稳定过进程边界。
         self.encoder = MsgpackEncoder()
 
-        # 创建用于反序列化 EngineCoreOutputs 的解码器。
+        # 后台返回的 `EngineCoreOutputs` 也统一按固定 schema 解码，避免手写拆包逻辑。
         self.decoder = MsgpackDecoder(EngineCoreOutputs)
 
-        # 先创建同步 ZMQ context，作为底层真实上下文。
+        # 先创建一个真实的同步 ZMQ context；
+        # 即使上层走 asyncio，也是在它外面包一层异步 facade，而不是维护两套底层资源。
         sync_ctx = zmq.Context(io_threads=2)
 
-        # 根据模式决定暴露同步 context 还是 asyncio context。
+        # 根据当前 client 形态决定暴露同步 context 还是 asyncio context，
+        # 这样后续 socket 创建代码可以共用同一套初始化主线。
         self.ctx = zmq.asyncio.Context(sync_ctx) if asyncio_mode else sync_ctx
 
-        # 把已创建资源打包进清理器，方便异常或 GC 时统一回收。
+        # 把 context、socket、线程、engine manager 等资源统一托管到清理器里，
+        # 便于初始化失败、显式 shutdown 或 GC 析构时走同一条回收路径。
         self.resources = BackgroundResources(ctx=sync_ctx)
 
-        # 注册对象终结器，确保 client 析构时资源能被释放。
+        # 给当前对象注册终结器，避免调用方忘记 `shutdown()` 时遗留后台进程或 socket。
         self._finalizer = weakref.finalize(self, self.resources)
 
-        # 用于记录初始化是否完整成功。
+        # 初始化期间任何一步失败都必须回滚已创建资源，因此这里先记录成功标记。
         success = False
         try:
-            # 初始化“engine 是否正在运行”的本地状态位。
+            # ------------------------------- 初始化运行状态与并行配置 -------------------------------
+            # 该标记反映“当前 client 负责管理的 engine 是否仍在活跃处理请求”，
+            # 后续 DP client 会用它决定是否继续等待远端输出。
             self.engines_running = False
 
-            # 取出并行配置，后面会据此决定地址和 rank 管理方式。
+            # 取出并行配置，后面地址规划、DP rank 归属和握手范围都依赖它。
             parallel_config = cfie_config.parallel_config
 
-            # Elastic EP 下开启 ROUTER handover，允许新 engine 接管旧 identity。
+            # Elastic EP 允许新 engine 接管旧 identity，
+            # 因而这里需要给 ROUTER 打开 handover，避免扩缩容时旧连接卡死。
             enable_input_socket_handover = parallel_config.enable_elastic_ep
 
-            # 统计发布地址属于控制面通道，不承载普通请求/响应数据。
-            # DP client 会通过它订阅 coordinator / engine 发布的 waiting/running
-            # 计数、wave 状态以及 elastic EP 通知，用于本地负载均衡和唤醒逻辑。
-            # 单 engine 或不需要控制面状态同步的路径下，它可以保持为空。
+            # 控制面统计地址不承载正常请求/响应，只用于订阅 DP 协调信息：
+            # - waiting / running 计数
+            # - wave 状态
+            # - elastic EP 控制通知
+            # 单 engine 或不需要控制面同步的路径下，它可以保持为空。
             self.stats_update_address: str | None = None
 
-            # 若传入了 `client_addresses`，说明当前 client 处于“外部连接模式”：
-            # engine 地址由外部 launcher / API server 进程预先分配并传入，
-            # 当前 client 只负责建立数据面与控制面的 socket 连接，
-            # 不负责拉起、托管或销毁底层 EngineCore 进程。
+            # ------------------------------- 根据模式建立前后端通信通道 -------------------------------
+            # 若上层传入了 `client_addresses`，说明当前 client 只做“外部连接”：
+            # 地址由 launcher / API server 预先分配，engine 也已由外部托管，
+            # 当前 client 只负责把本地 socket 接到既有 engine 上。
             if client_addresses:
-                # 读取外部提供的输入 socket 地址。
+                # 输入地址对应前端写入请求的 ROUTER 通道。
                 input_address = client_addresses["input_address"]
 
-                # 读取外部提供的输出 socket 地址。
+                # 输出地址对应后台推送结果的 PULL 通道。
                 output_address = client_addresses["output_address"]
 
-                # 若存在统计地址，也一并保存。
+                # 若外部同时提供控制面统计地址，也一并保留下来供 DP 逻辑使用。
                 self.stats_update_address = client_addresses.get("stats_update_address")
 
-                # 创建面向 engine 的输入 ROUTER socket，并绑定到指定地址。
+                # 当前 client 在前端侧持有 ROUTER 入口，所有请求都从这里进入后台 engine。
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
                     self.ctx,
                     input_address,
@@ -789,17 +798,16 @@ class MPClient(EngineCoreClient):
                     router_handover=enable_input_socket_handover,
                 )
 
-                # 创建接收 engine 输出的 PULL socket。
+                # 输出侧使用 PULL，从后台异步收集 `EngineCoreOutputs`。
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx, output_address, zmq.PULL
                 )
             else:  # 默认
-                # 未提供 `client_addresses` 时，当前 client 进入“自托管模式”：
-                # 由它自己分配地址、拉起 engine，并在 shutdown 时负责回收这些资源。
-                # 由当前 client 自行分配并获取一组 engine 通信地址。
+                # 未传入外部地址时，当前 client 进入“自托管模式”：
+                # 它自己负责规划地址、拉起 engine / coordinator，并在退出时回收这些资源。
                 addresses = get_engine_zmq_addresses(cfie_config)
 
-                # 创建并绑定输入 ROUTER socket。
+                # 先把前端请求入口绑到本地 ROUTER socket 上，供后续 engine 连接回来。
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
                     self.ctx,
                     addresses.inputs[0],
@@ -808,68 +816,78 @@ class MPClient(EngineCoreClient):
                     router_handover=enable_input_socket_handover,
                 )
 
-                # 创建接收输出的 PULL socket。
+                # 再创建结果回收通道，后续后台 engine 会把输出推到这里。
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx,
                     addresses.outputs[0],
                     zmq.PULL
                 )
 
-                # 拉起后台 engine 进程/actor，并在上下文退出时确保其已就绪。
+                # 在握手上下文里拉起后台 engine manager / coordinator；
+                # 上下文退出前会保证需要的后台进程已经进入可通信状态。
                 with launch_core_engines(
                         cfie_config, executor_class, log_stats, addresses
                 ) as (engine_manager, coordinator, addresses):
-
-                    # 保存 engine manager，供后续 shutdown 和监控使用。
+                    # coordinator 只在 DP 协调场景下存在，后续 shutdown 与监控都要用到它。
                     self.resources.coordinator = coordinator
 
-                    # 保存 engine manager，供后续 shutdown 和监控使用。
+                    # engine manager 负责托管本地拉起的 engine core 进程集合。
                     self.resources.engine_manager = engine_manager
 
-                # 保存 frontend 统计发布地址。
+                # 启动完成后，把最终协商出的控制面统计地址暴露给前端使用。
                 self.stats_update_address = addresses.frontend_stats_publish_address
 
-                # 若存在 coordinator，则校验它报告的统计地址一致。
+                # 若 coordinator 已启动，则要求它自己报告的统计地址与前端视角保持一致，
+                # 避免后续 DP client 订阅到错误通道。
                 if coordinator is not None:
                     assert self.stats_update_address == (
                         coordinator.get_stats_publish_address()
                     )
 
-            # 读取数据并行总规模。
+            # ------------------------------- 计算当前 client 负责管理的 engine 范围 -------------------------------
+            # DP 总规模决定全局一共有多少条 engine 主线。
             dp_size = parallel_config.data_parallel_size
-            # 读取当前 client 对应的数据并行起始 rank。
+            # `data_parallel_index` 表示当前 client 管理的起始 DP rank。
             dp_rank = parallel_config.data_parallel_index
-            # 读取当前节点本地可管理的数据并行规模。
+            # `data_parallel_size_local` 表示当前节点本地会托管多少个 engine core。
             dp_local_size = parallel_config.data_parallel_size_local
-            # 判断当前是否处于 offline/local-rank 模式。
+            # offline 模式下，当前 client 只面向一个显式指定的本地 DP rank。
             offline_mode = parallel_config.data_parallel_rank_local is not None
-            # Client manages local+remote EngineCores in pure internal LB case.
-            # Client manages local EngineCores in hybrid and external LB case.
-            # 根据是否只管理本地 engines，决定当前 client 需要覆盖多少 rank。
+
+            # 在纯 internal LB 下，当前 client 可能同时感知本地和远端 engines；
+            # 在 hybrid / external LB 下，它通常只负责自己本地的 engines。
             num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
-            # 生成当前 client 负责管理的 engine rank 列表。
+
+            # 生成当前 client 逻辑上需要对接的 engine rank 列表；
+            # 后续 ready 等待、utility 调用和输出状态聚合都按这组 rank 进行。
             self.engine_ranks_managed = (
                 [dp_rank] if offline_mode else list(range(dp_rank, dp_rank + num_ranks))
             )
-            # 本地可见 rank 数不能超过实际被当前 client 管理的 rank 数。
+
+            # 本地 engine 数不能超过当前 client 的管理范围，否则说明 DP 配置自相矛盾。
             assert parallel_config.data_parallel_size_local <= len(
                 self.engine_ranks_managed
             )
 
-            # ZMQ identity of each engine that this client will talk to.
-            # 把每个 rank 编码成 ZMQ ROUTER 需要的 identity。
+            # 把每个 engine rank 编码成 ROUTER socket 使用的 identity，
+            # 后续所有点对点消息都会靠这个 identity 路由到正确的 engine。
             self.core_engines: list[EngineIdentity] = [
                 rank.to_bytes(2, "little") for rank in self.engine_ranks_managed
             ]
 
-            # Wait for ready messages from each engine on the input socket.
-            # 初始化一个待确认就绪的 engine identity 集合。
+            # ------------------------------- 等待所有目标 engine 完成就绪 -------------------------------
+            # 初始化一个“尚未 ready 的 engine identity”集合；
+            # 只有全部 ready 后，前端才能安全发送正式请求。
             identities = set(self.core_engines)
-            # 从 ROUTER socket 上创建同步 shadow socket，便于阻塞等待 ready。
+
+            # 这里显式构造同步 shadow socket，是为了在初始化阶段用阻塞式等待 ready，
+            # 避免把 engine 尚未启动完成的复杂性泄露给后续正常收发逻辑。
             sync_input_socket = zmq.Socket.shadow(self.input_socket)
-            # 循环等待每个 engine 都发来 ready 信号。
+
+            # 循环直到当前 client 负责管理的所有 engine 都发来 ready 为止。
             while identities:
-                # 超时未收到 ready 时，抛出明确的启动超时错误。
+                # 启动超时通常意味着大模型权重加载慢、后台进程卡死或握手链路异常；
+                # 这里直接抛出明确错误，避免前端静默挂住。
                 if not sync_input_socket.poll(
                         timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
                 ):
@@ -882,30 +900,28 @@ class MPClient(EngineCoreClient):
                         f"timeout, set the environment variable: "
                         f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                     )
-                # 读取一条 ready 消息，并取出其 identity。
+                # 读取一条 ready 消息，并根据 identity 把对应 engine 从等待集合里移除。
                 identity, _ = sync_input_socket.recv_multipart()
-                # 将已就绪的 identity 从等待集合中移除。
                 identities.remove(identity)
 
-            # 默认把第一个 engine 作为当前 client 的主通信目标。
+            # 默认用第一条 engine identity 作为普通请求的默认目标；
+            # DP / LB 场景下，后续子类仍可根据策略动态切换目标。
             self.core_engine: EngineIdentity = self.core_engines[0]
-            # 保存所有正在等待返回的 utility 调用 future。
+
+            # utility RPC 需要按 call_id 回填返回值，因此这里准备一个 future 映射表。
             self.utility_results: dict[int, AnyFuture] = {}
 
-            # Request objects which may contain pytorch-allocated tensors
-            # that we need to keep references to until zmq is done with the
-            # underlying data.
-            # 保存仍被 ZMQ tracker 使用中的消息对象，避免底层 buffer 过早释放。
+            # 某些请求对象里可能夹带 torch tensor backing buffer；
+            # 在 ZMQ 真正完成发送前必须保留这些对象引用，避免底层 buffer 被 Python 提前回收。
             self.pending_messages = deque[tuple[zmq.MessageTracker, Any]]()
 
-            # Start monitoring engine core processes for unexpected failures
-            # 启动后台监控线程，观察 engine 进程是否异常退出。
+            # 启动后台监控逻辑，尽早发现 engine core 意外退出并把异常传播回前端。
             self.start_engine_core_monitor()
 
-            # 走到这里说明初始化全部成功。
+            # 走到这里说明 socket、后台 engine 和 ready 握手都已经完成。
             success = True
         finally:
-            # 若初始化中途失败，则立刻触发资源清理。
+            # 任何中途失败都要立即回收已创建资源，避免遗留半初始化的后台进程与 socket。
             if not success:
                 self._finalizer()
 

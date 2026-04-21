@@ -79,11 +79,19 @@ class EngineHandshakeMetadata:
 
 
 class CoreEngineProcManager:
-    """
-    Utility class to handle creation, readiness, and shutdown
-    of background processes used by the AsyncLLM and LLMEngine.
+    """托管本地 `EngineCore` 后台进程集合的轻量管理器。
+
+    它只负责进程级生命周期管理，不参与调度或模型执行本身：
+
+    - 按给定的 DP rank 范围拉起本地 `EngineCoreProc`
+    - 在启动阶段跟踪这些子进程是否成功存活
+    - 在失败或退出时统一执行 shutdown / join / 状态查询
+
+    上层 `MPClient` / `launch_core_engines()` 会用它来持有
+    “当前前端负责管理的那一批本地 engine 进程”。
     """
 
+    # ------------------------------- 拉起并托管本地 EngineCore 进程 -------------------------------
     def __init__(
         self,
         local_engine_count: int,
@@ -96,7 +104,11 @@ class CoreEngineProcManager:
         log_stats: bool,
         client_handshake_address: str | None = None,
     ):
+        # 统一取多进程上下文，确保后面创建出来的所有 engine 进程共享同一启动语义。
         context = get_mp_context()
+
+        # 这批参数对当前 manager 管理的所有本地 engine 都一致，
+        # 后面只会按具体 DP rank 再补上各自独有的 rank 信息。
         common_kwargs = {
             "cfie_config": cfie_config,
             "local_client": local_client,
@@ -105,20 +117,29 @@ class CoreEngineProcManager:
             "log_stats": log_stats,
         }
 
+        # 某些 DP 拓扑下，client 与 engine 的握手地址需要拆分；
+        # 只有传入时才额外注入，避免默认路径携带无意义配置。
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address
 
+        # 是否处于 DP 场景会影响子进程命名和部分设备控制策略。
         is_dp = cfie_config.parallel_config.data_parallel_size > 1
 
         from cfie.v1.engine.core import EngineCoreProc
 
+        # `processes` 保存当前 manager 持有的所有后台 engine 进程句柄。
         self.processes: list[BaseProcess] = []
+        # `local_dp_ranks` 与 `processes` 一一对应，后面启动时会用到。
         local_dp_ranks = []
         for index in range(local_engine_count):
+            # `local_index` 是当前节点内部的局部 DP 序号。
             local_index = local_start_index + index
+            # `global_index` 是全局 DP 视角下的 engine rank。
             global_index = start_index + index
 
-            # Start EngineCore in background process.
+            # ------------------------------- 逐个构造后台 EngineCoreProc -------------------------------
+            # 这里先只创建 `Process` 对象，真正 `start()` 放到后面统一执行，
+            # 便于在全部参数就绪后再进入启动阶段。
             local_dp_ranks.append(local_index)
             self.processes.append(
                 context.Process(
@@ -129,13 +150,14 @@ class CoreEngineProcManager:
                 )
             )
 
+        # 给 manager 自己也挂一个终结器，防止外层忘记显式 shutdown 时遗留子进程。
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
 
         try:
             for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
-                # Adjust device control in DP for non-CUDA platforms
-                # as well as external and ray launchers
-                # For CUDA platforms, we use torch.accelerator.set_device_index()()
+                # ------------------------------- 启动子进程并处理平台差异 -------------------------------
+                # 在非 CUDA 平台、外部 launcher 或 Ray 路径下，
+                # 设备可见性往往不能依赖 CUDA 默认语义，因此要临时注入设备控制环境变量。
                 if is_dp and (
                     not current_platform.is_cuda_alike()
                     or cfie_config.parallel_config.use_ray
@@ -145,24 +167,31 @@ class CoreEngineProcManager:
                 else:
                     proc.start()
         finally:
-            # Kill other procs if not all are running.
+            # 只要发现某些子进程已经异常结束，就说明本轮启动不完整；
+            # 此时直接把整批进程回收掉，避免留下半活状态的 engine 集合。
             if self.finished_procs():
                 self.shutdown()
 
+    # ------------------------------- 按给定超时关闭整批 EngineCore 进程 -------------------------------
     def shutdown(self, timeout: float | None = None) -> None:
-        """Shutdown engine core processes with configurable timeout."""
+        # 只有在终结器尚未被消费时，才真正执行一次关闭，避免重复 shutdown。
         if self._finalizer.detach() is not None:
             shutdown(self.processes, timeout=timeout)
 
+    # ------------------------------- 等待任意一个 EngineCore 子进程退出 -------------------------------
     def join_first(self):
-        """Wait for any process to exit."""
+        # 该方法常用于监控线程阻塞等待“是否有子进程先异常退出”。
         connection.wait(proc.sentinel for proc in self.processes)
 
+    # ------------------------------- 导出全部子进程 sentinel -------------------------------
     def sentinels(self) -> list:
+        # 上层 poller / 监控器会把这些 sentinel 与其他句柄一起监听。
         return [proc.sentinel for proc in self.processes]
 
+    # ------------------------------- 统计已退出的 EngineCore 子进程 -------------------------------
     def finished_procs(self) -> dict[str, int]:
-        """Returns dict of proc name -> exit code for any finished procs."""
+        # 只返回已经拿到 exitcode 的子进程；
+        # 仍在运行的进程不会出现在结果里。
         return {
             proc.name: proc.exitcode
             for proc in self.processes
@@ -928,22 +957,42 @@ def launch_core_engines(
         EngineZmqAddresses,
     ]
 ]:
-    """Launch engine and DP coordinator processes as needed."""
+    """按当前并行配置拉起本地 `EngineCore` 与可选的 DP coordinator。
 
+    这是前端进入多进程模式时的总入口，负责把“当前 client 该托管哪些后台组件”
+    统一决策出来。它处理的核心问题有三类：
+
+    - 当前是否需要额外拉起 `DPCoordinator`
+    - 当前是使用本地进程版 engine 还是 Ray actor 版 engine
+    - 当前前端需要与哪些 DP rank 完成启动握手
+
+    函数会先把需要的后台组件创建出来并 `yield` 给调用方，
+    待调用方完成前端 socket 初始化后，再继续等待所有目标 engine 完成启动握手。
+    """
+
+    # ------------------------------- 读取当前 DP 启动所需的基础配置 -------------------------------
     parallel_config = cfie_config.parallel_config
+    # DP 总规模决定全局一共有多少条 engine 主线。
     dp_size = parallel_config.data_parallel_size
+    # 当前节点本地需要拉起多少个 engine。
     local_engine_count = parallel_config.data_parallel_size_local
+    # offline 模式下，本地 engine 的起始局部 rank 由外部显式给出。
     local_start_index = parallel_config.data_parallel_rank_local
+    # 当前前端视角下的起始 DP rank。
     dp_rank = parallel_config.data_parallel_rank
+    # 握手地址可能需要走跨节点网络，因此先取出 master host。
     host = parallel_config.data_parallel_master_ip
+    # 某些 LB 模式下，当前前端只管理本地 engines。
     local_engines_only = parallel_config.local_engines_only
 
+    # offline 模式表示当前前端只和一个显式指定的本地 DP rank 打交道。
     offline_mode = local_start_index is not None
 
-    # Run the DP Coordinator process with rank 0 when in online DP mode.
-    # The coordinator is needed for:
-    # 1. Internal/hybrid LB: collecting and publishing queue stats for load balancing
-    # 2. MoE models: wave coordination in addition to stats
+    # ------------------------------- 决定是否需要拉起 DP coordinator -------------------------------
+    # DP coordinator 只在 online DP 场景下由 rank 0 拉起；
+    # 它负责：
+    # 1. internal / hybrid LB 下的队列统计汇总与发布
+    # 2. MoE 模型下的 wave 协调
     run_coordinator = (
         cfie_config.needs_dp_coordinator and not offline_mode and dp_rank == 0
     )
@@ -965,6 +1014,8 @@ def launch_core_engines(
     else:
         coordinator = None
 
+    # ------------------------------- 按 DP backend 选择 engine 托管方式 -------------------------------
+    # Ray backend 不走本地 `EngineCoreProcManager`，而是交给 actor manager 统一托管。
     if parallel_config.data_parallel_backend == "ray":
         logger.info("Starting ray-based data parallel backend")
 
@@ -978,19 +1029,21 @@ def launch_core_engines(
         yield engine_actor_manager, coordinator, addresses
         return
 
+    # ------------------------------- 推导当前前端需要等待握手的 engine 集合 -------------------------------
     if offline_mode:
+        # offline 模式只允许当前前端对应一个本地 engine。
         assert local_engine_count == 1
         engines_to_handshake = [CoreEngine(index=dp_rank, local=True)]
     elif dp_rank == 0:
-        # Rank 0 holds Coordinator, so it handshakes with all Cores
-        # in both external dplb and internal dplb mode.
-        # Note this also covers the case where we have zero local engines
-        # and rank 0 is headless.
+        # rank 0 持有 coordinator，因此无论 internal 还是 external DPLB，
+        # 它都要感知并等待所有 core engines 完成握手。
+        # 这也覆盖了“rank 0 本身不托管本地 engine、只做控制面”的 headless 情况。
         engines_to_handshake = [
             CoreEngine(index=i, local=(i < local_engine_count)) for i in range(dp_size)
         ]
     else:
-        # Rank > 0 handshakes with just the local cores it is managing.
+        # 非 rank 0 前端只应等待自己实际托管的本地 cores；
+        # 若这里仍要求它管理远端 cores，说明并行拓扑和 LB 模式不兼容。
         assert local_engines_only, (
             "Attempting to launch core_engines from dp_rank > 0, but "
             "found internal DPLB, which is incompatible."
@@ -1000,20 +1053,23 @@ def launch_core_engines(
             for i in range(dp_rank, dp_rank + local_engine_count)
         ]
 
-    # Whether the started engines will handshake only with co-located
-    # front-end processes. In external_dp_lb mode, ranks > 0 handshake with
-    # their co-located frontend and also the rank 0 front-end, and hence this
-    # will be False.
+    # ------------------------------- 规划 engine-client 握手地址 -------------------------------
+    # `handshake_local_only` 表示本轮启动出来的 engines 是否只和同机前端握手。
+    # external DP LB 下，非 rank 0 前端上的 engines 还需要和 rank 0 前端协作，
+    # 因此不能把握手范围限制在 purely local。
     handshake_local_only = offline_mode or local_engine_count == dp_size
 
-    # NOTE(yongji): handling scaling from intra-node to inter-node
+    # Elastic EP 会发生跨节点扩缩容，因此强制走可跨节点复用的握手地址。
     if parallel_config.enable_elastic_ep:
         handshake_local_only = False
 
+    # 根据握手可见范围，得到 engine-client 之间真正使用的握手入口地址。
     handshake_address = get_engine_client_zmq_addr(
         handshake_local_only, host, parallel_config.data_parallel_rpc_port
     )
 
+    # local_engines_only 且 dp_rank > 0 时，需要给本地 client 额外分配一个本地握手地址，
+    # 这样本地 engines 和 rank 0 前端可以分层握手，避免地址冲突。
     if local_engines_only and dp_rank > 0:
         assert not handshake_local_only
         local_handshake_address = get_open_zmq_ipc_path()
@@ -1022,10 +1078,12 @@ def launch_core_engines(
         local_handshake_address = handshake_address
         client_handshake_address = None
 
+    # ------------------------------- 拉起本地 engine manager 并等待后续握手 -------------------------------
+    # 这里先把握手 ROUTER 建起来，再启动本地 engines；
+    # 这样子进程起来后可以立刻把 HELLO / READY 打回到已存在的握手通道上。
     with zmq_socket_ctx(
         local_handshake_address, zmq.ROUTER, bind=True
     ) as handshake_socket:
-        # Start local engines.
         if local_engine_count:
             local_engine_manager = CoreEngineProcManager(
                 cfie_config=cfie_config,
@@ -1041,9 +1099,11 @@ def launch_core_engines(
         else:
             local_engine_manager = None
 
+        # 先把刚创建好的 manager / coordinator / addresses 暴露给调用方，
+        # 让前端有机会完成 socket 连接与资源登记。
         yield local_engine_manager, coordinator, addresses
 
-        # Now wait for engines to start.
+        # 当前端准备完成后，再统一等待目标 engines 完成正式启动握手。
         wait_for_engine_startup(
             handshake_socket,
             addresses,
