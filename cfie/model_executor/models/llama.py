@@ -428,9 +428,14 @@ class LlamaModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
+            intermediate_tensors = IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+            # PP 非最后 stage 命中 aux 层时，先把本 stage 的辅助 hidden states
+            # 交给 model runner 本地消费，主干中间张量仍按原有 PP 字典继续传递。
+            if aux_hidden_states:
+                return intermediate_tensors, aux_hidden_states
+            return intermediate_tensors
 
         hidden_states, _ = self.norm(hidden_states, residual)
 

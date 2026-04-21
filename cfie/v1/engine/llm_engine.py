@@ -244,9 +244,11 @@ class LLMEngine:
     def has_unfinished_requests(self) -> bool:
         # 先看当前 rank 本地是否仍有未完成请求。
         has_unfinished = self.output_processor.has_unfinished_requests()
+
         # 非 DP 模式下，再结合 engine core 的全局运行状态返回。
         if self.dp_group is None:
             return has_unfinished or self.engine_core.dp_engines_running()
+
         # DP 模式下需要汇总各 rank 状态。
         return self.has_unfinished_requests_dp(has_unfinished)
 

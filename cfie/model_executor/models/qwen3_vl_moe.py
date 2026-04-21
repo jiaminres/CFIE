@@ -126,9 +126,14 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
+            intermediate_tensors = IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+            # PP 非最后 stage 仍可能产生需要导出的 aux hidden states；
+            # 这里返回 tuple 交给 model runner 本地消费，不改变 PP 主链路传输内容。
+            if aux_hidden_states:
+                return intermediate_tensors, aux_hidden_states
+            return intermediate_tensors
         hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:

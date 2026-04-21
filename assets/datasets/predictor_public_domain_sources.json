@@ -1,0 +1,33 @@
+{
+  "dataset_kind": "cfie_predictor_public_domain_texts",
+  "record_count": 731,
+  "sources": [
+    {
+      "author": "Jane Austen",
+      "character_count": 721387,
+      "license": "Project Gutenberg public-domain text",
+      "record_count": 446,
+      "source_id": "gutenberg_pg1342",
+      "title": "Pride and Prejudice",
+      "url": "https://www.gutenberg.org/cache/epub/1342/pg1342.txt"
+    },
+    {
+      "author": "Lewis Carroll",
+      "character_count": 144013,
+      "license": "Project Gutenberg public-domain text",
+      "record_count": 86,
+      "source_id": "gutenberg_pg11",
+      "title": "Alice's Adventures in Wonderland",
+      "url": "https://www.gutenberg.org/cache/epub/11/pg11.txt"
+    },
+    {
+      "author": "Arthur Conan Doyle",
+      "character_count": 312241,
+      "license": "Project Gutenberg public-domain text",
+      "record_count": 199,
+      "source_id": "gutenberg_pg1661",
+      "title": "The Adventures of Sherlock Holmes",
+      "url": "https://www.gutenberg.org/cache/epub/1661/pg1661.txt"
+    }
+  ]
+}

@@ -1143,6 +1143,7 @@ def wait_for_engine_startup(
     # 统一使用 poller 同时监听握手 socket 与子进程 sentinel。
     poller = zmq.Poller()
     poller.register(handshake_socket, zmq.POLLIN)
+    process_sentinels = []
 
     # remote engine 是否必须以 headless 方式启动，取决于 DP 负载均衡模式。
     remote_should_be_headless = (
@@ -1153,14 +1154,31 @@ def wait_for_engine_startup(
     # 注册本地 engine 子进程 sentinel；若子进程提前退出，poller 会立刻感知。
     if proc_manager is not None:
         for sentinel in proc_manager.sentinels():
-            poller.register(sentinel, zmq.POLLIN)
+            process_sentinels.append(sentinel)
+            # Windows 的进程 sentinel 不是 ZMQ socket；
+            # 不能注册进 zmq.Poller，否则会在 poll 阶段触发 “not a socket”。
+            if os.name != "nt":
+                poller.register(sentinel, zmq.POLLIN)
     # 若存在 coordinator，也把其 sentinel 一并纳入监控。
     if coord_process is not None:
-        poller.register(coord_process.sentinel, zmq.POLLIN)
+        process_sentinels.append(coord_process.sentinel)
+        if os.name != "nt":
+            poller.register(coord_process.sentinel, zmq.POLLIN)
+
+    def _poll_windows_process_sentinels() -> list[tuple[object, int]]:
+        # Windows 下用 multiprocessing.connection.wait 单独检查进程退出；
+        # 这样既保留子进程提前失败检测，又避免把非 socket 句柄交给 ZMQ。
+        if os.name != "nt" or not process_sentinels:
+            return []
+        ready_sentinels = connection.wait(process_sentinels, timeout=0)
+        return [(sentinel, zmq.POLLIN) for sentinel in ready_sentinels]
 
     # ----------------- 轮询等待握手完成 -----------------
     while any(conn_pending) or any(start_pending):
-        events = poller.poll(STARTUP_POLL_PERIOD_MS)
+        events = _poll_windows_process_sentinels()
+        if not events:
+            events = poller.poll(STARTUP_POLL_PERIOD_MS)
+            events.extend(_poll_windows_process_sentinels())
         if not events:
             # 长时间未收到事件时输出当前卡在哪个阶段，便于判断是没连上还是没 ready。
             if any(conn_pending):

@@ -1584,9 +1584,14 @@ class Qwen3LLMModel(Qwen3Model):
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
+            intermediate_tensors = IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+            # PP 非最后 stage 的 aux hidden states 只用于本地 capture / speculative 侧路；
+            # 主干 PP 通信仍保持 hidden_states/residual 两个核心张量。
+            if aux_hidden_states:
+                return intermediate_tensors, aux_hidden_states
+            return intermediate_tensors
         hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:

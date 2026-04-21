@@ -1,3 +1,46 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
+
+# ------------------------------- Python 虚拟环境与工具缓存 -------------------------------
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+pip-wheel-metadata/
+*.egg-info/
+
+# ------------------------------- IDE 与本地编辑器文件 -------------------------------
+.idea/
+.vscode/
+
+# ------------------------------- 本地临时目录与运行日志 -------------------------------
+.tmp/
+logs/
+%LOG%
+*.log
+
+# ------------------------------- CMake / Ninja / 本地构建输出 -------------------------------
+.deps/
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# ------------------------------- 原生扩展与编译产物 -------------------------------
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.ilk
+*.dll
+*.dylib
+*.so
+*.pyd

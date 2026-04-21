@@ -503,9 +503,14 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
+            intermediate_tensors = IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+            # PP 非最后 stage 的 aux hidden states 不应该丢弃；
+            # model runner 会就地缓存它们，PP 通信仍只传递主干 hidden/residual。
+            if aux_hidden_states:
+                return intermediate_tensors, aux_hidden_states
+            return intermediate_tensors
         hidden_states, _ = self.norm(hidden_states, residual)
 
         # Return auxiliary hidden states if collected

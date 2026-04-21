@@ -23,6 +23,7 @@ PackDType = Literal["int32"]
 QuantizedComputeViewDType = Literal["fp16", "fp32"]
 ShardMaterializationMode = Literal["representative", "logical"]
 LogicalCudaExecutionMode = Literal["compact_layer", "full_bucket"]
+TeacherOutputKind = Literal["final_only", "cumulative", "delta"]
 
 
 # 校验字符串字段不能为空。
@@ -283,6 +284,70 @@ class ModelSourceConfig:
         return self
 
     # dataclass 初始化后立即校验模型源配置。
+    def __post_init__(self) -> None:
+        self.validate()
+
+
+@dataclass(slots=True)
+class TeacherSamplingConfig:
+    """
+    描述 predictor teacher 前向捕获时使用的采样参数来源。
+
+    这里的配置只控制 teacher 引擎为了完成一次真实 generate 请求所需的采样行为。
+    若某个采样字段保持为 None，则运行时会优先从模型目录下的
+    generation_config.json 读取对应默认值；若文件缺失或字段不存在，
+    再退回到 vLLM/CFIE 侧的安全默认值。
+
+    max_tokens 默认仍固定为 1，因为 teacher trace 只需要最小生成步来驱动
+    请求完成与 routed experts 回传，不应该默认继承模型聊天配置里的长生成上限。
+    """
+
+    # 模型目录下用于读取默认采样参数的配置文件名。
+    generation_config_filename: str = "generation_config.json"
+
+    # teacher 采样温度；为 None 时继承 generation_config.json 中的 temperature。
+    temperature: float | None = None
+
+    # nucleus sampling 阈值；为 None 时继承 generation_config.json 中的 top_p。
+    top_p: float | None = None
+
+    # top-k 候选数量；为 None 时继承 generation_config.json 中的 top_k。
+    top_k: int | None = None
+
+    # min-p 阈值；为 None 时继承 generation_config.json 中的 min_p。
+    min_p: float | None = None
+
+    # 重复惩罚；为 None 时继承 generation_config.json 中的 repetition_penalty。
+    repetition_penalty: float | None = None
+
+    # teacher trace 每条请求只需要生成的 token 数，默认保持最小生成 1。
+    max_tokens: int = 1
+
+    # teacher capture 只消费最终输出对象，因此默认使用 final-only 输出。
+    output_kind: TeacherOutputKind = "final_only"
+
+    # 校验 teacher 采样配置的取值范围。
+    def validate(self) -> "TeacherSamplingConfig":
+        _require_non_empty(
+            "generation_config_filename",
+            self.generation_config_filename,
+        )
+        if self.temperature is not None:
+            _require_non_negative_float("temperature", self.temperature)
+        if self.top_p is not None and not 0.0 < self.top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+        if self.top_k is not None and self.top_k < -1:
+            raise ValueError("top_k must be -1, 0, or a positive integer")
+        if self.min_p is not None and not 0.0 <= self.min_p <= 1.0:
+            raise ValueError("min_p must be in [0, 1]")
+        if self.repetition_penalty is not None:
+            _require_positive_float("repetition_penalty", self.repetition_penalty)
+        _require_positive_int("max_tokens", self.max_tokens)
+        if self.output_kind not in {"final_only", "cumulative", "delta"}:
+            raise ValueError("output_kind must be final_only, cumulative, or delta")
+        return self
+
+    # dataclass 初始化后立即校验 teacher 采样配置。
     def __post_init__(self) -> None:
         self.validate()
 
@@ -610,6 +675,10 @@ class TrainingProjectConfig:
     predictor_trainer: PredictorTrainerConfig = field(
         default_factory=PredictorTrainerConfig
     )
+    # teacher 采样配置，定义 trace 捕获时如何继承模型默认 generation_config。
+    teacher_sampling: TeacherSamplingConfig = field(
+        default_factory=TeacherSamplingConfig
+    )
 
     # ------------------------------- 显存预算与状态字节配置 -------------------------------
     # 分层内存预算配置，定义 GPU-hot/CPU-hot/NVMe-cold 各层可用容量。
@@ -642,6 +711,7 @@ class TrainingProjectConfig:
         self.runtime_quantization.validate()
         self.predictor_routing.validate()
         self.predictor_trainer.validate()
+        self.teacher_sampling.validate()
         self.memory_budget.validate()
         self.state_bytes.validate()
 

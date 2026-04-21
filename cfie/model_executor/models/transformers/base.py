@@ -566,7 +566,12 @@ class Base(
             aux_hidden_states = [x[0][0, ...] for x in outputs[1:]]
 
         if not self.pp_group.is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
+            intermediate_tensors = IntermediateTensors({"hidden_states": hidden_states})
+            # HF transformer 包装层在 PP 非最后 stage 也可能被要求导出 aux hidden states；
+            # 返回 tuple 让 runner 本地消费辅助张量，PP 主通道仍只传 hidden_states。
+            if self._output_aux_hidden_states_kwargs and len(aux_hidden_states) > 0:
+                return intermediate_tensors, aux_hidden_states
+            return intermediate_tensors
 
         if self._output_aux_hidden_states_kwargs and len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states

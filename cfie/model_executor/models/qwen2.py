@@ -447,9 +447,14 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
+            intermediate_tensors = IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+            # PP 非最后 stage 也可能采到 aux hidden states；
+            # 这些张量只供本地捕获逻辑使用，不参与后续 PP 中间张量传递。
+            if aux_hidden_states:
+                return intermediate_tensors, aux_hidden_states
+            return intermediate_tensors
 
         hidden_states, _ = self.norm(hidden_states, residual)
 

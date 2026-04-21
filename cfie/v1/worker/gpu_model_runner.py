@@ -505,8 +505,9 @@ class GPUModelRunner(
         # 2. ready：请求完成捕获后等待上层通过 RPC 取走。
         self.predictor_capture_enabled = False
         self.predictor_capture_layer_ids: tuple[int, ...] = ()
+        self.predictor_capture_local_layer_ids: tuple[int, ...] = ()
         self._in_progress_predictor_hidden_states: dict[str, list[torch.Tensor]] = {}
-        self._ready_predictor_hidden_states: dict[str, tuple[torch.Tensor, ...]] = {}
+        self._ready_predictor_hidden_states: dict[str, dict[str, Any]] = {}
         # ----------------- speculative drafter 初始化入口 -----------------
         # drafter 统一在最后一个 PP rank 上构造。
         # mtp 不走 draft_model 分支，而是会落到 use_eagle() 分支，由 EagleProposer 承接。
@@ -2797,6 +2798,41 @@ class GPUModelRunner(
 
         return fallback_model
 
+    # ------------------------------- 推导当前 PP stage 负责捕获的层号 -------------------------------
+    def _resolve_predictor_capture_local_layer_ids(
+        self,
+        layer_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        # predictor 下发的是全模型层号；PP 场景下当前 worker 只拥有其中一段层，
+        # 因此 worker 返回结果时必须携带“本 stage 实际捕获了哪些层”的精确元数据。
+        model = self._resolve_predictor_capture_model()
+
+        # 常见模型会把 `start_layer/end_layer` 挂在文本 backbone 上；
+        # 这里同时检查当前对象和下一层 `model`，兼容外层 CausalLM 包装。
+        language_model = getattr(model, "language_model", None)
+        candidate_models = [
+            model,
+            getattr(model, "model", None),
+            language_model,
+            getattr(language_model, "model", None),
+        ]
+        for candidate_model in candidate_models:
+            if candidate_model is None:
+                continue
+
+            # 只有同时拿到起止层号时，才把全局捕获列表裁成当前 PP stage 的局部列表。
+            start_layer = getattr(candidate_model, "start_layer", None)
+            end_layer = getattr(candidate_model, "end_layer", None)
+            if isinstance(start_layer, int) and isinstance(end_layer, int):
+                return tuple(
+                    layer_id
+                    for layer_id in layer_ids
+                    if start_layer <= layer_id < end_layer
+                )
+
+        # 非 PP 或模型未暴露边界时，保守认为当前 worker 会返回完整捕获列表。
+        return layer_ids
+
     # ------------------------------- 打开 predictor hidden-state 捕获 -------------------------------
     def enable_predictor_capture(self, layer_ids: tuple[int, ...]) -> None:
         # predictor trace 只依赖目标模型真实前向，因此这里直接在已加载模型上打开
@@ -2811,6 +2847,12 @@ class GPUModelRunner(
         # 记录当前捕获层集合，并清空历史缓存，避免跨批次串数据。
         self.predictor_capture_enabled = True
         self.predictor_capture_layer_ids = layer_ids
+        self.predictor_capture_local_layer_ids = (
+            GPUModelRunner._resolve_predictor_capture_local_layer_ids(
+                self,
+                layer_ids,
+            )
+        )
         self._in_progress_predictor_hidden_states.clear()
         self._ready_predictor_hidden_states.clear()
 
@@ -2822,6 +2864,7 @@ class GPUModelRunner(
     def disable_predictor_capture(self) -> None:
         self.predictor_capture_enabled = False
         self.predictor_capture_layer_ids = ()
+        self.predictor_capture_local_layer_ids = ()
         self._in_progress_predictor_hidden_states.clear()
         self._ready_predictor_hidden_states.clear()
         self.use_aux_hidden_state_outputs = False
@@ -2833,11 +2876,11 @@ class GPUModelRunner(
     def take_predictor_hidden_states(
         self,
         request_ids: list[str] | tuple[str, ...] | None = None,
-    ) -> dict[str, tuple[torch.Tensor, ...]]:
+    ) -> dict[str, dict[str, Any]]:
         if request_ids is None:
             request_ids = tuple(self._ready_predictor_hidden_states.keys())
 
-        captured: dict[str, tuple[torch.Tensor, ...]] = {}
+        captured: dict[str, dict[str, Any]] = {}
         for request_id in request_ids:
             resolved_request_id = request_id
             if resolved_request_id not in self._ready_predictor_hidden_states:
@@ -2850,11 +2893,25 @@ class GPUModelRunner(
                 if len(matched_request_ids) == 1:
                     resolved_request_id = matched_request_ids[0]
 
-            hidden_states = self._ready_predictor_hidden_states.pop(
+            payload = self._ready_predictor_hidden_states.pop(
                 resolved_request_id, None
             )
-            if hidden_states is not None:
-                captured[str(request_id)] = hidden_states
+            if payload is not None:
+                hidden_states = tuple(
+                    hidden_state.tolist()
+                    for hidden_state in payload["hidden_states"]
+                )
+                # worker 返回结果必须带上并行 rank 元数据；
+                # trainer 侧据此区分“TP 重复副本”和“PP 不同层段”。
+                captured[str(request_id)] = {
+                    "layer_ids": payload["layer_ids"],
+                    "hidden_states": hidden_states,
+                    "global_rank": get_tp_group().rank,
+                    "tp_rank": get_tp_group().rank_in_group,
+                    "tp_world_size": get_tp_group().world_size,
+                    "pp_rank": get_pp_group().rank_in_group,
+                    "pp_world_size": get_pp_group().world_size,
+                }
         return captured
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -3905,8 +3962,15 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
+                # aux hidden-state 输出开启后，最后一个 PP stage 通常返回
+                # `(hidden_states, aux_hidden_states)`；
+                # 非最后 PP stage 在支持 capture 时也会返回
+                # `(IntermediateTensors, aux_hidden_states)`，以便本地先完成捕获再继续传递。
+                if isinstance(model_output, tuple):
+                    hidden_states, aux_hidden_states = model_output
+                else:
+                    hidden_states = model_output
+                    aux_hidden_states = None
             else:
                 # Common case.
                 hidden_states = model_output
@@ -3917,6 +3981,12 @@ class GPUModelRunner(
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
+                    # 非最后 PP stage 不会进入采样后处理路径，
+                    # 因此 predictor capture 必须在发送中间张量前就地收割本 stage 的层结果。
+                    self._capture_predictor_hidden_states(
+                        aux_hidden_states,
+                        scheduler_output.num_scheduled_tokens,
+                    )
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
@@ -3938,6 +4008,12 @@ class GPUModelRunner(
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
+                    # 非最后 PP stage 只负责把中间张量传给下一 stage；
+                    # predictor capture 的本地层结果同样要在发送前完成缓存。
+                    self._capture_predictor_hidden_states(
+                        aux_hidden_states,
+                        scheduler_output.num_scheduled_tokens,
+                    )
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
                             self.cfie_config, num_tokens_padded
@@ -4997,9 +5073,20 @@ class GPUModelRunner(
         if not self.predictor_capture_enabled:
             return
 
+        local_layer_ids = self.predictor_capture_local_layer_ids
         if not self.use_aux_hidden_state_outputs or aux_hidden_states is None:
+            if not local_layer_ids:
+                return
             raise ValueError(
                 "predictor capture requires aux_hidden_states to be enabled"
+            )
+
+        # 当前 worker 只缓存自己真实产出的 aux hidden states；
+        # PP 场景下不同 stage 会各自返回不同层号，后续由 trainer 按层号拼成全模型结果。
+        if len(local_layer_ids) != len(aux_hidden_states):
+            raise ValueError(
+                "predictor capture local layer count does not match "
+                "aux_hidden_states"
             )
 
         # chunked prefill 下同一请求可能分多轮把 prompt 跑完；
@@ -5052,9 +5139,10 @@ class GPUModelRunner(
                 )
 
             if start_idx + num_capture_tokens >= num_prompt_tokens:
-                self._ready_predictor_hidden_states[capture_req_id] = tuple(
-                    buffered_layers
-                )
+                self._ready_predictor_hidden_states[capture_req_id] = {
+                    "layer_ids": local_layer_ids,
+                    "hidden_states": tuple(buffered_layers),
+                }
                 completed_prefill_reqs.append(capture_req_id)
 
         for req_id in completed_prefill_reqs:

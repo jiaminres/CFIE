@@ -957,7 +957,7 @@ class Worker(WorkerBase):
     def take_predictor_hidden_states(
         self,
         request_ids: list[str] | tuple[str, ...] | None = None,
-    ) -> dict[str, tuple[torch.Tensor, ...]]:
+    ) -> dict[str, dict[str, Any]]:
         take_fn = getattr(self.model_runner, "take_predictor_hidden_states", None)
         if not callable(take_fn):
             raise RuntimeError("current model runner does not support predictor capture")

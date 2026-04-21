@@ -647,9 +647,12 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
                 output_tensors[PREDICTOR_PENDING_LAYER_PLANS_KEY] = (
                     pending_layer_plans
                 )
-            return IntermediateTensors(
-                output_tensors
-            )
+            intermediate_tensors = IntermediateTensors(output_tensors)
+            # PP 非最后 stage 也可能负责一部分需要采集的 hidden-state 层；
+            # 返回 tuple 让 model runner 在本地落盘这些层，再继续按原 PP 字典传递主干状态。
+            if aux_hidden_states:
+                return intermediate_tensors, aux_hidden_states
+            return intermediate_tensors
         if self.predictor_runtime is not None:
             self.predictor_runtime.commit_observed_online_expert_states()
         hidden_states, _ = self.norm(hidden_states, residual)
