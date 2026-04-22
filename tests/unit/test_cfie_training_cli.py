@@ -407,6 +407,55 @@ def test_predictor_train_command_writes_checkpoint_and_schema(
     assert schema_payload["candidate_experts_per_layer"] == 40
 
 
+def test_predictor_train_command_exports_final_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_fake_predictor_runtime(monkeypatch)
+    dataset_path = _write_text_dataset(tmp_path, "predictor-final-bundle.txt")
+    checkpoint_path = tmp_path / "predictor.ckpt"
+    bundle_dir = tmp_path / "bundle"
+
+    code = main([
+        "predictor-train",
+        "--steps",
+        "1",
+        "--examples-per-step",
+        "1",
+        "--epochs",
+        "2",
+        "--dataset",
+        str(dataset_path),
+        "--checkpoint-output",
+        str(checkpoint_path),
+        "--checkpoint-every-epochs",
+        "5",
+        "--bundle-output-dir",
+        str(bundle_dir),
+        "--json",
+    ])
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    manifest_path = bundle_dir / "predictor_bundle.json"
+    metrics_path = bundle_dir / "predictor_metrics.json"
+    weights_path = bundle_dir / "predictor_weights.pt"
+
+    assert checkpoint_path.exists()
+    assert manifest_path.exists()
+    assert metrics_path.exists()
+    assert weights_path.exists()
+
+    checkpoint_payload = torch.load(checkpoint_path, map_location="cpu")
+    metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+
+    assert payload["epochs"] == 2
+    assert checkpoint_payload["run_trace"]["epochs"] == 2
+    assert metrics_payload["epochs"] == 2
+    assert metrics_payload["final_mean_loss"] == payload["final_mean_loss"]
+
+
 def test_predictor_train_command_accepts_resume_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

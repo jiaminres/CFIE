@@ -16,7 +16,25 @@ version = "0.1.0"
 description = "Capacity-First Inference Engine (CFIE)"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
-dependencies = []
+dependencies = [
+    "aiohttp",
+    "cachetools",
+    "cbor2",
+    "cloudpickle",
+    "gguf",
+    "huggingface_hub",
+    "msgspec",
+    "pillow",
+    "prometheus_client",
+    "psutil",
+    "py-cpuinfo",
+    "pybase64",
+    "pydantic",
+    "pyzmq",
+    "regex",
+    "safetensors",
+    "transformers",
+]
 
 [project.scripts]
 cfie = "cfie.cli.main:main"

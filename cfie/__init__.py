@@ -37,7 +37,10 @@ def _iter_windows_dll_dirs() -> list[Path]:
             candidates.append(cuda_versions[0] / "bin")
 
     def add_package_bin(module_name: str, suffix: str = "bin") -> None:
-        spec = importlib.util.find_spec(module_name)
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except ModuleNotFoundError:
+            return
         if spec is None or not spec.submodule_search_locations:
             return
         for location in spec.submodule_search_locations:

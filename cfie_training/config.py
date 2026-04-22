@@ -453,15 +453,34 @@ class RuntimeQuantizationConfig:
 
 @dataclass(slots=True)
 class PredictorRoutingConfig:
+    """
+    描述 predictor 在推理侧如何把未来专家预测结果映射成候选池与执行池的配置。
+
+    这组配置不直接决定 predictor 网络的结构，而是规定 predictor 产出的
+    future expert 预测结果要按多大的窗口解释、给每层预留多少共享候选槽位、
+    最终允许多少 expert 进入执行集合，以及这些候选 expert 在运行时从哪里取。
+    训练、评估、checkpoint 校验和后续部署都需要复用这一套口径，因此必须集中定义。
+    """
+
+    # 是否启用 predictor 路由链路；关闭后，后续窗口预算和候选池约束都不再生效。
     enabled: bool = True
+    # predictor 一次要覆盖多少个未来层；它决定单条样本要输出多长的 future window。
     window_layers: int = 8
+    # 相邻训练样本在层维度上向前推进多少层；它决定 future window 的滑动步长。
     stride_layers: int = 8
+    # 整个 future window 共享的 GPU 候选 expert 槽位总数；后续会按窗口层数均分到每一层。
     shared_gpu_candidate_slots: int = 256
+    # 每个未来层最终允许真正执行的 expert 数量；它对应推理侧的硬执行预算。
     executed_experts_per_layer: int = 8
+    # 每个未来层允许进入候选集合的 expert 数量；它必须覆盖执行预算和额外 speculative 预算。
     candidate_experts_per_layer: int = 40
+    # 候选 expert 在线补齐时优先从哪里取；它约束推理期可以使用的在线专家来源。
     online_expert_source: OnlineExpertSource = "cpu_hot_only"
+    # predictor 输出的候选集合如何裁剪成最终可执行集合；它定义推理侧选择策略的解释方式。
     selection_mode: PredictorSelectionMode = "masked_candidate_topk"
+    # 是否允许候选集合与 teacher 标签存在一定不完全一致；它用于放宽训练到部署之间的严格对齐要求。
     allow_candidate_mismatch: bool = True
+    # teacher 监督链路默认关注的核心指标名称；它通常会和候选预算口径保持一致。
     teacher_metric: str = "recall@40"
 
     # 返回均分窗口后每层可用的 speculative expert 数。

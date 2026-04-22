@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -246,3 +247,72 @@ def test_predictor_trainer_prefers_forward_capture_backend(
     assert len(dataset.examples[0].future_layer_indices) == (
         config.predictor_routing.window_layers
     )
+
+
+def test_predictor_trainer_rejects_dataset_config_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = build_profile_config("qwen35-35b-a3b")
+    trainer = PredictorTrainer(
+        config,
+        teacher_model_backend=_FakeForwardBackend(
+            hidden_dim=config.model_spec.hidden_size,
+            num_layers=config.model_spec.num_hidden_layers,
+            num_experts=config.model_spec.num_experts,
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_build_batch_planner",
+        lambda **_: _FakeTokenBatchPlanner(),
+    )
+
+    dataset = trainer.build_trace_dataset(
+        steps=1,
+        examples_per_step=1,
+        dataset_path="fake.txt",
+    )
+    mismatched_dataset = replace(
+        dataset,
+        candidate_experts_per_layer=dataset.candidate_experts_per_layer - 1,
+    )
+
+    with pytest.raises(ValueError, match="candidate_experts_per_layer"):
+        trainer.evaluate_dataset(mismatched_dataset)
+
+
+def test_predictor_trainer_rejects_resume_run_trace_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = build_profile_config("qwen35-35b-a3b")
+    trainer = PredictorTrainer(
+        config,
+        teacher_model_backend=_FakeForwardBackend(
+            hidden_dim=config.model_spec.hidden_size,
+            num_layers=config.model_spec.num_hidden_layers,
+            num_experts=config.model_spec.num_experts,
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_build_batch_planner",
+        lambda **_: _FakeTokenBatchPlanner(),
+    )
+
+    dataset = trainer.build_trace_dataset(
+        steps=1,
+        examples_per_step=1,
+        dataset_path="fake.txt",
+    )
+    _, run_trace, _ = trainer.fit_dataset(dataset, epochs=1)
+    mismatched_run_trace = replace(
+        run_trace,
+        example_count=run_trace.example_count + 1,
+    )
+
+    with pytest.raises(ValueError, match="example_count"):
+        trainer.fit_dataset(
+            dataset,
+            epochs=1,
+            initial_run_trace=mismatched_run_trace,
+        )

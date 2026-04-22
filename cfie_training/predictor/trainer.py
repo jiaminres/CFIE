@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import json
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -12,6 +11,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from cfie_training.config import TrainingProjectConfig
+from cfie_training.predictor.models import (
+    CapturedForwardBatch,
+    CapturedHiddenStatePayload,
+    PredictorCaptureRequest,
+    PredictorCheckpointMetadata,
+    PredictorDeploymentManifest,
+    PredictorEpochSummary,
+    PredictorEvaluationTrace,
+    PredictorExampleSpec,
+    PredictorMetricsSummary,
+    PredictorRuntimeSchema,
+    PredictorTraceDataset,
+    PredictorTraceExample,
+    PredictorTrainingRunTrace,
+)
 from cfie_training.runtime.data import TokenizedDatasetBatchPlanner
 from cfie_training.runtime.types import BatchShape
 
@@ -23,67 +37,6 @@ class PredictorBatchPlanner(Protocol):
     # 返回指定 step 使用的 batch 形状。
     def batch_for_step(self, step_index: int) -> BatchShape:
         ...
-
-
-@dataclass(slots=True, frozen=True)
-class CapturedForwardBatch:
-    """一次真实 teacher 前向捕获后的按层监督数据。
-
-    设：
-    - L = 模型层数
-    - T = 当前 batch 内所有 request 的有效 prompt token 总数
-    - H = hidden size
-    - K = routed top-k 专家数
-    """
-
-    # 按层保存 hidden state；tuple 长度为 L，每个 tensor 形状为 [T, H]。
-    layer_hidden_states: tuple[torch.Tensor, ...]
-
-    # 按层保存 teacher router top-k 专家 id；tuple 长度为 L，每个 tensor 形状为 [T, K]。
-    layer_teacher_topk_ids: tuple[torch.Tensor, ...]
-
-
-@dataclass(slots=True, frozen=True)
-class CapturedHiddenStatePayload:
-    """trainer 内部使用的标准 hidden-state 捕获载荷。
-
-    worker 侧必须返回结构化字典协议；trainer 侧收到后立即转换成该对象。
-    这样合并逻辑只面对具名字段，不再传递难读的多元素 tuple，也不会再
-    根据返回位置猜测层号或 rank 语义。
-    """
-
-    # 当前 payload 对应的请求 id，用于把多 worker 返回结果归并回同一个 request。
-    request_id: str
-
-    # 当前 worker 实际返回的层号集合；tuple 长度必须与 hidden_states 一致。
-    layer_ids: tuple[int, ...]
-
-    # 当前 worker 对应层段捕获到的 hidden states；
-    # tuple 长度等于 len(layer_ids)，每个 tensor 通常形状为 [request_token_count, hidden_size]。
-    hidden_states: tuple[torch.Tensor, ...]
-
-    # pipeline parallel rank，用于区分不同 PP stage 返回的不同层段。
-    pp_rank: int
-
-    # tensor parallel rank，用于稳定处理同一层的 TP 重复副本。
-    tp_rank: int
-
-
-@dataclass(slots=True)
-class PredictorCaptureRequest:
-    """一次 teacher capture 请求在 trainer 侧的本地状态。
-
-    capture_batch 同时需要跟踪 request_id、真实 prompt、最终输出对象和按层
-    hidden states。如果这些信息分散在多个 `dict[str, ...]` 里，后续维护时很
-    难判断哪些字段必须同时存在。这里用具名对象把同一个 request 的状态收拢
-    到一起，让提交、step 回收、hidden-state 合并和最终校验都围绕同一份状态。
-    """
-
-    request_id: str
-    row_index: int
-    prompt_row: tuple[int, ...]
-    output: Any | None = None
-    hidden_states: tuple[torch.Tensor, ...] | None = None
 
 
 class PredictorTeacherModelBackend(Protocol):
@@ -650,6 +603,7 @@ class EngineRouterTeacherModelBackend:
                 row_index=row_index,
                 prompt_row=prompt_row,
             )
+
             request_records.append(request_record)
             request_by_id[request_id] = request_record
             request_ids.append(request_id)
@@ -773,7 +727,9 @@ class EngineRouterTeacherModelBackend:
             # 把当前请求的每层 hidden state 与 top-k 标签分别归档到对应层桶里，
             # 最终形成“按层训练”的监督布局。
             for layer_index in range(num_layers):
+                # hidden_states原先layer_index在第一维
                 layer_hidden_states[layer_index].append(hidden_states[layer_index])
+                # layer_teacher_topk_ids将第二维度的layer_index取出来
                 layer_teacher_topk_ids[layer_index].append(
                     routed_experts_tensor[:, layer_index, :]
                 )
@@ -806,565 +762,20 @@ class EngineRouterTeacherModelBackend:
         self._shutdown_engine()
 
 
-@dataclass(slots=True, frozen=True)
-class PredictorExampleSpec:
-    """单个 predictor 监督样本的轻量级选点规格。
+class FutureExpertPredictor(nn.Module):
+    """
+    基于当前层 hidden state 预测未来窗口层候选专家分布的轻量 predictor。
 
-    该对象只描述“后续应该从哪里取数据”，不直接保存 hidden state 或 teacher
-    标签。trace builder 会先在 token 与插入层组成的二维槽位空间中生成这些
-    规格，再根据规格去 `CapturedForwardBatch` 中读取真实前向捕获结果。
+    这个模块接收两类输入：
+    1. 当前插入层位置处的真实 hidden state；
+    2. 当前样本对应的插入层号。
+
+    前向时会先把 hidden state 投影到统一隐层空间，再把层号编码成一组连续特征并投影到同一空间，
+    随后把两部分表示相加后送入多层感知机，最终输出
+    `[batch_size, window_layers, num_experts]` 形状的 logits，
+    用于表示未来每一层上各个 expert 的打分。
     """
 
-    # 当前 step 内的局部样本序号，用来稳定保留本轮采样顺序。
-    example_offset: int
-
-    # predictor 插入层号；后续会读取该层、该 token 的 hidden state 作为输入特征。
-    insertion_layer_index: int
-
-    # 当前捕获 batch 内的展平 token 序号；后续会用它对齐 hidden state 与 teacher 标签。
-    token_index: int
-
-
-@dataclass(slots=True, frozen=True)
-class PredictorTraceExample:
-    example_index: int
-    step_index: int
-    token_index: int
-    insertion_layer_index: int
-    future_layer_indices: tuple[int, ...]
-    hidden_state: tuple[float, ...]
-    future_teacher_topk_ids: tuple[tuple[int, ...], ...]
-
-    # 将单条 predictor trace 样本序列化为字典。
-    def to_dict(self) -> dict[str, Any]:
-        # 输出样本编号、插入层、hidden_state 和未来 teacher top-k 标签。
-        return {
-            "example_index": self.example_index,
-            "step_index": self.step_index,
-            "token_index": self.token_index,
-            "insertion_layer_index": self.insertion_layer_index,
-            "future_layer_indices": list(self.future_layer_indices),
-            "hidden_state": list(self.hidden_state),
-            "future_teacher_topk_ids": [
-                list(expert_ids) for expert_ids in self.future_teacher_topk_ids
-            ],
-        }
-
-    @classmethod
-    # 从字典恢复单条 predictor trace 样本。
-    def from_dict(cls, payload: dict[str, Any]) -> "PredictorTraceExample":
-        # 逐字段恢复样本索引、未来层索引、hidden_state 和 top-k 标签；
-        # 同时兼容旧版数据里的 hidden_summary 字段。
-        return cls(
-            example_index=int(payload["example_index"]),
-            step_index=int(payload["step_index"]),
-            token_index=int(payload.get("token_index", 0)),
-            insertion_layer_index=int(payload["insertion_layer_index"]),
-            future_layer_indices=tuple(
-                int(layer_index) for layer_index in payload["future_layer_indices"]
-            ),
-            hidden_state=tuple(
-                float(value)
-                for value in payload.get(
-                    "hidden_state",
-                    payload.get("hidden_summary", ()),
-                )
-            ),
-            future_teacher_topk_ids=tuple(
-                tuple(int(expert_id) for expert_id in expert_ids)
-                for expert_ids in payload["future_teacher_topk_ids"]
-            ),
-        )
-
-
-@dataclass(slots=True, frozen=True)
-class PredictorTraceDataset:
-    profile_name: str
-    example_count: int
-    window_layers: int
-    candidate_experts_per_layer: int
-    executed_experts_per_layer: int
-    examples: tuple[PredictorTraceExample, ...]
-
-    # 将 predictor trace 数据集序列化为字典。
-    def to_dict(self) -> dict[str, Any]:
-        # 输出数据集来源、窗口配置和所有样本。
-        return {
-            "profile_name": self.profile_name,
-            "example_count": self.example_count,
-            "window_layers": self.window_layers,
-            "candidate_experts_per_layer": self.candidate_experts_per_layer,
-            "executed_experts_per_layer": self.executed_experts_per_layer,
-            "examples": [example.to_dict() for example in self.examples],
-        }
-
-    # 将 predictor trace 数据集导出为 JSON。
-    def to_json(self, *, indent: int = 2) -> str:
-        # 使用稳定排序键和指定缩进导出 JSON 文本。
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
-
-    # 将 predictor trace 数据集写入 JSON 文件。
-    def write_json(self, path: str | Path, *, indent: int = 2) -> None:
-        # 直接把 JSON 文本写到目标路径。
-        Path(path).write_text(self.to_json(indent=indent), encoding="utf-8")
-
-    @classmethod
-    # 从字典恢复 predictor trace 数据集。
-    def from_dict(cls, payload: dict[str, Any]) -> "PredictorTraceDataset":
-        # 先逐条恢复 examples 列表。
-        examples = tuple(
-            PredictorTraceExample.from_dict(example)
-            for example in payload.get("examples", [])
-        )
-        # 再恢复数据集元信息和 examples 元组。
-        return cls(
-            profile_name=str(payload["profile_name"]),
-            example_count=int(payload.get("example_count", len(examples))),
-            window_layers=int(payload["window_layers"]),
-            candidate_experts_per_layer=int(payload["candidate_experts_per_layer"]),
-            executed_experts_per_layer=int(payload["executed_experts_per_layer"]),
-            examples=examples,
-        )
-
-    @classmethod
-    # 从 JSON 文件恢复 predictor trace 数据集。
-    def from_json_file(cls, path: str | Path) -> "PredictorTraceDataset":
-        # 读取并解析 JSON 文本。
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        # 顶层必须解析成对象。
-        if not isinstance(payload, dict):
-            raise ValueError("predictor trace dataset JSON must decode to an object")
-        # 继续按字典格式恢复数据集。
-        return cls.from_dict(payload)
-
-
-@dataclass(slots=True, frozen=True)
-class PredictorEpochSummary:
-    epoch_index: int
-    mean_loss: float
-    recall_at_candidate_budget: float
-    recall_at_executed_budget: float
-
-    # 将单个 epoch 汇总序列化为字典。
-    def to_dict(self) -> dict[str, Any]:
-        # 输出 loss 和两档 recall 指标。
-        return {
-            "epoch_index": self.epoch_index,
-            "mean_loss": self.mean_loss,
-            "recall_at_candidate_budget": self.recall_at_candidate_budget,
-            "recall_at_executed_budget": self.recall_at_executed_budget,
-        }
-
-    @classmethod
-    # 从字典恢复单个 epoch 汇总。
-    def from_dict(cls, payload: dict[str, Any]) -> "PredictorEpochSummary":
-        # 逐字段恢复 epoch 编号、loss 与两档 recall。
-        return cls(
-            epoch_index=int(payload["epoch_index"]),
-            mean_loss=float(payload["mean_loss"]),
-            recall_at_candidate_budget=float(
-                payload["recall_at_candidate_budget"]
-            ),
-            recall_at_executed_budget=float(
-                payload["recall_at_executed_budget"]
-            ),
-        )
-
-
-@dataclass(slots=True, frozen=True)
-class PredictorTrainingRunTrace:
-    profile_name: str
-    example_count: int
-    epochs: int
-    candidate_experts_per_layer: int
-    executed_experts_per_layer: int
-    epoch_summaries: tuple[PredictorEpochSummary, ...]
-
-    @property
-    # 返回最后一个 epoch 的平均损失。
-    def final_mean_loss(self) -> float:
-        # 没有 epoch 时退回 0。
-        return self.epoch_summaries[-1].mean_loss if self.epoch_summaries else 0.0
-
-    @property
-    # 返回最后一个 epoch 的 candidate budget recall。
-    def final_recall_at_candidate_budget(self) -> float:
-        # 没有 epoch 时退回 0。
-        if not self.epoch_summaries:
-            return 0.0
-        # 否则取最后一个 epoch 的 recall。
-        return self.epoch_summaries[-1].recall_at_candidate_budget
-
-    @property
-    # 返回最后一个 epoch 的 executed budget recall。
-    def final_recall_at_executed_budget(self) -> float:
-        # 没有 epoch 时退回 0。
-        if not self.epoch_summaries:
-            return 0.0
-        # 否则取最后一个 epoch 的 recall。
-        return self.epoch_summaries[-1].recall_at_executed_budget
-
-    # 将整个 predictor 训练 run 序列化为字典。
-    def to_dict(self) -> dict[str, Any]:
-        # 输出训练来源、epoch 数、最终指标和逐 epoch 汇总。
-        return {
-            "profile_name": self.profile_name,
-            "example_count": self.example_count,
-            "epochs": self.epochs,
-            "candidate_experts_per_layer": self.candidate_experts_per_layer,
-            "executed_experts_per_layer": self.executed_experts_per_layer,
-            "final_mean_loss": self.final_mean_loss,
-            "final_recall_at_candidate_budget": (
-                self.final_recall_at_candidate_budget
-            ),
-            "final_recall_at_executed_budget": (
-                self.final_recall_at_executed_budget
-            ),
-            "epoch_summaries": [
-                summary.to_dict() for summary in self.epoch_summaries
-            ],
-        }
-
-    # 将 predictor 训练 run 导出为 JSON。
-    def to_json(self, *, indent: int = 2) -> str:
-        # 使用稳定排序键和指定缩进导出 JSON 文本。
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
-
-    @classmethod
-    # 从字典恢复 predictor 训练 run。
-    def from_dict(cls, payload: dict[str, Any]) -> "PredictorTrainingRunTrace":
-        # 先恢复逐 epoch 汇总列表。
-        epoch_summaries = tuple(
-            PredictorEpochSummary.from_dict(summary)
-            for summary in payload.get("epoch_summaries", [])
-        )
-        # 再恢复训练来源、预算和总 epoch 数。
-        return cls(
-            profile_name=str(payload["profile_name"]),
-            example_count=int(payload["example_count"]),
-            epochs=int(payload["epochs"]),
-            candidate_experts_per_layer=int(
-                payload["candidate_experts_per_layer"]
-            ),
-            executed_experts_per_layer=int(
-                payload["executed_experts_per_layer"]
-            ),
-            epoch_summaries=epoch_summaries,
-        )
-
-
-@dataclass(slots=True, frozen=True)
-class PredictorCheckpointMetadata:
-    checkpoint_kind: str
-    profile_name: str
-    input_summary_dim: int
-    hidden_dim: int
-    window_layers: int
-    stride_layers: int
-    num_experts: int
-    candidate_experts_per_layer: int
-    executed_experts_per_layer: int
-    selection_mode: str
-    online_expert_source: str
-    allow_candidate_mismatch: bool
-    example_count: int
-    epochs: int
-    final_mean_loss: float
-    final_recall_at_candidate_budget: float
-    final_recall_at_executed_budget: float
-
-    # 将 predictor checkpoint 元信息序列化为字典。
-    def to_dict(self) -> dict[str, Any]:
-        # 输出 checkpoint 对运行时兼容性和最终指标有影响的全部字段。
-        return {
-            "checkpoint_kind": self.checkpoint_kind,
-            "profile_name": self.profile_name,
-            "input_summary_dim": self.input_summary_dim,
-            "hidden_dim": self.hidden_dim,
-            "window_layers": self.window_layers,
-            "stride_layers": self.stride_layers,
-            "num_experts": self.num_experts,
-            "candidate_experts_per_layer": self.candidate_experts_per_layer,
-            "executed_experts_per_layer": self.executed_experts_per_layer,
-            "selection_mode": self.selection_mode,
-            "online_expert_source": self.online_expert_source,
-            "allow_candidate_mismatch": self.allow_candidate_mismatch,
-            "example_count": self.example_count,
-            "epochs": self.epochs,
-            "final_mean_loss": self.final_mean_loss,
-            "final_recall_at_candidate_budget": (
-                self.final_recall_at_candidate_budget
-            ),
-            "final_recall_at_executed_budget": (
-                self.final_recall_at_executed_budget
-            ),
-        }
-
-    @classmethod
-    # 从字典恢复 predictor checkpoint 元信息。
-    def from_dict(cls, payload: dict[str, Any]) -> "PredictorCheckpointMetadata":
-        # 逐字段恢复 checkpoint 兼容性约束和最终指标。
-        return cls(
-            checkpoint_kind=str(
-                payload.get("checkpoint_kind", "cfie_predictor_checkpoint")
-            ),
-            profile_name=str(payload["profile_name"]),
-            input_summary_dim=int(payload["input_summary_dim"]),
-            hidden_dim=int(payload["hidden_dim"]),
-            window_layers=int(payload["window_layers"]),
-            stride_layers=int(payload["stride_layers"]),
-            num_experts=int(payload["num_experts"]),
-            candidate_experts_per_layer=int(
-                payload["candidate_experts_per_layer"]
-            ),
-            executed_experts_per_layer=int(
-                payload["executed_experts_per_layer"]
-            ),
-            selection_mode=str(payload["selection_mode"]),
-            online_expert_source=str(payload["online_expert_source"]),
-            allow_candidate_mismatch=bool(
-                payload.get("allow_candidate_mismatch", True)
-            ),
-            example_count=int(payload["example_count"]),
-            epochs=int(payload["epochs"]),
-            final_mean_loss=float(payload["final_mean_loss"]),
-            final_recall_at_candidate_budget=float(
-                payload["final_recall_at_candidate_budget"]
-            ),
-            final_recall_at_executed_budget=float(
-                payload.get("final_recall_at_executed_budget", 0.0)
-            ),
-        )
-
-
-@dataclass(slots=True, frozen=True)
-class PredictorRuntimeSchema:
-    schema_kind: str
-    profile_name: str
-    input_summary_dim: int
-    predictor_hidden_dim: int
-    window_layers: int
-    stride_layers: int
-    num_experts: int
-    candidate_experts_per_layer: int
-    executed_experts_per_layer: int
-    selection_mode: str
-    online_expert_source: str
-    allow_candidate_mismatch: bool
-
-    # 将 predictor runtime schema 序列化为字典。
-    def to_dict(self) -> dict[str, Any]:
-        # 输出运行时推理侧需要的 predictor 结构与路由约束。
-        return {
-            "schema_kind": self.schema_kind,
-            "profile_name": self.profile_name,
-            "input_summary_dim": self.input_summary_dim,
-            "predictor_hidden_dim": self.predictor_hidden_dim,
-            "window_layers": self.window_layers,
-            "stride_layers": self.stride_layers,
-            "num_experts": self.num_experts,
-            "candidate_experts_per_layer": self.candidate_experts_per_layer,
-            "executed_experts_per_layer": self.executed_experts_per_layer,
-            "selection_mode": self.selection_mode,
-            "online_expert_source": self.online_expert_source,
-            "allow_candidate_mismatch": self.allow_candidate_mismatch,
-        }
-
-    # 将 predictor runtime schema 导出为 JSON。
-    def to_json(self, *, indent: int = 2) -> str:
-        # 使用稳定排序键和指定缩进导出 JSON 文本。
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
-
-    # 将 predictor runtime schema 写入 JSON 文件。
-    def write_json(self, path: str | Path, *, indent: int = 2) -> None:
-        # 直接把 JSON 文本写到目标路径。
-        Path(path).write_text(self.to_json(indent=indent), encoding="utf-8")
-
-    @classmethod
-    # 基于 checkpoint 元信息构造运行时 schema。
-    def from_checkpoint_metadata(
-            cls,
-            metadata: PredictorCheckpointMetadata,
-    ) -> "PredictorRuntimeSchema":
-        # 把 checkpoint 中的兼容性字段映射到 runtime schema。
-        return cls(
-            schema_kind="cfie_predictor_runtime_schema",
-            profile_name=metadata.profile_name,
-            input_summary_dim=metadata.input_summary_dim,
-            predictor_hidden_dim=metadata.hidden_dim,
-            window_layers=metadata.window_layers,
-            stride_layers=metadata.stride_layers,
-            num_experts=metadata.num_experts,
-            candidate_experts_per_layer=metadata.candidate_experts_per_layer,
-            executed_experts_per_layer=metadata.executed_experts_per_layer,
-            selection_mode=metadata.selection_mode,
-            online_expert_source=metadata.online_expert_source,
-            allow_candidate_mismatch=metadata.allow_candidate_mismatch,
-        )
-
-    @classmethod
-    # 从字典恢复 predictor runtime schema。
-    def from_dict(cls, payload: dict[str, Any]) -> "PredictorRuntimeSchema":
-        # 逐字段恢复运行时 schema 内容。
-        return cls(
-            schema_kind=str(
-                payload.get("schema_kind", "cfie_predictor_runtime_schema")
-            ),
-            profile_name=str(payload["profile_name"]),
-            input_summary_dim=int(payload["input_summary_dim"]),
-            predictor_hidden_dim=int(payload["predictor_hidden_dim"]),
-            window_layers=int(payload["window_layers"]),
-            stride_layers=int(payload["stride_layers"]),
-            num_experts=int(payload["num_experts"]),
-            candidate_experts_per_layer=int(
-                payload["candidate_experts_per_layer"]
-            ),
-            executed_experts_per_layer=int(
-                payload["executed_experts_per_layer"]
-            ),
-            selection_mode=str(payload["selection_mode"]),
-            online_expert_source=str(payload["online_expert_source"]),
-            allow_candidate_mismatch=bool(
-                payload.get("allow_candidate_mismatch", True)
-            ),
-        )
-
-
-@dataclass(slots=True, frozen=True)
-class PredictorEvaluationTrace:
-    profile_name: str
-    example_count: int
-    candidate_experts_per_layer: int
-    executed_experts_per_layer: int
-    mean_loss: float
-    recall_at_candidate_budget: float
-    recall_at_executed_budget: float
-    checkpoint_metadata: PredictorCheckpointMetadata | None = None
-
-    # 将 predictor 评估结果序列化为字典。
-    def to_dict(self) -> dict[str, Any]:
-        # 输出评估来源、loss、recall，以及可选的 checkpoint 元信息。
-        return {
-            "profile_name": self.profile_name,
-            "example_count": self.example_count,
-            "candidate_experts_per_layer": self.candidate_experts_per_layer,
-            "executed_experts_per_layer": self.executed_experts_per_layer,
-            "mean_loss": self.mean_loss,
-            "recall_at_candidate_budget": self.recall_at_candidate_budget,
-            "recall_at_executed_budget": self.recall_at_executed_budget,
-            "checkpoint_metadata": (
-                None
-                if self.checkpoint_metadata is None
-                else self.checkpoint_metadata.to_dict()
-            ),
-        }
-
-    # 将 predictor 评估结果导出为 JSON。
-    def to_json(self, *, indent: int = 2) -> str:
-        # 使用稳定排序键和指定缩进导出 JSON 文本。
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
-
-
-@dataclass(slots=True, frozen=True)
-class PredictorMetricsSummary:
-    metrics_kind: str
-    profile_name: str
-    example_count: int
-    epochs: int
-    final_mean_loss: float
-    final_recall_at_candidate_budget: float
-    final_recall_at_executed_budget: float
-
-    # 将 predictor 指标摘要序列化为字典。
-    def to_dict(self) -> dict[str, Any]:
-        # 输出最终 loss 与 recall 指标摘要。
-        return {
-            "metrics_kind": self.metrics_kind,
-            "profile_name": self.profile_name,
-            "example_count": self.example_count,
-            "epochs": self.epochs,
-            "final_mean_loss": self.final_mean_loss,
-            "final_recall_at_candidate_budget": (
-                self.final_recall_at_candidate_budget
-            ),
-            "final_recall_at_executed_budget": (
-                self.final_recall_at_executed_budget
-            ),
-        }
-
-    # 将 predictor 指标摘要导出为 JSON。
-    def to_json(self, *, indent: int = 2) -> str:
-        # 使用稳定排序键和指定缩进导出 JSON 文本。
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
-
-    # 将 predictor 指标摘要写入 JSON 文件。
-    def write_json(self, path: str | Path, *, indent: int = 2) -> None:
-        # 直接把 JSON 文本写到目标路径。
-        Path(path).write_text(self.to_json(indent=indent), encoding="utf-8")
-
-    @classmethod
-    # 根据 checkpoint 元信息构造指标摘要。
-    def from_checkpoint_metadata(
-            cls,
-            metadata: PredictorCheckpointMetadata,
-    ) -> "PredictorMetricsSummary":
-        # 直接把 checkpoint 中的最终指标映射成 metrics summary。
-        return cls(
-            metrics_kind="cfie_predictor_metrics_summary",
-            profile_name=metadata.profile_name,
-            example_count=metadata.example_count,
-            epochs=metadata.epochs,
-            final_mean_loss=metadata.final_mean_loss,
-            final_recall_at_candidate_budget=(
-                metadata.final_recall_at_candidate_budget
-            ),
-            final_recall_at_executed_budget=(
-                metadata.final_recall_at_executed_budget
-            ),
-        )
-
-
-@dataclass(slots=True, frozen=True)
-class PredictorDeploymentManifest:
-    bundle_kind: str
-    profile_name: str
-    source_checkpoint: str
-    weights_kind: str
-    weights_format: str
-    weights_file: str
-    schema_kind: str
-    schema_file: str
-    metrics_kind: str
-    metrics_file: str
-
-    # 将 predictor 部署清单序列化为字典。
-    def to_dict(self) -> dict[str, Any]:
-        # 输出 bundle 中各个文件及其语义类型。
-        return {
-            "bundle_kind": self.bundle_kind,
-            "profile_name": self.profile_name,
-            "source_checkpoint": self.source_checkpoint,
-            "weights_kind": self.weights_kind,
-            "weights_format": self.weights_format,
-            "weights_file": self.weights_file,
-            "schema_kind": self.schema_kind,
-            "schema_file": self.schema_file,
-            "metrics_kind": self.metrics_kind,
-            "metrics_file": self.metrics_file,
-        }
-
-    # 将 predictor 部署清单导出为 JSON。
-    def to_json(self, *, indent: int = 2) -> str:
-        # 使用稳定排序键和指定缩进导出 JSON 文本。
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
-
-    # 将 predictor 部署清单写入 JSON 文件。
-    def write_json(self, path: str | Path, *, indent: int = 2) -> None:
-        # 直接把 JSON 文本写到目标路径。
-        Path(path).write_text(self.to_json(indent=indent), encoding="utf-8")
-
-
-class FutureExpertPredictor(nn.Module):
     def __init__(
             self,
             *,
@@ -1373,14 +784,26 @@ class FutureExpertPredictor(nn.Module):
             window_layers: int,
             num_experts: int,
     ) -> None:
+        # ------------------------------- 初始化 predictor 的结构超参数与各个子模块 -------------------------------
+        # 先初始化 nn.Module 基类，确保后续挂载的线性层和顺序模块都会被 PyTorch 正常注册。
         super().__init__()
+
+        # 缓存未来窗口层数，后面输出张量需要按这个维度重新整理。
         self.window_layers = window_layers
+
+        # 缓存专家总数，后面输出层和最终 reshape 都依赖这个维度。
         self.num_experts = num_experts
+
+        # 把输入 hidden state 从原始模型维度投影到 predictor 内部的统一隐层空间。
         self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        # 把层号构造成的 6 维连续特征投影到同一隐层空间，便于和 hidden 表示直接相加融合。
         self.layer_proj = nn.Sequential(
             nn.Linear(6, hidden_dim),
             nn.SiLU(),
         )
+
+        # 主干网络负责在融合后的隐表示上继续提炼特征，并一次性产出整个未来窗口的 expert logits。
         self.net = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -1390,10 +813,13 @@ class FutureExpertPredictor(nn.Module):
 
     @staticmethod
     def _normalize_hidden_state(hidden_state: torch.Tensor) -> torch.Tensor:
+        # 如果调用方传入的是单条样本的 rank-1 hidden state，就在最前面补出 batch 维度以统一后续前向形状。
         if hidden_state.ndim == 1:
             return hidden_state.unsqueeze(0)
+        # predictor 只接受“单样本”或“批量样本”两种输入形状；更高或更低秩都说明上游调用有误。
         if hidden_state.ndim != 2:
             raise ValueError("hidden_state must be rank-1 or rank-2")
+        # 已经是标准 `[batch_size, hidden_dim]` 形状时，直接原样返回给后续投影层使用。
         return hidden_state
 
     @staticmethod
@@ -1403,6 +829,7 @@ class FutureExpertPredictor(nn.Module):
             batch_size: int,
             device: torch.device,
     ) -> torch.Tensor:
+        # 如果调用方传入的是 Python 整数，说明整批样本共用同一个插入层号，这里显式扩成 batch 级向量。
         if isinstance(layer_index, int):
             return torch.full(
                 (batch_size,),
@@ -1410,6 +837,8 @@ class FutureExpertPredictor(nn.Module):
                 dtype=torch.float32,
                 device=device,
             )
+
+        # 如果调用方传入的是标量 tensor，也按“整批共用一个层号”处理，并展开成 batch 级向量。
         if layer_index.ndim == 0:
             return torch.full(
                 (batch_size,),
@@ -1417,13 +846,19 @@ class FutureExpertPredictor(nn.Module):
                 dtype=torch.float32,
                 device=device,
             )
+
+        # 如果已经传入逐样本层号向量，就要求它必须是一维且长度与 batch 大小一致，否则无法逐样本对齐。
         if layer_index.ndim != 1 or int(layer_index.shape[0]) != batch_size:
             raise ValueError("layer_index must be scalar or match batch size")
+
+        # 把层号张量统一搬到 hidden state 所在设备，并转换成后续特征构造使用的 float32。
         return layer_index.to(device=device, dtype=torch.float32)
 
     @staticmethod
     def _layer_features(layer_index: torch.Tensor) -> torch.Tensor:
+        # 先把 `[batch_size]` 形状的层号扩成列向量，便于后面按最后一维拼接多组手工特征。
         layer_index = layer_index.unsqueeze(-1)
+        # 同时提供线性项、平方项和两组不同频率的正余弦项，让 predictor 能表达更平滑的层位置信号。
         return torch.cat(
             (
                 layer_index,
@@ -1441,16 +876,30 @@ class FutureExpertPredictor(nn.Module):
             hidden_state: torch.Tensor,
             layer_index: int | torch.Tensor,
     ) -> torch.Tensor:
+        # ------------------------------- 规范化 hidden state 与层号输入形状 -------------------------------
+        # 先把 hidden state 统一整理成 `[batch_size, input_dim]` 形状，避免单样本与批量路径分叉。
         hidden_state = self._normalize_hidden_state(hidden_state)
+
+        # 再把层号统一整理成 `[batch_size]`，并确保它和 hidden state 在同一设备上。
         layer_index = self._normalize_layer_index(
             layer_index,
             batch_size=int(hidden_state.shape[0]),
             device=hidden_state.device,
         )
+
+        # ------------------------------- 融合 hidden 表示与层位置信息 -------------------------------
+        # input_proj(hidden_state): `[batch_size, hidden_dim]`
+        # layer_proj(_layer_features(layer_index)): `[batch_size, hidden_dim]`
         fused_hidden = self.input_proj(hidden_state) + self.layer_proj(
             self._layer_features(layer_index)
         )
+
+        # ------------------------------- 生成未来窗口层上的 expert logits 并整理输出形状 -------------------------------
+        # logits: `[batch_size, window_layers * num_experts]`
         logits = self.net(fused_hidden)
+
+        # 最后把展平输出还原成 `[batch_size, window_layers, num_experts]`，
+        # 让下游可以按“未来第几层 -> 各 expert 打分”直接读取结果。
         return logits.view(-1, self.window_layers, self.num_experts)
 
 
@@ -1694,7 +1143,7 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
                 )
 
                 # 收集未来每层 teacher top-k experts，作为多标签监督目标。
-                #[[layer0_cur_token_topks], [layer1_cur_token_topks]...]
+                # [[layer0_cur_token_topks], [layer1_cur_token_topks]...]
                 future_teacher_topk_ids = []
                 for future_layer_index in future_layer_indices:
                     # teacher 后端已经返回真实前向里的执行专家 top-k，
@@ -1802,9 +1251,9 @@ class PredictorTrainer:
 
     def build_model(self) -> FutureExpertPredictor:
         # -------------------- 读取决定 predictor 形状的关键配置 --------------------
-        # trainer 配置决定隐藏层宽度；
         # 输入维度当前直接取 model hidden_size。
         trainer_cfg = self.config.predictor_trainer
+
         # routing 配置决定未来窗口层数，也就决定输出张量的第二维大小。
         routing_cfg = self.config.predictor_routing
 
@@ -1842,11 +1291,57 @@ class PredictorTrainer:
     def _read_checkpoint_payload(path: str | Path) -> dict[str, Any]:
         # 使用 torch.load 在 CPU 上读取 checkpoint。
         payload = torch.load(Path(path), map_location="cpu")
+
         # 顶层必须解码成字典。
         if not isinstance(payload, dict):
             raise ValueError("predictor checkpoint must decode to a dictionary")
+
         # 返回原始 payload。
         return payload
+
+    @classmethod
+    # 从已读取的 checkpoint payload 中一次性解析训练侧会用到的全部核心组件。
+    def _checkpoint_components_from_payload(
+            cls,
+            payload: dict[str, Any],
+    ) -> tuple[
+        dict[str, Any],
+        PredictorCheckpointMetadata,
+        PredictorTrainingRunTrace | None,
+        dict[str, Any] | None,
+    ]:
+        # model_state_dict 是恢复 predictor 权重的核心字段，缺失时该 checkpoint 无法继续使用。
+        state_dict = payload.get("model_state_dict")
+        if not isinstance(state_dict, dict):
+            raise ValueError("predictor checkpoint is missing model_state_dict")
+
+        # metadata 负责描述 checkpoint 与当前配置是否兼容，也必须始终存在。
+        metadata_payload = payload.get("metadata")
+        if not isinstance(metadata_payload, dict):
+            raise ValueError("predictor checkpoint is missing metadata")
+        metadata = PredictorCheckpointMetadata.from_dict(metadata_payload)
+
+        # run_trace 在旧 checkpoint 里可能不存在，因此这里保留可选语义。
+        run_trace_payload = payload.get("run_trace")
+        if run_trace_payload is None:
+            run_trace = None
+        else:
+            if not isinstance(run_trace_payload, dict):
+                raise ValueError("predictor checkpoint run_trace must be a dictionary")
+            run_trace = PredictorTrainingRunTrace.from_dict(run_trace_payload)
+
+        # optimizer_state_dict 只在续训场景需要；若存在，则必须保持字典结构。
+        optimizer_state_dict = payload.get("optimizer_state_dict")
+        if optimizer_state_dict is not None and not isinstance(
+                optimizer_state_dict,
+                dict,
+        ):
+            raise ValueError(
+                "predictor checkpoint optimizer_state_dict must be a dictionary"
+            )
+
+        # 返回统一解析后的权重、元信息、训练轨迹和优化器状态。
+        return state_dict, metadata, run_trace, optimizer_state_dict
 
     @classmethod
     # 只读取 predictor checkpoint 的 metadata 部分。
@@ -1856,11 +1351,14 @@ class PredictorTrainer:
     ) -> PredictorCheckpointMetadata:
         # 先读取 checkpoint 原始载荷。
         payload = cls._read_checkpoint_payload(path)
+
         # 取出 metadata 部分。
         metadata_payload = payload.get("metadata")
+
         # metadata 必须存在且为字典。
         if not isinstance(metadata_payload, dict):
             raise ValueError("predictor checkpoint is missing metadata")
+
         # 继续恢复为 PredictorCheckpointMetadata。
         return PredictorCheckpointMetadata.from_dict(metadata_payload)
 
@@ -1872,14 +1370,18 @@ class PredictorTrainer:
     ) -> PredictorTrainingRunTrace | None:
         # 先读取 checkpoint 原始载荷。
         payload = cls._read_checkpoint_payload(path)
+
         # 取出可选的 run_trace 部分。
         run_trace_payload = payload.get("run_trace")
+
         # 旧 checkpoint 没有 run_trace 时直接返回空。
         if run_trace_payload is None:
             return None
+
         # run_trace 若存在，则必须是字典。
         if not isinstance(run_trace_payload, dict):
             raise ValueError("predictor checkpoint run_trace must be a dictionary")
+
         # 继续恢复为 PredictorTrainingRunTrace。
         return PredictorTrainingRunTrace.from_dict(run_trace_payload)
 
@@ -1919,32 +1421,50 @@ class PredictorTrainer:
             self,
             metadata: PredictorCheckpointMetadata,
     ) -> None:
-        # 读取当前 trainer 与 routing 配置。
+        # ------------------------------- 校验 checkpoint 元数据与当前 predictor 配置是否兼容 -------------------------------
+        # 先取出当前训练侧的 predictor 超参数，后面的宽度类字段都要拿 checkpoint 中的快照与它对齐。
         trainer_cfg = self.config.predictor_trainer
+        # 再取出当前路由侧配置，窗口长度、步长和专家预算都要按当前运行口径校验。
         routing_cfg = self.config.predictor_routing
-        # 用列表累积所有不兼容字段。
+        # 不在发现第一个不匹配时立即返回，而是把所有不兼容项一次性收集起来，便于调用方统一修正配置。
         mismatches = []
+
+        # checkpoint 记录的输入维度必须和当前模型 hidden size 一致，否则恢复后的首层映射就无法正确接收输入。
         if metadata.input_summary_dim != self.config.model_spec.hidden_size:
             mismatches.append("input_summary_dim")
+
+        # predictor 隐层宽度决定中间权重张量形状；这项不一致时，旧权重不能安全复用到当前模型。
         if metadata.hidden_dim != trainer_cfg.hidden_dim:
             mismatches.append("hidden_dim")
+
+        # 未来窗口层数决定单条样本要预测多少个未来层；窗口长度变化后，训练标签的结构也会随之变化。
         if metadata.window_layers != routing_cfg.window_layers:
             mismatches.append("window_layers")
+
+        # 窗口步长决定样本在层维度上的推进方式；这项变化后，同一份 checkpoint 的训练语义就不再一致。
         if metadata.stride_layers != routing_cfg.stride_layers:
             mismatches.append("stride_layers")
+
+        # 专家总数直接决定输出空间大小；如果当前模型专家数不同，checkpoint 中的输出头语义就会失效。
         if metadata.num_experts != self.config.model_spec.num_experts:
             mismatches.append("num_experts")
+
+        # 候选专家预算影响 predictor 输出结果在推理侧的解释方式，口径变化后不能继续沿用旧 checkpoint。
         if (
                 metadata.candidate_experts_per_layer
                 != routing_cfg.candidate_experts_per_layer
         ):
             mismatches.append("candidate_experts_per_layer")
+
+        # 实际执行专家预算决定候选集合如何落到最终执行集合；这项不一致会让评估和部署口径同时失真。
         if (
                 metadata.executed_experts_per_layer
                 != routing_cfg.executed_experts_per_layer
         ):
             mismatches.append("executed_experts_per_layer")
-        # 只要存在任一关键字段不匹配，就拒绝加载 checkpoint。
+
+        # ------------------------------- 在发现关键口径不一致时直接拒绝加载该 checkpoint -------------------------------
+        # 只要任一核心字段不兼容，就抛出包含全部不匹配项的异常，阻止把错误结构的权重继续接入当前训练流程。
         if mismatches:
             raise ValueError(
                 "predictor checkpoint is incompatible with current config: "
@@ -1974,30 +1494,89 @@ class PredictorTrainer:
                 + ", ".join(mismatches)
             )
 
-    def _validate_resume_dataset(
+    def _validate_dataset(
             self,
             dataset: PredictorTraceDataset,
-            run_trace: PredictorTrainingRunTrace,
+            *,
+            resume_run_trace: PredictorTrainingRunTrace | None = None,
     ) -> None:
-        # 续训时要求数据集来源与历史 run_trace 一致。
-        mismatches = []
-        if dataset.profile_name != run_trace.profile_name:
-            mismatches.append("profile_name")
-        if dataset.example_count != run_trace.example_count:
-            mismatches.append("example_count")
+        # ------------------------------- 校验数据集是否与当前 trainer 及续训上下文兼容 -------------------------------
+        # 空数据集无法进入后续训练或评估。
+        if dataset.example_count < 1:
+            raise ValueError("predictor trace dataset must contain at least 1 example")
+
+        # 先汇总数据集与当前 trainer 配置的不匹配项。
+        routing_cfg = self.config.predictor_routing
+        cfg_mismatches = []
+
+        # profile 变了，说明数据集不属于当前配置。
+        if dataset.profile_name != self.config.profile_name:
+            cfg_mismatches.append("profile_name")
+
+        # window_layers 不一致时，标签窗口无法对齐。
+        if dataset.window_layers != routing_cfg.window_layers:
+            cfg_mismatches.append("window_layers")
+
+        # 候选预算不一致时，训练和评估口径会偏移。
         if dataset.candidate_experts_per_layer != (
-                run_trace.candidate_experts_per_layer
+                routing_cfg.candidate_experts_per_layer
         ):
-            mismatches.append("candidate_experts_per_layer")
+            cfg_mismatches.append("candidate_experts_per_layer")
+
+        # 执行预算不一致时，训练和评估口径会偏移。
         if dataset.executed_experts_per_layer != (
-                run_trace.executed_experts_per_layer
+                routing_cfg.executed_experts_per_layer
         ):
-            mismatches.append("executed_experts_per_layer")
-        # 数据集与续训起点不一致时直接报错。
-        if mismatches:
+            cfg_mismatches.append("executed_experts_per_layer")
+
+        # 用首条样本确认 hidden_state 维度口径。
+        first_example = dataset.examples[0]
+        if (
+                len(first_example.hidden_state)
+                != self.config.model_spec.hidden_size
+        ):
+            raise ValueError(
+                "predictor trace dataset hidden_state size does not match "
+                "model_spec.hidden_size"
+            )
+
+        # 数据集与当前 trainer 口径不一致时直接拒绝。
+        if cfg_mismatches:
+            raise ValueError(
+                "predictor trace dataset is incompatible with current config: "
+                + ", ".join(cfg_mismatches)
+            )
+
+        # 非续训场景到这里就完成了。
+        if resume_run_trace is None:
+            return
+
+        # 再汇总数据集与历史 run_trace 的不匹配项。
+        resume_mismatches = []
+
+        # profile 变了，说明不是同一条训练主线。
+        if dataset.profile_name != resume_run_trace.profile_name:
+            resume_mismatches.append("profile_name")
+
+        # 样本规模变了，历史统计就不可直接续用。
+        if dataset.example_count != resume_run_trace.example_count:
+            resume_mismatches.append("example_count")
+
+        # 路由预算变了，teacher 标签口径也会变化。
+        if dataset.candidate_experts_per_layer != (
+                resume_run_trace.candidate_experts_per_layer
+        ):
+            resume_mismatches.append("candidate_experts_per_layer")
+        if dataset.executed_experts_per_layer != (
+                resume_run_trace.executed_experts_per_layer
+        ):
+            resume_mismatches.append("executed_experts_per_layer")
+
+        # 只要关键口径不一致，就拒绝续训。
+        if resume_mismatches:
             raise ValueError(
                 "predictor resume dataset is incompatible with checkpoint run_trace: "
-                + ", ".join(mismatches)
+                + ", ".join(resume_mismatches)
             )
 
     def save_checkpoint(
@@ -2018,6 +1597,7 @@ class PredictorTrainer:
         payload = {
             "checkpoint_kind": metadata.checkpoint_kind,
             "metadata": metadata.to_dict(),
+
             "model_state_dict": model.state_dict(),
             "run_trace": run_trace.to_dict(),
         }
@@ -2034,18 +1614,16 @@ class PredictorTrainer:
     ) -> tuple[FutureExpertPredictor, PredictorCheckpointMetadata]:
         # 先读取 checkpoint 原始载荷。
         payload = self._read_checkpoint_payload(path)
-        # 提取模型参数字典。
-        state_dict = payload.get("model_state_dict")
-        # checkpoint 必须包含 model_state_dict。
-        if not isinstance(state_dict, dict):
-            raise ValueError("predictor checkpoint is missing model_state_dict")
-        # 再读取并校验 metadata。
-        metadata = self.read_checkpoint_metadata(path)
+        # 再一次性解析权重和 metadata，避免重复读取同一路径。
+        state_dict, metadata, _, _ = self._checkpoint_components_from_payload(payload)
         self._validate_checkpoint_metadata(metadata)
+
         # 基于当前配置重建模型实例。
         model = self.build_model()
+
         # 加载 checkpoint 权重。
         model.load_state_dict(state_dict)
+
         # 返回模型和 metadata。
         return model, metadata
 
@@ -2060,22 +1638,18 @@ class PredictorTrainer:
     ]:
         # 先读取 checkpoint 原始载荷。
         payload = self._read_checkpoint_payload(path)
-        # 复用现有模型权重与 metadata 加载逻辑。
-        model, metadata = self.load_checkpoint(path)
-        # 再读取可选的 run_trace。
-        run_trace = self.read_checkpoint_run_trace(path)
+        # 再一次性解析续训所需的全部组件，避免对同一 checkpoint 重复反序列化。
+        state_dict, metadata, run_trace, optimizer_state_dict = (
+            self._checkpoint_components_from_payload(payload)
+        )
+        self._validate_checkpoint_metadata(metadata)
+        # 基于当前配置重建模型并恢复权重。
+        model = self.build_model()
+        model.load_state_dict(state_dict)
         if run_trace is not None:
             # 若存在 run_trace，则校验它与当前配置兼容。
             self._validate_resume_run_trace(run_trace)
-        # 读取可选的 optimizer 状态。
-        optimizer_state_dict = payload.get("optimizer_state_dict")
-        if optimizer_state_dict is not None and not isinstance(
-                optimizer_state_dict,
-                dict,
-        ):
-            raise ValueError(
-                "predictor checkpoint optimizer_state_dict must be a dictionary"
-            )
+
         # 返回完整训练续训所需的全部状态。
         return model, metadata, run_trace, optimizer_state_dict
 
@@ -2088,14 +1662,8 @@ class PredictorTrainer:
     ) -> PredictorDeploymentManifest:
         # 先读取 checkpoint 原始载荷。
         payload = cls._read_checkpoint_payload(checkpoint_path)
-        # 提取模型参数字典。
-        state_dict = payload.get("model_state_dict")
-        # checkpoint 必须包含 model_state_dict。
-        if not isinstance(state_dict, dict):
-            raise ValueError("predictor checkpoint is missing model_state_dict")
-
-        # 再恢复 checkpoint metadata、runtime schema 和指标摘要。
-        metadata = cls.read_checkpoint_metadata(checkpoint_path)
+        # 一次性解析 bundle 导出需要的权重和 metadata。
+        state_dict, metadata, _, _ = cls._checkpoint_components_from_payload(payload)
         schema = PredictorRuntimeSchema.from_checkpoint_metadata(metadata)
         metrics = PredictorMetricsSummary.from_checkpoint_metadata(metadata)
 
@@ -2237,39 +1805,26 @@ class PredictorTrainer:
             targets: torch.Tensor,
             budget: int,
     ) -> float:
+        # logits: `[batch_size, window_layers, num_experts]`
+        # targets: `[batch_size, window_layers, num_experts]`
         # 先按预算取每个样本/未来层的 top-k experts。
+        # topk: `[batch_size, window_layers, budget]`
         topk = torch.topk(logits, k=budget, dim=-1).indices
+
         # 取出 top-k 位置上的命中标签。
+        # matches: `[batch_size, window_layers, budget]`
         matches = torch.gather(targets, dim=-1, index=topk)
+
         # 分母等于 teacher 正样本数，至少夹到 1。
+        # denom: `[batch_size, window_layers]`
         denom = targets.sum(dim=-1).clamp_min(1.0)
+
         # recall 等于 top-k 命中数除以 teacher 正样本数。
+        # recall: `[batch_size, window_layers]`
         recall = matches.sum(dim=-1) / denom
+
         # 返回全数据集平均 recall。
         return float(recall.mean().item())
-
-    def _validate_dataset_compatibility(
-            self,
-            dataset: PredictorTraceDataset,
-    ) -> None:
-        # 数据集至少要有 1 条样本。
-        if dataset.example_count < 1:
-            raise ValueError("predictor trace dataset must contain at least 1 example")
-        # 取第一条样本检查 hidden_state 维度。
-        first_example = dataset.examples[0]
-        if (
-                len(first_example.hidden_state)
-                != self.config.model_spec.hidden_size
-        ):
-            raise ValueError(
-                "predictor trace dataset hidden_state size does not match "
-                "model_spec.hidden_size"
-            )
-        if dataset.window_layers != self.config.predictor_routing.window_layers:
-            raise ValueError(
-                "predictor trace dataset window_layers does not match "
-                "predictor_routing.window_layers"
-            )
 
     def evaluate_dataset(
             self,
@@ -2279,8 +1834,8 @@ class PredictorTrainer:
             checkpoint_metadata: PredictorCheckpointMetadata | None = None,
     ) -> PredictorEvaluationTrace:
         # -------------------- 校验输入并准备评估对象 --------------------
-        # 评估前先确认数据集维度与当前 trainer 配置兼容，避免 silent mismatch。
-        self._validate_dataset_compatibility(dataset)
+        # 评估前先统一校验数据集口径，避免 silent mismatch。
+        self._validate_dataset(dataset)
         # routing 配置里的候选预算和执行预算会直接决定 recall 指标的取值口径。
         routing_cfg = self.config.predictor_routing
         # 若调用方未传入模型，就按当前配置构造一个新 predictor 实例。
@@ -2304,7 +1859,7 @@ class PredictorTrainer:
                 targets=targets,
                 budget=routing_cfg.candidate_experts_per_layer,
             )
-            # 按执行预算统计 recall，用来度量“最终真正会执行的 experts”覆盖得如何。
+            # 按执行预算统计 recall
             executed_recall = self._mean_recall_at_budget(
                 logits=logits,
                 targets=targets,
@@ -2353,6 +1908,28 @@ class PredictorTrainer:
         )
         return run_trace
 
+    def _build_run_trace(
+            self,
+            *,
+            dataset: PredictorTraceDataset,
+            epoch_summaries: list[PredictorEpochSummary],
+    ) -> PredictorTrainingRunTrace:
+        # 读取当前 routing 配置，保证轨迹里的预算口径和当前训练一致。
+        routing_cfg = self.config.predictor_routing
+        # 基于当前数据集和累计 epoch 汇总构造完整训练轨迹。
+        return PredictorTrainingRunTrace(
+            profile_name=self.config.profile_name,
+            example_count=dataset.example_count,
+            epochs=len(epoch_summaries),
+            candidate_experts_per_layer=(
+                routing_cfg.candidate_experts_per_layer
+            ),
+            executed_experts_per_layer=(
+                routing_cfg.executed_experts_per_layer
+            ),
+            epoch_summaries=tuple(epoch_summaries),
+        )
+
     def fit_dataset(
             self,
             dataset: PredictorTraceDataset,
@@ -2361,62 +1938,119 @@ class PredictorTrainer:
             model: FutureExpertPredictor | None = None,
             optimizer_state_dict: dict[str, Any] | None = None,
             initial_run_trace: PredictorTrainingRunTrace | None = None,
+            logger: logging.Logger | None = None,
+            log_every_steps: int | None = None,
+            checkpoint_output_path: str | Path | None = None,
+            checkpoint_every_epochs: int | None = None,
     ) -> tuple[
         FutureExpertPredictor,
         PredictorTrainingRunTrace,
         dict[str, Any],
     ]:
         # -------------------- 校验训练输入并解析超参数 --------------------
-        # 训练前先做数据集维度校验，避免把不匹配的 summary 或窗口长度送进模型。
-        self._validate_dataset_compatibility(dataset)
-        # 若当前是续训，还要确认历史 run_trace 与新数据集来源一致，避免接错 checkpoint。
-        if initial_run_trace is not None:
-            self._validate_resume_dataset(dataset, initial_run_trace)
+        # 训练前统一校验数据集；续训时再追加历史 run_trace 口径检查。
+        self._validate_dataset(
+            dataset,
+            resume_run_trace=initial_run_trace,
+        )
+
         # trainer 配置负责优化超参，routing 配置负责 recall 预算口径。
         trainer_cfg = self.config.predictor_trainer
         routing_cfg = self.config.predictor_routing
+
         # 若调用方未显式给 epochs，就沿用配置默认值。
         epochs = trainer_cfg.epochs if epochs is None else int(epochs)
+
         # 训练轮数至少为 1；0 轮训练没有意义，也无法产出新的 run_trace。
         if epochs < 1:
             raise ValueError("epochs must be >= 1")
+        # step 级日志频率不能为负；0 表示关闭 step 级日志。
+        if log_every_steps is not None and int(log_every_steps) < 0:
+            raise ValueError("log_every_steps must be >= 0")
+        # 若调用方给了 checkpoint 路径但没给周期，则默认每个 epoch 保存。
+        if checkpoint_output_path is not None and checkpoint_every_epochs is None:
+            checkpoint_every_epochs = 1
+        # checkpoint 周期若启用，则至少按 1 个 epoch 为单位。
+        if checkpoint_every_epochs is not None and int(checkpoint_every_epochs) < 1:
+            raise ValueError("checkpoint_every_epochs must be >= 1")
 
         # -------------------- 物化张量并初始化训练对象 --------------------
         # 先把 trace 数据集物化成 CPU 张量，后续训练循环直接复用，避免重复构造。
+        # features: [example_count, hidden_size]
+        # layer_indices: [example_count]
+        # targets: [example_count, window_layers, num_experts]
         features, layer_indices, targets = self._dataset_tensors(dataset)
+
         # 固定随机种子，保证模型初始化和 epoch 内打乱顺序可复现。
         torch.manual_seed(trainer_cfg.seed)
+
         # 若调用方未传入模型，就按当前 trainer 配置构造一个新 predictor。
         model = self.build_model() if model is None else model
+
         # 训练目前使用 AdamW；这里只优化 predictor 自身参数，不涉及主模型参数。
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=trainer_cfg.learning_rate,
             weight_decay=trainer_cfg.weight_decay,
         )
+
         # 若本次是从 checkpoint 续训，就把优化器状态一并恢复，保持动量连续。
         if optimizer_state_dict is not None:
             optimizer.load_state_dict(optimizer_state_dict)
+
         # batch_size 不能超过样本总数，避免最后构造空 batch。
         batch_size = min(trainer_cfg.batch_size, dataset.example_count)
+
         # epoch_summaries 既承载本轮训练结果，也在续训场景下承接历史轨迹。
         epoch_summaries: list[PredictorEpochSummary] = (
             []
             if initial_run_trace is None
             else list(initial_run_trace.epoch_summaries)
         )
+
         # 续训时，新的 epoch 编号要接在历史已完成 epoch 之后。
         completed_epochs = 0 if initial_run_trace is None else initial_run_trace.epochs
+        # 训练 step 从 1 开始累计，便于按固定间隔输出日志。
+        global_step = 0
+        # interval_* 用于聚合 step 级日志区间内的平均损失。
+        interval_loss = 0.0
+        interval_examples = 0
+        interval_steps = 0
+        # checkpoint 和日志里展示的目标 epoch 数按本次训练完成后的总数来算。
+        target_total_epochs = completed_epochs + epochs
+
+        # 训练开始前输出一次整体配置摘要。
+        if logger is not None:
+            logger.info(
+                "predictor_train_start profile=%s examples=%d epochs=%d "
+                "batch_size=%d log_every_steps=%s checkpoint_path=%s "
+                "checkpoint_every_epochs=%s",
+                self.config.profile_name,
+                dataset.example_count,
+                target_total_epochs,
+                batch_size,
+                0 if log_every_steps is None else int(log_every_steps),
+                None if checkpoint_output_path is None else str(checkpoint_output_path),
+                (
+                    None
+                    if checkpoint_every_epochs is None
+                    else int(checkpoint_every_epochs)
+                ),
+            )
 
         # -------------------- 执行逐 epoch 的训练循环 --------------------
         for epoch_offset in range(epochs):
             # 当前 epoch 的逻辑编号需要考虑续训场景下的历史偏移量。
             epoch_index = completed_epochs + epoch_offset
+
             # 每个 epoch 使用独立 generator 打乱顺序；
             # 这样既保证可复现，又能让不同 epoch 的样本顺序不同。
             generator = torch.Generator(device="cpu")
             generator.manual_seed(trainer_cfg.seed + epoch_index)
+
+            # 形状是[example_count]
             order = torch.randperm(dataset.example_count, generator=generator)
+
             # 累积当前 epoch 的样本加权损失，后面再除以总样本数得到 mean_loss。
             total_loss = 0.0
             total_examples = 0
@@ -2425,40 +2059,77 @@ class PredictorTrainer:
             for start in range(0, dataset.example_count, batch_size):
                 # 根据打乱后的顺序切出当前 mini-batch 的样本索引。
                 batch_indices = order[start: start + batch_size]
+
                 # 从全量张量中抽取当前 batch 的特征和标签。
                 batch_features = features.index_select(0, batch_indices)
                 batch_layer_indices = layer_indices.index_select(0, batch_indices)
                 batch_targets = targets.index_select(0, batch_indices)
+
                 # 前向得到每个 future layer / expert 的 logits。
                 logits = model(batch_features, batch_layer_indices)
+
                 # 目标是多标签预测，因此这里按多热标签计算 BCEWithLogitsLoss。
                 loss = F.binary_cross_entropy_with_logits(logits, batch_targets)
+
                 # 标准训练三步：清梯度、反向传播、参数更新。
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
+
                 # 用样本数加权累计 batch loss，避免最后一个不满 batch 时均值失真。
                 batch_count = int(batch_features.shape[0])
-                total_loss += float(loss.item()) * batch_count
+                batch_loss = float(loss.item())
+                total_loss += batch_loss * batch_count
                 total_examples += batch_count
+                global_step += 1
+                interval_loss += batch_loss * batch_count
+                interval_examples += batch_count
+                interval_steps += 1
+
+                # 按固定 step 间隔输出训练日志，避免 predictor 太小时日志刷屏。
+                if (
+                        logger is not None
+                        and log_every_steps is not None
+                        and int(log_every_steps) > 0
+                        and global_step % int(log_every_steps) == 0
+                ):
+                    logger.info(
+                        "predictor_train_step profile=%s epoch=%d/%d "
+                        "global_step=%d interval_steps=%d interval_mean_loss=%.6f",
+                        self.config.profile_name,
+                        epoch_index + 1,
+                        target_total_epochs,
+                        global_step,
+                        interval_steps,
+                        interval_loss / max(interval_examples, 1),
+                    )
+                    interval_loss = 0.0
+                    interval_examples = 0
+                    interval_steps = 0
 
             # -------------------- 在全量数据上计算 epoch 级指标 --------------------
             with torch.no_grad():
                 # 训练完一个 epoch 后，在全量数据上做一次统一评估，记录可比较的指标。
                 model.eval()
+                # all_logits: `[example_count, window_layers, num_experts]`
                 all_logits = model(features, layer_indices)
+
                 # candidate recall 衡量“给推理侧准备的候选 experts”覆盖了多少 teacher experts。
+                # logits/targets: `[example_count, window_layers, num_experts]`
                 candidate_recall = self._mean_recall_at_budget(
                     logits=all_logits,
                     targets=targets,
                     budget=routing_cfg.candidate_experts_per_layer,
                 )
+
                 # executed recall 衡量“最终真正允许执行的 experts”能覆盖多少 teacher experts。
+                # logits/targets: `[example_count, window_layers, num_experts]`
                 executed_recall = self._mean_recall_at_budget(
                     logits=all_logits,
                     targets=targets,
                     budget=routing_cfg.executed_experts_per_layer,
                 )
+
                 # 评估完成后切回 train 模式，保证下一个 epoch 继续按训练模式运行。
                 model.train()
 
@@ -2471,26 +2142,59 @@ class PredictorTrainer:
                     recall_at_executed_budget=executed_recall,
                 )
             )
+            current_run_trace = self._build_run_trace(
+                dataset=dataset,
+                epoch_summaries=epoch_summaries,
+            )
+
+            # 每个 epoch 结束后输出一次稳定汇总，便于观察整体训练走势。
+            if logger is not None:
+                logger.info(
+                    "predictor_train_epoch_end profile=%s epoch=%d/%d "
+                    "mean_loss=%.6f recall@candidate=%.4f recall@executed=%.4f",
+                    self.config.profile_name,
+                    current_run_trace.epochs,
+                    target_total_epochs,
+                    current_run_trace.final_mean_loss,
+                    current_run_trace.final_recall_at_candidate_budget,
+                    current_run_trace.final_recall_at_executed_budget,
+                )
+
+            # 按 epoch 周期保存 checkpoint，并在最后一个 epoch 再强制保存一次。
+            if (
+                    checkpoint_output_path is not None
+                    and checkpoint_every_epochs is not None
+                    and (
+                        current_run_trace.epochs % int(checkpoint_every_epochs) == 0
+                        or epoch_offset == epochs - 1
+                    )
+            ):
+                current_optimizer_state_dict = optimizer.state_dict()
+                self.save_checkpoint(
+                    model=model,
+                    run_trace=current_run_trace,
+                    path=checkpoint_output_path,
+                    optimizer_state_dict=current_optimizer_state_dict,
+                )
+                if logger is not None:
+                    logger.info(
+                        "predictor_train_checkpoint_saved epoch=%d path=%s",
+                        current_run_trace.epochs,
+                        str(checkpoint_output_path),
+                    )
 
         # -------------------- 返回训练产物 --------------------
         # fit_dataset 会同时返回：
         # 1) 训练后的 predictor 模型
         # 2) 完整训练轨迹 run_trace
         # 3) 优化器状态，便于后续继续续训
+        final_run_trace = self._build_run_trace(
+            dataset=dataset,
+            epoch_summaries=epoch_summaries,
+        )
         return (
             model,
-            PredictorTrainingRunTrace(
-                profile_name=self.config.profile_name,
-                example_count=dataset.example_count,
-                epochs=completed_epochs + epochs,
-                candidate_experts_per_layer=(
-                    routing_cfg.candidate_experts_per_layer
-                ),
-                executed_experts_per_layer=(
-                    routing_cfg.executed_experts_per_layer
-                ),
-                epoch_summaries=tuple(epoch_summaries),
-            ),
+            final_run_trace,
             optimizer.state_dict(),
         )
 

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import sysconfig
 import ctypes
+import functools
 from pathlib import Path
 from shutil import which
 
@@ -14,6 +15,19 @@ import torch
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from torch.utils.cpp_extension import CUDA_HOME
+
+
+def _raise_cuda_torch_required() -> None:
+    torch_version = getattr(torch, "__version__", "unknown")
+    torch_cuda = getattr(torch.version, "cuda", None)
+    raise RuntimeError(
+        "CFIE native build requires a CUDA-enabled PyTorch environment. "
+        f"Detected torch={torch_version!s} with torch.version.cuda={torch_cuda!r}. "
+        "If you already installed a CUDA wheel into your virtual environment, "
+        "pip build isolation may be hiding it inside a temporary build env. "
+        "Install a CUDA build of torch in your target environment and rerun "
+        "`python -m pip install --no-build-isolation -e .`."
+    )
 
 
 def load_module_from_path(module_name: str, path: str):
@@ -129,16 +143,96 @@ def prepare_cuda_root(cuda_root: Path) -> Path:
         return cuda_root
 
 
+def _find_vcvars64_bat() -> Path | None:
+    if os.name != "nt":
+        return None
+
+    direct_candidates: list[Path] = []
+    vsinstalldir = os.environ.get("VSINSTALLDIR")
+    if vsinstalldir:
+        direct_candidates.append(
+            Path(vsinstalldir) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+        )
+
+    default_vs_root = Path("C:/Program Files/Microsoft Visual Studio/2022")
+    for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
+        direct_candidates.append(
+            default_vs_root / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+        )
+
+    for candidate in direct_candidates:
+        if candidate.is_file():
+            return candidate
+
+    program_files_x86 = os.environ.get("ProgramFiles(x86)")
+    if not program_files_x86:
+        return None
+
+    vswhere = Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.is_file():
+        return None
+
+    try:
+        installation_path = subprocess.check_output(
+            [
+                str(vswhere),
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property",
+                "installationPath",
+            ],
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    if not installation_path:
+        return None
+
+    candidate = Path(installation_path) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    return candidate if candidate.is_file() else None
+
+
+@functools.lru_cache(maxsize=1)
+def _load_msvc_build_env() -> dict[str, str]:
+    vcvars64 = _find_vcvars64_bat()
+    if vcvars64 is None:
+        return {}
+
+    command = f'cmd /d /s /c ""{vcvars64}" >nul && set"'
+    cmd_env = os.environ.copy()
+    cmd_env.setdefault("VSCMD_SKIP_SENDTELEMETRY", "1")
+
+    try:
+        output = subprocess.check_output(
+            command,
+            text=True,
+            env=cmd_env,
+            shell=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+    parsed_env: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key:
+            parsed_env[key] = value
+    return parsed_env
+
+
 if not is_supported_platform():
     raise RuntimeError(
         f"Unsupported platform for CFIE native build: {sys.platform}. "
         "Supported platforms are Windows and Linux."
     )
 if torch.version.cuda is None:
-    raise RuntimeError(
-        "CFIE native build requires a CUDA-enabled PyTorch environment. "
-        "Install a CUDA build of torch before building CFIE."
-    )
+    _raise_cuda_torch_required()
 
 CUDA_ROOT = resolve_cuda_home()
 if CUDA_ROOT is None:
@@ -172,6 +266,8 @@ class CMakeBuildExt(build_ext):
     @staticmethod
     def cmake_subprocess_env() -> dict[str, str]:
         env = os.environ.copy()
+        if os.name == "nt":
+            env.update(_load_msvc_build_env())
         cuda_root = str(CUDA_ROOT)
         cuda_alias_root = str(CUDA_ALIAS_ROOT)
         env.setdefault("CUDA_PATH", cuda_root)
@@ -250,13 +346,6 @@ class CMakeBuildExt(build_ext):
                         f"-DCMAKE_JOB_POOLS:STRING=compile={num_jobs}",
                     ]
                 )
-        elif os.name == "nt":
-            build_tool = [
-                "-G",
-                "Visual Studio 17 2022",
-                "-A",
-                os.environ.get("CMAKE_GENERATOR_PLATFORM", "x64"),
-            ]
         elif NINJA_EXECUTABLE is not None:
             build_tool = ["-G", "Ninja"]
             cmake_args.extend(
@@ -266,6 +355,13 @@ class CMakeBuildExt(build_ext):
                     f"-DCMAKE_JOB_POOLS:STRING=compile={num_jobs}",
                 ]
             )
+        elif os.name == "nt":
+            build_tool = [
+                "-G",
+                "Visual Studio 17 2022",
+                "-A",
+                os.environ.get("CMAKE_GENERATOR_PLATFORM", "x64"),
+            ]
 
         nvcc_name = "nvcc.exe" if os.name == "nt" else "nvcc"
         cmake_args.append(

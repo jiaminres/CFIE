@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
+import sys
 from typing import Sequence
 
 from cfie_training.config import TrainingProjectConfig
@@ -22,6 +24,25 @@ from cfie_training.runtime.types import (
     TrainingRuntimeSnapshot,
     TrainingSessionCheckpoint,
 )
+
+LOGGER = logging.getLogger("cfie_training.cli")
+
+
+def _configure_cli_logging() -> None:
+    # 仅在外部尚未配置日志时补一个默认配置，避免覆盖宿主程序已有的日志策略。
+    if logging.getLogger().handlers:
+        return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+def _emit_stdout(text: str) -> None:
+    # 统一负责向标准输出写文本，避免在 CLI 主链里直接使用 print。
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -237,6 +258,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional override for training epochs.",
+    )
+    # 添加 step 级日志间隔参数，用于避免 predictor 太小时每个优化 step 都刷日志。
+    predictor_train_parser.add_argument(
+        "--log-every-steps",
+        type=int,
+        default=10,
+        help="Emit one training log line every N optimizer steps. Use 0 to disable step logs.",
+    )
+    # 添加 epoch 级 checkpoint 落盘间隔参数，用于控制每多少个 epoch 保存一次续训状态。
+    predictor_train_parser.add_argument(
+        "--checkpoint-every-epochs",
+        type=int,
+        default=1,
+        help="Persist a predictor checkpoint every N epochs when a checkpoint path is available.",
+    )
+    # 添加最终 bundle 输出目录参数，用于在训练结束后自动导出部署包。
+    predictor_train_parser.add_argument(
+        "--bundle-output-dir",
+        type=Path,
+        help="Optional output directory used to export the final predictor deployment bundle.",
     )
     # 添加 JSON 输出开关，用于控制是否输出 predictor 训练过程轨迹。
     predictor_train_parser.add_argument(
@@ -644,9 +685,9 @@ def _load_config(args: argparse.Namespace) -> TrainingProjectConfig:
 
 
 def _parse_csv_numbers(
-    raw: str,
-    *,
-    cast,
+        raw: str,
+        *,
+        cast,
 ) -> tuple:
     # 空字符串直接返回空元组。
     if not raw.strip():
@@ -666,7 +707,7 @@ def _parse_csv_numbers(
 
 
 def _default_active_expert_candidates(
-    config: TrainingProjectConfig,
+        config: TrainingProjectConfig,
 ) -> tuple[int, ...]:
     # 读取模型和当前 expert rotation 配置。
     model = config.model_spec
@@ -691,7 +732,7 @@ def _default_active_expert_candidates(
 
 
 def _default_max_live_bucket_candidates(
-    config: TrainingProjectConfig,
+        config: TrainingProjectConfig,
 ) -> tuple[int, ...]:
     # 候选上界至少保留 4，给高显存设备留出更激进的并发搜索空间。
     upper = max(4, config.bucket_schedule.max_live_buckets)
@@ -700,7 +741,7 @@ def _default_max_live_bucket_candidates(
 
 
 def _default_prefetch_bucket_candidates(
-    config: TrainingProjectConfig,
+        config: TrainingProjectConfig,
 ) -> tuple[int, ...]:
     # 预取 bucket 上界至少保留 2，避免默认搜索过于保守。
     upper = max(2, config.bucket_schedule.prefetch_buckets)
@@ -714,43 +755,61 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     # 解析外部传入的命令行参数；当 argv 为空时，默认直接读取进程命令行参数。
     args = parser.parse_args(list(argv) if argv is not None else None)
+    # 补齐 CLI 默认日志配置，保证 predictor 训练过程有标准日志输出。
+    _configure_cli_logging()
 
     if args.command == "predictor-trace" and args.dataset is None:
         parser.error("predictor-trace requires --dataset")
     if (
-        args.command in {"predictor-train", "predictor-eval"}
-        and args.trace_input is None
-        and args.dataset is None
+            args.command in {"predictor-train", "predictor-eval"}
+            and args.trace_input is None
+            and args.dataset is None
     ):
         parser.error(f"{args.command} requires --trace-input or --dataset")
     if (
-        args.command == "train"
-        and args.dataset is None
-        and getattr(args, "resume_from", None) is None
+            args.command == "train"
+            and args.dataset is None
+            and getattr(args, "resume_from", None) is None
     ):
         parser.error(
             "train requires --dataset unless --resume-from points to a "
             "dataset-backed session checkpoint"
         )
+    if args.command == "predictor-train":
+        if args.log_every_steps < 0:
+            parser.error("predictor-train --log-every-steps must be >= 0")
+        if args.checkpoint_every_epochs < 1:
+            parser.error("predictor-train --checkpoint-every-epochs must be >= 1")
+        if (
+                args.bundle_output_dir is not None
+                and args.checkpoint_output is None
+                and args.resume_checkpoint is None
+        ):
+            parser.error(
+                "predictor-train --bundle-output-dir requires "
+                "--checkpoint-output or --resume-checkpoint"
+            )
 
     # ------------------------------- 处理独立于通用配置加载的 predictor checkpoint 检查命令 -------------------------------
     # 当命令为 predictor-inspect 时，直接读取 checkpoint 元信息，而不走通用配置加载流程。
     if args.command == "predictor-inspect":
+        # predictor-inspect 的摘要信息统一走标准日志。
+        logger = LOGGER.getChild("predictor.inspect")
         # 读取指定 predictor checkpoint 的元信息。
         metadata = PredictorTrainer.read_checkpoint_metadata(args.checkpoint)
 
         # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出 checkpoint 元信息。
         if args.json:
             # 将 checkpoint 元信息转换为字典后，以格式化 JSON 方式输出。
-            print(json.dumps(metadata.to_dict(), indent=2, sort_keys=True))
+            _emit_stdout(json.dumps(metadata.to_dict(), indent=2, sort_keys=True))
         else:
             # 输出 checkpoint 的基础身份信息与来源信息。
-            print(
+            logger.info(
                 f"checkpoint_kind={metadata.checkpoint_kind} "
                 f"profile={metadata.profile_name}"
             )
             # 输出模型结构相关元信息。
-            print(
+            logger.info(
                 f"input_summary_dim={metadata.input_summary_dim} "
                 f"hidden_dim={metadata.hidden_dim} "
                 f"window={metadata.window_layers} "
@@ -758,7 +817,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"num_experts={metadata.num_experts}"
             )
             # 输出训练轮数、最终损失与召回指标等结果信息。
-            print(
+            logger.info(
                 f"candidate={metadata.candidate_experts_per_layer} "
                 f"executed={metadata.executed_experts_per_layer} "
                 f"epochs={metadata.epochs} "
@@ -772,6 +831,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # ------------------------------- 处理独立于通用配置加载的 predictor 导出命令 -------------------------------
     # 当命令为 predictor-export 时，直接执行 checkpoint 导出逻辑，而不走通用配置加载流程。
     if args.command == "predictor-export":
+        # predictor-export 的摘要信息统一走标准日志。
+        logger = LOGGER.getChild("predictor.export")
         # 将指定 checkpoint 导出为部署 bundle，并返回导出清单。
         manifest = PredictorTrainer.export_checkpoint_bundle(
             checkpoint_path=args.checkpoint,
@@ -781,21 +842,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出导出结果。
         if args.json:
             # 输出部署清单的 JSON 表示。
-            print(manifest.to_json())
+            _emit_stdout(manifest.to_json())
         else:
             # 输出导出成功信息与对应 profile 名称。
-            print(
+            logger.info(
                 f"Exported predictor deployment bundle for profile "
                 f"{manifest.profile_name}."
             )
             # 输出 bundle 中各关键文件的路径与来源信息。
-            print(
+            logger.info(
                 f"weights={manifest.weights_file} "
                 f"schema={manifest.schema_file} "
                 f"metrics={manifest.metrics_file}"
             )
             # 输出最终导出的 bundle 目录。
-            print(f"bundle_dir={args.output_dir}")
+            logger.info("bundle_dir=%s", args.output_dir)
 
         # 当前命令执行成功，返回 0。
         return 0
@@ -809,6 +870,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "predictor-trace":
         # 基于当前配置创建 predictor 训练器。
         trainer = PredictorTrainer(config)
+        # predictor-trace 的摘要信息统一走标准日志。
+        logger = LOGGER.getChild("predictor.trace")
         # 构造 predictor trace 数据集。
         dataset = trainer.build_trace_dataset(
             steps=args.steps,
@@ -831,15 +894,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出结果。
         if args.json:
             # 输出完整 predictor trace 数据集的 JSON 表示。
-            print(dataset.to_json())
+            _emit_stdout(dataset.to_json())
         else:
             # 输出已构造样本数量与 profile 信息。
-            print(
+            logger.info(
                 f"Built {dataset.example_count} predictor trace example(s) for profile "
                 f"{dataset.profile_name}."
             )
             # 输出教师来源、摘要来源以及专家窗口等关键信息。
-            print(
+            logger.info(
                 f"window={dataset.window_layers} "
                 f"candidate={dataset.candidate_experts_per_layer} "
                 f"executed={dataset.executed_experts_per_layer}"
@@ -847,7 +910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # 当存在输出文件路径时，额外打印保存位置。
             if args.output is not None:
                 # 输出 trace 数据集保存路径。
-                print(f"saved_trace={args.output}")
+                logger.info("saved_trace=%s", args.output)
 
         # 当前命令执行成功，返回 0。
         return 0
@@ -857,6 +920,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "predictor-train":
         # 基于当前配置创建 predictor 训练器。
         trainer = PredictorTrainer(config)
+        # predictor-train 的普通进度信息统一走标准日志。
+        logger = LOGGER.getChild("predictor.train")
 
         # ------------------------------- 初始化可选的模型状态、优化器状态与历史运行轨迹 -------------------------------
         # 默认先不加载任何已有模型。
@@ -879,19 +944,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trainer.load_training_checkpoint(args.resume_checkpoint)
             )
 
+        # 优先使用显式输出路径；若未指定但当前是 resume，则默认回写到 resume checkpoint。
+        checkpoint_save_path = args.checkpoint_output
+        if checkpoint_save_path is None and args.resume_checkpoint is not None:
+            checkpoint_save_path = args.resume_checkpoint
+
         # ------------------------------- 构造或加载 predictor 训练所需的 trace 数据集 -------------------------------
         # 当用户提供现成的 trace 输入文件时，直接从 JSON 文件读取。
         if args.trace_input is not None:
             # 从已有 JSON 文件中恢复 predictor trace 数据集。
             dataset = PredictorTraceDataset.from_json_file(args.trace_input)
-            # 基于该数据集执行训练。
-            model, run_trace, optimizer_state_dict = trainer.fit_dataset(
-                dataset,
-                epochs=args.epochs,
-                model=model,
-                optimizer_state_dict=optimizer_state_dict,
-                initial_run_trace=initial_run_trace,
-            )
         else:
             # 未提供现成 trace 输入时，现场构造训练所需的 predictor trace 数据集。
             dataset = trainer.build_trace_dataset(
@@ -904,56 +966,67 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dataset_format=args.dataset_format,
                 dataset_text_key=args.dataset_text_key,
             )
-            # 基于新构造的数据集执行训练。
-            model, run_trace, optimizer_state_dict = trainer.fit_dataset(
-                dataset,
-                epochs=args.epochs,
-                model=model,
-                optimizer_state_dict=optimizer_state_dict,
-                initial_run_trace=initial_run_trace,
-            )
 
-        # ------------------------------- 按需导出训练后的 checkpoint 与 runtime schema -------------------------------
-        # 当用户指定 checkpoint 输出路径时，保存训练后的模型与状态。
-        if args.checkpoint_output is not None:
-            # 将训练后的模型、轨迹与优化器状态保存为 checkpoint。
-            trainer.save_checkpoint(
-                model=model,
-                run_trace=run_trace,
-                path=args.checkpoint_output,
-                optimizer_state_dict=optimizer_state_dict,
-            )
+        # 基于数据集执行训练，并按 step/epoch 输出日志与周期性 checkpoint。
+        model, run_trace, optimizer_state_dict = trainer.fit_dataset(
+            dataset,
+            epochs=args.epochs,
+            model=model,
+            optimizer_state_dict=optimizer_state_dict,
+            initial_run_trace=initial_run_trace,
+            logger=logger,
+            log_every_steps=args.log_every_steps,
+            checkpoint_output_path=checkpoint_save_path,
+            checkpoint_every_epochs=args.checkpoint_every_epochs,
+        )
+
+        # ------------------------------- 按需导出训练后的 runtime schema 与最终部署 bundle -------------------------------
+        # 若本次训练可落盘 checkpoint，则显式记录最终可续训 checkpoint 路径。
+        if checkpoint_save_path is not None:
+            logger.info("predictor_train_final_checkpoint=%s", checkpoint_save_path)
 
         # 当用户指定 schema 输出路径时，导出运行时 schema。
         if args.schema_output is not None:
             # 基于训练轨迹中的来源信息构造运行时 schema，并写入目标文件。
             trainer.build_runtime_schema().write_json(args.schema_output)
+            logger.info("predictor_train_schema_written=%s", args.schema_output)
+
+        # 当用户指定 bundle 输出目录时，基于最终落盘 checkpoint 自动构建部署包。
+        if args.bundle_output_dir is not None and checkpoint_save_path is not None:
+            manifest = PredictorTrainer.export_checkpoint_bundle(
+                checkpoint_path=checkpoint_save_path,
+                output_dir=args.bundle_output_dir,
+            )
+            logger.info(
+                "predictor_train_bundle_written profile=%s bundle_dir=%s",
+                manifest.profile_name,
+                args.bundle_output_dir,
+            )
 
         # ------------------------------- 输出 predictor 训练结果 -------------------------------
         # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出训练结果。
         if args.json:
             # 输出完整训练轨迹的 JSON 表示。
-            print(run_trace.to_json())
+            _emit_stdout(run_trace.to_json())
         else:
-            # 输出训练完成信息与样本规模。
-            print(
-                f"Trained predictor for profile {run_trace.profile_name} on "
-                f"{run_trace.example_count} trace example(s)."
+            # 普通模式下，训练结果统一走标准日志输出。
+            logger.info(
+                "Trained predictor for profile %s on %d trace example(s).",
+                run_trace.profile_name,
+                run_trace.example_count,
             )
-            # 输出关键训练指标，如 epochs、最终损失与召回率。
-            print(
-                f"epochs={run_trace.epochs} "
-                f"final_loss={run_trace.final_mean_loss:.6f} "
-                f"recall@candidate={run_trace.final_recall_at_candidate_budget:.4f}"
+            logger.info(
+                "epochs=%d final_loss=%.6f recall@candidate=%.4f",
+                run_trace.epochs,
+                run_trace.final_mean_loss,
+                run_trace.final_recall_at_candidate_budget,
             )
-            # 当保存了 checkpoint 时，额外输出 checkpoint 路径。
-            if args.checkpoint_output is not None:
-                # 输出保存的 checkpoint 路径。
-                print(f"saved_checkpoint={args.checkpoint_output}")
-            # 当导出了 schema 时，额外输出 schema 路径。
+            if checkpoint_save_path is not None:
+                logger.info("saved_checkpoint=%s", checkpoint_save_path)
             if args.schema_output is not None:
-                # 输出保存的 schema 路径。
-                print(f"saved_schema={args.schema_output}")
+                logger.info("saved_schema=%s", args.schema_output)
+            if args.bundle_output_dir is not None:
+                logger.info("saved_bundle_dir=%s", args.bundle_output_dir)
 
         # 当前命令执行成功，返回 0。
         return 0
@@ -963,6 +1036,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "predictor-eval":
         # 基于当前配置创建 predictor 训练器。
         trainer = PredictorTrainer(config)
+        # predictor-eval 的摘要信息统一走标准日志。
+        logger = LOGGER.getChild("predictor.eval")
 
         # ------------------------------- 构造或加载 predictor 评估所需的 trace 数据集 -------------------------------
         # 当用户提供现成的 trace 输入文件时，直接读取该数据集。
@@ -993,15 +1068,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出评估结果。
         if args.json:
             # 输出完整评估结果的 JSON 表示。
-            print(evaluation.to_json())
+            _emit_stdout(evaluation.to_json())
         else:
             # 输出评估完成信息与样本规模。
-            print(
+            logger.info(
                 f"Evaluated predictor for profile {evaluation.profile_name} on "
                 f"{evaluation.example_count} trace example(s)."
             )
             # 输出平均损失与不同预算下的召回率指标。
-            print(
+            logger.info(
                 f"loss={evaluation.mean_loss:.6f} "
                 f"recall@candidate={evaluation.recall_at_candidate_budget:.4f} "
                 f"recall@executed={evaluation.recall_at_executed_budget:.4f}"
@@ -1027,7 +1102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # ------------------------------- 定义内部辅助函数以统一加载恢复快照与会话 checkpoint -------------------------------
     # 定义内部函数，用于从磁盘路径加载运行时快照或完整训练会话 checkpoint。
     def _load_checkpoint(
-        path: Path | None,
+            path: Path | None,
     ) -> tuple[TrainingRuntimeSnapshot | None, BatchPlannerCheckpoint | None]:
         # ------------------------------- 处理未提供恢复路径的情况 -------------------------------
         # 当未提供恢复路径时，直接返回空运行时快照与空 planner checkpoint。
