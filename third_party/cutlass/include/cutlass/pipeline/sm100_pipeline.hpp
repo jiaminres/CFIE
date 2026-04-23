@@ -598,7 +598,7 @@ public:
   void init_masks(ClusterShape cluster_shape, dim3 block_id_in_cluster = cute::block_id_in_cluster()) {
     // Calculate consumer mask
     if (params_.role == ThreadCategory::Consumer) {
-      auto cluster_layout = make_layout(cluster_shape);
+      [[maybe_unused]] auto cluster_layout = make_layout(cluster_shape);
       block_id_mask_ = detail::calculate_multicast_mask<McastDirection::kRowCol>(cluster_shape, AtomThrShape_MNK{}, block_id_in_cluster);
     }
   }
@@ -607,7 +607,7 @@ public:
   void init_masks(ClusterShape cluster_shape, McastDirection mcast_direction) {
     // Calculate consumer mask
     dim3 block_id_in_cluster = cute::block_id_in_cluster();
-    auto cluster_layout = make_layout(cluster_shape);
+    [[maybe_unused]] auto cluster_layout = make_layout(cluster_shape);
     if (mcast_direction == McastDirection::kRow) {
       block_id_mask_ = detail::calculate_multicast_mask<McastDirection::kRow>(cluster_shape, AtomThrShape_MNK{}, block_id_in_cluster);
     }

@@ -1499,7 +1499,8 @@ nullspace(Layout<Shape,Stride> const& layout)
 {
   auto flat_layout = flatten(layout);
 
-  auto iseq = detail::nullspace_seq<0>(flat_layout.stride(), seq<>{});
+  [[maybe_unused]] auto iseq =
+      detail::nullspace_seq<0>(flat_layout.stride(), seq<>{});
 
   if constexpr (iseq.size() == 0) {
     return Layout<_1,_0>{};     // Empty case, nothing found

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <assert.h>
+#include <limits>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -26,6 +27,13 @@
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace FLASH_NAMESPACE {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline constexpr float kFloatInfinity = std::numeric_limits<float>::infinity();
+inline constexpr float kFloatNegInfinity = -std::numeric_limits<float>::infinity();
+inline constexpr float kLog2e = 1.4426950408889634f;
+inline constexpr float kLn2 = 0.6931471805599453f;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

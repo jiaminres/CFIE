@@ -1057,7 +1057,6 @@ sm100_dense_compute_tile_shape_or_override() {
                     "EpilogueTile must be a cute::Tile or cute::Shape");
 
     EpilogueTileType epi_tile;
-    constexpr int M = size<0>(shape(epi_tile));
     constexpr int N = size<1>(shape(epi_tile));
     static_assert(N % 8 == 0, "Unsupported tile shape");
 
@@ -1104,15 +1103,6 @@ template<
 >
 static constexpr auto
 sm100_dense_dispatch_policy() {
-  // 8b residuals load fast and consume little smem, so the perf cost of waiting on stores to finish outweighs the cost of extra allocation
-  constexpr bool ReuseSmem = sizeof_bits_v<ElementC_> > 8;
-  // TMA store delay performs worse with residual loads
-  constexpr bool DelayTmaStore = is_void_v<ElementC_>;
-
-  constexpr int StagesD = cute::min(EpiTiles, 2);
-  constexpr int StagesC = ReuseSmem ? cute::max(cute::min(EpiTiles, 4), StagesD+1)
-                                    : cute::min(EpiTiles, 4);
-
   if constexpr (is_base_of_v<PtrArrayNoSmemWarpSpecialized1Sm, EpilogueScheduleType> ||
                 is_base_of_v<PtrArrayNoSmemWarpSpecialized2Sm, EpilogueScheduleType>) {
     return Sm100PtrArrayNoSmemWarpSpecialized{};
@@ -1122,10 +1112,22 @@ sm100_dense_dispatch_policy() {
   }
   else if constexpr (is_same_v<EpilogueScheduleType, PtrArrayTmaWarpSpecialized1Sm> ||
                      is_same_v<EpilogueScheduleType, PtrArrayTmaWarpSpecialized2Sm>) {
+    // 8b residuals load fast and consume little smem, so the perf cost of waiting on stores to finish outweighs the cost of extra allocation
+    constexpr bool ReuseSmem = sizeof_bits_v<ElementC_> > 8;
+    constexpr int StagesD = cute::min(EpiTiles, 2);
+    constexpr int StagesC = ReuseSmem ? cute::max(cute::min(EpiTiles, 4), StagesD+1)
+                                      : cute::min(EpiTiles, 4);
     constexpr bool DelayTmaStore_ = false; // TMA store delay complicates tensormap updates for Ptr-Array GEMMs
     return Sm100PtrArrayTmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmem, DelayTmaStore_>{};
   }
   else {
+    // 8b residuals load fast and consume little smem, so the perf cost of waiting on stores to finish outweighs the cost of extra allocation
+    constexpr bool ReuseSmem = sizeof_bits_v<ElementC_> > 8;
+    // TMA store delay performs worse with residual loads
+    constexpr bool DelayTmaStore = is_void_v<ElementC_>;
+    constexpr int StagesD = cute::min(EpiTiles, 2);
+    constexpr int StagesC = ReuseSmem ? cute::max(cute::min(EpiTiles, 4), StagesD+1)
+                                      : cute::min(EpiTiles, 4);
     return Sm100TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmem, DelayTmaStore>{};
   }
 }
@@ -1642,18 +1644,20 @@ private:
   static constexpr bool
   is_2sm() {
     using namespace cute;
-    constexpr int MmaTileM = size<0>(MmaTileShape_MNK{});
     constexpr int ClusterM = size<0>(ClusterShape_MNK{});
     constexpr bool StaticClusterM = is_static_v<decltype(get<0>(ClusterShape_MNK{}))>;
     constexpr bool EvenClusterM = StaticClusterM && ClusterM % 2 == 0;
     if constexpr (not EvenClusterM) {
       return false;
     }
-    else if constexpr (is_same_v<OpClass,arch::OpClassBlockScaledTensorOp>) {
-      return MmaTileM == 256;
-    }
     else {
-      return MmaTileM == 256 || MmaTileM == 128;
+      constexpr int MmaTileM = size<0>(MmaTileShape_MNK{});
+      if constexpr (is_same_v<OpClass,arch::OpClassBlockScaledTensorOp>) {
+        return MmaTileM == 256;
+      }
+      else {
+        return MmaTileM == 256 || MmaTileM == 128;
+      }
     }
   }
   using EpilogueSchedule = cute::conditional_t<is_2sm(), TmaWarpSpecialized2Sm, TmaWarpSpecialized1Sm>;

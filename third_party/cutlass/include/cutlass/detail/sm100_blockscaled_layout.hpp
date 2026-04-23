@@ -162,8 +162,6 @@ struct Sm1xxBlockScaledConfig {
     using Blk_SF    = typename Sm1xxBlkScaledChunk::Blk_SF; 
     using Blk_Elems = decltype(Blk_MN{} * Blk_SF{});
 
-    using TL_VMNK = typename TiledMma::ThrLayoutVMNK;
-    constexpr TL_VMNK tl_vmnk{};
     constexpr int MMA_N = cute::size<1>(TileShape_MNK{});
     // If MMA_N is 192, we need to operate at MMA_N = 256 granularity for UTCCP to work for ScaleFactorB.
     // Both TMA and UTCCP will transfer scale factor B as if we have 256 columns in B matrix.

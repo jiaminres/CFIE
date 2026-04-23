@@ -575,8 +575,10 @@ public:
     // Get the appropriate blocks for this thread block -- potential for thread block locality
     TiledMma tiled_mma;
     const auto blk_shape = TileShape{};                                                                // (BLK_M,BLK_N,BLK_K)
-    const auto c_tile_count = CollectiveEpilogue::get_load_pipe_increment(blk_shape);
-    const auto d_tile_count = CollectiveEpilogue::get_store_pipe_increment(blk_shape);
+    [[maybe_unused]] const auto c_tile_count =
+        CollectiveEpilogue::get_load_pipe_increment(blk_shape);
+    [[maybe_unused]] const auto d_tile_count =
+        CollectiveEpilogue::get_store_pipe_increment(blk_shape);
 
     // Wait for all thread blocks in the Cluster
     cluster_wait_fn();

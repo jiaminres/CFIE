@@ -14,25 +14,6 @@
 #pragma warning(disable : 4244 4267)
 #endif
 
-// 本文件集中把 C++ / CUDA 算子暴露给 PyTorch；
-// Python 层看到的 `torch.ops.<namespace>.*` 入口，最终都会从这里拿到 schema 和后端实现。
-//
-// `ops.def(...)` 负责声明 PyTorch 侧 schema，决定算子名称、参数签名和返回值形态。
-// `ops.impl(...)` 负责把同名 schema 绑定到具体后端实现；本文件大多数实现绑定到 CUDA，
-// 也有少量 helper 绑定到 CPU。
-//
-// 如果某个算子在这里只有 `def(...)`、没有对应的 `impl(...)`，
-// 通常表示它依赖条件编译，并会在满足编译条件的源文件里补做实现注册。
-//
-// 关于 meta 函数的说明：
-// `X_meta` 这一类签名表示与算子 `X` 对应的 meta 函数签名。
-// 它们必须与 `X` 本身的函数签名保持同步。
-// 一般来说，只有返回 `Tensor` 的函数才需要配套的 meta 函数。
-//
-// 关于算子注册和函数 schema 的详细文档，可参考下面链接。
-// https://docs.google.com/document/d/1_W62p8WJOQQUzPsJYa7s701JXt0qf2OfLub2sbkHOaU/edit#heading=h.ptttacy8y1u9
-// https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
-
 
 // ------------------------------- 注册主命名空间下的自定义算子 -------------------------------
 // 下面这一整段是主算子表；

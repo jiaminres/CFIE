@@ -857,7 +857,6 @@ struct CollectiveMma<
       BarrierType* tma_barrier = mainloop_pipeline.producer_get_barrier(mainloop_pipe_producer_state);
 
       int write_stage = mainloop_pipe_producer_state.index();
-      auto curr_mainloop_pipe_producer_state = mainloop_pipe_producer_state;
       ++mainloop_pipe_producer_state;
       barrier_token = mainloop_pipeline.producer_try_acquire(mainloop_pipe_producer_state);
 

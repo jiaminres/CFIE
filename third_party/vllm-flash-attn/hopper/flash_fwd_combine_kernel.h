@@ -490,7 +490,7 @@ public:
                     if (si < num_splits) {
                         cute::copy(gmem_tiled_copy_LSE, mLSEpartial_cur_copy(_, si), tLSEsLSE(_, s, m));
                     } else {
-                        cute::fill(tLSEsLSE(_, s, m), -INFINITY);
+                cute::fill(tLSEsLSE(_, s, m), kFloatNegInfinity);
                     }
                 }
             } else {
@@ -587,11 +587,11 @@ public:
             int max_valid_idx = -1;
             #pragma unroll
             for (int s = 0; s < size<1>(ts2rrLSE); ++s) {
-                if (ts2rrLSE(_0{}, s, m) != -INFINITY) { max_valid_idx = get<0>(ts2rcLSE(_0{}, s, _0{})); }
+            if (ts2rrLSE(_0{}, s, m) != kFloatNegInfinity) { max_valid_idx = get<0>(ts2rcLSE(_0{}, s, _0{})); }
             }
             MaxOp<int> max_int_op;
             max_valid_split[m] = Allreduce<kSmemThreadsPerColLSEt>::run(max_valid_idx, max_int_op);
-            float lse_max_cur = lse_max == -INFINITY ? 0.0f : lse_max;  // In case all local LSEs are -inf
+        float lse_max_cur = lse_max == kFloatNegInfinity ? 0.0f : lse_max;  // In case all local LSEs are -inf
             float lse_sum_cur = 0.f;
             #pragma unroll
             for (int s = 0; s < size<1>(ts2rrLSE); ++s) {

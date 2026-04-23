@@ -102,7 +102,8 @@ sm120_get_tma_dispatch_policy() {
   constexpr int StagesC = ReuseSmem ? cute::max(cute::min(EpiTiles, 2), StagesD+1)
                                     : StagesD;  
 
-  constexpr int NumEpilogueWarpGroups = GetNumEpilogueWarpGroups<Schedule>::value;
+  [[maybe_unused]] constexpr int NumEpilogueWarpGroups =
+      GetNumEpilogueWarpGroups<Schedule>::value;
 
   if constexpr (IsGroupedGemmKernel) {
     return Sm120PtrArrayTmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmem, 

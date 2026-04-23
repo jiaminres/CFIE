@@ -734,7 +734,8 @@ select_instr() {
   using ElementB = typename detail::blockscaled::blockscaled_type<BuilderScheduleTag, ElementPairB>::data_type;
   constexpr uint32_t SfVectorSizeA = detail::blockscaled::blockscaled_type<BuilderScheduleTag, ElementPairA>::SfVectorSize;
   constexpr uint32_t SfVectorSizeB = detail::blockscaled::blockscaled_type<BuilderScheduleTag, ElementPairB>::SfVectorSize;
-  constexpr int SfVectorSize = SfVectorSizeA > SfVectorSizeB ? SfVectorSizeA : SfVectorSizeB;
+  [[maybe_unused]] constexpr int SfVectorSize =
+      SfVectorSizeA > SfVectorSizeB ? SfVectorSizeA : SfVectorSizeB;
   using ElementSF = ElementSFA;
 
   if constexpr (cute::is_base_of_v<KernelScheduleMxf8f6f4Sm100, BuilderScheduleTag>

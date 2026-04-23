@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.26)
 
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+endif()
+
+if(WIN32)
+    # Match PyTorch's `/Z7` choice on Windows so host compilation does not emit
+    # `/Zi` overridden by `/Z7` noise in RelWithDebInfo builds.
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+        "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+endif()
+
 project(vllm_flash_attn LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -126,7 +137,12 @@ list(APPEND VLLM_FA_GPU_FLAGS --expt-relaxed-constexpr --expt-extended-lambda --
 list(APPEND VLLM_FA_GPU_FLAGS -DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 
 # Replace instead of appending, nvcc doesn't like duplicate -O flags.
-string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+if (WIN32)
+    string(REPLACE "-O2" "/O2" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+    string(REPLACE "-Ob1" "/Ob1" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+else ()
+    string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+endif ()
 
 #
 # _C extension
@@ -184,8 +200,13 @@ if (FA2_ENABLED)
     endif()
 endif ()
 
-# FA3 requires CUDA 12.0 or later
-if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+# FA3 requires CUDA 12.0 or later.  The FA3 host dispatch source currently
+# embeds preprocessor directives inside macro arguments, which MSVC rejects.
+# Windows builds therefore use FA2 and skip the Hopper-only FA3 extension.
+if (WIN32 AND FA3_ENABLED)
+    message(STATUS "FA3 is disabled on Windows because MSVC cannot compile "
+                   "the current FA3 host dispatch macros.")
+elseif (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
     # BF16 source files
     file(GLOB FA3_BF16_GEN_SRCS
         "hopper/instantiations/flash_fwd_hdim64_bf16_*packgqa_sm90.cu"
@@ -320,7 +341,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
             $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
             $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor->)
     endif()
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
     message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")

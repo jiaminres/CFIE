@@ -648,7 +648,7 @@ public:
 
       // Signal the epilogue warps to proceed once the prologue is complete
       epilogue_throttle_barrier.arrive();
-      bool requires_clc_query = true;
+      [[maybe_unused]] bool requires_clc_query = true;
 
       do {
 
@@ -723,7 +723,7 @@ public:
       // unflushed global memory prior to this instruction
       cutlass::arch::wait_on_dependent_grids();
 
-      bool requires_clc_query = true;
+      [[maybe_unused]] bool requires_clc_query = true;
 
       do {
 
@@ -776,7 +776,7 @@ public:
         // Whether a new CLC query must be performed.
         // See comment below where this variable is updated for a description of
         // why this variable is needed.
-        bool requires_clc_query = true;
+      [[maybe_unused]] bool requires_clc_query = true;
 
         cutlass::arch::wait_on_dependent_grids();
 

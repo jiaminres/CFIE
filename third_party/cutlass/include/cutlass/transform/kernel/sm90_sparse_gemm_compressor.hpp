@@ -378,7 +378,7 @@ private:
     }
 
     // Construct a sign bit mask for handling negative zeros 
-    ElementAMmaRawUnit sign_mask = ElementAMmaRawUnit{ 0 };
+    [[maybe_unused]] ElementAMmaRawUnit sign_mask = ElementAMmaRawUnit{ 0 };
     if constexpr (has_negative_zero_v<ElementA>) {
       ElementAMmaRawUnit one_sign_mask = static_cast<ElementAMmaRawUnit>(~(ElementAMmaRawUnit{ 1 } << (cute::sizeof_bits_v<ElementA> - 1)));
       for (int i = 0; i < sizeof(ElementAMmaRawUnit) / sizeof(ElementAUint); ++i) {

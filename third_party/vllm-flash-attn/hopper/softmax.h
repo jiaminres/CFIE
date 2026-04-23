@@ -75,7 +75,7 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
         // If max is -inf, then all elements must have been -inf (possibly due to masking).
         // We don't want (-inf - (-inf)) since that would give NaN.
         const float max_scaled = Check_inf
-            ? (max(mi) == -INFINITY ? 0.f : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset)
+            ? (max(mi) == kFloatNegInfinity ? 0.f : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset)
             : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset;
         #pragma unroll
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
@@ -115,7 +115,7 @@ struct Softmax {
             for (int mi = 0; mi < size(row_max); ++mi) {
                 float scores_max_cur = !Check_inf
                     ? row_max(mi)
-                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                    : (row_max(mi) == kFloatNegInfinity ? 0.0f : row_max(mi));
                 scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
                 row_sum(mi) *= scores_scale(mi);
             }
@@ -148,7 +148,7 @@ struct Softmax {
                 static constexpr float sum_scale = 1.f / float(1 << Max_offset);
                 sum *= sum_scale;
             }
-            row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
+            row_sum(mi) = (sum == 0.f || sum != sum) ? kFloatNegInfinity : row_max(mi) * (softmax_scale_log2 * kLn2) + __logf(sum);
         }
         return scores_scale;
     };
@@ -159,9 +159,9 @@ struct Softmax {
         TensorT scores_scale;
         #pragma unroll
         for (int mi = 0; mi < size(row_sum); ++mi) {
-            if (row_max(mi) == -INFINITY) { row_max(mi) = 0.f; }
+            if (row_max(mi) == kFloatNegInfinity) { row_max(mi) = 0.f; }
             const float max_scaled = row_max(mi) * softmax_scale_log2 - Max_offset;
-            float sum = row_sum(mi) + exp2f(float(M_LOG2E) * tSrSAux(mi) - max_scaled);
+            float sum = row_sum(mi) + exp2f(kLog2e * tSrSAux(mi) - max_scaled);
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
             scores_scale(mi) = inv_sum * final_scale;
             // For FP8, we might have scaled the output of exp by 2**8 so we need to divide sum by that amount.
@@ -169,7 +169,7 @@ struct Softmax {
                 static constexpr float sum_scale = 1.f / float(1 << Max_offset);
                 sum *= sum_scale;
             }
-            row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
+            row_sum(mi) = (sum == 0.f || sum != sum) ? kFloatNegInfinity : row_max(mi) * (softmax_scale_log2 * kLn2) + __logf(sum);
         }
         return scores_scale;
     };

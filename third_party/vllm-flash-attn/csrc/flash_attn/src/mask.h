@@ -3,7 +3,7 @@
  ******************************************************************************/
 
 #pragma once
-#include "namespace_config.h"
+#include "utils.h"
 
 #include <cute/tensor.hpp>
 
@@ -28,7 +28,7 @@ __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const
                 // Without the "make_coord" we get wrong results
                 #pragma unroll
                 for (int mi = 0; mi < size<0>(tensor); ++mi) {
-                    tensor(mi, make_coord(j, nj)) = -INFINITY;
+                    tensor(mi, make_coord(j, nj)) = kFloatNegInfinity;
                 }
             }
         }
@@ -59,7 +59,7 @@ __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor,
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const int col_idx = col_idx_base + j;
                     if (col_idx >= col_idx_limit_right || (HasWSLeft && col_idx < col_idx_limit_left)) {
-                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                        tensor(make_coord(i, mi), make_coord(j, nj)) = kFloatNegInfinity;
                     }
                 }
             }
@@ -97,7 +97,7 @@ __forceinline__ __device__ void apply_mask_causal_w_idx(
         #pragma unroll
         for (int ni = 0; ni < size<1, 1>(tensor); ++ni) {
             if (col_idx_offset_ + get<1>(idx_rowcol(0, ni)) >= col_idx_limit) {
-                tensor(mi, ni) = -INFINITY;
+                tensor(mi, ni) = kFloatNegInfinity;
             }
         }
         // if (cute::thread0()) {
@@ -157,7 +157,7 @@ struct Mask {
                                 tensor(mi, make_coord(j, nj)) += alibi_slope * col_idx;
                             }
                             if constexpr (!Is_even_MN) {
-                                if (col_idx >= max_seqlen_k) { tensor(mi, make_coord(j, nj)) = -INFINITY; }
+                                if (col_idx >= max_seqlen_k) { tensor(mi, make_coord(j, nj)) = kFloatNegInfinity; }
                             }
                         }
                     }
@@ -187,18 +187,18 @@ struct Mask {
                                 }
                                 if constexpr (Causal_mask) {
                                     if (col_idx >= col_idx_limit_right) {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                                        tensor(make_coord(i, mi), make_coord(j, nj)) = kFloatNegInfinity;
                                     }
                                 }
                                 if constexpr (Is_local) {
                                     if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                                        tensor(make_coord(i, mi), make_coord(j, nj)) = kFloatNegInfinity;
                                     }
                                 }
                                 if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
                                     // Causal and Local already handles MN masking
                                     if (col_idx >= max_seqlen_k) {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                                        tensor(make_coord(i, mi), make_coord(j, nj)) = kFloatNegInfinity;
                                     }
                                 }
                             }

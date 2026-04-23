@@ -1487,12 +1487,13 @@ nullspace(Layout<Shape,Stride> const& layout)
   [[maybe_unused]] auto flat_stride = flatten(layout.stride());
 
   // Select all indices corresponding to stride-0s
-  auto iseq = cute::fold(make_seq<rank_v<decltype(flat_stride)>>{}, cute::tuple<>{},
-                         [&](auto init, auto i){
-                           if constexpr (is_constant_v<0, decltype(get<i>(flat_stride))>) { return append(init, i); }
-                           else                                                           { return init;            }
-                           CUTE_GCC_UNREACHABLE;
-                         });
+  [[maybe_unused]] auto iseq =
+      cute::fold(make_seq<rank_v<decltype(flat_stride)>>{}, cute::tuple<>{},
+                 [&](auto init, auto i){
+                   if constexpr (is_constant_v<0, decltype(get<i>(flat_stride))>) { return append(init, i); }
+                   else                                                           { return init;            }
+                   CUTE_GCC_UNREACHABLE;
+                 });
 
   if constexpr (tuple_size<decltype(iseq)>::value == 0) {
     return Layout<_1,_0>{};     // Empty case, nothing found

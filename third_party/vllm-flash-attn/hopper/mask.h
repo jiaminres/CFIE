@@ -72,7 +72,7 @@ struct Mask {
                 for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                     if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= seqlenk_col_limit) {
                         #pragma unroll
-                        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) { tSrS_rowcol(m, n) = -INFINITY; }
+            for (int m = 0; m < size<0>(tSrS_rowcol); ++m) { tSrS_rowcol(m, n) = kFloatNegInfinity; }
                     }
                 }
             }
@@ -105,11 +105,11 @@ struct Mask {
                                 int abs_k_idx = local_k_idx * cp_world_size + cp_rank;
                                 int k_limit = row_idx + tot_seqlen_k - seqlen_q;
                                 if (abs_k_idx > k_limit || (Seqlenk_mask && abs_k_idx >= tot_seqlen_k)) {
-                                    tSrS_rowcol(m, n) = -INFINITY;
+                        tSrS_rowcol(m, n) = kFloatNegInfinity;
                                 }
                             } else {
                                 if (col_idx >= col_limit_right) {
-                                    tSrS_rowcol(m, n) = -INFINITY;
+                        tSrS_rowcol(m, n) = kFloatNegInfinity;
                                 }
                             }
                         }
@@ -130,7 +130,7 @@ struct Mask {
                         #pragma unroll
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                             int const col_idx = int(get<Col>(t0ScS_rowcol(m, n)));
-                            if (col_idx >= col_limit_right || (col_idx < col_limit_left && col_idx >= col_limit_sink)) { tSrS_rowcol(m, n) = -INFINITY; }
+                if (col_idx >= col_limit_right || (col_idx < col_limit_left && col_idx >= col_limit_sink)) { tSrS_rowcol(m, n) = kFloatNegInfinity; }
                         }
                     }
                 }
@@ -146,7 +146,7 @@ struct Mask {
                         int const row_limit_top = col0 >= seqlenk_col_limit ? kBlockM : col0 - causal_row_offset;
                         #pragma unroll
                         for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-                            if (int(get<Row>(t0ScS_rowcol(m, _0{}))) < row_limit_top) { tSrS_rowcol(m, n) = -INFINITY; }
+            if (int(get<Row>(t0ScS_rowcol(m, _0{}))) < row_limit_top) { tSrS_rowcol(m, n) = kFloatNegInfinity; }
                         }
                     }
                 } else {
@@ -161,7 +161,7 @@ struct Mask {
                         #pragma unroll
                         for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
                             int const row_idx = int(get<Row>(t0ScS_rowcol(m, _0{})));
-                            if (row_idx < row_limit_top || row_idx > row_limit_bot) { tSrS_rowcol(m, n) = -INFINITY; }
+            if (row_idx < row_limit_top || row_idx > row_limit_bot) { tSrS_rowcol(m, n) = kFloatNegInfinity; }
                         }
                     }
                 }

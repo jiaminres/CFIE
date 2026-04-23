@@ -582,7 +582,7 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::FastDivmod(!args.ptr_pagetable ? 1 : cute::ceil_div(page_size, kBlockN)),  // blockN_per_page_size_divmod
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
                 tma_load_Q, tma_load_K, tma_load_V, tma_load_K_new, tma_load_V_new, tma_load_Qv,
-                !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
+                !Has_softcap ? float(args.softmax_scale * kLog2e) : float(args.softcap_val * kLog2e),
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,

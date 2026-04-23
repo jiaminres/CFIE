@@ -42,7 +42,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+    [[maybe_unused]] const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
@@ -285,7 +285,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
         #pragma unroll
         for (int m = 0; m < size<1>(tOgO); ++m) {
             const int row = get<0>(tOcO(0, m, 0));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
+        if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = kFloatInfinity; }
         }
         return;
     }
@@ -521,7 +521,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                             #pragma unroll
                             for (int j = 0; j < size<1, 0>(tensor); ++j) {
                                 if (col_idx_base + j >= num_cols || cols_ptr[col_idx_base + j] >= col_idx_limit) {
-                                    tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                                tensor(make_coord(i, mi), make_coord(j, nj)) = kFloatNegInfinity;
                                 }
                             }
                         }

@@ -358,7 +358,7 @@ struct CollectiveMainloopBwdSm80 {
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale,
-                !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
+                !Has_softcap ? float(args.softmax_scale * kLog2e) : float(args.softcap_val * kLog2e),
                 args.window_size_left, args.window_size_right,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,

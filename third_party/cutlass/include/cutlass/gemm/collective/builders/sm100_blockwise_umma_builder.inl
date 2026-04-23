@@ -117,12 +117,9 @@ auto sm100_make_simt_gmem_tiled_copy_SFA() {
 
   // we have at most a warp to perform the loads
 
-  constexpr int ScaleGranularityM = size<0,0>(LayoutSFA{});
-  constexpr int ScaleMsPerTile = size<0>(CtaShape_MNK{}) / ScaleGranularityM;
-  constexpr int ScaleGranularityK = size<1,0>(LayoutSFA{});
-  constexpr int ScaleKsPerTile = size<2>(CtaShape_MNK{}) / ScaleGranularityK;
-
   if constexpr (size<0,1>(LayoutSFA{}.stride()) == 1) {
+    constexpr int ScaleGranularityM = size<0,0>(LayoutSFA{});
+    constexpr int ScaleMsPerTile = size<0>(CtaShape_MNK{}) / ScaleGranularityM;
     constexpr int LeadingScalesPerTileSFA = ScaleMsPerTile;
     if constexpr (LeadingScalesPerTileSFA >= 32) {
       constexpr int Alignment = cute::min(static_cast<int>(LeadingScalesPerTileSFA * sizeof(Element)) / 32, 16);
@@ -151,12 +148,9 @@ auto sm100_make_simt_gmem_tiled_copy_SFB() {
 
   // we have at most a warp to perform the loads
 
-  constexpr int ScaleGranularityN = size<0,0>(LayoutSFB{});
-  constexpr int ScaleNsPerTile = size<1>(CtaShape_MNK{}) / ScaleGranularityN;
-  constexpr int ScaleGranularityK = size<1,0>(LayoutSFB{});
-  constexpr int ScaleKsPerTile = size<2>(CtaShape_MNK{}) / ScaleGranularityK;
-
   if constexpr (size<0,1>(LayoutSFB{}.stride()) == 1) {
+    constexpr int ScaleGranularityN = size<0,0>(LayoutSFB{});
+    constexpr int ScaleNsPerTile = size<1>(CtaShape_MNK{}) / ScaleGranularityN;
     constexpr int LeadingScalesPerTileSFB = ScaleNsPerTile;
     if constexpr (LeadingScalesPerTileSFB >= 32) {
       constexpr int Alignment = cute::min(static_cast<int>(LeadingScalesPerTileSFB * sizeof(Element)) / 32, 16);

@@ -331,7 +331,7 @@ public:
       , empty_barrier_ptr_(&storage.empty_barrier_[0]) {
 
     int warp_idx = canonical_warp_idx_sync();
-    int thread_idx = threadIdx.x;
+    [[maybe_unused]] int thread_idx = threadIdx.x;
     int lane_predicate = cute::elect_one_sync();
 
     static_assert(cute::is_same_v<InitBarriers, cute::true_type> || cute::is_same_v<InitBarriers, cute::false_type>);

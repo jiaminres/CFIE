@@ -5,6 +5,9 @@
 #pragma once
 
 #include <assert.h>
+#include <cfloat>
+#include <cmath>
+#include <limits>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -26,6 +29,18 @@
 namespace flash {
 
 using namespace cute;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if defined(__CUDACC__)
+static __device__ constexpr float kFloatInfinity = FLT_MAX;
+static __device__ constexpr float kFloatNegInfinity = -FLT_MAX;
+#else
+static constexpr float kFloatInfinity = FLT_MAX;
+static constexpr float kFloatNegInfinity = -FLT_MAX;
+#endif
+inline constexpr float kLog2e = 1.4426950408889634f;
+inline constexpr float kLn2 = 0.6931471805599453f;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -724,7 +724,7 @@ public:
       // Even the first tile for a CTA can be from any of the batches.
       // And during initialization of the first TMA descriptor on host, we don't initialize to the first batch due to that args value being device-only.
       bool did_batch_change = true;
-      bool requires_clc_query = true;
+      [[maybe_unused]] bool requires_clc_query = true;
 
       do {
         int32_t curr_batch = idx2crd(work_tile_info.L_idx, shape<4>(gA_mkl)); // Usually just returns work_tile_info.L_idx;
@@ -813,7 +813,7 @@ public:
         // Whether a new CLC query must be performed.
         // See comment below where this variable is updated for a description of
         // why this variable is needed.
-        bool requires_clc_query = true;
+      [[maybe_unused]] bool requires_clc_query = true;
 
         cutlass::arch::wait_on_dependent_grids();
 
