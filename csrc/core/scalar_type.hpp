@@ -1,6 +1,7 @@
 #pragma once
 
 // For TORCH_CHECK
+#include <cstddef>
 #include <torch/library.h>
 
 namespace vllm {
@@ -125,15 +126,15 @@ class ScalarType {
     static_assert(id_size_bits() <= sizeof(Id) * 8,
                   "ScalarType id is too large to be stored");
 
-    auto or_and_advance = [](std::pair<Id, uint32_t> result,
-                             auto member) -> std::pair<Id, uint32_t> {
+    auto or_and_advance = [](std::pair<Id, size_t> result,
+                             auto member) -> std::pair<Id, size_t> {
       auto [id, bit_offset] = result;
       auto constexpr bits = member_id_field_width<decltype(member)>();
       return {id | (int64_t(member) & ((uint64_t(1) << bits) - 1))
                        << bit_offset,
               bit_offset + bits};
     };
-    return reduce_members(or_and_advance, std::pair<Id, uint32_t>{}).first;
+    return reduce_members(or_and_advance, std::pair<Id, size_t>{}).first;
   }
 
   // create a ScalarType from an id, for c++17 template specialization,
@@ -147,11 +148,12 @@ class ScalarType {
       auto extracted_val = static_cast<T>((int64_t(id) >> bit_offset) &
                                           ((uint64_t(1) << bits) - 1));
       auto new_tuple = std::tuple_cat(tuple, std::make_tuple(extracted_val));
-      return std::pair<decltype(new_tuple), int>{new_tuple, bit_offset + bits};
+      return std::pair<decltype(new_tuple), size_t>{new_tuple,
+                                                    bit_offset + bits};
     };
 
     auto [tuple_args, _] = reduce_member_types(extract_and_advance,
-                                               std::pair<std::tuple<>, int>{});
+                                               std::pair<std::tuple<>, size_t>{});
     return std::apply([](auto... args) { return ScalarType(args...); },
                       tuple_args);
   }

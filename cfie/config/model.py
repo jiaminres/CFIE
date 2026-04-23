@@ -969,13 +969,23 @@ class ModelConfig:
                 "mxfp4",
                 "cpu_awq",
             ]
+            builtin_quantization_methods = set(
+                get_args(me_quant.QuantizationMethods)
+            )
             quantization_methods = [
-                q for q in supported_quantization if q not in overrides
+                q
+                for q in supported_quantization
+                if q not in builtin_quantization_methods
             ]
-            # Any custom overrides will be in quantization_methods so we place
-            # them at the start of the list so custom overrides have preference
-            # over the built-in ones.
-            quantization_methods = quantization_methods + overrides
+            if self.quantization is not None and self.quantization not in (
+                    quantization_methods
+            ):
+                quantization_methods.append(self.quantization)
+            for name in overrides:
+                if name not in quantization_methods:
+                    quantization_methods.append(name)
+            if quant_method and quant_method not in quantization_methods:
+                quantization_methods.append(quant_method)
 
             # Detect which checkpoint is it
             for name in quantization_methods:

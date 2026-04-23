@@ -37,6 +37,11 @@ def configure_logging(level: str | int | None = None) -> None:
         str(resolved_level).upper(),
         logging.INFO,
     )
+    resolved_level_name = str(logging.getLevelName(numeric_level)).upper()
+
+    # 将最终日志级别同步回环境变量，确保后续拉起的子进程继承同一配置。
+    os.environ["CFIE_LOG_LEVEL"] = resolved_level_name
+    os.environ["VLLM_LOGGING_LEVEL"] = resolved_level_name
 
     # 设置 "cfie" 根 logger 的日志级别。
     root_logger.setLevel(numeric_level)

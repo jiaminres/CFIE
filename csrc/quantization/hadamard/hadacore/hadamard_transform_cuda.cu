@@ -120,7 +120,7 @@ hadamard_transform_kernel(b16* a, b16* out, int total_num_chunks) {
     int64_t threadid = threadIdx.x % 32;
     extern __shared__ b32 bfrag_arr[]; // num_chunks * warps_per_block * 128
     int64_t real_num_chunks = ((blockid + 1) * num_chunks) > total_num_chunks ? (total_num_chunks - (blockid * num_chunks)) : num_chunks;
-    int64_t diff_num_chunks = real_num_chunks - num_chunks;
+    [[maybe_unused]] int64_t diff_num_chunks = real_num_chunks - num_chunks;
 
     b32* a_start_ptr = (b32*) (a + blockid * num_chunks * 256); // offset a to where this warp starts
     b32* out_start_ptr = (b32*) (out + blockid * num_chunks * 256);
@@ -265,7 +265,7 @@ hadamard_transform_kernel(b16* a, b16* out, int total_num_chunks) {
     }
 
     // log had size above 8, only used for above 2^8 = 256 size
-    constexpr int64_t part8_log_had_size = log_had_size - 8;
+    [[maybe_unused]] constexpr int64_t part8_log_had_size = log_had_size - 8;
 
     b32* a_chunk_ptr = a_start_ptr; // first chunk starts at this warp's data starts
     b32* out_chunk_ptr = out_start_ptr;

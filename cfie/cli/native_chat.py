@@ -376,6 +376,10 @@ def _needs_answer_retry(text: str, thinking_enabled: bool) -> bool:
     )
 
 
+def _needs_non_thinking_retry(text: str, thinking_enabled: bool) -> bool:
+    return thinking_enabled and not _final_assistant_content(text, thinking_enabled)
+
+
 def _remaining_retry_tokens(
         tokenizer: Any,
         generated_text: str,
@@ -409,6 +413,8 @@ def _stream_request_text(
         prompt: Any,
         sampling_params: Any,
         show_runtime_output: bool,
+        *,
+        emit_text: bool = True,
 ) -> list[str]:
     chunks: list[str] = []
 
@@ -421,9 +427,34 @@ def _stream_request_text(
 
         for text in _iter_request_text(outputs, request_id):
             chunks.append(text)
-            print(text, end="", flush=True)
+            if emit_text:
+                print(text, end="", flush=True)
 
     return chunks
+
+
+def _retry_without_thinking(
+        engine: Any,
+        prompt_messages: list[dict[str, str]],
+        args: Namespace,
+        sampling_params: Any,
+        request_id: str,
+) -> list[str]:
+    retry_args = copy.copy(args)
+    retry_args.enable_thinking = False
+    retry_sampling_params = _clone_sampling_params_with_max_tokens(
+        sampling_params,
+        int(args.max_new_tokens),
+    )
+    retry_prompt = _render_engine_chat_prompt(engine, prompt_messages, retry_args)
+    return _stream_request_text(
+        engine,
+        f"{request_id}-plain-answer",
+        retry_prompt,
+        retry_sampling_params,
+        args.show_runtime_output,
+        emit_text=True,
+    )
 
 
 # 在真正进入交互前跑一次最小请求，把首轮固定冷启动前移到启动阶段。
@@ -551,6 +582,7 @@ def run_native_chat(args: Namespace) -> int:
 
     # 构建采样参数，如 temperature、top_p、stop 等。
     sampling_params = _build_sampling_params(args)
+    thinking_enabled = _thinking_mode_enabled(args)
 
     # 自增请求编号，用于区分每一轮请求。
     turn_index = 0
@@ -626,11 +658,12 @@ def run_native_chat(args: Namespace) -> int:
                     engine_prompt,
                     sampling_params,
                     args.show_runtime_output,
+                    emit_text=not thinking_enabled,
                 )
             )
 
             assistant_text = "".join(assistant_chunks)
-            if _needs_answer_retry(assistant_text, _thinking_mode_enabled(args)):
+            if _needs_answer_retry(assistant_text, thinking_enabled):
                 retry_tokens = _remaining_retry_tokens(tokenizer, assistant_text, args)
                 if retry_tokens > 0:
                     retry_sampling_params = _clone_sampling_params_with_max_tokens(
@@ -644,16 +677,40 @@ def run_native_chat(args: Namespace) -> int:
                             _build_answer_retry_prompt(prompt, assistant_text),
                             retry_sampling_params,
                             args.show_runtime_output,
+                            emit_text=not thinking_enabled,
                         )
                     )
+                    assistant_text = "".join(assistant_chunks)
+
+            effective_thinking_enabled = thinking_enabled
+            if thinking_enabled:
+                final_answer = _final_assistant_content(assistant_text, True)
+                if final_answer:
+                    print(final_answer, end="", flush=True)
+                elif _needs_non_thinking_retry(assistant_text, True):
+                    print(
+                        "thinking output did not reach a final answer; "
+                        "retrying without thinking",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    assistant_chunks = _retry_without_thinking(
+                        engine,
+                        prompt_messages,
+                        args,
+                        sampling_params,
+                        request_id,
+                    )
+                    assistant_text = "".join(assistant_chunks)
+                    effective_thinking_enabled = False
 
             # 一轮输出结束后补一个换行。
             print(flush=True)
 
             history_content = _history_assistant_content(
-                "".join(assistant_chunks),
-                args.keep_thinking_in_history,
-                _thinking_mode_enabled(args),
+                assistant_text,
+                args.keep_thinking_in_history and effective_thinking_enabled,
+                effective_thinking_enabled,
             )
 
             if history_content:

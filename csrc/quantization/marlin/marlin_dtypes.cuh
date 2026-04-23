@@ -13,7 +13,7 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-template <long scalar_type_id>
+template <vllm::ScalarTypeId scalar_type_id>
 class MarlinScalarType {};
 
 template <>

@@ -11,12 +11,10 @@ from cfie.logger import init_logger
 from cfie.reasoning import ReasoningParserManager
 from cfie.tokenizers import cached_tokenizer_from_config
 from cfie.utils.import_utils import LazyLoader
-from cfie.v1.structured_output.backend_guidance import GuidanceBackend
 from cfie.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
 )
-from cfie.v1.structured_output.backend_xgrammar import XgrammarBackend
 
 if TYPE_CHECKING:
     import numpy as np
@@ -113,12 +111,16 @@ class StructuredOutputManager:
             backend = request.sampling_params.structured_outputs._backend
             vocab_size = self.cfie_config.model_config.get_vocab_size()
             if backend == "xgrammar":
+                from cfie.v1.structured_output.backend_xgrammar import XgrammarBackend
+
                 self.backend = XgrammarBackend(
                     self.cfie_config,
                     tokenizer=self.tokenizer,
                     vocab_size=vocab_size,
                 )
             elif backend == "guidance":
+                from cfie.v1.structured_output.backend_guidance import GuidanceBackend
+
                 self.backend = GuidanceBackend(
                     self.cfie_config,
                     tokenizer=self.tokenizer,

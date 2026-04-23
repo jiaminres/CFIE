@@ -8,6 +8,7 @@ import sys
 import sysconfig
 import ctypes
 import functools
+import shutil
 from pathlib import Path
 from shutil import which
 
@@ -47,9 +48,25 @@ def to_cmake_path(path: str | os.PathLike[str]) -> str:
     return str(path).replace("\\", "/")
 
 
+def default_generator_tag() -> str:
+    requested_generator = (
+        os.environ.get("CFIE_CMAKE_GENERATOR")
+        or os.environ.get("CMAKE_GENERATOR")
+    )
+    if requested_generator:
+        return requested_generator.replace(" ", "-").lower()
+    if find_tool("ninja") is not None:
+        return "ninja"
+    if os.name == "nt":
+        return "vs2022"
+    return "default"
+
+
 def default_fetchcontent_base_dir() -> Path:
     machine = platform.machine() or "unknown"
-    platform_dir = f"{sys.platform}-{machine}".replace(" ", "_")
+    platform_dir = f"{sys.platform}-{machine}-{default_generator_tag()}".replace(
+        " ", "_"
+    )
     return ROOT_DIR / ".deps" / platform_dir
 
 
@@ -58,20 +75,136 @@ def is_supported_platform() -> bool:
 
 
 def find_tool(name: str) -> str | None:
-    script_dir = Path(sysconfig.get_path("scripts") or "")
+    def iter_windows_fallback_candidates(executable_name: str) -> list[Path]:
+        if os.name != "nt":
+            return []
+
+        candidates: list[Path] = []
+        program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+        program_files_x86 = Path(
+            os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")
+        )
+
+        if executable_name == "cmake.exe":
+            candidates.append(program_files / "CMake" / "bin" / executable_name)
+            jetbrains_root = program_files / "JetBrains"
+            if jetbrains_root.is_dir():
+                candidates.extend(
+                    sorted(
+                        jetbrains_root.glob("CLion* /bin/cmake/win/x64/bin/cmake.exe"),
+                        reverse=True,
+                    )
+                )
+                candidates.extend(
+                    sorted(
+                        jetbrains_root.glob("CLion*/bin/cmake/win/x64/bin/cmake.exe"),
+                        reverse=True,
+                    )
+                )
+            for root in (program_files, program_files_x86):
+                vs_root = root / "Microsoft Visual Studio"
+                if not vs_root.is_dir():
+                    continue
+                candidates.extend(
+                    sorted(
+                        vs_root.glob(
+                            "*/**/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
+                        ),
+                        reverse=True,
+                    )
+                )
+        elif executable_name == "ninja.exe":
+            jetbrains_root = program_files / "JetBrains"
+            if jetbrains_root.is_dir():
+                candidates.extend(
+                    sorted(
+                        jetbrains_root.glob("CLion*/bin/ninja/win/x64/ninja.exe"),
+                        reverse=True,
+                    )
+                )
+            for root in (program_files, program_files_x86):
+                vs_root = root / "Microsoft Visual Studio"
+                if not vs_root.is_dir():
+                    continue
+                candidates.extend(
+                    sorted(
+                        vs_root.glob(
+                            "*/**/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe"
+                        ),
+                        reverse=True,
+                    )
+                )
+        return candidates
+
+    def is_usable_tool(candidate: Path) -> bool:
+        if not candidate.is_file():
+            return False
+        try:
+            subprocess.run(
+                [str(candidate), "--version"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return True
+
     executable = f"{name}.exe" if os.name == "nt" else name
-    script_tool = script_dir / executable
-    if script_tool.exists():
-        return str(script_tool)
-    return which(executable) or which(name)
+    candidate_paths: list[Path] = []
+
+    for env_name in (f"CFIE_{name.upper()}_EXECUTABLE", f"{name.upper()}_EXECUTABLE"):
+        raw_override = os.environ.get(env_name)
+        if not raw_override:
+            continue
+        candidate_paths.append(Path(str(raw_override).strip()).expanduser())
+
+    script_dir = Path(sysconfig.get_path("scripts") or "")
+    candidate_paths.append(script_dir / executable)
+
+    for resolved in (which(executable), which(name)):
+        if resolved:
+            candidate_paths.append(Path(resolved))
+
+    candidate_paths.extend(iter_windows_fallback_candidates(executable))
+
+    seen: set[str] = set()
+    for candidate in candidate_paths:
+        normalized = os.path.normcase(str(candidate))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if is_usable_tool(candidate):
+            return str(candidate)
+    return None
+
+
+def iter_default_cuda_roots() -> list[Path]:
+    candidates: list[Path] = []
+    if os.name == "nt":
+        default_root = Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA")
+        if default_root.is_dir():
+            candidates.extend(sorted(default_root.glob("v*"), reverse=True))
+    else:
+        canonical_root = Path("/usr/local/cuda")
+        if canonical_root.is_dir():
+            candidates.append(canonical_root)
+        cuda_parent = Path("/usr/local")
+        if cuda_parent.is_dir():
+            candidates.extend(sorted(cuda_parent.glob("cuda-*"), reverse=True))
+    return candidates
 
 
 def iter_cuda_roots() -> list[Path]:
     candidates: list[Path] = []
     for raw_path in (
+        os.environ.get("CFIE_CUDA_HOME"),
         CUDA_HOME,
         os.environ.get("CUDA_HOME"),
         os.environ.get("CUDA_PATH"),
+        os.environ.get("CUDAToolkit_ROOT"),
+        os.environ.get("CUDA_TOOLKIT_ROOT_DIR"),
     ):
         if raw_path:
             normalized = str(raw_path).strip()
@@ -82,6 +215,8 @@ def iter_cuda_roots() -> list[Path]:
     if spec and spec.submodule_search_locations:
         for location in spec.submodule_search_locations:
             candidates.append(Path(location))
+
+    candidates.extend(iter_default_cuda_roots())
 
     deduped: list[Path] = []
     seen: set[str] = set()
@@ -148,6 +283,9 @@ def _find_vcvars64_bat() -> Path | None:
         return None
 
     direct_candidates: list[Path] = []
+    explicit_vcvars = os.environ.get("VCVARS64_BAT")
+    if explicit_vcvars:
+        direct_candidates.append(Path(explicit_vcvars))
     vsinstalldir = os.environ.get("VSINSTALLDIR")
     if vsinstalldir:
         direct_candidates.append(
@@ -196,6 +334,22 @@ def _find_vcvars64_bat() -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _find_msvc_cl() -> str | None:
+    return which("cl.exe") or which("cl")
+
+
+def _raise_missing_windows_toolchain() -> None:
+    raise RuntimeError(
+        "Unable to locate a usable MSVC x64 build toolchain for the CFIE native "
+        "build. Install Visual Studio 2022 Build Tools with the 'Desktop "
+        "development with C++' workload, or launch the build from a Developer "
+        "PowerShell. If your Build Tools are installed in a custom location, set "
+        "`VCVARS64_BAT` to the full path of `vcvars64.bat`, or set "
+        "`VSINSTALLDIR` to the Visual Studio installation root before rerunning "
+        "`python -m pip install --no-build-isolation -e . --verbose`."
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def _load_msvc_build_env() -> dict[str, str]:
     vcvars64 = _find_vcvars64_bat()
@@ -234,11 +388,29 @@ if not is_supported_platform():
 if torch.version.cuda is None:
     _raise_cuda_torch_required()
 
+if os.name == "nt" and _find_msvc_cl() is None and _find_vcvars64_bat() is None:
+    _raise_missing_windows_toolchain()
+
 CUDA_ROOT = resolve_cuda_home()
 if CUDA_ROOT is None:
+    if os.name == "nt":
+        raise RuntimeError(
+            "Unable to locate a CUDA toolkit with an nvcc compiler. CFIE checked "
+            "`CFIE_CUDA_HOME`, `CUDA_HOME`, `CUDA_PATH`, `CUDAToolkit_ROOT`, "
+            "`CUDA_TOOLKIT_ROOT_DIR`, the `nvidia.cuda_nvcc` Python package, and "
+            "the standard Windows CUDA install directory under "
+            "`C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA`. Install the "
+            "CUDA toolkit and/or set `CUDA_PATH` or `CUDA_HOME` to the toolkit "
+            "root before rerunning the editable install."
+        )
     raise RuntimeError(
-        "Unable to locate a CUDA toolkit with an nvcc compiler. "
-        "Install the CUDA toolkit and set CUDA_HOME or CUDA_PATH."
+        "Unable to locate a CUDA toolkit with an nvcc compiler. CFIE checked "
+        "`CFIE_CUDA_HOME`, `CUDA_HOME`, `CUDA_PATH`, `CUDAToolkit_ROOT`, "
+        "`CUDA_TOOLKIT_ROOT_DIR`, the `nvidia.cuda_nvcc` Python package, and "
+        "common Linux toolkit locations such as `/usr/local/cuda`. On Linux/WSL, "
+        "install the NVIDIA CUDA toolkit (for example `cuda-toolkit-13-1`) or "
+        "install `nvidia-cuda-nvcc-cu13` into the target environment, then set "
+        "`CUDA_HOME` if needed before rerunning the editable install."
     )
 CUDA_ALIAS_ROOT = prepare_cuda_root(CUDA_ROOT)
 
@@ -264,16 +436,47 @@ class CMakeBuildExt(build_ext):
     configured: set[str] = set()
 
     @staticmethod
+    def _is_wsl_drvfs_path(path: str | os.PathLike[str]) -> bool:
+        if not sys.platform.startswith("linux"):
+            return False
+        return Path(path).resolve().as_posix().startswith("/mnt/")
+
+    @staticmethod
+    def _copy_file_without_copystat(
+        src: str | os.PathLike[str], dst: str | os.PathLike[str]
+    ) -> tuple[str, bool]:
+        src_path = Path(src)
+        dst_path = Path(dst)
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src_path, dst_path)
+        try:
+            shutil.copymode(src_path, dst_path)
+        except OSError:
+            pass
+        return str(dst_path), True
+
+    @staticmethod
     def cmake_subprocess_env() -> dict[str, str]:
         env = os.environ.copy()
         if os.name == "nt":
             env.update(_load_msvc_build_env())
         cuda_root = str(CUDA_ROOT)
         cuda_alias_root = str(CUDA_ALIAS_ROOT)
+        nvcc_name = "nvcc.exe" if os.name == "nt" else "nvcc"
+        cuda_bin_dir = str(CUDA_ROOT / "bin")
+        cuda_libnvvp_dir = str(CUDA_ROOT / "libnvvp")
         env.setdefault("CUDA_PATH", cuda_root)
         env.setdefault("CUDA_HOME", cuda_root)
         env.setdefault("CUDAToolkit_ROOT", cuda_alias_root)
         env.setdefault("CUDA_TOOLKIT_ROOT_DIR", cuda_alias_root)
+        env["CUDA_NVCC_EXECUTABLE"] = str(CUDA_ROOT / "bin" / nvcc_name)
+        env["CUDACXX"] = str(CUDA_ROOT / "bin" / nvcc_name)
+        path_entries = env.get("PATH", "").split(os.pathsep)
+        prepend_entries = [
+            entry for entry in (cuda_bin_dir, cuda_libnvvp_dir) if entry not in path_entries
+        ]
+        if prepend_entries:
+            env["PATH"] = os.pathsep.join([*prepend_entries, *path_entries])
         if os.name == "nt":
             env.setdefault("CudaToolkitDir", cuda_alias_root)
         return env
@@ -382,11 +585,19 @@ class CMakeBuildExt(build_ext):
         if extra_cmake_args:
             cmake_args.extend(extra_cmake_args.split())
 
-        build_dir = self.cmake_build_dir()
+        build_dir = str(Path(self.cmake_build_dir()).resolve())
         os.makedirs(build_dir, exist_ok=True)
         subprocess.check_call(
-            [CMAKE_EXECUTABLE, ext.cmake_lists_dir, *build_tool, *cmake_args],
-            cwd=build_dir,
+            [
+                CMAKE_EXECUTABLE,
+                "-S",
+                ext.cmake_lists_dir,
+                "-B",
+                build_dir,
+                *build_tool,
+                *cmake_args,
+            ],
+            cwd=ROOT_DIR,
             env=self.cmake_subprocess_env(),
         )
 
@@ -396,7 +607,7 @@ class CMakeBuildExt(build_ext):
 
     def build_extensions(self) -> None:
         subprocess.check_call([CMAKE_EXECUTABLE, "--version"])
-        self.build_temp = self.cmake_build_dir()
+        self.build_temp = str(Path(self.cmake_build_dir()).resolve())
         os.makedirs(self.build_temp, exist_ok=True)
         cmake_env = self.cmake_subprocess_env()
         cfg = getattr(envs, "CMAKE_BUILD_TYPE", None) or (
@@ -412,13 +623,15 @@ class CMakeBuildExt(build_ext):
         build_cmd = [
             CMAKE_EXECUTABLE,
             "--build",
-            ".",
+            self.build_temp,
             f"-j={num_jobs}",
             *[f"--target={target}" for target in targets],
         ]
+        if getattr(envs, "VERBOSE", False):
+            build_cmd.append("--verbose")
         if os.name == "nt":
             build_cmd.extend(["--config", cfg])
-        subprocess.check_call(build_cmd, cwd=self.build_temp, env=cmake_env)
+        subprocess.check_call(build_cmd, cwd=ROOT_DIR, env=cmake_env)
 
         for ext in self.extensions:
             outdir = Path(self.get_ext_fullpath(ext.name)).parent.resolve()
@@ -433,16 +646,41 @@ class CMakeBuildExt(build_ext):
                 [
                     CMAKE_EXECUTABLE,
                     "--install",
-                    ".",
+                    self.build_temp,
                     "--prefix",
                     str(prefix),
                     "--component",
                     self.target_name(ext.name),
                     *(["--config", cfg] if os.name == "nt" else []),
                 ],
-                cwd=self.build_temp,
+                cwd=ROOT_DIR,
                 env=cmake_env,
             )
+
+    def copy_extensions_to_source(self) -> None:
+        build_py = self.get_finalized_command("build_py")
+        for ext in self.extensions:
+            inplace_file, regular_file = self._get_inplace_equivalent(build_py, ext)
+
+            if os.path.exists(regular_file) or not ext.optional:
+                try:
+                    self.copy_file(regular_file, inplace_file, level=self.verbose)
+                except PermissionError:
+                    if not (
+                        self._is_wsl_drvfs_path(inplace_file)
+                        and self._is_wsl_drvfs_path(ROOT_DIR)
+                    ):
+                        raise
+                    self.announce(
+                        "WSL DrvFs does not support shutil.copy2/copystat for "
+                        f"{inplace_file}; falling back to plain copy.",
+                        level=2,
+                    )
+                    self._copy_file_without_copystat(regular_file, inplace_file)
+
+            if ext._needs_stub:
+                inplace_stub = self._get_equivalent_stub(ext, inplace_file)
+                self._write_stub_file(inplace_stub, ext, compile=True)
 
 
 ext_modules = [

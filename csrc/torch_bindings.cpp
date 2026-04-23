@@ -6,6 +6,14 @@
 #include <torch/library.h>
 #include <torch/version.h>
 
+#if defined(_MSC_VER)
+// PyTorch 的 schema 解析模板在 MSVC 下会从 `size_t`/`uint64_t` 推导出一批
+// 与本文件注册逻辑无关的窄化告警；这里仅对注册文件本身做局部静音，避免把
+// 真正来自核心 kernel 源码的 warning 淹没掉。
+#pragma warning(push)
+#pragma warning(disable : 4244 4267)
+#endif
+
 // 本文件集中把 C++ / CUDA 算子暴露给 PyTorch；
 // Python 层看到的 `torch.ops.<namespace>.*` 入口，最终都会从这里拿到 schema 和后端实现。
 //
@@ -1273,3 +1281,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
 
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif

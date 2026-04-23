@@ -51,7 +51,7 @@ __global__ void gptq_marlin_repack_kernel(
   constexpr int stage_k_threads = has_perm ? target_tile_k_size : tile_ints;
   constexpr int stage_size = stage_k_threads * stage_n_threads;
 
-  auto load_perm_to_shared = [&](int k_tile_id) {
+  [[maybe_unused]] auto load_perm_to_shared = [&](int k_tile_id) {
     int first_k_int4 = (k_tile_id * target_tile_k_size) / 4;
 
     int4 const* perm_int4_ptr = reinterpret_cast<int4 const*>(perm_ptr);
@@ -132,7 +132,8 @@ __global__ void gptq_marlin_repack_kernel(
     int4* sh_stage_ptr = sh_pipe_ptr + stage_size * pipe;
     uint32_t* sh_stage_int_ptr = reinterpret_cast<uint32_t*>(sh_stage_ptr);
 
-    uint32_t* sh_perm_int_ptr = reinterpret_cast<uint32_t*>(sh_perm_ptr);
+    [[maybe_unused]] uint32_t* sh_perm_int_ptr =
+        reinterpret_cast<uint32_t*>(sh_perm_ptr);
 
     uint32_t vals[8];
 
@@ -156,7 +157,7 @@ __global__ void gptq_marlin_repack_kernel(
 
     } else {
       uint32_t b1_vals[tile_ints];
-      uint32_t b2_vals[tile_ints];
+      [[maybe_unused]] uint32_t b2_vals[tile_ints];
 
 #pragma unroll
       for (int i = 0; i < tile_ints; i++) {

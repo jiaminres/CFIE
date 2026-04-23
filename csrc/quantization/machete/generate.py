@@ -5,12 +5,24 @@ import itertools
 import math
 import os
 import shutil
+import sys
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, fields
 from functools import reduce
+from pathlib import Path
 
 import jinja2
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_CUTLASS_EXTENSION_DIR = _REPO_ROOT / "csrc" / "cutlass_extensions"
+_CUTLASS_PYTHON_DIR = _REPO_ROOT / "third_party" / "cutlass" / "python"
+
+for _path in (_CUTLASS_EXTENSION_DIR, _CUTLASS_PYTHON_DIR):
+    _path_str = str(_path)
+    if _path.exists() and _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
+
 from vllm_cutlass_library_extension import (
     DataType,
     EpilogueScheduleTag,

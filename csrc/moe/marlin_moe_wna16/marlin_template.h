@@ -331,7 +331,8 @@ __global__ void Marlin(
   extern __shared__ int4 sh[];
   static constexpr auto a_type = vllm::ScalarType::from_id(a_type_id);
   static constexpr auto b_type = vllm::ScalarType::from_id(b_type_id);
-  static constexpr auto c_type = vllm::ScalarType::from_id(c_type_id);
+  [[maybe_unused]] static constexpr auto c_type =
+      vllm::ScalarType::from_id(c_type_id);
   static constexpr auto s_type = vllm::ScalarType::from_id(s_type_id);
   if constexpr (b_type == vllm::kFE2M1f) {
     static_assert(s_type == vllm::kFE4M3fn && group_blocks == 1 ||
@@ -347,9 +348,10 @@ __global__ void Marlin(
     static_assert(std::is_same<scalar_t, c_scalar_t>::value);
   }
   constexpr bool has_zp = b_type == vllm::kU4 || b_type == vllm::kU8;
-  constexpr bool is_int_type = b_type == vllm::kU4 || b_type == vllm::kU8 ||
-                               b_type == vllm::kS4 || b_type == vllm::kS8 ||
-                               b_type == vllm::kU4B8 || b_type == vllm::kU8B128;
+  [[maybe_unused]] constexpr bool is_int_type =
+      b_type == vllm::kU4 || b_type == vllm::kU8 ||
+      b_type == vllm::kS4 || b_type == vllm::kS8 ||
+      b_type == vllm::kU4B8 || b_type == vllm::kU8B128;
   // see comments of dequant.h for more details
   constexpr bool dequant_skip_flop =
       is_a_8bit || b_type == vllm::kFE4M3fn ||
@@ -357,7 +359,7 @@ __global__ void Marlin(
       has_zp && !is_zp_float && !std::is_same<scalar_t, nv_bfloat16>::value ||
       has_zp && !is_zp_float && !(b_type == vllm::kU8);
 
-  c_scalar_t2 global_scale;
+  [[maybe_unused]] c_scalar_t2 global_scale;
 
   constexpr bool has_act_order = group_blocks == 0;
 
@@ -367,7 +369,7 @@ __global__ void Marlin(
       (!has_act_order && group_blocks == -1) ? prob_k : prob_k / num_groups;
   const int scales_expert_stride =
       prob_n * prob_k / group_size / (b_type == vllm::kFE2M1f ? 16 : 8);
-  const int zp_expert_stride =
+  [[maybe_unused]] const int zp_expert_stride =
       is_zp_float ? prob_n * prob_k / group_size / 8
                   : prob_n * prob_k / group_size / (pack_factor * 4);
   const int b_bias_expert_stride = prob_n / 8;
@@ -693,7 +695,7 @@ __global__ void Marlin(
           ? thread_k_blocks / group_blocks
           : 1;
   constexpr int s_sh_stage = s_tb_groups * s_sh_stride;
-  int s_gl_rd_delta = s_gl_stride;
+  [[maybe_unused]] int s_gl_rd_delta = s_gl_stride;
 
   // Scale size/strides with act_order
   constexpr int tb_k = 16 * thread_k_blocks;
@@ -714,7 +716,7 @@ __global__ void Marlin(
                                    : ((16 * thread_n_blocks) / pack_factor) / 4;
   constexpr int zp_tb_groups = s_tb_groups;
   constexpr int zp_sh_stage = has_zp ? zp_tb_groups * zp_sh_stride : 0;
-  int zp_gl_rd_delta = zp_gl_stride;
+  [[maybe_unused]] int zp_gl_rd_delta = zp_gl_stride;
 
   // Global A read index of current thread.
   int a_gl_rd_row = threadIdx.x / a_gl_rd_delta_o;
@@ -744,7 +746,7 @@ __global__ void Marlin(
   // For act_order
   int slice_k_start = tb_k * slice_row;
   int slice_k_finish = slice_k_start + tb_k * slice_iters;
-  int slice_k_start_shared_fetch = slice_k_start;
+  [[maybe_unused]] int slice_k_start_shared_fetch = slice_k_start;
   int slice_n_offset = act_s_col_tb_stride * slice_col;
 
   // No act_order
@@ -784,7 +786,7 @@ __global__ void Marlin(
   // We use a different scale layout for grouped and column-wise quantization as
   // we scale a `half2` tile in column-major layout in the former and in
   // row-major in the latter case.
-  int s_sh_rd;
+  [[maybe_unused]] int s_sh_rd;
   if constexpr (is_a_8bit) {
     s_sh_rd = 4 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 4);
   } else if constexpr (group_blocks != -1)
@@ -808,10 +810,10 @@ __global__ void Marlin(
 
   // Zero-points have the same read layout as the scales
   // (without column-wise case)
-  constexpr int num_col_threads = 8;
-  constexpr int num_row_threads = 4;
+  [[maybe_unused]] constexpr int num_col_threads = 8;
+  [[maybe_unused]] constexpr int num_row_threads = 4;
   constexpr int num_ints_per_thread = 8 / pack_factor;
-  int zp_sh_rd;
+  [[maybe_unused]] int zp_sh_rd;
   if constexpr (has_zp) {
     if constexpr (is_zp_float) {
       if constexpr (group_blocks != -1) {
@@ -892,8 +894,8 @@ __global__ void Marlin(
   FragS frag_bias[2][4];
   FragS act_frag_s[2][4][4];             // For act-order
   int frag_qzp[2][num_ints_per_thread];  // Zero-points
-  FragZP frag_zp;                        // Zero-points in fp16
-  FragZP frag_zpf[2];                    // Zero-points in fp16 in HQQ
+  [[maybe_unused]] FragZP frag_zp;       // Zero-points in fp16
+  [[maybe_unused]] FragZP frag_zpf[2];   // Zero-points in fp16 in HQQ
 
   if constexpr (is_a_8bit && group_blocks != -1) {
   #pragma unroll
@@ -1032,13 +1034,13 @@ __global__ void Marlin(
     cp_async_fence();
   };
 
-  auto fetch_col_zp_to_shared = [&]() {
+  [[maybe_unused]] auto fetch_col_zp_to_shared = [&]() {
     if (zp_sh_wr_pred) {
       cp_async4(&sh_zp[zp_sh_wr], &zp_ptr[zp_gl_rd]);
     }
   };
 
-  auto fetch_col_scale_to_shared = [&]() {
+  [[maybe_unused]] auto fetch_col_scale_to_shared = [&]() {
     if (s_sh_wr_pred) {
       cp_async4(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
     }
@@ -1093,7 +1095,8 @@ __global__ void Marlin(
     int pipe = full_pipe % stages;
     using IT1 = typename std::conditional_t<is_a_8bit, int2, int4>;
     using IT0 = typename std::conditional_t<is_a_8bit, int, int2>;
-    constexpr int group_blocks2 = div_ceil(group_blocks, is_a_8bit ? 2 : 1);
+    [[maybe_unused]] constexpr int group_blocks2 =
+        div_ceil(group_blocks, is_a_8bit ? 2 : 1);
 
     if constexpr (!has_act_order) {
       // No act-order case
@@ -1218,7 +1221,7 @@ __global__ void Marlin(
     static_assert(!has_zp || group_blocks != 0);
 
     if constexpr (has_zp && !is_zp_float) {
-      int pipe = full_pipe % stages;
+    [[maybe_unused]] int pipe = full_pipe % stages;
 
       if constexpr (group_blocks == -1) {
         // load only when starting a new slice
@@ -1298,12 +1301,12 @@ __global__ void Marlin(
 
   // Execute the actual tensor core matmul of a sub-tile.
   bool is_first_matmul_in_slice = true;
-  auto matmul = [&](int k, int pipe) {
+  [[maybe_unused]] auto matmul = [&](int k, int pipe) {
     if (is_a_8bit) return;
     int k2 = k % 2;
     constexpr int g =
         group_blocks > 0 ? div_ceil(group_blocks, thread_k_blocks) : 1;
-    const bool is_new_zp =
+    [[maybe_unused]] const bool is_new_zp =
         (group_blocks == 0) ||
         ((group_blocks > 0) && (group_blocks < b_sh_wr_iters || k == 0)) &&
             (pipe % g == 0) ||
@@ -1416,7 +1419,7 @@ __global__ void Marlin(
     }
   };
 
-  auto matmul_a8 = [&](int k) {
+  [[maybe_unused]] auto matmul_a8 = [&](int k) {
     int k2 = k % 2;
   #pragma unroll
     for (int j = 0; j < 2; j++) {
@@ -1599,7 +1602,7 @@ __global__ void Marlin(
     }
 
     int c_gl_stride = prob_n / 8 * (is_a_8bit ? 2 : 1);
-    int c_gl_wr_delta_o = 8 * c_gl_stride;
+    [[maybe_unused]] int c_gl_wr_delta_o = 8 * c_gl_stride;
     int c_gl_wr_delta_i = 4 * (active_threads / 32);
     int c_gl_wr;
     if constexpr (m_block_size_8) {

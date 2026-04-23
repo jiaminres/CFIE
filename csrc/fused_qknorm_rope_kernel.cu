@@ -222,7 +222,7 @@ __global__ void fusedQKNormRopeKernel(
     }
 
     // Apply RoPE to normalized elements
-    float elements2[numElemsPerThread];  // Additional buffer required for RoPE.
+    [[maybe_unused]] float elements2[numElemsPerThread];  // Additional buffer required for RoPE.
 
     int64_t pos_id = position_ids[tokenIdx];
 

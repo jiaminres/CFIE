@@ -136,10 +136,14 @@ void register_graph_buffers(fptr_t _fa,
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   std::vector<std::string> bytes;
   bytes.reserve(handles.size());
-  for (int i = 0; i < handles.size(); i++) {
-    bytes.emplace_back(handles[i].begin(), handles[i].end());
+  for (size_t i = 0; i < handles.size(); ++i) {
+    std::string handle_bytes;
+    handle_bytes.reserve(handles[i].size());
+    for (const int64_t value : handles[i]) {
+      handle_bytes.push_back(static_cast<char>(value));
+    }
+    bytes.emplace_back(std::move(handle_bytes));
   }
-  bytes.reserve(handles.size());
   fa->register_graph_buffers(bytes, offsets);
 }
 

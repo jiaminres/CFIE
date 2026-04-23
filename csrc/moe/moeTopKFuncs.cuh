@@ -66,7 +66,7 @@ struct TopKRedType {
     value = reinterpret_cast<T&>(valueBits);
   }
 
-  __host__ __device__ TopKRedType() = default;
+  __host__ __device__ TopKRedType() : compValIdx{} {}
 
   __host__ __device__ TopKRedType(T val, int32_t idx)
       : compValIdx(makeCmpVal(val, idx)) {}

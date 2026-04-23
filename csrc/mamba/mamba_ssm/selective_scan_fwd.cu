@@ -41,6 +41,12 @@
 #include "selective_scan.h"
 #include "static_switch.h"
 
+namespace {
+
+constexpr float kLog2e = 1.4426950408889634f;
+
+}  // namespace
+
 template<int kNThreads_, int kNItems_, int kNRows_, bool kIsEvenLen_,
          bool kIsVariableB_, bool kIsVariableC_,
          bool kHasZ_, bool kVarlen_, typename input_t_, typename weight_t_, typename state_t_>
@@ -144,10 +150,20 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     input_t *delta = reinterpret_cast<input_t *>(params.delta_ptr) + sequence_start_index * params.delta_batch_stride
         + dim_id * kNRows * params.delta_d_stride;
     weight_t *A = reinterpret_cast<weight_t *>(params.A_ptr) + dim_id * kNRows * params.A_d_stride;
-    weight_t *B = reinterpret_cast<weight_t *>(params.B_ptr) + dim_id * kNRows * params.B_d_stride;
-    input_t *Bvar = reinterpret_cast<input_t *>(params.B_ptr) + sequence_start_index * params.B_batch_stride + group_id * params.B_group_stride;
-    weight_t *C = reinterpret_cast<weight_t *>(params.C_ptr) + dim_id * kNRows * params.C_d_stride;
-    input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + sequence_start_index * params.C_batch_stride + group_id * params.C_group_stride;
+    [[maybe_unused]] weight_t *B =
+        reinterpret_cast<weight_t *>(params.B_ptr) +
+        dim_id * kNRows * params.B_d_stride;
+    [[maybe_unused]] input_t *Bvar =
+        reinterpret_cast<input_t *>(params.B_ptr) +
+        sequence_start_index * params.B_batch_stride +
+        group_id * params.B_group_stride;
+    [[maybe_unused]] weight_t *C =
+        reinterpret_cast<weight_t *>(params.C_ptr) +
+        dim_id * kNRows * params.C_d_stride;
+    [[maybe_unused]] input_t *Cvar =
+        reinterpret_cast<input_t *>(params.C_ptr) +
+        sequence_start_index * params.C_batch_stride +
+        group_id * params.C_group_stride;
 
     typename Ktraits::state_t *ssm_states;
     if (params.cache_enabled) {
@@ -262,7 +278,6 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             for (int r = 0; r < kNRows; ++r) {
                 A_val[r] = A[state_idx * params.A_dstate_stride + r * params.A_d_stride];
                 // Multiply the real part of A with LOG2E so we can use exp2f instead of expf.
-                constexpr float kLog2e = M_LOG2E;
                 A_val[r] *= kLog2e;
             }
             // This variable holds B * C if both B and C are constant across seqlen. If only B varies

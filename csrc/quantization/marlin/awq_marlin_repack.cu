@@ -81,7 +81,7 @@ __global__ void awq_marlin_repack_kernel(
     int tc_col = th_id / 4;
     int tc_row = (th_id % 4) * (is_a_8bit ? 4 : 2);
 
-    constexpr int tc_offsets[4] = {0, 1, 8, 9};
+    [[maybe_unused]] constexpr int tc_offsets[4] = {0, 1, 8, 9};
 
     int cur_n = (warp_id / (is_a_8bit ? 2 : 1)) * 16 + tc_col;
     int cur_n_packed = cur_n / pack_factor;

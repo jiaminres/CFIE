@@ -687,7 +687,7 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
   alignas(128) __shared__ float smemScoreBias[MaxNumExperts];
   // number of expert groups is bounded by number of warps
   int constexpr NumWarps = MaxNumExperts / WARP_SIZE;
-  alignas(128) __shared__ float smemGroupScores[NumWarps];
+  [[maybe_unused]] alignas(128) __shared__ float smemGroupScores[NumWarps];
 
   // needed for warp reduce
   auto block = cg::this_thread_block();
@@ -705,7 +705,7 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
   // note that for invalid scores, we simply use a negative value:
   // they work well even with the compacted format used in topK, and
   // sigmoid / bias activated scores cannot be negative
-  const float invalidScoreFloat = float{-INFINITY};
+  const float invalidScoreFloat = -cuda::std::numeric_limits<float>::max();
 
   // load bias already; each warp represents one expert group
   auto threadExpert = threadIdx.x;
@@ -740,10 +740,10 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
   }
 
   // registers for top group score reduction
-  float topExpGroupScores[NumTopGroupScores];
+  [[maybe_unused]] float topExpGroupScores[NumTopGroupScores];
   [[maybe_unused]] int32_t topExpGroupIdx[NumTopGroupScores];
-  float topGroups[MaxNumTopGroups];  // bound of numGroup
-  int32_t topGroupIdx[MaxNumTopGroups];
+  [[maybe_unused]] float topGroups[MaxNumTopGroups];  // bound of numGroup
+  [[maybe_unused]] int32_t topGroupIdx[MaxNumTopGroups];
   float expertScoreGroup[MaxNumTopGroups];
   int32_t expertIdxGroup[MaxNumTopGroups];
   float topScores[MaxNumTopExperts];  // bound of topk

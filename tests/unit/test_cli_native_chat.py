@@ -119,6 +119,7 @@ def _make_args(**overrides):
         max_model_len=128,
         max_new_tokens=16,
         gpu_memory_utilization=0.9,
+        enable_prefix_caching=None,
         moe_cpu_budget_gb=0.0,
         moe_cpu_min_free_gb=0.0,
         cpu_offload_gb=0.0,
@@ -130,6 +131,9 @@ def _make_args(**overrides):
         num_speculative_tokens=1,
         attention_backend=None,
         moe_backend="auto",
+        mamba_cache_mode=None,
+        language_model_only=False,
+        skip_mm_profiling=False,
         temperature=0.0,
         top_p=1.0,
         top_k=0,
@@ -328,3 +332,49 @@ def test_native_chat_retries_when_thinking_has_no_final_answer(
     assert code == 0
     stdout = capsys.readouterr().out
     assert "最终回答" in stdout
+
+
+def test_native_chat_retries_without_thinking_when_think_never_closes(
+    monkeypatch,
+    capsys,
+):
+    fake_tokenizer = _FakeTokenizer()
+    _FakeEngine.renderer_tokenizer = fake_tokenizer
+    inputs = iter(["hello", "/quit"])
+
+    class _UnclosedThinkingEngine(_FakeEngine):
+        def step(self):
+            self._step_count += 1
+            reply_text = (
+                "<think>internal reasoning that should stay hidden"
+                if self._current_request_id == "native-chat-0"
+                else "final-visible-answer"
+            )
+            return [
+                SimpleNamespace(
+                    request_id=self._current_request_id,
+                    outputs=[SimpleNamespace(text=reply_text)],
+                )
+            ]
+
+    runtime_symbols = lambda: (
+        _FakeEngineArgs,
+        _FakeSamplingParams,
+        _FakeRequestOutputKind,
+        _UnclosedThinkingEngine,
+    )
+    monkeypatch.setattr("cfie.cli.native_generate._resolve_runtime_symbols",
+                        runtime_symbols)
+    monkeypatch.setattr("cfie.cli.native_chat._resolve_runtime_symbols",
+                        runtime_symbols)
+    monkeypatch.setattr("cfie.cli.native_chat._load_tokenizer",
+                        lambda args: fake_tokenizer)
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+
+    code = run_native_chat(_make_args(enable_thinking=True))
+
+    assert code == 0
+    stdout, stderr = capsys.readouterr()
+    assert "internal reasoning" not in stdout
+    assert "final-visible-answer" in stdout
+    assert "retrying without thinking" in stderr

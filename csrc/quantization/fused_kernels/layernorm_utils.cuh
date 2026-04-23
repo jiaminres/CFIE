@@ -21,7 +21,8 @@ __device__ void compute_rms(float* rms, scalar_t const* __restrict__ input,
                             scalar_t const* __restrict__ residual = nullptr) {
   int64_t const input_token_offset =
       blockIdx.x * static_cast<int64_t>(input_stride);
-  int64_t const token_offset = blockIdx.x * static_cast<int64_t>(hidden_size);
+  [[maybe_unused]] int64_t const token_offset =
+      blockIdx.x * static_cast<int64_t>(hidden_size);
   // sum of squares
   float ss = 0.0f;
 
@@ -85,10 +86,11 @@ __device__ void compute_dynamic_per_token_scales(
 
   int64_t const input_token_offset =
       blockIdx.x * static_cast<int64_t>(input_stride);
-  int64_t const token_offset = blockIdx.x * static_cast<int64_t>(hidden_size);
+  [[maybe_unused]] int64_t const token_offset =
+      blockIdx.x * static_cast<int64_t>(hidden_size);
 
   if (group_size > 0) {
-    int64_t num_groups = hidden_size / group_size;
+    [[maybe_unused]] int64_t num_groups = hidden_size / group_size;
     __shared__ float s_max_vals[1024];
     int64_t const threads_per_group = blockDim.x / num_groups;
     int64_t const thread_in_group = threadIdx.x % threads_per_group;
@@ -196,7 +198,8 @@ __device__ void norm_and_quant(
     int64_t outer_scale_stride = 1) {
   int64_t const input_token_offset =
       blockIdx.x * static_cast<int64_t>(input_stride);
-  int64_t const token_offset = blockIdx.x * static_cast<int64_t>(hidden_size);
+  [[maybe_unused]] int64_t const token_offset =
+      blockIdx.x * static_cast<int64_t>(hidden_size);
 
   for (auto i = threadIdx.x; i < hidden_size; i += blockDim.x) {
     float x = static_cast<float>(input[input_token_offset + i]);
@@ -238,12 +241,13 @@ __device__ void compute_rms(float* rms, scalar_t const* __restrict__ input,
                             scalar_t const* __restrict__ residual = nullptr) {
   int64_t const input_token_offset =
       blockIdx.x * static_cast<int64_t>(input_stride);
-  int64_t const token_offset = blockIdx.x * static_cast<int64_t>(hidden_size);
+  [[maybe_unused]] int64_t const token_offset =
+      blockIdx.x * static_cast<int64_t>(hidden_size);
 
   // Vectorized input/output to better utilize memory bandwidth.
   vec4_t<scalar_t> const* vec_input =
       reinterpret_cast<vec4_t<scalar_t> const*>(&input[input_token_offset]);
-  vec4_t<scalar_t> const* vec_residual = nullptr;
+  [[maybe_unused]] vec4_t<scalar_t> const* vec_residual = nullptr;
   if constexpr (has_residual) {
     vec_residual =
         reinterpret_cast<vec4_t<scalar_t> const*>(&residual[token_offset]);
@@ -311,16 +315,17 @@ __device__ void compute_dynamic_per_token_scales(
   // Vectorized input/weight/residual to better utilize memory bandwidth.
   vec4_t<scalar_t> const* vec_input = nullptr;
   vec4_t<scalar_t> const* vec_weight = nullptr;
-  vec4_t<scalar_t> const* vec_residual = nullptr;
+  [[maybe_unused]] vec4_t<scalar_t> const* vec_residual = nullptr;
 
   int64_t const input_token_offset =
       blockIdx.x * static_cast<int64_t>(input_stride);
-  int64_t const token_offset = blockIdx.x * static_cast<int64_t>(hidden_size);
+  [[maybe_unused]] int64_t const token_offset =
+      blockIdx.x * static_cast<int64_t>(hidden_size);
 
   if constexpr (group_size > 0) {
     __shared__ float s_max_vals[1024];
 
-    int64_t const num_groups = hidden_size / group_size;
+    [[maybe_unused]] int64_t const num_groups = hidden_size / group_size;
     int64_t const threads_per_group = blockDim.x / num_groups;
     int64_t const thread_in_group = threadIdx.x % threads_per_group;
     int64_t const group_offset =
@@ -495,7 +500,7 @@ __device__ void norm_and_quant(
       reinterpret_cast<vec4_t<scalar_t> const*>(weight);
   q8x4_t<scalar_out_t>* vec_output =
       reinterpret_cast<q8x4_t<scalar_out_t>*>(&output[token_offset]);
-  vec4_t<scalar_t>* vec_residual = nullptr;
+  [[maybe_unused]] vec4_t<scalar_t>* vec_residual = nullptr;
   if constexpr (has_residual) {
     vec_residual = reinterpret_cast<vec4_t<scalar_t>*>(&residual[token_offset]);
   }
@@ -535,7 +540,7 @@ __device__ void norm_and_quant(
     float scale_val;
 
     if constexpr (group_size > 0) {
-      int64_t const num_groups = hidden_size / group_size;
+    [[maybe_unused]] int64_t const num_groups = hidden_size / group_size;
       int64_t scale_idx = 0;
       if constexpr (is_scale_transposed) {
         int64_t const scale_rows = (gridDim.x + outer_scale_stride - 1) /

@@ -86,8 +86,6 @@ void cutlass_gemm_caller(torch::Tensor& out, torch::Tensor const& a,
       cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, L));
   StrideD d_stride =
       cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, L));
-  StrideAux aux_stride = d_stride;
-
   auto a_ptr = static_cast<ElementAB*>(a.data_ptr());
   auto b_ptr = static_cast<ElementAB*>(b.data_ptr());
   typename GemmKernel::MainloopArguments mainloop_args{a_ptr, a_stride, b_ptr,

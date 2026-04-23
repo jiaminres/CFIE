@@ -16,7 +16,7 @@ __global__ void expandInputRowsKernel(
   int64_t expanded_dest_row = blockIdx.x;
   int64_t const expanded_source_row =
       expanded_dest_row_to_expanded_source_row[expanded_dest_row];
-  int expert_id = sorted_experts[expanded_dest_row];
+  [[maybe_unused]] int expert_id = sorted_experts[expanded_dest_row];
 
   if (threadIdx.x == 0) {
     assert(expanded_dest_row <= INT32_MAX);

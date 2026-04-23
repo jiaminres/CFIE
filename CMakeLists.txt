@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.26)
 
+if(POLICY CMP0141)
+  cmake_policy(SET CMP0141 NEW)
+endif()
+
+if(WIN32)
+  # PyTorch's CMake package already injects `/Z7` on Windows. Use the same
+  # debug information format for this project to avoid `/Zi` vs `/Z7`
+  # override noise (`warning D9025`) in RelWithDebInfo builds.
+  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+      "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+endif()
 
 # When building directly using CMake, make sure you run the install step
 # (it places the .so files in the correct location).
@@ -16,6 +27,32 @@ project(cfie_extensions LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(WIN32)
+  # Keep Windows host compilation readable:
+  # - /utf-8 avoids C4819 noise from UTF-8 CUDA / dependency headers.
+  # - /wd4267 suppresses third-party size_t narrowing noise from STL / PyTorch.
+  # - /wd4819 suppresses codepage-only warnings once source decoding is fixed.
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CXX>:/wd4267>
+    $<$<COMPILE_LANGUAGE:CXX>:/wd4819>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4267>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4819>)
+  add_compile_definitions(
+    CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING=1)
+
+  function(cfie_apply_windows_extension_hygiene target_name)
+    target_compile_options(${target_name} PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:/FI${CFIE_WINDOWS_FORCE_INCLUDE_HEADER}>
+      $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+      $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+      $<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CFIE_WINDOWS_FORCE_INCLUDE_HEADER_CMAKE}>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+  endfunction()
+endif()
 
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
@@ -373,11 +410,26 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set(VLLM_CUTLASS_SRC_DIR $ENV{VLLM_CUTLASS_SRC_DIR})
   endif()
 
+  if(NOT VLLM_CUTLASS_SRC_DIR)
+    set(VLLM_BUNDLED_CUTLASS_SRC_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
+    if(EXISTS "${VLLM_BUNDLED_CUTLASS_SRC_DIR}/CMakeLists.txt")
+      set(VLLM_CUTLASS_SRC_DIR "${VLLM_BUNDLED_CUTLASS_SRC_DIR}")
+    endif()
+  endif()
+
   if(VLLM_CUTLASS_SRC_DIR)
     if(NOT IS_ABSOLUTE VLLM_CUTLASS_SRC_DIR)
       get_filename_component(VLLM_CUTLASS_SRC_DIR "${VLLM_CUTLASS_SRC_DIR}" ABSOLUTE)
     endif()
     message(STATUS "The VLLM_CUTLASS_SRC_DIR is set, using ${VLLM_CUTLASS_SRC_DIR} for compilation")
+    set(CUTLASS_DIR "${VLLM_CUTLASS_SRC_DIR}"
+        CACHE PATH "CUTLASS Repository Directory" FORCE)
+    set(CUTLASS_INCLUDE_DIR "${VLLM_CUTLASS_SRC_DIR}/include"
+        CACHE PATH "CUTLASS Header Library" FORCE)
+    set(CUTLASS_TOOLS_UTIL_INCLUDE_DIR
+        "${VLLM_CUTLASS_SRC_DIR}/tools/util/include"
+        CACHE PATH "CUTLASS Tools util include directory" FORCE)
     FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
   else()
     FetchContent_Declare(
@@ -923,9 +975,25 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 
     if (NOT DEFINED CACHE{MACHETE_GEN_SCRIPT_HASH}
         OR NOT $CACHE{MACHETE_GEN_SCRIPT_HASH} STREQUAL ${MACHETE_GEN_SCRIPT_HASH})
+      set(MACHETE_PYTHONPATH_ENTRIES
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/cutlass_extensions"
+        "${CUTLASS_DIR}/python")
+      if (DEFINED VLLM_PYTHON_PATH AND NOT "${VLLM_PYTHON_PATH}" STREQUAL "")
+        list(APPEND MACHETE_PYTHONPATH_ENTRIES "${VLLM_PYTHON_PATH}")
+      endif()
+      if (DEFINED ENV{PYTHONPATH} AND NOT "$ENV{PYTHONPATH}" STREQUAL "")
+        list(APPEND MACHETE_PYTHONPATH_ENTRIES "$ENV{PYTHONPATH}")
+      endif()
+
+      if (WIN32)
+        string(JOIN ";" MACHETE_PYTHONPATH ${MACHETE_PYTHONPATH_ENTRIES})
+      else()
+        string(JOIN ":" MACHETE_PYTHONPATH ${MACHETE_PYTHONPATH_ENTRIES})
+      endif()
+
       execute_process(
         COMMAND ${CMAKE_COMMAND} -E env
-        PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/csrc/cutlass_extensions/:${CUTLASS_DIR}/python/:${VLLM_PYTHON_PATH}:$ENV{PYTHONPATH}
+        "PYTHONPATH=${MACHETE_PYTHONPATH}"
           ${Python_EXECUTABLE} ${MACHETE_GEN_SCRIPT}
         RESULT_VARIABLE machete_generation_result
         OUTPUT_VARIABLE machete_generation_output
@@ -1038,17 +1106,7 @@ define_extension_target(
   WITH_SOABI)
 
 if(WIN32)
-  target_compile_options(_C PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:/FI${CFIE_WINDOWS_FORCE_INCLUDE_HEADER}>
-    $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
-    $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
-    $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CFIE_WINDOWS_FORCE_INCLUDE_HEADER_CMAKE}>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
-  target_compile_definitions(_C PRIVATE
-    CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING=1)
+  cfie_apply_windows_extension_hygiene(_C)
 endif()
 
 # If CUTLASS is compiled on NVCC >= 12.5, it by default uses
@@ -1236,17 +1294,7 @@ define_extension_target(
   WITH_SOABI)
 
 if(WIN32)
-  target_compile_options(_moe_C PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:/FI${CFIE_WINDOWS_FORCE_INCLUDE_HEADER}>
-    $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
-    $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
-    $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CFIE_WINDOWS_FORCE_INCLUDE_HEADER_CMAKE}>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
-  target_compile_definitions(_moe_C PRIVATE
-    CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING=1)
+  cfie_apply_windows_extension_hygiene(_moe_C)
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "HIP")
