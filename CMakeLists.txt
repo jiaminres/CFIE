@@ -1,5 +1,21 @@
 cmake_minimum_required(VERSION 3.26)
 
+# 可单独设置如下参数 和 环境变量 单独编译调试
+#-DVLLM_TARGET_DEVICE=cuda
+#-DVLLM_PYTHON_EXECUTABLE=C:/Users/13642/PycharmProjects/vllm/.venv/Scripts/python.exe
+#-DPython_EXECUTABLE=C:/Users/13642/PycharmProjects/vllm/.venv/Scripts/python.exe
+#-DPython3_EXECUTABLE=C:/Users/13642/PycharmProjects/vllm/.venv/Scripts/python.exe
+#-DFETCHCONTENT_BASE_DIR=C:/Users/13642/PycharmProjects/vllm/CFIE/.deps/win32-AMD64-ninja
+#-DVLLM_CUTLASS_SRC_DIR=C:/Users/13642/PycharmProjects/vllm/CFIE/third_party/cutlass
+#-DVLLM_FLASH_ATTN_SRC_DIR=C:/Users/13642/PycharmProjects/vllm/CFIE/third_party/vllm-flash-attn
+#-DCMAKE_MAKE_PROGRAM=C:/Users/13642/PycharmProjects/vllm/.venv/Scripts/ninja.exe
+#-DCMAKE_JOB_POOL_COMPILE:STRING=compile
+#-DCMAKE_JOB_POOLS:STRING=compile=8
+#-DCMAKE_CUDA_COMPILER=C:/PROGRA~1/NVIDIA~2/CUDA/v13.1/bin/nvcc.exe
+#-DCUDAToolkit_ROOT=C:/PROGRA~1/NVIDIA~2/CUDA/v13.1
+#-DCUDA_TOOLKIT_ROOT_DIR=C:/PROGRA~1/NVIDIA~2/CUDA/v13.1
+
+# CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1;CUDA_NVCC_EXECUTABLE=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe;CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1;CUDA_TOOLKIT_ROOT_DIR=C:\PROGRA~1\NVIDIA~2\CUDA\v13.1;CUDACXX=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe;CUDAToolkit_ROOT=C:\PROGRA~1\NVIDIA~2\CUDA\v13.1;CudaToolkitDir=C:\PROGRA~1\NVIDIA~2\CUDA\v13.1;PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin
 # ------------------------------- 初始化 CMake 与 Windows 编译探测策略 -------------------------------
 if(POLICY CMP0141)
   # 使用新版 MSVC 调试信息策略，使后续 CMAKE_MSVC_DEBUG_INFORMATION_FORMAT 能稳定生效。
