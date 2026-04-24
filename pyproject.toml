@@ -38,6 +38,7 @@ dependencies = [
     "pyzmq",
     "regex",
     "safetensors",
+    "torch",
     "torchvision",
     "transformers",
 ]

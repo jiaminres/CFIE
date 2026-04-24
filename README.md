@@ -123,33 +123,35 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install cmake ninja packaging jinja2
 ```
 
-先安装与本机 CUDA/驱动匹配的 GPU 版 PyTorch。下面给出两个常见示例：
-
-CUDA 12.4：
-
-```bash
-python -m pip install "torch==2.10.0" --index-url https://download.pytorch.org/whl/cu124
-```
-
-CUDA 12.6：
+先安装项目约定版本的 GPU 版 `torch` 与匹配的 `torchvision`。当前项目的构建与运行依赖统一按
+`torch==2.10.0`、`torchvision==0.25.0` 维护，推荐直接从 `cu126` 仓库安装：
 
 ```bash
-python -m pip install "torch==2.10.0" --index-url https://download.pytorch.org/whl/cu126
+python -m pip install "torch==2.10.0" "torchvision==0.25.0" --index-url https://download.pytorch.org/whl/cu126
 ```
 
-如果你的 `torch` 已经是匹配 CUDA 的可用版本，可以跳过重新安装。
+说明：
 
-然后安装其余构建依赖：
-
-```bash
-python -m pip install cmake ninja packaging jinja2
-```
+- `cu126` 仓库当前同时提供 `torch==2.10.0` 与匹配的 `torchvision==0.25.0`。
+- `cu124` 仓库当前不提供 `torch==2.10.0`，因此这里不再保留 `CUDA 12.4` 的安装示例。
+- 如果你需要编译原生扩展，建议本机 `CUDA Toolkit` 也尽量与 `cu126` 对齐，避免本地 `nvcc` 与 PyTorch CUDA 运行时版本错配。
+- 如果你的环境里已经装好了这组匹配版本，可以跳过这一步。
 
 ### 3. 编译并以开发模式安装
+
+普通安装：
 
 ```bash
 python -m pip install --no-build-isolation -e .
 ```
+
+如果你需要观察 CUDA/C++ 编译进度，通常只要给 `pip` 增加一个 `-v` 就够了：
+
+```bash
+python -m pip -v install --no-build-isolation -e .
+```
+
+如果你还需要更详细的输出，可以改成 `-vv`。
 
 这一步会自动：
 
@@ -164,20 +166,6 @@ python -m pip install --no-build-isolation -e .
   进而报错 “CFIE native build requires a CUDA-enabled PyTorch environment”。
 - Windows 下若已安装 `ninja`，CFIE 会优先使用 `Ninja` 生成器，避免 Visual Studio 默认生成器
   对 CUDA VS toolset 的额外依赖。
-
-Windows 下如果需要观察 CUDA/C++ 编译进度，建议把并发控制在一个较容易阅读的范围，并把 MSVC
-的头文件依赖扫描噪声过滤掉：
-
-```powershell
-$env:VSCMD_SKIP_SENDTELEMETRY = "1"
-$env:MAX_JOBS = "8"
-$env:VERBOSE = "1"
-$env:CMAKE_ARGS = "-DCMAKE_VERBOSE_MAKEFILE=ON -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE"
-python -m pip -v install --no-build-isolation -e . 2>&1 `
-  | Tee-Object -FilePath .logs\pip-install-verbose.raw.log `
-  | Where-Object { $_ -notmatch '^\s*(注意: 包含文件:|Note: including file:)' } `
-  | Tee-Object -FilePath .logs\pip-install-verbose.log
-```
 
 这里的 `注意: 包含文件:` / `Note: including file:` 是 CMake + Ninja + MSVC 生成依赖关系时的正常输出，
 通常不是编译错误。真正需要关注的是 `error`、`fatal error`、`ninja: build stopped`、`subprocess-exited-with-error`
