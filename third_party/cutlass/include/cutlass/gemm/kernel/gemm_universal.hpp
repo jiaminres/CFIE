@@ -64,6 +64,15 @@ struct IsCutlass3ArrayKernel<ProblemShape, cute::void_t<typename ProblemShape::U
 #include "cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp"
 #include "cutlass/gemm/kernel/sm90_gemm_array_tma_warpspecialized_pingpong.hpp"
 #include "cutlass/gemm/kernel/sm90_gemm_array_tma_warpspecialized_cooperative.hpp"
+
+// CFIE compatibility note:
+// CUTLASS 4.2.x ships Blackwell/SM100+ kernel headers in this common dispatch
+// header. Older CUDA toolchains (for example nvcc 12.4 on Windows) can fail
+// while merely parsing those headers, even when the current translation unit is
+// only compiling pre-Blackwell kernels such as scaled_mm_c2x for sm80/sm89.
+// Guard the includes with CUTLASS' own *_SUPPORTED macros so old toolchains
+// skip unsupported kernel families instead of failing during header parsing.
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 #include "cutlass/gemm/kernel/sm100_gemm_tma_warpspecialized.hpp"
 #include "cutlass/gemm/kernel/sm100_gemm_tma_warpspecialized_mma_transform.hpp"
 #include "cutlass/gemm/kernel/sm100_gemm_array_tma_warpspecialized.hpp"
@@ -74,8 +83,15 @@ struct IsCutlass3ArrayKernel<ProblemShape, cute::void_t<typename ProblemShape::U
 #include "cutlass/gemm/kernel/sm100_sparse_gemm_tma_warpspecialized.hpp"
 #include "cutlass/gemm/kernel/sm100_gemm_cpasync_warpspecialized.hpp"
 #include "cutlass/gemm/kernel/sm100_gemm_mixed_tma_cpasync_warpspecialized.hpp"
+#endif
+
+#if defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED)
 #include "cutlass/gemm/kernel/sm103_blockscaled_gemm_tma_warpspecialized.hpp"
 #include "cutlass/gemm/kernel/sm103_blockscaled_gemm_array_tma_warpspecialized.hpp"
+#endif
+
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
 #include "cutlass/gemm/kernel/sm120_gemm_tma_warpspecialized_cooperative_asymmetric_dma.hpp"
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
