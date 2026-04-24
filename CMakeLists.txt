@@ -121,6 +121,8 @@ else()
 endif()
 
 # 将当前 Python 环境中的 torch CMake 前缀追加到 CMAKE_PREFIX_PATH，供 find_package(Torch) 使用。
+# 这一步只负责让 CMake 找到当前 venv 里的 TorchConfig.cmake。
+# 它不会校验 torch wheel 的 CUDA tag 是否和本机 toolkit 版本一致。
 append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
 
 # ------------------------------- 规范化 CUDA Toolkit 输入并修补 Windows 探测状态 -------------------------------
@@ -131,6 +133,7 @@ if (CUDA_FOUND AND NOT NVCC_EXECUTABLE)
 endif()
 
 # CFIE_CUDA_COMPILE_ROOT 表示本次构建认定的 CUDA 根目录，后续 include/lib 都从它派生。
+# 这里选中的是“本次编译使用哪套本机 CUDA toolkit”，不是 torch wheel 自带的 cuXXX 标记。
 set(CFIE_CUDA_COMPILE_ROOT "")
 if(DEFINED CUDAToolkit_ROOT AND EXISTS "${CUDAToolkit_ROOT}")
   # 新版 CMake 的 CUDAToolkit_ROOT 优先级最高，通常由 setup.py 传入无空格短路径。
@@ -185,6 +188,11 @@ endif()
 
 # ------------------------------- 导入 Torch 并启用 CUDA/HIP 语言环境 -------------------------------
 # Torch CMake 包会内部调用 FindCUDA/enable_language(CUDA)，因此这里不手动 check_language。
+# configure 日志里的 “PyTorch: CUDA detected / CUDA toolkit directory / Header version”
+# 说的是当前被 Torch CMake 包选中的本机 toolkit。
+# PyTorch 默认只校验这套 toolkit 的 nvcc 版本和头文件版本是否自洽。
+# 它不会把 torch.version.cuda 和本机 toolkit 版本做强一致校验。
+# 若需要严格阻止 cu126 wheel 搭配 12.4 toolkit 之类的组合，需要在项目里额外加显式检查。
 find_package(Torch REQUIRED)
 
 if(CFIE_CUDA_COMPILE_ROOT)
