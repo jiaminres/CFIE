@@ -837,17 +837,15 @@ def make_layers(
         get_pp_group().world_size
     )
 
-    # 构造完整层列表：
-    # 1. 当前 rank 之前的层：全部放 PPMissingLayer 占位
-    # 2. 当前 rank 负责的层：真实创建，并交给 offloader 包装
-    # 3. 当前 rank 之后的层：也全部放 PPMissingLayer 占位
+    # 按 PP 切分结果拼出当前 rank 看到的完整层列表。
     modules = torch.nn.ModuleList(
+        # 当前 rank 之前的层全部用占位模块补齐。
         [PPMissingLayer() for _ in range(start_layer)]
-        # ------------ 实际layer --------------------
+        # 当前 rank 真正持有的层在这里创建，并交给 offloader 包装。
         + get_offloader().wrap_modules(
             layer_fn(prefix=f"{prefix}.{idx}") for idx in range(start_layer, end_layer)
         )
-        # ------------ 实际layer --------------------
+        # 当前 rank 之后的层继续用占位模块补齐。
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
     )
 

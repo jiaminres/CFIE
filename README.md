@@ -145,6 +145,22 @@ python -m pip install "torch==2.10.0" "torchvision==0.25.0" --index-url https://
 python -m pip install --no-build-isolation -e .
 ```
 
+如果你想限制编译并发，可以先设置 `MAX_JOBS`，再执行安装命令。例如：
+
+Windows：
+
+```powershell
+$env:MAX_JOBS = "8"
+python -m pip -v install --no-build-isolation -e .
+```
+
+Linux：
+
+```bash
+export MAX_JOBS=8
+python -m pip -v install --no-build-isolation -e .
+```
+
 如果你需要观察 CUDA/C++ 编译进度，通常只要给 `pip` 增加一个 `-v` 就够了：
 
 ```bash
@@ -166,6 +182,7 @@ python -m pip -v install --no-build-isolation -e .
   进而报错 “CFIE native build requires a CUDA-enabled PyTorch environment”。
 - Windows 下若已安装 `ninja`，CFIE 会优先使用 `Ninja` 生成器，避免 Visual Studio 默认生成器
   对 CUDA VS toolset 的额外依赖。
+- `MAX_JOBS` 会传给 `setup.py` 控制 `cmake --build -j` 的并发数；如果机器内存紧张、CUDA 编译容易卡死或想更方便观察进度，建议显式设置。
 
 这里的 `注意: 包含文件:` / `Note: including file:` 是 CMake + Ninja + MSVC 生成依赖关系时的正常输出，
 通常不是编译错误。真正需要关注的是 `error`、`fatal error`、`ninja: build stopped`、`subprocess-exited-with-error`

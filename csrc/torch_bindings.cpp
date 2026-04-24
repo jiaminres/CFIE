@@ -32,7 +32,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
 
+  // 注册 CPU tensor -> CUDA 视图的 schema，供 Python 侧通过 torch.ops._C 调用。
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
+  // 把该 schema 绑定到 CPU dispatch 的 UVA 原生实现。
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
 

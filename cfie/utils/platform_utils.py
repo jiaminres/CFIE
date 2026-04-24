@@ -41,16 +41,17 @@ def cuda_get_device_properties(
 
 @cache
 def is_pin_memory_available() -> bool:
+    # 延迟导入平台对象，避免模块导入阶段过早探测设备能力。
     from cfie.platforms import current_platform
 
+    # 复用平台抽象层返回当前后端的 pinned memory 支持情况。
     return current_platform.is_pin_memory_available()
 
 
 @cache
 def is_uva_available() -> bool:
     """Check if Unified Virtual Addressing (UVA) is available."""
-    # UVA requires pinned memory.
-    # TODO: Add more requirements for UVA if needed.
+    # 当前实现把 pinned memory 可用性视为 UVA 的前置条件。
     return is_pin_memory_available()
 
 

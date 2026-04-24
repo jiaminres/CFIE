@@ -678,14 +678,19 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
     """
     Get an accelerator view of a CPU tensor using Unified Virtual Addressing (UVA).
     """
+    # 延迟导入当前平台对象，避免模块初始化时过早绑定设备后端。
     from cfie.platforms import current_platform
 
+    # XPU 路径要求输入已经是 pinned memory。
     if current_platform.is_xpu():
         assert cpu_tensor.is_pinned(), "CPU tensor must be pinned"
+        # 调用 _C 扩展为 CPU tensor 构造 XPU 侧视图。
         return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
+    # CUDA/ROCm 路径统一走 _C 扩展里的 UVA 桥接算子。
     elif current_platform.is_cuda() or current_platform.is_rocm():
         return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
     else:
+        # 其余后端当前还没有 CPU tensor 视图实现。
         raise ValueError(
             f"`get_accelerator_view_from_cpu_tensor` is currently "
             f"not supported in: {current_platform.device_name}"

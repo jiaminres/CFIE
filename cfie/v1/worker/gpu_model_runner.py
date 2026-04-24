@@ -390,133 +390,166 @@ class GPUModelRunner(
         cfie_config: CfieConfig,
         device: torch.device,
     ):
+        # ------------------------------- 拆出 runner 后续会频繁读取的顶层配置对象 -------------------------------
+        # 保存完整 cfie 配置对象。
         self.cfie_config = cfie_config
+        # 保存模型配置对象。
         self.model_config = cfie_config.model_config
+        # 保存 KV cache 配置对象。
         self.cache_config = cfie_config.cache_config
+        # 保存权重 offload 配置对象。
         self.offload_config = cfie_config.offload_config
+        # 保存编译配置对象。
         self.compilation_config = cfie_config.compilation_config
+        # 保存 LoRA 配置对象。
         self.lora_config = cfie_config.lora_config
+        # 保存权重加载配置对象。
         self.load_config = cfie_config.load_config
+        # 保存并行配置对象。
         self.parallel_config = cfie_config.parallel_config
+        # 保存调度配置对象。
         self.scheduler_config = cfie_config.scheduler_config
+        # 保存 speculative decoding 配置对象。
         self.speculative_config = cfie_config.speculative_config
+        # 保存观测配置对象。
         self.observability_config = cfie_config.observability_config
 
+        # 取模型配置局部别名。
         model_config = self.model_config
+        # 取 cache 配置局部别名。
         cache_config = self.cache_config
+        # 取调度配置局部别名。
         scheduler_config = self.scheduler_config
+        # 取并行配置局部别名。
         parallel_config = self.parallel_config
+        # 记录当前 runner 绑定的设备对象。
         self.device = device
+        # 记录当前平台是否支持 pinned memory。
         self.pin_memory = is_pin_memory_available()
+        # 记录模型主 dtype。
         self.dtype = self.model_config.dtype
 
+        # 把 KV cache dtype 解析成实际 torch dtype。
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
         )
 
+        # ------------------------------- 初始化模型能力开关与运行上限 -------------------------------
+        # 标记当前 runner 是否服务于 pooling 模型。
         self.is_pooling_model = model_config.runner_type == "pooling"
+        # 标记当前模型是否允许 prompt embeds 输入。
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
+        # 标记当前多模态模型是否只接受原始模态输入。
         self.is_multimodal_raw_input_only_model = (
             model_config.is_multimodal_raw_input_only_model
         )
-        # This will be overridden in load_model()
+        # load_model() 后会按真实模型能力回填多模态剪枝开关。
         self.is_multimodal_pruning_enabled = False
-        # Set to True after init_routed_experts_capturer() completes.
-        # Prevents routed experts code from running during profiling/dummy run.
+        # routed experts 捕获器完成初始化后才会打开该标记。
         self.routed_experts_initialized = False
+        # 记录当前 worker 允许的最大上下文长度。
         self.max_model_len = model_config.max_model_len
 
-        # Always set to false after the first forward pass
+        # 首次前向前根据配置决定是否计算 KV scale。
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
+        # 记录 decode context parallel 的 world size。
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
+        # DCP 未启用时固定使用 rank 0。
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
+        # 记录单步允许的最大 token 数。
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        # 记录单步允许的最大请求数。
         self.max_num_reqs = scheduler_config.max_num_seqs
 
-        # Broadcast PP output for external_launcher (torchrun)
-        # to make sure we are synced across pp ranks
-        # TODO: Support overlapping micro-batches
-        # https://github.com/vllm-project/vllm/issues/18019
+        # external_launcher 的多 PP rank 场景下需要显式广播 PP 输出。
         self.broadcast_pp_output = (
             self.parallel_config.distributed_executor_backend == "external_launcher"
             and len(get_pp_group().ranks) > 1
         )
 
-        # Model-related.
+        # 记录当前并行布局下的 query head 数。
         self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
+        # 记录 inputs_embeds 的最后一维大小。
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
+        # 记录 attention chunk 计算使用的块大小。
         self.attention_chunk_size = model_config.attention_chunk_size
-        # Only relevant for models using ALiBi (e.g, MPT)
+        # 标记当前模型是否使用 ALiBi。
         self.use_alibi = model_config.uses_alibi
 
+        # 标记当前模型是否允许使用 cascade attention。
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
+        # 标记当前模型是否属于多模态 prefix LM。
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
 
-        # Multi-modal data support
+        # ------------------------------- 初始化多模态与位置编码相关能力描述 -------------------------------
+        # 挂上全局多模态注册表。
         self.mm_registry = MULTIMODAL_REGISTRY
+        # 标记当前模型是否使用 M-RoPE。
         self.uses_mrope = model_config.uses_mrope
+        # 记录 XD-RoPE 使用的维度数。
         self.uses_xdrope_dim = model_config.uses_xdrope_dim
+        # 根据模型配置判断当前 runner 是否支持多模态输入。
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
         )
 
+        # encoder-decoder 模型需要为 encoder 输入单独保留长度上限。
         if self.model_config.is_encoder_decoder:
-            # Maximum length of the encoder input, only for encoder-decoder
-            # models.
             self.max_encoder_len = scheduler_config.max_num_encoder_input_tokens
         else:
+            # decoder-only 模型没有独立的 encoder 长度预算。
             self.max_encoder_len = 0
 
-        # Async scheduling
+        # ------------------------------- 初始化调度与采样基础状态 -------------------------------
+        # 记录当前是否启用了异步调度。
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
-        # Sampler
+        # 构造统一的采样器实例。
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
+        # EPLB 状态在模型真正加载后再按需初始化。
         self.eplb_state: EplbState | None = None
-        # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
+        # 扩缩容期间可用该标记暂时抑制 EPLB。
         self.eep_eplb_suppressed = False
-        """
-        State of the expert parallelism load balancer.
 
-        Will be lazily initialized when the model is loaded.
-        """
-
-        # Lazy initializations
-        # self.model: nn.Module  # Set after load_model
-        # Initialize in initialize_kv_cache
+        # ------------------------------- 预留模型与 KV cache 相关的延迟初始化状态 -------------------------------
+        # KV cache 张量列表会在 initialize_kv_cache() 中真正分配。
         self.kv_caches: list[torch.Tensor] = []
-        # Initialize in initialize_kv_cache_tensors
+        # cross-layer KV cache 会在独立初始化阶段补建。
         self.cross_layers_kv_cache: torch.Tensor | None = None
+        # cross-layer attention backend 会在 KV 初始化时确定。
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
-        # indexes: [kv_cache_group_id][attn_group]
+        # attn_groups: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
-        # self.kv_cache_config: KVCacheConfig
 
-        # mm_hash ->  encoder_output
+        # encoder_cache: mm_hash -> encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
+        # 构造 late interaction runner。
         self.late_interaction_runner = LateInteractionRunner()
 
+        # 默认不请求额外 hidden state 输出。
         self.use_aux_hidden_state_outputs = False
-        # ----------------- predictor trace 捕获状态 -----------------
-        # predictor 训练轨迹需要在真实推理前向里抓取每层 hidden states。
-        # 这里维护两级缓存：
-        # 1. in-progress：用于 chunked prefill 场景下按块累积整段 prompt 的 hidden states。
-        # 2. ready：请求完成捕获后等待上层通过 RPC 取走。
+        # ------------------------------- 初始化 predictor trace 捕获状态 -------------------------------
+        # 默认关闭 predictor hidden state 捕获。
         self.predictor_capture_enabled = False
+        # 记录需要捕获的全局 layer id 列表。
         self.predictor_capture_layer_ids: tuple[int, ...] = ()
+        # 记录当前 PP rank 本地持有的捕获 layer id 列表。
         self.predictor_capture_local_layer_ids: tuple[int, ...] = ()
+        # 缓存 chunked prefill 过程中尚未取走的 hidden states。
         self._in_progress_predictor_hidden_states: dict[str, list[torch.Tensor]] = {}
+        # 缓存已经完成聚合、等待上层取走的 hidden states。
         self._ready_predictor_hidden_states: dict[str, dict[str, Any]] = {}
-        # ----------------- speculative drafter 初始化入口 -----------------
-        # drafter 统一在最后一个 PP rank 上构造。
-        # mtp 不走 draft_model 分支，而是会落到 use_eagle() 分支，由 EagleProposer 承接。
+        # ------------------------------- 在最后一个 PP rank 上初始化 speculative drafter -------------------------------
         if self.speculative_config and get_pp_group().is_last_rank:
+            # 声明 drafter 占位属性，具体类型由 method 分支决定。
             self.drafter: object
+            # ngram 模式使用纯 ngram proposer。
             if self.speculative_config.method == "ngram":
                 from cfie.v1.spec_decode.ngram_proposer import NgramProposer
 
                 self.drafter = NgramProposer(self.cfie_config)
+            # draft model 模式构造专用的草稿模型 proposer。
             elif self.speculative_config.uses_draft_model():
                 from cfie.v1.spec_decode.draft_model import DraftModelProposer
 
@@ -525,41 +558,49 @@ class GPUModelRunner(
                     device=self.device,
                     runner=self,
                 )
+            # ngram GPU 模式额外准备 GPU 侧索引与值缓冲。
             elif self.speculative_config.use_ngram_gpu():
                 self.drafter = NgramProposerGPU(self.cfie_config, self.device, self)
+                # num_tokens_no_spec_gpu: [max_num_reqs]
                 self.num_tokens_no_spec_gpu = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, device=device
                 )
+                # token_ids_gpu_tensor: [max_num_reqs, max_model_len]
                 self.token_ids_gpu_tensor = torch.zeros(
                     self.max_num_reqs,
                     self.max_model_len,
                     dtype=torch.int32,
                     device=device,
                 )
+                # _ngram_pinned_idx_buf: [max_num_reqs]
                 self._ngram_pinned_idx_buf = torch.zeros(
                     self.max_num_reqs, dtype=torch.long, pin_memory=True
                 )
+                # _ngram_pinned_val_buf: [max_num_reqs]
                 self._ngram_pinned_val_buf = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, pin_memory=True
                 )
+            # suffix 模式使用 suffix proposer。
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.cfie_config)
+            # eagle 系列与 mtp 统一走 EagleProposer 分支。
             elif self.speculative_config.use_eagle():
                 from cfie.v1.spec_decode.eagle import EagleProposer
 
-                # method in {"eagle", "eagle3", "mtp"} 都会走这里。
-                # 其中 mtp 真正加载 draft 模型的入口在 EagleProposer._get_model()。
                 self.drafter = EagleProposer(self.cfie_config, self.device, self)
+                # eagle3 会额外请求辅助 hidden states 输出。
                 if self.speculative_config.method == "eagle3":
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
                     )
+            # medusa 模式使用 Medusa proposer。
             elif self.speculative_config.method == "medusa":
                 from cfie.v1.spec_decode.medusa import MedusaProposer
 
                 self.drafter = MedusaProposer(
                     cfie_config=self.cfie_config, device=self.device
                 )
+            # extract_hidden_states 模式直接捕获额外 hidden states。
             elif self.speculative_config.method == "extract_hidden_states":
                 from cfie.v1.spec_decode.extract_hidden_states import (
                     ExtractHiddenStatesProposer,
@@ -568,52 +609,56 @@ class GPUModelRunner(
                 self.drafter = ExtractHiddenStatesProposer(
                     cfie_config=self.cfie_config, device=self.device
                 )
+                # 该模式同样需要打开辅助 hidden states 输出。
                 self.use_aux_hidden_state_outputs = True
             else:
+                # 未识别的 speculative 方法直接拒绝初始化。
                 raise ValueError(
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
+            # speculative 模式统一复用 rejection sampler。
             self.rejection_sampler = RejectionSampler(self.sampler)
 
+        # 默认没有 speculative token。
         self.num_spec_tokens = 0
+        # speculative 模式下从配置中读取草稿 token 数与长度上限。
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
             draft_config = self.speculative_config.draft_model_config
+            # drafter 自己声明了 max_model_len 时优先使用草稿模型上限。
             if draft_config is not None and draft_config.max_model_len is not None:
                 self.effective_drafter_max_model_len = draft_config.max_model_len
             else:
+                # 否则沿用主模型的最大上下文长度。
                 self.effective_drafter_max_model_len = self.max_model_len
 
-        # Request states.
+        # ------------------------------- 初始化请求级运行时状态与输入批次容器 -------------------------------
+        # requests: request_id -> CachedRequestState
         self.requests: dict[str, CachedRequestState] = {}
-        # NOTE(rob): num_prompt_logprobs only includes reqs
-        # that are currently in the prefill phase.
+        # num_prompt_logprobs 只跟踪仍在 prefill 阶段的请求。
         self.num_prompt_logprobs: dict[str, int] = {}
+        # 通信流用于跨 stream 的张量传输协作。
         self.comm_stream = torch.cuda.Stream()
 
-        # Input Batch
-        # NOTE(Chen): Ideally, we should initialize the input batch inside
-        # `initialize_kv_cache` based on the kv cache config. However, as in
-        # https://github.com/vllm-project/vllm/pull/18298, due to some unknown
-        # reasons, we have to initialize the input batch before `load_model`,
-        # quantization + weight offloading will fail otherwise. As a temporary
-        # solution, we initialize the input batch here, and re-initialize it
-        # in `initialize_kv_cache` if the block_sizes here is different from
-        # the block_sizes in the kv cache config.
+        # 先读取 logits processor 配置。
         logits_processors = model_config.logits_processors
+        # 把可选 logits processor 列表标准化成 tuple。
         custom_logitsprocs: Sequence[str | type[LogitsProcessor]] = (
             tuple(logits_processors) if logits_processors is not None else ()
         )
+        # 在 KV cache 真正初始化前，先用占位 block size 构造输入批次。
         placeholder_block_size = (
             self.cache_config.block_size or CacheConfig.DEFAULT_BLOCK_SIZE
         )
+        # 记录初始化阶段的逻辑 block size。
         self._init_block_sizes = [placeholder_block_size]
+        # 记录初始化阶段的 kernel block size。
         self._init_kernel_block_sizes = [placeholder_block_size]
+        # 提前构造输入批次，避免量化与 offload 在 load_model 前失效。
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
-            # We need to use the encoder length for encoder-decoder
-            # because of KV cache for cross-attention.
+            # encoder-decoder 模型需要把 encoder 长度纳入批次上限。
             max_model_len=max(self.max_model_len, self.max_encoder_len),
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
@@ -629,24 +674,23 @@ class GPUModelRunner(
                 self.is_pooling_model,
                 custom_logitsprocs,
             ),
-            # We currently don't know whether a particular custom logits processor
-            # uses output token ids so we set this conservatively.
+            # 自定义 logits processor 是否依赖输出 token id 先保守地按 true 处理。
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
-        # Separate cuda stream for overlapping transfer of sampled token ids from
-        # GPU to CPU when async scheduling is enabled.
+        # ------------------------------- 初始化异步调度与 cudagraph 依赖的流、事件与批次信息 -------------------------------
+        # 异步调度时用独立 stream 重叠 sampled token 的 D2H 拷贝。
         self.async_output_copy_stream: torch.cuda.Stream | None = None
-        # cuda event to synchronize use of reused CPU tensors between steps
-        # when async scheduling is enabled.
+        # 准备输入事件用于跨 step 协调 CPU 复用缓冲。
         self.prepare_inputs_event: torch.Event | None = None
+        # 只有异步调度开启时才真正分配这些同步原语。
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
 
-        # self.cudagraph_batch_sizes sorts in ascending order.
+        # cudagraph 捕获尺寸列表需要按升序缓存，便于后续分发。
         if (
             self.compilation_config.cudagraph_capture_sizes
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
@@ -655,125 +699,131 @@ class GPUModelRunner(
                 self.compilation_config.cudagraph_capture_sizes
             )
         else:
+            # 未启用 cudagraph 捕获时保存空列表。
             self.cudagraph_batch_sizes = []
 
-        # Cache the device properties.
+        # 缓存设备属性，避免后续重复探测。
         self._init_device_properties()
 
-        # Encoder timing registry for observability
+        # encoder_timing_registry: request_id -> EncoderTimingStats
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
+        # 观测数据需要线程锁保护。
         self._encoder_timing_lock = threading.Lock()
 
-        # Persistent buffers for CUDA graphs.
+        # ------------------------------- 预分配 cudagraph 复用的持久缓冲 -------------------------------
+        # input_ids: [max_num_tokens]
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+        # positions: [max_num_tokens]
         self.positions = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
+        # query_start_loc: [max_num_reqs + 1]
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
+        # seq_lens: [max_num_reqs]
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        # encoder_seq_lens: [max_num_reqs]
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        # DCP 模式下额外为本地 query 长度保留缓冲。
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
-        # Because inputs_embeds may be bfloat16 and we don't need a numpy
-        # version of this tensor, avoid a RuntimeError by not creating a
-        # numpy buffer.
+        # inputs_embeds: [max_num_tokens, inputs_embeds_size]
         self.inputs_embeds = self._make_buffer(
             self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
         )
+        # is_token_ids: [max_num_tokens]
         self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
+        # discard_request_mask: [max_num_reqs]
         self.discard_request_mask = self._make_buffer(
             self.max_num_reqs, dtype=torch.bool
         )
+        # num_decode_draft_tokens: [max_num_reqs]
         self.num_decode_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
+        # num_accepted_tokens: [max_num_reqs]
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int64
         )
 
-        # Only relevant for multimodal models
+        # 多模态模型额外准备双缓冲，避免异步拷贝与当前 step 写入冲突。
         if self.supports_mm_inputs:
-            # Double buffer to avoid race condition: previous iteration's async
-            # copy may still be reading from CPU while current iteration writes.
             self.is_mm_embed_buffers = [
                 self._make_buffer(self.max_num_tokens, dtype=torch.bool),
                 self._make_buffer(self.max_num_tokens, dtype=torch.bool),
             ]
+            # 记录当前轮使用的多模态 embed buffer 索引。
             self.is_mm_embed_idx = 0
 
-        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+        # M-RoPE 模型需要预留 3 维位置张量。
         if self.uses_mrope:
-            # NOTE: `mrope_positions` is implemented with one additional dummy
-            # position on purpose to make it non-contiguous so that it can work
-            # with torch compile.
-            # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
-
-            # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
-            # the modality of inputs. For text-only inputs, each dimension has
-            # identical position IDs, making M-RoPE functionally equivalent to
-            # 1D-RoPE.
-            # See page 5 of https://arxiv.org/abs/2409.12191
+            # mrope_positions: [3, max_num_tokens + 1]
             self.mrope_positions = self._make_buffer(
                 (3, self.max_num_tokens + 1), dtype=torch.int64
             )
 
-        # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
+        # XD-RoPE 模型需要按配置维度数预留位置张量。
         if self.uses_xdrope_dim > 0:
-            # Similar to mrope but use assigned dimension number for RoPE, 4 as default.
+            # xdrope_positions: [uses_xdrope_dim, max_num_tokens + 1]
             self.xdrope_positions = self._make_buffer(
                 (self.uses_xdrope_dim, self.max_num_tokens + 1), dtype=torch.int64
             )
 
-        # None in the first PP rank. The rest are set after load_model.
+        # 非首个 PP rank 的中间张量会在 load_model 后回填。
         self.intermediate_tensors: IntermediateTensors | None = None
 
-        # OPTIMIZATION: Cache the tensors rather than creating them every step.
-        # Keep in int64 to avoid overflow with long context
+        # arange_np 供多处索引构造复用，避免每步重复创建。
         self.arange_np = np.arange(
             max(self.max_num_reqs + 1, self.max_model_len, self.max_num_tokens),
             dtype=np.int64,
         )
 
-        # Layer pairings for cross-layer KV sharing.
-        # If an Attention layer `layer_name` is in the keys of this dict, it
-        # means this layer will perform attention using the keys and values
-        # from the KV cache of `shared_kv_cache_layers[layer_name]`.
+        # ------------------------------- 初始化 KV sharing 与多模态预算相关状态 -------------------------------
+        # shared_kv_cache_layers: layer_name -> source_layer_name
         self.shared_kv_cache_layers: dict[str, str] = {}
+        # 记录允许 fast prefill 的 KV sharing 层集合。
         self.kv_sharing_fast_prefill_eligible_layers: set[str] = set()
 
+        # 默认不分配 fast prefill logits 索引张量。
         self.kv_sharing_fast_prefill_logits_indices = None
+        # 启用 fast prefill 时预分配索引张量。
         if self.cache_config.kv_sharing_fast_prefill:
             self.kv_sharing_fast_prefill_logits_indices = torch.zeros(
                 self.max_num_tokens, dtype=torch.int32, device=self.device
             )
 
+        # uniform decode 查询长度等于 1 个主 token 加 speculative token 数。
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
-        # Cudagraph dispatcher for runtime cudagraph dispatching.
+        # 构造运行期 cudagraph 分发器。
         self.cudagraph_dispatcher = CudagraphDispatcher(self.cfie_config)
 
+        # 多模态模型才需要单独的预算管理器。
         self.mm_budget = (
             MultiModalBudget(self.cfie_config, self.mm_registry)
             if self.supports_mm_inputs
             else None
         )
 
+        # 默认不启用 batch reorder 阈值。
         self.reorder_batch_threshold: int | None = None
 
-        # Attention layers that are only in the KVCacheConfig of the runner
-        # (e.g., KV sharing, encoder-only attention), but not in the
-        # KVCacheConfig of the scheduler.
+        # 记录只存在于 runner 侧、而不暴露给 scheduler 的 attention 层。
         self.runner_only_attn_layers: set[str] = set()
 
-        # Cached outputs.
+        # ------------------------------- 初始化 speculative 输出缓存与异步回传缓冲 -------------------------------
+        # _draft_token_ids 缓存上一步草稿 token 输出。
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
-        # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
+        # _num_valid_draft_tokens: [max_num_reqs]
         self._num_valid_draft_tokens: torch.Tensor | None = None
+        # _num_valid_draft_tokens_cpu: [max_num_reqs]
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
+        # 有效草稿 token 数的异步 D2H 事件。
         self._num_valid_draft_tokens_event: torch.cuda.Event | None = None
+        # 有效草稿 token 数的异步 D2H stream。
         self._num_valid_draft_tokens_copy_stream: torch.cuda.Stream | None = None
+        # ngram GPU 模式需要额外的 CPU 回传缓冲与同步原语。
         if (
             self.speculative_config is not None
             and self.speculative_config.use_ngram_gpu()
@@ -784,8 +834,11 @@ class GPUModelRunner(
             self._num_valid_draft_tokens_event = torch.cuda.Event()
             self._num_valid_draft_tokens_copy_stream = torch.cuda.Stream()
 
+        # 缓存草稿 token 对应的 request id 顺序。
         self._draft_token_req_ids: list[str] | None = None
+        # 采样结果回传过程使用的同步事件。
         self.transfer_event = torch.Event()
+        # sampled_token_ids_pinned_cpu: [max_num_reqs, 1]
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
             dtype=torch.int64,
@@ -793,17 +846,21 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
         )
 
-        # Pre-allocated tensor for copying valid sampled token counts to CPU,
-        # with dedicated stream for overlapping and event for coordination.
+        # valid_sampled_token_count 的异步回传事件。
         self.valid_sampled_token_count_event: torch.Event | None = None
+        # valid_sampled_token_count 的异步回传 stream。
         self.valid_sampled_token_count_copy_stream: torch.cuda.Stream | None = None
-        # We also copy the drafted tokens to the CPU asynchronously,
-        # in case we need them for structured outputs.
+        # drafted token ids 的异步回传事件。
         self.draft_token_ids_event: torch.Event | None = None
+        # drafted token ids 的异步回传 stream。
         self.draft_token_ids_copy_stream: torch.cuda.Stream | None = None
+        # valid_sampled_token_count_cpu: [max_num_reqs]
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
+        # draft_token_ids_cpu: [max_num_reqs, num_spec_tokens]
         self.draft_token_ids_cpu: torch.Tensor | None = None
+        # num_accepted_tokens 的同步事件。
         self.num_accepted_tokens_event: torch.Event | None = None
+        # 只有 speculative 模式才需要分配这些额外 CPU 回传缓冲。
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
@@ -824,15 +881,20 @@ class GPUModelRunner(
                     pin_memory=self.pin_memory,
                 )
 
-        # Model weight offloader
-        # Make sure this is called before any get_offloader call
+        # ------------------------------- 安装本次模型构建使用的全局 offloader -------------------------------
+        # 在任何层构建逻辑读取 offloader 之前，先按配置安装具体后端。
         set_offloader(create_offloader(self.offload_config))
 
-        # Ephemeral state transferred between execute_model() and sample_tokens().
+        # ------------------------------- 初始化 execute_model 与 sample_tokens 之间的暂存状态 -------------------------------
+        # execute_model_state 保存二段执行链之间共享的瞬时状态。
         self.execute_model_state: ExecuteModelState | None = None
+        # kv_connector_output 保存本步 KV connector 的中间输出。
         self.kv_connector_output: KVConnectorOutput | None = None
+        # mamba_state_idx 记录各 Mamba 状态块的索引。
         self.mamba_state_idx: dict[str, int] = {}
+        # Mamba 拷贝缓冲按需延迟构造。
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+        # layerwise NVTX hook 默认尚未注册。
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:

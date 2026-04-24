@@ -159,57 +159,64 @@ def process_weights_after_loading(
 # 在需要后处理时，临时把模块参数搬到目标设备，结束后再恢复原状态。
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
-    # 如果目标设备本来就是 CPU，就不需要为后处理做任何临时搬运。
+    # 目标已经是 CPU 时，不需要临时搬运参数。
     if target_device.type == "cpu":
-        # If target is CPU, no need to move anything
+        # 直接把原模块交给调用方。
         yield module
+        # 结束当前上下文。
         return
 
-    # 记录哪些参数原来在哪个设备上，后面结束时要恢复。
+    # 记录原始设备: param_name -> device。
     original_device_states: dict[str, torch.device] = {}
-    # 记录哪些参数原来处于 UVA offload 状态，后面需要重新挂回。
+    # 记录原本走 UVA 的参数名。
     uva_offloaded_parameters: list[str] = []
 
-    # Store original device states and move parameters to GPU if they're on CPU
+    # 逐个参数准备临时加载状态。
     for name, p in module.named_parameters():
-        # 如果参数当前在 CPU，但后处理希望在 target_device 上执行，
-        # 这里先临时搬过去。
+        # CPU 参数需要临时搬到 target_device。
         if p.device.type == "cpu":
+            # 记住原始设备，供 finally 恢复。
             original_device_states[name] = p.device
+            # CPU -> target_device。
             p.data = p.data.to(target_device)
-        # 如果它原来是 UVA offload，也把名字记下来。
+
+        # 记录原本是 UVA 视图的参数。
         if getattr(p, "_cfie_is_uva_offloaded", False):
+            # 保存参数名，后续重新挂回 UVA。
             uva_offloaded_parameters.append(name)
-        # Parameters already on target device are not touched
 
     try:
-        # 把准备好的模块交给调用者执行真正的后处理逻辑。
+        # 把临时加载后的模块交给调用方。
         yield module
 
     finally:
-        # 结束后判断恢复到 CPU 时是否允许 pin_memory。
+        # 恢复到 CPU 时按平台决定是否启用 pinned memory。
         use_pin_memory = (
             is_pin_memory_available()
             and not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY
         )
-        # Restore parameters to their original devices, ignoring new parameters
+
+        # 逐个参数恢复原始设备/UVA 形态。
         for name, p in module.named_parameters():
-            # 需要恢复原设备的参数，搬回去。
+            # 需要恢复原设备的参数搬回原位。
             if name in original_device_states:
+                # 取回该参数记录下来的原始设备。
                 original_device: torch.device = original_device_states[name]
+                # target_device -> original_device。
                 p.data = p.data.to(original_device)
 
-            # parameter is UVA offloaded, but was replaced with a new device tensor
-            # re-offload it to CPU using UVA
-            # 如果它原来是 UVA offload，但后处理过程中被替换成普通 device tensor，
-            # 这里要重新变回“CPU tensor + accelerator view”形式。
+            # 原本是 UVA 参数且当前已丢失 UVA 标记时，重新挂回 UVA。
             if name in uva_offloaded_parameters and not getattr(
                 p, "_cfie_is_uva_offloaded", False
             ):
+                # 先把当前 device tensor 落回 CPU。
                 cpu_data = p.data.to(device="cpu")
+                # 按配置把 CPU tensor 升级成 pinned memory。
                 if use_pin_memory:
                     cpu_data = cpu_data.pin_memory()
+                # CPU tensor -> accelerator view。
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
+                # 恢复 UVA 标记。
                 p._cfie_is_uva_offloaded = True
 
 
