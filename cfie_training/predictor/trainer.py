@@ -14,6 +14,7 @@ from cfie_training.config import TrainingProjectConfig
 from cfie_training.predictor.models import (
     CapturedForwardBatch,
     CapturedHiddenStatePayload,
+    PredictorCaptureOutput,
     PredictorCaptureRequest,
     PredictorCheckpointMetadata,
     PredictorDeploymentManifest,
@@ -632,7 +633,9 @@ class EngineRouterTeacherModelBackend:
                     request_id = getattr(output, "request_id", None)
                     request_record = request_by_id.get(str(request_id))
                     if request_record is not None:
-                        request_record.output = output
+                        request_record.output = (
+                            PredictorCaptureOutput.from_engine_output(output)
+                        )
 
                 # 有些请求的 prompt capture 会在中途 step 就先写入 worker 缓存；
                 # 这里每轮都尝试取走一次，避免全部结束后部分结果已被后续流程清理。

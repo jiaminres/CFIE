@@ -5,9 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from cfie.outputs import CompletionOutput, RequestOutput
 
 
 @dataclass(slots=True, frozen=True)
@@ -54,6 +58,86 @@ class CapturedHiddenStatePayload:
     tp_rank: int
 
 
+@dataclass(slots=True, frozen=True)
+class PredictorCaptureCompletion:
+    """训练侧保留的单条 completion 快照。
+
+    predictor teacher 训练最终只会消费 `outputs[0].routed_experts`，但直接把
+    推理引擎的完整 `CompletionOutput` 挂在 trainer 本地状态里，会让阅读者不得不
+    跳到推理侧输出模型才能看懂当前链路到底依赖了哪些字段。
+
+    这里显式定义一份训练侧快照，只保留当前 teacher capture 确实会读到的稳定字段，
+    这样 `PredictorCaptureRequest` 的状态边界就会更清楚：
+    - 当前 completion 是第几个候选；
+    - 对应生成 token ids 是什么；
+    - 当前 completion 是否带回 routed experts；
+    - 当前 completion 的结束原因是什么。
+    """
+
+    # 当前 completion 在 request 输出列表中的序号。
+    index: int
+    # 当前 completion 已生成的 token ids。
+    token_ids: tuple[int, ...]
+    # teacher 返回的 routed experts，形状通常为 [seq_len, num_layers, topk]。
+    routed_experts: np.ndarray | None
+    # 当前 completion 的结束原因。
+    finish_reason: str | None
+    # 当前 completion 的 stop 原因。
+    stop_reason: int | str | None
+
+    @classmethod
+    def from_engine_completion(
+            cls,
+            completion: CompletionOutput,
+    ) -> "PredictorCaptureCompletion":
+        # routed_experts 可能来自共享底层缓冲；这里显式复制一份只读快照，
+        # 避免后续引擎继续推进时 trainer 侧观察到被原地覆盖的内容。
+        routed_experts = (
+            None
+            if completion.routed_experts is None
+            else np.array(completion.routed_experts, copy=True)
+        )
+        return cls(
+            index=int(completion.index),
+            token_ids=tuple(int(token_id) for token_id in completion.token_ids),
+            routed_experts=routed_experts,
+            finish_reason=completion.finish_reason,
+            stop_reason=completion.stop_reason,
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class PredictorCaptureOutput:
+    """训练侧保留的 request 输出快照。
+
+    `capture_batch` 不需要持有推理引擎完整 `RequestOutput` 的全部字段；真正依赖的
+    只有 request_id、是否结束以及 completion 列表。这里把它们收敛成训练侧模型，
+    让 predictor 链路读起来只围绕“teacher 训练需要什么”展开，而不是被推理侧
+    大而全的输出对象分散注意力。
+    """
+
+    # 当前 request 的唯一标识。
+    request_id: str
+    # 当前 request 是否已经产生最终输出。
+    finished: bool
+    # 当前 request 的 completion 快照集合。
+    outputs: tuple[PredictorCaptureCompletion, ...]
+
+    @classmethod
+    def from_engine_output(
+            cls,
+            request_output: RequestOutput,
+    ) -> "PredictorCaptureOutput":
+        return cls(
+            request_id=str(request_output.request_id),
+            finished=bool(request_output.finished),
+            outputs=tuple(
+                PredictorCaptureCompletion.from_engine_completion(completion)
+                for completion in request_output.outputs
+            ),
+        )
+
+
 @dataclass(slots=True)
 class PredictorCaptureRequest:
     """一次 teacher capture 请求在 trainer 侧的本地状态。
@@ -70,8 +154,8 @@ class PredictorCaptureRequest:
     row_index: int
     # 当前请求对应的原始 token 序列。
     prompt_row: tuple[int, ...]
-    # 引擎返回的最终输出对象。
-    output: Any | None = None
+    # trainer 侧冻结后的最终输出快照。
+    output: PredictorCaptureOutput | None = None
     # 当前请求聚合完成的按层 hidden states。
     hidden_states: tuple[torch.Tensor, ...] | None = None
 
@@ -714,7 +798,9 @@ class PredictorDeploymentManifest:
 __all__ = [
     "CapturedForwardBatch",
     "CapturedHiddenStatePayload",
+    "PredictorCaptureCompletion",
     "PredictorCaptureRequest",
+    "PredictorCaptureOutput",
     "PredictorCheckpointMetadata",
     "PredictorDeploymentManifest",
     "PredictorEpochSummary",
