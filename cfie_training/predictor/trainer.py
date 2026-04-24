@@ -158,9 +158,19 @@ class EngineRouterTeacherModelBackend:
         # 也避免比例过高把训练进程的其他预算吃掉。
         return max(0.35, min(0.85, ratio))
 
-    # ------------------------------- 推导 teacher 引擎 CPU 卸载预算 -------------------------------
+    # ------------------------------- 推导 teacher 引擎通用 CPU offload 预算 -------------------------------
     def _resolve_cpu_offload_gb(self) -> float:
-        # teacher 引擎只能消费“预算减去安全余量”后的 CPU 热存空间，
+        # `cpu_offload_gb` 走的是通用 UVA CPU offload 通道，
+        # 而不是 MoE tiered cache 的 CPU/NVMe 专家缓存主链。
+        #
+        # 当前客户端侧 UVA 路径尚未完成适配，因此训练 teacher 默认不启用这条通道。
+        # 只有当资源策略明确声明为纯 `cpu` 时，才把 CPU 热存预算映射成 UVA 空间；
+        # 对 `cpu+nvme` / `nvme` 等档位，这里一律返回 0，让 teacher 仅依赖
+        # `moe_tiered_cache` 自己的 CPU 预算与 planner。
+        if self._config.resource_policy.weight_offload_backend != "cpu":
+            return 0.0
+
+        # 纯 CPU offload 场景下，teacher 只能消费“预算减去安全余量”后的 CPU 热存空间，
         # 否则训练侧很容易把预留给系统与其他组件的缓冲区也占满。
         available_cpu_budget = (
                 self._config.memory_budget.cpu_hot_budget_gb
@@ -176,34 +186,20 @@ class EngineRouterTeacherModelBackend:
         backend = self._config.resource_policy.weight_offload_backend
 
         # 纯 CPU 卸载最接近引擎里的 UVA 路线；
-        # 直接映射成 `uva` 可以让 teacher 路径明确走主存访问逻辑。
+        # 仅当训练档位显式声明纯 CPU 策略时，teacher 才走这条通用 UVA 路线。
         if backend == "cpu":
             return "uva"
 
-        # 对 `nvme` 与 `cpu+nvme` 则统一交给 `auto`，
-        # 让引擎依据当前 `cpu_offload_gb` 和其他预算自行选择细节实现，
-        # 避免训练侧自定义枚举直接穿透到底层后触发配置校验失败。
+        # 对 `nvme` 与 `cpu+nvme` 则统一交给 `auto`。
+        # 由于 `_resolve_cpu_offload_gb` 在这些档位会返回 0，
+        # 因此这里不会默认落到通用 UVA/prefetch，而是把 CPU/NVMe 预算留给
+        # MoE tiered cache planner 与运行时 expert cache 主链使用。
         return "auto"
 
     # ------------------------------- 构造训练 teacher 专用 additional_config -------------------------------
     def _resolve_engine_additional_config(self) -> dict[str, Any]:
-        # predictor teacher 的职责是“尽快启动真实前向并采集监督信号”，
-        # 不是完整复刻推理侧 MoE tiered cache 的冷启动链路。
-        #
-        # 若这里不显式关闭，CfieConfig 在量化 MoE 场景下可能自动展开
-        # 一整套 tiered cache 规划，并进一步拉起较重的 CPU expert pool。
-        # 这对训练 trace 来说收益很小，却会显著拖慢首批采样启动速度。
-        #
-        # 因此此处专门给训练 teacher 注入一份 disabled 配置：
-        # - 仅影响 predictor 训练专用 teacher 引擎
-        # - 不影响普通 chat / native-generate 主链
-        # - 也不改变后续 predictor 真正挂载到推理侧时的配置口径
-        return {
-            "moe_tiered_cache": {
-                "enabled": False,
-                "reason": "predictor_teacher_engine_disabled",
-            }
-        }
+        # 当前额外覆盖项留空，后续若训练侧需要加专用开关，再从这里集中注入。
+        return {}
 
     # ------------------------------- 按真实有效长度提取 prompt 行 -------------------------------
     @staticmethod
@@ -2168,9 +2164,9 @@ class PredictorTrainer:
                     checkpoint_output_path is not None
                     and checkpoint_every_epochs is not None
                     and (
-                        current_run_trace.epochs % int(checkpoint_every_epochs) == 0
-                        or epoch_offset == epochs - 1
-                    )
+                    current_run_trace.epochs % int(checkpoint_every_epochs) == 0
+                    or epoch_offset == epochs - 1
+            )
             ):
                 current_optimizer_state_dict = optimizer.state_dict()
                 self.save_checkpoint(

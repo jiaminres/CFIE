@@ -225,15 +225,16 @@ def test_predictor_teacher_backend_maps_training_offload_policy() -> None:
     backend = EngineRouterTeacherModelBackend.create(cfg)
 
     assert backend._resolve_engine_offload_backend() == "auto"
-    assert backend._resolve_engine_additional_config()["moe_tiered_cache"] == {
-        "enabled": False,
-        "reason": "predictor_teacher_engine_disabled",
-    }
+    assert backend._resolve_cpu_offload_gb() == 0.0
+    assert backend._resolve_engine_additional_config() == {}
 
     cfg.resource_policy.weight_offload_backend = "cpu"
     backend = EngineRouterTeacherModelBackend.create(cfg)
 
     assert backend._resolve_engine_offload_backend() == "uva"
+    assert backend._resolve_cpu_offload_gb() == pytest.approx(
+        cfg.memory_budget.cpu_hot_budget_gb - cfg.memory_budget.cpu_safety_margin_gb
+    )
 
 
 def test_expert_rotation_scheduler_blends_next_step_prefetch_with_overlap(
