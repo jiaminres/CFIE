@@ -11,6 +11,9 @@ import torch
 
 from cfie.predictor import (
     PredictorCandidatePlanner,
+    PredictorDeploymentManifest,
+    PredictorMetricsSummary,
+    PredictorRuntimeSchema,
     load_predictor_bundle,
     load_predictor_model,
 )
@@ -64,7 +67,7 @@ class _FakeTokenBatchPlanner:
         )
 
 
-def _export_predictor_bundle(tmp_path: Path) -> Path:
+def _build_predictor_bundle(tmp_path: Path) -> Path:
     # 构造一份最小可训练的 predictor 配置。
     config = build_profile_config("qwen35-35b-a3b")
     trainer = PredictorTrainer(
@@ -84,24 +87,90 @@ def _export_predictor_bundle(tmp_path: Path) -> Path:
     )
     model, run_trace, _ = trainer.fit_dataset(dataset, epochs=1)
 
-    # 将训练结果先保存成 checkpoint，再导出部署 bundle。
+    # 将训练结果保存为 checkpoint，并手工组装一份最小 bundle。
     checkpoint_path = tmp_path / "predictor.ckpt"
     bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    weights_path = bundle_dir / "predictor_weights.pt"
+    schema_path = bundle_dir / "predictor_schema.json"
+    metrics_path = bundle_dir / "predictor_metrics.json"
+    manifest_path = bundle_dir / "predictor_bundle.json"
     trainer.save_checkpoint(
         model=model,
         run_trace=run_trace,
         path=checkpoint_path,
     )
-    PredictorTrainer.export_checkpoint_bundle(
-        checkpoint_path=checkpoint_path,
-        output_dir=bundle_dir,
+
+    schema = PredictorRuntimeSchema(
+        schema_kind="cfie_predictor_runtime_schema",
+        profile_name=config.profile_name,
+        input_summary_dim=config.model_spec.hidden_size,
+        predictor_hidden_dim=config.predictor_trainer.hidden_dim,
+        window_layers=config.predictor_routing.window_layers,
+        stride_layers=config.predictor_routing.stride_layers,
+        num_experts=config.model_spec.num_experts,
+        candidate_experts_per_layer=(
+            config.predictor_routing.candidate_experts_per_layer
+        ),
+        executed_experts_per_layer=(
+            config.predictor_routing.executed_experts_per_layer
+        ),
+        selection_mode=config.predictor_routing.selection_mode,
+        online_expert_source=config.predictor_routing.online_expert_source,
+        allow_candidate_mismatch=config.predictor_routing.allow_candidate_mismatch,
+    ).validate()
+    metrics = PredictorMetricsSummary(
+        metrics_kind="cfie_predictor_metrics_summary",
+        profile_name=run_trace.profile_name,
+        example_count=run_trace.example_count,
+        epochs=run_trace.epochs,
+        final_mean_loss=run_trace.final_mean_loss,
+        final_recall_at_candidate_budget=(
+            run_trace.final_recall_at_candidate_budget
+        ),
+        final_recall_at_executed_budget=(
+            run_trace.final_recall_at_executed_budget
+        ),
+    ).validate()
+    manifest = PredictorDeploymentManifest(
+        bundle_kind="cfie_predictor_deployment_bundle",
+        profile_name=config.profile_name,
+        source_checkpoint=checkpoint_path.name,
+        weights_kind="cfie_predictor_weights",
+        weights_format="torch_state_dict",
+        weights_file=weights_path.name,
+        schema_kind=schema.schema_kind,
+        schema_file=schema_path.name,
+        metrics_kind=metrics.metrics_kind,
+        metrics_file=metrics_path.name,
+    ).validate()
+
+    torch.save(
+        {
+            "weights_kind": manifest.weights_kind,
+            "profile_name": manifest.profile_name,
+            "model_state_dict": model.state_dict(),
+        },
+        weights_path,
+    )
+    schema_path.write_text(
+        json.dumps(schema.to_dict(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    metrics_path.write_text(
+        json.dumps(metrics.to_dict(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    manifest_path.write_text(
+        json.dumps(manifest.to_dict(), indent=2, sort_keys=True),
+        encoding="utf-8",
     )
     # 返回 bundle 目录，供测试继续加载。
     return bundle_dir
 
 
-def test_load_predictor_bundle_reads_exported_bundle(tmp_path: Path) -> None:
-    bundle_dir = _export_predictor_bundle(tmp_path)
+def test_load_predictor_bundle_reads_bundle_directory(tmp_path: Path) -> None:
+    bundle_dir = _build_predictor_bundle(tmp_path)
 
     bundle = load_predictor_bundle(bundle_dir)
 
@@ -117,7 +186,7 @@ def test_load_predictor_bundle_reads_exported_bundle(tmp_path: Path) -> None:
 
 
 def test_load_predictor_model_rebuilds_predictor_module(tmp_path: Path) -> None:
-    bundle_dir = _export_predictor_bundle(tmp_path)
+    bundle_dir = _build_predictor_bundle(tmp_path)
 
     model, bundle = load_predictor_model(bundle_dir)
     inputs = torch.zeros(2, bundle.schema.input_summary_dim, dtype=torch.float32)
@@ -132,10 +201,10 @@ def test_load_predictor_model_rebuilds_predictor_module(tmp_path: Path) -> None:
     )
 
 
-def test_load_predictor_model_preserves_exported_weight_dtype(
+def test_load_predictor_model_preserves_bundle_weight_dtype(
     tmp_path: Path,
 ) -> None:
-    bundle_dir = _export_predictor_bundle(tmp_path)
+    bundle_dir = _build_predictor_bundle(tmp_path)
     original_default_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.float16)
     try:
@@ -154,7 +223,7 @@ def test_load_predictor_model_preserves_exported_weight_dtype(
 
 
 def test_load_predictor_bundle_rejects_schema_kind_mismatch(tmp_path: Path) -> None:
-    bundle_dir = _export_predictor_bundle(tmp_path)
+    bundle_dir = _build_predictor_bundle(tmp_path)
     schema_path = bundle_dir / "predictor_schema.json"
     payload = json.loads(schema_path.read_text(encoding="utf-8"))
     payload["schema_kind"] = "broken_schema_kind"
@@ -168,7 +237,7 @@ def test_load_predictor_bundle_rejects_schema_kind_mismatch(tmp_path: Path) -> N
 
 
 def test_predictor_candidate_planner_builds_window_plan(tmp_path: Path) -> None:
-    bundle_dir = _export_predictor_bundle(tmp_path)
+    bundle_dir = _build_predictor_bundle(tmp_path)
     model, bundle = load_predictor_model(bundle_dir)
     planner = PredictorCandidatePlanner(
         schema=bundle.schema,
@@ -202,7 +271,7 @@ def test_predictor_candidate_planner_builds_window_plan(tmp_path: Path) -> None:
 def test_predictor_candidate_planner_rejects_bad_hidden_summary_dim(
     tmp_path: Path,
 ) -> None:
-    bundle_dir = _export_predictor_bundle(tmp_path)
+    bundle_dir = _build_predictor_bundle(tmp_path)
     model, bundle = load_predictor_model(bundle_dir)
     planner = PredictorCandidatePlanner(
         schema=bundle.schema,

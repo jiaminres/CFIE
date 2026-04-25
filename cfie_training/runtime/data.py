@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from transformers import AutoTokenizer
 
@@ -34,8 +34,14 @@ class _TokenizedSample:
     token_ids: tuple[int, ...]
 
 
+class PredictorBatchPlanner(Protocol):
+    # 返回指定 step 使用的 batch 形状。
+    def batch_for_step(self, step_index: int) -> BatchShape:
+        ...
+
+
 @dataclass(slots=True)
-class TokenizedDatasetBatchPlanner:
+class TokenizedDatasetBatchPlanner(PredictorBatchPlanner):
     # ------------------------------- 外部输入配置字段 -------------------------------
     # 训练项目全局配置，用于回退 tokenizer 路径与共享运行参数。
     config: TrainingProjectConfig

@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -18,27 +18,21 @@ from cfie_training.predictor.models import (
     PredictorCaptureOutput,
     PredictorCaptureRequest,
     PredictorCheckpointMetadata,
-    PredictorDeploymentManifest,
     PredictorEpochSummary,
     PredictorEvaluationTrace,
     PredictorExampleSpec,
-    PredictorMetricsSummary,
-    PredictorRuntimeSchema,
     PredictorTraceDataset,
     PredictorTraceExample,
     PredictorTrainingRunTrace,
 )
-from cfie_training.runtime.data import TokenizedDatasetBatchPlanner
+from cfie_training.runtime.data import (
+    PredictorBatchPlanner,
+    TokenizedDatasetBatchPlanner,
+)
 from cfie_training.runtime.types import BatchShape
 
 if TYPE_CHECKING:
     from cfie.v1.engine.llm_engine import LLMEngine
-
-
-class PredictorBatchPlanner(Protocol):
-    # 返回指定 step 使用的 batch 形状。
-    def batch_for_step(self, step_index: int) -> BatchShape:
-        ...
 
 
 class PredictorTeacherModelBackend(ABC):
@@ -1231,26 +1225,6 @@ class PredictorTrainer:
             num_experts=self.config.model_spec.num_experts,
         )
 
-    def build_runtime_schema(self) -> PredictorRuntimeSchema:
-        # 读取 routing 与 trainer 配置。
-        routing_cfg = self.config.predictor_routing
-        trainer_cfg = self.config.predictor_trainer
-        # 组装当前配置对应的 runtime schema。
-        return PredictorRuntimeSchema(
-            schema_kind="cfie_predictor_runtime_schema",
-            profile_name=self.config.profile_name,
-            input_summary_dim=self.config.model_spec.hidden_size,
-            predictor_hidden_dim=trainer_cfg.hidden_dim,
-            window_layers=routing_cfg.window_layers,
-            stride_layers=routing_cfg.stride_layers,
-            num_experts=self.config.model_spec.num_experts,
-            candidate_experts_per_layer=routing_cfg.candidate_experts_per_layer,
-            executed_experts_per_layer=routing_cfg.executed_experts_per_layer,
-            selection_mode=routing_cfg.selection_mode,
-            online_expert_source=routing_cfg.online_expert_source,
-            allow_candidate_mismatch=routing_cfg.allow_candidate_mismatch,
-        )
-
     @staticmethod
     # 从 checkpoint 文件读取原始载荷。
     def _read_checkpoint_payload(path: str | Path) -> dict[str, Any]:
@@ -1617,60 +1591,6 @@ class PredictorTrainer:
 
         # 返回完整训练续训所需的全部状态。
         return model, metadata, run_trace, optimizer_state_dict
-
-    @classmethod
-    def export_checkpoint_bundle(
-            cls,
-            *,
-            checkpoint_path: str | Path,
-            output_dir: str | Path,
-    ) -> PredictorDeploymentManifest:
-        # 先读取 checkpoint 原始载荷。
-        payload = cls._read_checkpoint_payload(checkpoint_path)
-        # 一次性解析 bundle 导出需要的权重和 metadata。
-        state_dict, metadata, _, _ = cls._checkpoint_components_from_payload(payload)
-        schema = PredictorRuntimeSchema.from_checkpoint_metadata(metadata)
-        metrics = PredictorMetricsSummary.from_checkpoint_metadata(metadata)
-
-        # 规范化 bundle 输出目录并预先创建。
-        bundle_dir = Path(output_dir)
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-
-        # 约定 bundle 内各文件名。
-        weights_path = bundle_dir / "predictor_weights.pt"
-        schema_path = bundle_dir / "predictor_schema.json"
-        metrics_path = bundle_dir / "predictor_metrics.json"
-        manifest_path = bundle_dir / "predictor_bundle.json"
-
-        # 写出权重文件。
-        torch.save(
-            {
-                "weights_kind": "cfie_predictor_weights",
-                "profile_name": metadata.profile_name,
-                "model_state_dict": state_dict,
-            },
-            weights_path,
-        )
-        # 写出 schema 和 metrics 文件。
-        schema.write_json(schema_path)
-        metrics.write_json(metrics_path)
-
-        # 组装 bundle manifest。
-        manifest = PredictorDeploymentManifest(
-            bundle_kind="cfie_predictor_deployment_bundle",
-            profile_name=metadata.profile_name,
-            source_checkpoint=Path(checkpoint_path).name,
-            weights_kind="cfie_predictor_weights",
-            weights_format="torch_state_dict",
-            weights_file=weights_path.name,
-            schema_kind=schema.schema_kind,
-            schema_file=schema_path.name,
-            metrics_kind=metrics.metrics_kind,
-            metrics_file=metrics_path.name,
-        )
-        # 写出 manifest 并返回。
-        manifest.write_json(manifest_path)
-        return manifest
 
     def build_trace_dataset(
             self,
