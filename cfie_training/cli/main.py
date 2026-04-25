@@ -55,11 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     # 创建子命令解析器容器，用于挂载不同功能模块对应的命令。
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # ------------------------------- 注册 predictor trace、训练、检查、评估与导出命令 -------------------------------
+    # ------------------------------- 注册 predictor trace、训练、检查与评估命令 -------------------------------
     # 注册 predictor 教师轨迹采样命令，用于构造 predictor 训练所需的教师轨迹样本。
     # ------------------------------- 注册 predictor 子命令族 -------------------------------
     #
-    # predictor-trace -> predictor-train -> predictor-eval -> predictor-export。
+    # predictor-trace -> predictor-train -> predictor-eval。
     # predictor-inspect 作为 checkpoint 元信息检查辅助命令。
     #
     # ------------------------------- 注册 predictor-trace 子命令 -------------------------------
@@ -246,12 +246,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional output path that receives the trained predictor checkpoint.",
     )
-    # 添加运行时 schema 输出路径参数，用于保存 predictor 运行时结构定义 JSON。
-    predictor_train_parser.add_argument(
-        "--schema-output",
-        type=Path,
-        help="Optional output path that receives the predictor runtime schema JSON.",
-    )
     # 添加训练轮数覆盖参数，用于覆盖默认训练 epoch 数。
     predictor_train_parser.add_argument(
         "--epochs",
@@ -272,12 +266,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Persist a predictor checkpoint every N epochs when a checkpoint path is available.",
-    )
-    # 添加最终 bundle 输出目录参数，用于在训练结束后自动导出部署包。
-    predictor_train_parser.add_argument(
-        "--bundle-output-dir",
-        type=Path,
-        help="Optional output directory used to export the final predictor deployment bundle.",
     )
     # 添加 JSON 输出开关，用于控制是否输出 predictor 训练过程轨迹。
     predictor_train_parser.add_argument(
@@ -396,33 +384,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Emit the predictor evaluation trace as JSON.",
-    )
-
-    # 注册 predictor bundle 导出命令，用于将 predictor checkpoint 导出为部署包。
-    # ------------------------------- 注册 predictor-export 子命令 -------------------------------
-    predictor_export_parser = subparsers.add_parser(
-        "predictor-export",
-        help="Export a predictor checkpoint as a deployment bundle.",
-    )
-    # 添加 checkpoint 路径参数，该参数必填，用于指定待导出的 predictor checkpoint。
-    predictor_export_parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        required=True,
-        help="Predictor checkpoint to export.",
-    )
-    # 添加输出目录参数，该参数必填，用于指定导出部署包的目标目录。
-    predictor_export_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="Output directory that receives the exported deployment bundle.",
-    )
-    # 添加 JSON 输出开关，用于控制是否输出 predictor 部署清单。
-    predictor_export_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit the predictor deployment manifest as JSON.",
     )
 
     # ------------------------------- 注册训练基座校验、模拟、启动估算与训练命令 -------------------------------
@@ -780,15 +741,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("predictor-train --log-every-steps must be >= 0")
         if args.checkpoint_every_epochs < 1:
             parser.error("predictor-train --checkpoint-every-epochs must be >= 1")
-        if (
-                args.bundle_output_dir is not None
-                and args.checkpoint_output is None
-                and args.resume_checkpoint is None
-        ):
-            parser.error(
-                "predictor-train --bundle-output-dir requires "
-                "--checkpoint-output or --resume-checkpoint"
-            )
 
     # ------------------------------- 处理独立于通用配置加载的 predictor checkpoint 检查命令 -------------------------------
     # 当命令为 predictor-inspect 时，直接读取 checkpoint 元信息，而不走通用配置加载流程。
@@ -824,39 +776,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"final_loss={metadata.final_mean_loss:.6f} "
                 f"recall@candidate={metadata.final_recall_at_candidate_budget:.4f}"
             )
-
-        # 当前命令执行成功，返回 0。
-        return 0
-
-    # ------------------------------- 处理独立于通用配置加载的 predictor 导出命令 -------------------------------
-    # 当命令为 predictor-export 时，直接执行 checkpoint 导出逻辑，而不走通用配置加载流程。
-    if args.command == "predictor-export":
-        # predictor-export 的摘要信息统一走标准日志。
-        logger = LOGGER.getChild("predictor.export")
-        # 将指定 checkpoint 导出为部署 bundle，并返回导出清单。
-        manifest = PredictorTrainer.export_checkpoint_bundle(
-            checkpoint_path=args.checkpoint,
-            output_dir=args.output_dir,
-        )
-
-        # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出导出结果。
-        if args.json:
-            # 输出部署清单的 JSON 表示。
-            _emit_stdout(manifest.to_json())
-        else:
-            # 输出导出成功信息与对应 profile 名称。
-            logger.info(
-                f"Exported predictor deployment bundle for profile "
-                f"{manifest.profile_name}."
-            )
-            # 输出 bundle 中各关键文件的路径与来源信息。
-            logger.info(
-                f"weights={manifest.weights_file} "
-                f"schema={manifest.schema_file} "
-                f"metrics={manifest.metrics_file}"
-            )
-            # 输出最终导出的 bundle 目录。
-            logger.info("bundle_dir=%s", args.output_dir)
 
         # 当前命令执行成功，返回 0。
         return 0
@@ -980,28 +899,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             checkpoint_every_epochs=args.checkpoint_every_epochs,
         )
 
-        # ------------------------------- 按需导出训练后的 runtime schema 与最终部署 bundle -------------------------------
+        # ------------------------------- 记录训练后的最终 checkpoint -------------------------------
         # 若本次训练可落盘 checkpoint，则显式记录最终可续训 checkpoint 路径。
         if checkpoint_save_path is not None:
             logger.info("predictor_train_final_checkpoint=%s", checkpoint_save_path)
-
-        # 当用户指定 schema 输出路径时，导出运行时 schema。
-        if args.schema_output is not None:
-            # 基于训练轨迹中的来源信息构造运行时 schema，并写入目标文件。
-            trainer.build_runtime_schema().write_json(args.schema_output)
-            logger.info("predictor_train_schema_written=%s", args.schema_output)
-
-        # 当用户指定 bundle 输出目录时，基于最终落盘 checkpoint 自动构建部署包。
-        if args.bundle_output_dir is not None and checkpoint_save_path is not None:
-            manifest = PredictorTrainer.export_checkpoint_bundle(
-                checkpoint_path=checkpoint_save_path,
-                output_dir=args.bundle_output_dir,
-            )
-            logger.info(
-                "predictor_train_bundle_written profile=%s bundle_dir=%s",
-                manifest.profile_name,
-                args.bundle_output_dir,
-            )
 
         # ------------------------------- 输出 predictor 训练结果 -------------------------------
         # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出训练结果。
@@ -1023,10 +924,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if checkpoint_save_path is not None:
                 logger.info("saved_checkpoint=%s", checkpoint_save_path)
-            if args.schema_output is not None:
-                logger.info("saved_schema=%s", args.schema_output)
-            if args.bundle_output_dir is not None:
-                logger.info("saved_bundle_dir=%s", args.bundle_output_dir)
 
         # 当前命令执行成功，返回 0。
         return 0

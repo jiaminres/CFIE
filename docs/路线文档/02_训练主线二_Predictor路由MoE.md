@@ -119,18 +119,16 @@ flowchart LR
 
 因此，普通 `chat` / `generate` 链路默认不应受到 predictor 训练代码影响。
 
-## 7. 四个 CLI 的工程顺序
+## 7. 三个 CLI 的工程顺序
 
-当前 Predictor 训练/导出流程建议按下面顺序执行：
+当前 Predictor 训练流程建议按下面顺序执行：
 
 1. `predictor-trace`
    - 作用：从真实 dataset + 真实 teacher 前向采集训练样本
 2. `predictor-train`
-   - 作用：训练 predictor，并输出 checkpoint / schema
+   - 作用：训练 predictor，并输出 checkpoint
 3. `predictor-eval`
    - 作用：在 trace 数据上验证 loss 与 recall
-4. `predictor-export`
-   - 作用：把 checkpoint 导出成推理侧可消费的 bundle
 
 ## 8. 当前验收口径
 

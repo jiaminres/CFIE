@@ -22,7 +22,7 @@
 
 ## 4. 最小可跑通参数
 
-这组参数已经实测可跑通 `predictor-trace / predictor-train / predictor-eval / predictor-export`：
+这组参数已经实测可跑通 `predictor-trace / predictor-train / predictor-eval`：
 
 - `--profile qwen35-122b-a10b`
 - `--steps 1`
@@ -76,7 +76,6 @@ py -V:Astral/CPython3.12.13 -m cfie_training.cli.main predictor-train `
   --dataset C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\dataset.txt `
   --epochs 1 `
   --checkpoint-output C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\predictor_122b_direct.ckpt `
-  --schema-output C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\predictor_122b_direct.schema.json `
   --json
 ```
 
@@ -89,15 +88,12 @@ py -V:Astral/CPython3.12.13 -m cfie_training.cli.main predictor-train `
   --trace-input C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\trace_122b.json `
   --epochs 1 `
   --checkpoint-output C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\predictor_122b.ckpt `
-  --schema-output C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\predictor_122b.schema.json `
   --json
 ```
 
 - 产物：
   - `C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\predictor_122b_direct.ckpt`
-  - `C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\predictor_122b_direct.schema.json`
   - `C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\predictor_122b.ckpt`
-  - `C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\predictor_122b.schema.json`
 - 结果摘要：
   - `epochs = 1`
   - `example_count = 1`
@@ -140,30 +136,9 @@ py -V:Astral/CPython3.12.13 -m cfie_training.cli.main predictor-eval `
   - `recall_at_candidate_budget = 0.171875`
   - `recall_at_executed_budget = 0.0625`
 
-### 5.4 predictor-export
-
-- 状态：通过
-- 命令：
-
-```powershell
-$env:PYTHONPATH='C:\Users\13642\PycharmProjects\vllm\.venv\Lib\site-packages;C:\Users\13642\PycharmProjects\vllm\CFIE'
-py -V:Astral/CPython3.12.13 -m cfie_training.cli.main predictor-export `
-  --checkpoint C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\predictor_122b.ckpt `
-  --output-dir C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\export_bundle `
-  --json
-```
-
-- 导出目录：
-  - `C:\Users\13642\PycharmProjects\vllm\CFIE\.tmp\predictor_122b_smoke\export_bundle`
-- 导出内容：
-  - `predictor_bundle.json`
-  - `predictor_metrics.json`
-  - `predictor_schema.json`
-  - `predictor_weights.pt`
-
 ## 6. 运行观察
 
-- 本机单命令串行执行时，上述四条命令均可跑通。
+- 本机单命令串行执行时，上述三条命令均可跑通。
 - `predictor-trace / predictor-train(直接采样) / predictor-eval(直接采样)` 都会真实加载 122B teacher，因此耗时主要集中在模型加载。
 - `predictor-train --trace-input ...` 与 `predictor-eval --trace-input ...` 明显更快，适合回归测试。
 - 日志中会看到：

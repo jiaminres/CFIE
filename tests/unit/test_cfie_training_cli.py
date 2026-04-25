@@ -361,7 +361,7 @@ def test_predictor_train_command_accepts_trace_input(
     assert payload["epochs"] == 1
 
 
-def test_predictor_train_command_writes_checkpoint_and_schema(
+def test_predictor_train_command_writes_checkpoint_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -369,7 +369,6 @@ def test_predictor_train_command_writes_checkpoint_and_schema(
     _install_fake_predictor_runtime(monkeypatch)
     dataset_path = _write_text_dataset(tmp_path, "predictor-checkpoint.txt")
     checkpoint_path = tmp_path / "predictor.ckpt"
-    schema_path = tmp_path / "predictor_schema.json"
 
     code = main([
         "predictor-train",
@@ -383,77 +382,24 @@ def test_predictor_train_command_writes_checkpoint_and_schema(
         str(dataset_path),
         "--checkpoint-output",
         str(checkpoint_path),
-        "--schema-output",
-        str(schema_path),
         "--json",
     ])
 
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert checkpoint_path.exists()
-    assert schema_path.exists()
+    assert payload["epochs"] == 1
 
     trainer = PredictorTrainer(build_profile_config("qwen35-35b-a3b"))
     _, metadata = trainer.load_checkpoint(checkpoint_path)
     checkpoint_payload = torch.load(checkpoint_path, map_location="cpu")
-    schema_payload = json.loads(schema_path.read_text(encoding="utf-8"))
 
     assert metadata.checkpoint_kind == "cfie_predictor_checkpoint"
     assert metadata.epochs == 1
     assert isinstance(checkpoint_payload["optimizer_state_dict"], dict)
     assert checkpoint_payload["run_trace"]["epochs"] == 1
-    assert schema_payload["schema_kind"] == "cfie_predictor_runtime_schema"
-    assert schema_payload["window_layers"] == 8
-    assert schema_payload["candidate_experts_per_layer"] == 40
-
-
-def test_predictor_train_command_exports_final_bundle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _install_fake_predictor_runtime(monkeypatch)
-    dataset_path = _write_text_dataset(tmp_path, "predictor-final-bundle.txt")
-    checkpoint_path = tmp_path / "predictor.ckpt"
-    bundle_dir = tmp_path / "bundle"
-
-    code = main([
-        "predictor-train",
-        "--steps",
-        "1",
-        "--examples-per-step",
-        "1",
-        "--epochs",
-        "2",
-        "--dataset",
-        str(dataset_path),
-        "--checkpoint-output",
-        str(checkpoint_path),
-        "--checkpoint-every-epochs",
-        "5",
-        "--bundle-output-dir",
-        str(bundle_dir),
-        "--json",
-    ])
-
-    assert code == 0
-    payload = json.loads(capsys.readouterr().out)
-    manifest_path = bundle_dir / "predictor_bundle.json"
-    metrics_path = bundle_dir / "predictor_metrics.json"
-    weights_path = bundle_dir / "predictor_weights.pt"
-
-    assert checkpoint_path.exists()
-    assert manifest_path.exists()
-    assert metrics_path.exists()
-    assert weights_path.exists()
-
-    checkpoint_payload = torch.load(checkpoint_path, map_location="cpu")
-    metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-
-    assert payload["epochs"] == 2
-    assert checkpoint_payload["run_trace"]["epochs"] == 2
-    assert metrics_payload["epochs"] == 2
-    assert metrics_payload["final_mean_loss"] == payload["final_mean_loss"]
+    assert checkpoint_payload["metadata"]["window_layers"] == 8
+    assert checkpoint_payload["metadata"]["candidate_experts_per_layer"] == 40
 
 
 def test_predictor_train_command_accepts_resume_checkpoint(
@@ -658,75 +604,6 @@ def test_predictor_eval_command_emits_json_metrics(
     assert 0.0 <= payload["recall_at_candidate_budget"] <= 1.0
     assert 0.0 <= payload["recall_at_executed_budget"] <= 1.0
     assert payload["checkpoint_metadata"]["checkpoint_kind"] == "cfie_predictor_checkpoint"
-
-
-def test_predictor_export_command_writes_deployment_bundle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _install_fake_predictor_runtime(monkeypatch)
-    dataset_path = _write_text_dataset(tmp_path, "predictor-export.txt")
-    checkpoint_path = tmp_path / "predictor.ckpt"
-    bundle_dir = tmp_path / "bundle"
-
-    train_code = main([
-        "predictor-train",
-        "--steps",
-        "1",
-        "--examples-per-step",
-        "1",
-        "--epochs",
-        "1",
-        "--dataset",
-        str(dataset_path),
-        "--checkpoint-output",
-        str(checkpoint_path),
-        "--json",
-    ])
-
-    assert train_code == 0
-    capsys.readouterr()
-
-    code = main([
-        "predictor-export",
-        "--checkpoint",
-        str(checkpoint_path),
-        "--output-dir",
-        str(bundle_dir),
-        "--json",
-    ])
-
-    assert code == 0
-    payload = json.loads(capsys.readouterr().out)
-    manifest_path = bundle_dir / "predictor_bundle.json"
-    schema_path = bundle_dir / "predictor_schema.json"
-    metrics_path = bundle_dir / "predictor_metrics.json"
-    weights_path = bundle_dir / "predictor_weights.pt"
-
-    assert manifest_path.exists()
-    assert schema_path.exists()
-    assert metrics_path.exists()
-    assert weights_path.exists()
-    assert payload == json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert payload["bundle_kind"] == "cfie_predictor_deployment_bundle"
-    assert payload["profile_name"] == "qwen35-35b-a3b"
-    assert payload["weights_file"] == "predictor_weights.pt"
-    assert payload["schema_file"] == "predictor_schema.json"
-    assert payload["metrics_file"] == "predictor_metrics.json"
-
-    schema_payload = json.loads(schema_path.read_text(encoding="utf-8"))
-    metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-    weights_payload = torch.load(weights_path, map_location="cpu")
-
-    assert schema_payload["schema_kind"] == "cfie_predictor_runtime_schema"
-    assert schema_payload["window_layers"] == 8
-    assert schema_payload["candidate_experts_per_layer"] == 40
-    assert metrics_payload["metrics_kind"] == "cfie_predictor_metrics_summary"
-    assert metrics_payload["epochs"] == 1
-    assert 0.0 <= metrics_payload["final_recall_at_candidate_budget"] <= 1.0
-    assert weights_payload["weights_kind"] == "cfie_predictor_weights"
-    assert isinstance(weights_payload["model_state_dict"], dict)
 
 
 def test_predictor_train_command_accepts_dataset_backed_batches(

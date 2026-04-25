@@ -49,9 +49,8 @@ dataset
   -> hidden_state + routed_experts top-k
   -> PredictorTraceDataset
   -> predictor-train
-  -> checkpoint / schema
+  -> checkpoint
   -> predictor-eval
-  -> predictor-export
 ```
 
 ### 4.2 当前隔离事实
