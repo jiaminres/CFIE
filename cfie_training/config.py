@@ -24,6 +24,7 @@ QuantizedComputeViewDType = Literal["fp16", "fp32"]
 ShardMaterializationMode = Literal["representative", "logical"]
 LogicalCudaExecutionMode = Literal["compact_layer", "full_bucket"]
 TeacherOutputKind = Literal["final_only", "cumulative", "delta"]
+TeacherEngineOffloadBackend = Literal["auto", "uva", "prefetch"]
 
 
 # 校验字符串字段不能为空。
@@ -348,6 +349,32 @@ class TeacherSamplingConfig:
         return self
 
     # dataclass 初始化后立即校验 teacher 采样配置。
+    def __post_init__(self) -> None:
+        self.validate()
+
+
+@dataclass(slots=True)
+class PredictorTeacherEngineConfig:
+    gpu_memory_utilization: float = 0.6
+    offload_backend: TeacherEngineOffloadBackend = "auto"
+    cpu_offload_gb: float = 0.0
+    moe_cpu_budget_gb: float = 0.0
+    moe_cpu_min_free_gb: float = 0.0
+
+    def validate(self) -> "PredictorTeacherEngineConfig":
+        if not 0.0 < self.gpu_memory_utilization < 1.0:
+            raise ValueError("gpu_memory_utilization must be in (0, 1)")
+        _require_non_negative_float("cpu_offload_gb", self.cpu_offload_gb)
+        _require_non_negative_float(
+            "moe_cpu_budget_gb",
+            self.moe_cpu_budget_gb,
+        )
+        _require_non_negative_float(
+            "moe_cpu_min_free_gb",
+            self.moe_cpu_min_free_gb,
+        )
+        return self
+
     def __post_init__(self) -> None:
         self.validate()
 
@@ -698,6 +725,9 @@ class TrainingProjectConfig:
     teacher_sampling: TeacherSamplingConfig = field(
         default_factory=TeacherSamplingConfig
     )
+    teacher_engine: PredictorTeacherEngineConfig = field(
+        default_factory=PredictorTeacherEngineConfig
+    )
 
     # ------------------------------- 显存预算与状态字节配置 -------------------------------
     # 分层内存预算配置，定义 GPU-hot/CPU-hot/NVMe-cold 各层可用容量。
@@ -731,6 +761,7 @@ class TrainingProjectConfig:
         self.predictor_routing.validate()
         self.predictor_trainer.validate()
         self.teacher_sampling.validate()
+        self.teacher_engine.validate()
         self.memory_budget.validate()
         self.state_bytes.validate()
 
@@ -820,6 +851,10 @@ class TrainingProjectConfig:
             )
         predictor_routing = PredictorRoutingConfig(**data.pop("predictor_routing", {}))
         predictor_trainer = PredictorTrainerConfig(**data.pop("predictor_trainer", {}))
+        teacher_sampling = TeacherSamplingConfig(**data.pop("teacher_sampling", {}))
+        teacher_engine = PredictorTeacherEngineConfig(
+            **data.pop("teacher_engine", {})
+        )
         memory_budget = MemoryBudgetConfig(**data.pop("memory_budget", {}))
         state_bytes = StateBytesConfig(**data.pop("state_bytes", {}))
         notes_raw = data.pop("notes", None)
@@ -841,6 +876,8 @@ class TrainingProjectConfig:
             runtime_quantization=runtime_quantization,
             predictor_routing=predictor_routing,
             predictor_trainer=predictor_trainer,
+            teacher_sampling=teacher_sampling,
+            teacher_engine=teacher_engine,
             memory_budget=memory_budget,
             state_bytes=state_bytes,
             **kwargs,

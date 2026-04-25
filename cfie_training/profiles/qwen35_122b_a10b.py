@@ -14,6 +14,7 @@ from cfie_training.config import (
     ResourcePolicyConfig,
     RuntimeQuantizationConfig,
     StateBytesConfig,
+    PredictorTeacherEngineConfig,
     TransportConfig,
     TrainingProjectConfig,
 )
@@ -129,6 +130,9 @@ def build_qwen35_122b_a10b_config() -> TrainingProjectConfig:
             weight_decay=1e-4,
             examples_per_step=4,
             seed=0,
+        ),
+        teacher_engine=PredictorTeacherEngineConfig(
+            gpu_memory_utilization=0.55,
         ),
         memory_budget=MemoryBudgetConfig(
             gpu_hot_budget_gb=10.0,

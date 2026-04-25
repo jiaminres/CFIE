@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -40,12 +41,13 @@ class PredictorBatchPlanner(Protocol):
         ...
 
 
-class PredictorTeacherModelBackend(Protocol):
+class PredictorTeacherModelBackend(ABC):
+    @abstractmethod
     def capture_batch(self, batch: BatchShape) -> CapturedForwardBatch:
-        ...
+        raise NotImplementedError
 
 
-class EngineRouterTeacherModelBackend:
+class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
     """复用推理引擎执行真实前向的 predictor teacher 后端。
 
     该后端不直接走 `AutoModelForCausalLM.from_pretrained`，而是复用 CFIE
@@ -141,60 +143,21 @@ class EngineRouterTeacherModelBackend:
 
     # ------------------------------- 推导 teacher 引擎显存占用比例 -------------------------------
     def _resolve_gpu_memory_utilization(self) -> float:
-        # 若当前环境没有 CUDA，则返回一个保守默认值；
-        # 这样即使在离线检查或 CPU 环境下也能顺利构造对象。
-        if not torch.cuda.is_available():
-            return 0.6
-
-        # 读取首张卡的总显存容量，用来把绝对预算换算成引擎接受的比例值。
-        total_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        if total_gib <= 0:
-            # 理论上这里不应出现非正显存；若驱动返回异常值，则回退到保守默认值。
-            return 0.6
-
-        # 用训练侧 GPU hot budget 对整卡显存做归一化，得到目标占用比例。
-        ratio = self._config.memory_budget.gpu_hot_budget_gb / total_gib
-        # 最终再做区间夹紧，避免比例过低导致引擎几乎无法工作，
-        # 也避免比例过高把训练进程的其他预算吃掉。
-        return max(0.35, min(0.85, ratio))
+        return float(self._config.teacher_engine.gpu_memory_utilization)
 
     # ------------------------------- 推导 teacher 引擎通用 CPU offload 预算 -------------------------------
     def _resolve_cpu_offload_gb(self) -> float:
-        # `cpu_offload_gb` 走的是通用 UVA CPU offload 通道，
-        # 而不是 MoE tiered cache 的 CPU/NVMe 专家缓存主链。
-        #
-        # 当前客户端侧 UVA 路径尚未完成适配，因此训练 teacher 默认不启用这条通道。
-        # 只有当资源策略明确声明为纯 `cpu` 时，才把 CPU 热存预算映射成 UVA 空间；
-        # 对 `cpu+nvme` / `nvme` 等档位，这里一律返回 0，让 teacher 仅依赖
-        # `moe_tiered_cache` 自己的 CPU 预算与 planner。
-        if self._config.resource_policy.weight_offload_backend != "cpu":
-            return 0.0
+        return float(self._config.teacher_engine.cpu_offload_gb)
 
-        # 纯 CPU offload 场景下，teacher 只能消费“预算减去安全余量”后的 CPU 热存空间，
-        # 否则训练侧很容易把预留给系统与其他组件的缓冲区也占满。
-        available_cpu_budget = (
-                self._config.memory_budget.cpu_hot_budget_gb
-                - self._config.memory_budget.cpu_safety_margin_gb
-        )
-        # 即使配置不合理导致预算为负，也在这里钳成 0，避免把非法值传进引擎。
-        return max(0.0, available_cpu_budget)
+    def _resolve_moe_cpu_budget_gb(self) -> float:
+        return float(self._config.teacher_engine.moe_cpu_budget_gb)
 
-    # ------------------------------- 将训练侧卸载策略映射成引擎后端 -------------------------------
+    def _resolve_moe_cpu_min_free_gb(self) -> float:
+        return float(self._config.teacher_engine.moe_cpu_min_free_gb)
+
+    # ------------------------------- 读取 teacher engine 卸载后端 -------------------------------
     def _resolve_engine_offload_backend(self) -> str:
-        # 训练配置里的 `weight_offload_backend` 是项目层面的资源策略，
-        # 但推理引擎只接受自己定义的一组后端枚举，因此这里要做一次语义映射。
-        backend = self._config.resource_policy.weight_offload_backend
-
-        # 纯 CPU 卸载最接近引擎里的 UVA 路线；
-        # 仅当训练档位显式声明纯 CPU 策略时，teacher 才走这条通用 UVA 路线。
-        if backend == "cpu":
-            return "uva"
-
-        # 对 `nvme` 与 `cpu+nvme` 则统一交给 `auto`。
-        # 由于 `_resolve_cpu_offload_gb` 在这些档位会返回 0，
-        # 因此这里不会默认落到通用 UVA/prefetch，而是把 CPU/NVMe 预算留给
-        # MoE tiered cache planner 与运行时 expert cache 主链使用。
-        return "auto"
+        return self._config.teacher_engine.offload_backend
 
     # ------------------------------- 构造训练 teacher 专用 additional_config -------------------------------
     def _resolve_engine_additional_config(self) -> dict[str, Any]:
@@ -297,7 +260,8 @@ class EngineRouterTeacherModelBackend:
         )
         gpu_memory_utilization = self._gpu_memory_utilization
         offload_backend = self._resolve_engine_offload_backend()
-        memory_budget = self._config.memory_budget
+        moe_cpu_budget_gb = self._resolve_moe_cpu_budget_gb()
+        moe_cpu_min_free_gb = self._resolve_moe_cpu_min_free_gb()
         cpu_offload_gb = self._resolve_cpu_offload_gb()
         additional_config = self._resolve_engine_additional_config()
 
@@ -320,9 +284,8 @@ class EngineRouterTeacherModelBackend:
             gpu_memory_utilization=gpu_memory_utilization,
             # 把训练项目层面的卸载策略翻译成引擎能识别的后端枚举。
             offload_backend=offload_backend,
-            # CPU 相关预算继续沿用训练配置，避免 teacher 启动绕开整体资源规划。
-            moe_cpu_budget_gb=memory_budget.cpu_hot_budget_gb,
-            moe_cpu_min_free_gb=memory_budget.cpu_safety_margin_gb,
+            moe_cpu_budget_gb=moe_cpu_budget_gb,
+            moe_cpu_min_free_gb=moe_cpu_min_free_gb,
             cpu_offload_gb=cpu_offload_gb,
             # predictor 训练必须把最终 routed experts 带回来，作为 teacher top-k 标签。
             enable_return_routed_experts=True,
@@ -354,27 +317,30 @@ class EngineRouterTeacherModelBackend:
     # ------------------------------- 关闭 teacher 引擎 -------------------------------
     def _shutdown_engine(self) -> None:
         # 没有已启动引擎时无需收尾，直接返回即可。
-        if self._engine is None:
+        engine = getattr(self, "_engine", None)
+        if engine is None:
             return
 
         # 先尝试通知 worker 关闭 predictor capture，
         # 避免遗留的捕获状态影响后续重建或析构。
         try:
-            self._engine.collective_rpc("disable_predictor_capture")
+            engine.collective_rpc("disable_predictor_capture")
         except Exception:
             # 析构链路以“尽最大努力回收”为主，收尾失败不再二次抛异常。
             pass
 
         # 再关闭 engine core，释放底层调度器、worker 与相关资源。
         try:
-            self._engine.engine_core.shutdown()
+            engine.engine_core.shutdown()
         except Exception:
             pass
 
         # 最后把本地句柄与容量记录清空，表示当前没有可复用的 teacher 引擎。
         self._engine = None
         self._engine_capacity = None
-        self._capture_fragments_by_request.clear()
+        capture_fragments = getattr(self, "_capture_fragments_by_request", None)
+        if capture_fragments is not None:
+            capture_fragments.clear()
 
     # ------------------------------- 归一化 worker 返回的捕获载荷 -------------------------------
     @staticmethod

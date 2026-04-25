@@ -220,21 +220,50 @@ def test_expert_rotation_scheduler_supports_sample_and_token_budgets() -> None:
     ) == (8, 9, 10, 11, 12, 13, 14, 15)
 
 
-def test_predictor_teacher_backend_maps_training_offload_policy() -> None:
+def test_predictor_teacher_backend_uses_dedicated_teacher_engine_config() -> None:
     cfg = build_profile_config("qwen35-35b-a3b")
     backend = EngineRouterTeacherModelBackend.create(cfg)
 
     assert backend._resolve_engine_offload_backend() == "auto"
     assert backend._resolve_cpu_offload_gb() == 0.0
+    assert backend._resolve_moe_cpu_budget_gb() == 0.0
+    assert backend._resolve_moe_cpu_min_free_gb() == 0.0
+    assert backend._resolve_gpu_memory_utilization() == pytest.approx(0.6)
     assert backend._resolve_engine_additional_config() == {}
 
     cfg.resource_policy.weight_offload_backend = "cpu"
+    cfg.memory_budget.gpu_hot_budget_gb = 1.0
+    cfg.memory_budget.cpu_hot_budget_gb = 1.0
     backend = EngineRouterTeacherModelBackend.create(cfg)
 
+    assert backend._resolve_engine_offload_backend() == "auto"
+    assert backend._resolve_cpu_offload_gb() == 0.0
+    assert backend._resolve_moe_cpu_budget_gb() == 0.0
+    assert backend._resolve_moe_cpu_min_free_gb() == 0.0
+    assert backend._resolve_gpu_memory_utilization() == pytest.approx(0.6)
+
+
+def test_predictor_teacher_backend_allows_profile_gpu_util_override() -> None:
+    cfg = build_profile_config("qwen35-122b-a10b")
+    backend = EngineRouterTeacherModelBackend.create(cfg)
+
+    assert backend._resolve_gpu_memory_utilization() == pytest.approx(0.55)
+
+
+def test_predictor_teacher_backend_allows_explicit_teacher_engine_overrides() -> None:
+    cfg = build_profile_config("qwen35-35b-a3b")
+    cfg.teacher_engine.gpu_memory_utilization = 0.7
+    cfg.teacher_engine.offload_backend = "uva"
+    cfg.teacher_engine.cpu_offload_gb = 12.0
+    cfg.teacher_engine.moe_cpu_budget_gb = 24.0
+    cfg.teacher_engine.moe_cpu_min_free_gb = 6.0
+    backend = EngineRouterTeacherModelBackend.create(cfg)
+
+    assert backend._resolve_gpu_memory_utilization() == pytest.approx(0.7)
     assert backend._resolve_engine_offload_backend() == "uva"
-    assert backend._resolve_cpu_offload_gb() == pytest.approx(
-        cfg.memory_budget.cpu_hot_budget_gb - cfg.memory_budget.cpu_safety_margin_gb
-    )
+    assert backend._resolve_cpu_offload_gb() == pytest.approx(12.0)
+    assert backend._resolve_moe_cpu_budget_gb() == pytest.approx(24.0)
+    assert backend._resolve_moe_cpu_min_free_gb() == pytest.approx(6.0)
 
 
 def test_expert_rotation_scheduler_blends_next_step_prefetch_with_overlap(

@@ -1606,7 +1606,10 @@ class LayerTieredExpertCacheController:
         # ------------------------------- 读取当前 bundle 的张量字典并预计算 w13 合并布局参数 -------------------------------
         # 取出当前 expert bundle 中保存的张量字典，后续按字段名逐个拼装。
         tensors = bundle.tensors
-
+        """
+        qweight 的 pack方向为行
+        qzero 的 pack方向为列 
+        """
         # 计算合并后 w13 的总列数，对应 gate_proj 与 up_proj 两半拼接后的总宽度。
         w13_cols = 2 * self.layer.intermediate_size_per_partition
 

@@ -222,6 +222,8 @@ python -m cfie.cli.main native-generate --model <模型路径> --prompt "你好"
 
 构造 predictor 教师轨迹：
 
+Linux/macOS：
+
 ```bash
 python -m cfie_training.cli.main predictor-trace \
   --profile qwen35-122b-a10b \
@@ -234,7 +236,23 @@ python -m cfie_training.cli.main predictor-trace \
   --json
 ```
 
+Windows PowerShell：
+
+```powershell
+python -m cfie_training.cli.main predictor-trace `
+  --profile qwen35-122b-a10b `
+  --steps 1 `
+  --examples-per-step 1 `
+  --samples 1 `
+  --tokens-per-sample 8 `
+  --dataset <数据集路径> `
+  --output <trace.json> `
+  --json
+```
+
 训练 predictor：
+
+Linux/macOS：
 
 ```bash
 python -m cfie_training.cli.main predictor-train \
@@ -246,7 +264,21 @@ python -m cfie_training.cli.main predictor-train \
   --json
 ```
 
+Windows PowerShell：
+
+```powershell
+python -m cfie_training.cli.main predictor-train `
+  --profile qwen35-122b-a10b `
+  --trace-input <trace.json> `
+  --epochs 1 `
+  --checkpoint-output <predictor.ckpt> `
+  --schema-output <predictor.schema.json> `
+  --json
+```
+
 评估 predictor：
+
+Linux/macOS：
 
 ```bash
 python -m cfie_training.cli.main predictor-eval \
@@ -256,12 +288,33 @@ python -m cfie_training.cli.main predictor-eval \
   --json
 ```
 
+Windows PowerShell：
+
+```powershell
+python -m cfie_training.cli.main predictor-eval `
+  --profile qwen35-122b-a10b `
+  --checkpoint <predictor.ckpt> `
+  --trace-input <trace.json> `
+  --json
+```
+
 导出部署 bundle：
+
+Linux/macOS：
 
 ```bash
 python -m cfie_training.cli.main predictor-export \
   --checkpoint <predictor.ckpt> \
   --output-dir <bundle_dir> \
+  --json
+```
+
+Windows PowerShell：
+
+```powershell
+python -m cfie_training.cli.main predictor-export `
+  --checkpoint <predictor.ckpt> `
+  --output-dir <bundle_dir> `
   --json
 ```
 
