@@ -1286,90 +1286,100 @@ class FusedMoE(CustomOp):
             self,
             param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
-            weight_name: str,
+            weight_name: str, # param_key
             shard_id: str,
             expert_id: int,
             return_success: bool = False,
     ) -> bool | None:
-        # -----------------
-        # 入口：统一装载一个 expert shard。
-        # -----------------
-        # 这是 FusedMoE 的统一权重装载入口：
-        # 先把全局 expert id 映射到本地 slot，再根据量化格式和 shard 类型分派到细分 loader。
+        # ------------------------------- 处理 MXFP4 特例直拷贝路径 -------------------------------
+        # MXFP4 某些检查点直接存 fused-expert 布局，这里按真实切片尺寸直接回写。
         if self.quant_config and self.quant_config.get_name() == "mxfp4":
-            # mxfp4 的某些 checkpoint 会把所有 experts 合在一起存，因此直接按实际 shape 拷贝。
-
+            # bias 分支：`loaded_weight` 形状通常为 `[E_ckpt, D]`，
+            # 写入 `param.data[:, :dim1]` 对应的局部窗口。
             if "bias" in weight_name:
+                # dim1 表示当前 checkpoint 里 bias 的列宽。
                 dim1 = loaded_weight.shape[1]
+                # 把 `[E_ckpt, D]` 拷贝到参数可见窗口 `[E_local, D_local]` 的前缀区域。
                 param.data[:, :dim1].copy_(loaded_weight)
             else:
+                # dim1/dim2 表示当前 checkpoint 里权重的二维矩阵窗口大小。
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
+                # 把 `[E_ckpt, D1, D2]` 拷贝到参数张量前缀区域 `[E_local, D1_local, D2_local]`。
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
+            # 调用方要求返回状态时返回 True；否则保持历史接口返回 None。
             return True if return_success else None
 
-        # -----------------
-        # 预处理：expert 映射与基础元数据。
-        # -----------------
+        # ------------------------------- 预计算量化上下文与 expert 映射 -------------------------------
+        # 记录当前量化方法类名，用于后续分支派发。
         quant_method_name = self.quant_method.__class__.__name__
+        # 先缓存原始全局 expert id，后续可能要用于全局 scale 回写。
         global_expert_id = expert_id
-        # 先把全局 expert id 映射成当前层“此刻”可用的本地物理 slot。
+        # 把全局 expert id 映射成当前层当前时刻可见的本地物理 slot。
         expert_id = self._map_global_expert_id_to_local_expert_id(global_expert_id)
 
-        # 某些量化格式的 input scale 是全局共享的，不受本地 expert 放置约束。
+        # 某些量化方法的 input_scale 以“全局 expert 维”存储，不依赖本地 slot 映射。
         use_global_sf = (
                 getattr(self.quant_method, "use_global_sf", False)
                 and "input_scale" in weight_name
-        )  # False
+        )
 
+        # 启动期 tiered-cache 只加载本地驻留 experts；
+        # 若当前 expert 未映射到本地 slot 且不是全局 scale 参数，则直接跳过。
         if expert_id == -1 and not use_global_sf:
-            # 这正是 CFIE tiered cache 启动期“只装初始 GPU experts”的关键逻辑：
-            # 未映射到 resident slot 的 expert 会在这里直接跳过，不会被加载进 GPU 权重张量。
             return False if return_success else None
-        # 从这里开始，expert_id 都表示“当前层本地物理 slot id”。
+        # 走到这里后，expert_id 语义即“当前层本地物理 slot id”。
 
-        # -----------------
-        # 特殊元数据分支：GGUF / BNB / 参数物化。
-        # -----------------
-        # 某些量化格式会把“应切分的维度”转置存储，因此这里要先识别出来。
-        is_transposed = getattr(param, "is_transposed", False)  # True
-
+        # ------------------------------- 处理压缩格式的转置布局 -------------------------------
+        # 某些压缩格式会把待切分维度以转置形式存储，装载前需恢复运行时视图。
+        is_transposed = getattr(param, "is_transposed", False)
         if quant_method_name in (
                 "CompressedTensorsWNA16MarlinMoEMethod",
                 "CompressedTensorsWNA16MoEMethod",
         ):
             if is_transposed:
-                # packed checkpoint 的布局和运行时参数布局相反时，先翻转再继续装载。
+                # `.t()` 仅适用于二维权重；这里转置后再 `contiguous()`，保证后续切片拷贝连续。
                 loaded_weight = loaded_weight.t().contiguous()
             else:
+                # 非转置布局保持原张量引用。
                 loaded_weight = loaded_weight
 
+        # ------------------------------- 校验 shard 与基础元数据 -------------------------------
+        # MoE gate/ffn 约定只支持 w1/w2/w3 三类 shard。
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
-        # shard_id 决定 TP 分片应该落在哪一维。
+        # shard_id -> TP 切分维度映射：
+        # - w1/w3 沿 dim0 切分；
+        # - w2 沿 dim1 切分。
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
 
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)  # False
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)  # False
+        # 标记当前参数是否来自 GGUF 权重通路。
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        # 标记当前参数是否是 GGUF 的“weight_type”元数据参数。
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if is_gguf_weight_type:
-            # GGUF 的权重类型元数据不是普通张量权重，直接记录类型和值即可。
+            # weight_type 走元数据回写，不参与普通矩阵切片与 TP 分片逻辑。
             param.weight_type = loaded_weight.item()
+            # 元数据参数直接整值复制。
             param.data.copy_(loaded_weight)
             return True if return_success else None
 
-        # BitsAndBytes 4bit 的 inflight quantization 已经提前做过分片，
-        # 这里不能再按 TP 规则二次切分。
-        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)  # False
+        # ------------------------------- 处理 BitsAndBytes 4bit 特殊路径 -------------------------------
+        # BnB 4bit inflight quantization 已提前完成分片，不能再按 TP 规则二次切分。
+        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
         if use_bitsandbytes_4bit:
+            # BnB 4bit 统一按 dim0 解释 shard 维。
             shard_dim = 0
 
+            # 取当前本地 expert 的参数视图，形状通常为 `[D_in_local, D_out_local]` 或其变体。
             expert_data = param.data[expert_id]
             if shard_id == "w2":
+                # w2 直接整块复制到本地 expert 视图。
                 expert_data.copy_(loaded_weight)
             elif shard_id in ("w1", "w3"):
+                # w1/w3 在运行时共享 w13 逻辑容器，这里按 full-load 路径交给 `_load_w13`。
                 full_load = True
-                # BNB 已经提前做过分片，因此这里禁止再按 TP 二次切分。
                 self._load_w13(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -1380,37 +1390,40 @@ class FusedMoE(CustomOp):
                 )
             return True if return_success else None
 
-        # 普通路径下，先确定真正要切的维度。
+        # ------------------------------- 推导普通路径的切分维度 -------------------------------
+        # 按 shard 类型取默认切分维度。
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if is_transposed:  # 默认
+        if is_transposed:
+            # 转置布局下切分维需要对调：0 <-> 1。
             shard_dim = int(not shard_dim)
 
-        # 3D 权重表示 checkpoint 已经把 expert 维合并到张量里，此时要按 full_load 处理。
-        full_load = len(loaded_weight.shape) == 3  # False
+        # 三维权重表示 checkpoint 已携带 expert 维，需按 full-load 处理整块参数。
+        full_load = len(loaded_weight.shape) == 3
         if full_load:
+            # 当 expert 维并入前缀后，原切分维右移一位。
             shard_dim += 1
 
-        # GGUF 某些参数在装载前还是未初始化状态；
-        # 这里要先按“合并专家 + 当前 TP 分片”的最终尺寸把参数物化出来。
+        # ------------------------------- 处理 GGUF 未初始化参数物化 -------------------------------
+        # GGUF 某些参数在此时还是 UninitializedParameter，需要先 materialize 成最终局部尺寸。
         if is_gguf_weight and isinstance(param, UninitializedParameter):
+            # GGUF 未初始化路径要求 checkpoint 提供 full-load 形状信息。
             assert full_load
+            # 基于 checkpoint 张量形状生成可修改的目标 shape。
             final_shape = list(loaded_weight.shape)
-            # w1 / w3 在运行时共享 w13 容器，因此 hidden_out 方向要乘 2。
+            # w1/w3 在运行时共用 w13 容器，因此 hidden_out 维需要扩到 2 倍。
             if shard_id in {"w1", "w3"}:
                 final_shape[1] *= 2
-            # 最终参数 shape 要按本 TP rank 的切分后尺寸 materialize。
+            # 按 TP 大小把切分维裁成当前 rank 的局部尺寸。
             final_shape[shard_dim] = final_shape[shard_dim] // self.tp_size
+            # 以 checkpoint dtype 物化参数存储，确保后续 copy_ 类型一致。
             param.materialize(final_shape, dtype=loaded_weight.dtype)
 
-        # full_load 时直接操作整块参数；否则只拿当前本地 expert 的那一片视图。
+        # full-load 时直接操作整块参数；否则仅操作本地 expert 视图。
         expert_data = param.data if full_load else param.data[expert_id]
 
-        # -----------------
-        # 特殊参数分支：input_scale / g_idx。
-        # -----------------
-        # input_scale 当前只走这条专门分支处理。
+        # ------------------------------- 处理 input_scale 标量参数 -------------------------------
         if "input_scale" in weight_name:
-            # 输入 scale 需要先和参数所在设备对齐。
+            # input_scale 是标量参数，先对齐到参数设备避免跨设备比较/回写异常。
             loaded_weight = loaded_weight.to(param.data.device)
 
             if (
@@ -1418,14 +1431,14 @@ class FusedMoE(CustomOp):
                     and param.data[expert_id] != 1
                     and (param.data[expert_id] - loaded_weight).abs() > 1e-5
             ):
-                # w1 / w3 共用输入 scale，不允许同一 expert 的两个值不一致。
+                # w1/w3 共用输入 scale；若同一 expert 两条路径不一致则立即失败。
                 raise ValueError(
                     "input_scales of w1 and w3 of a layer "
                     f"must be equal. But got {param.data[expert_id]} "
                     f"vs. {loaded_weight}"
                 )
 
-            # 某些格式要求按全局 expert 写入 shared scale，其余则按本地 expert 写入。
+            # 全局共享 scale 用全局 expert id 回写；否则用本地 slot id 回写。
             self._load_single_value(
                 param=param,
                 loaded_weight=loaded_weight,
@@ -1433,14 +1446,9 @@ class FusedMoE(CustomOp):
             )
             return True if return_success else None
 
-        # g_idx 走索引元数据专用分支。
+        # ------------------------------- 处理 g_idx 量化索引元数据 -------------------------------
         if "g_idx" in weight_name:
-            # g_idx 不属于普通权重矩阵，单独走索引装载逻辑。
-            # 当前 GPTQ Marlin 常见配置下，g_idx 通常表现为“按 group_size 分块递增”的
-            # 一维 int32 索引。例如 hidden_size=3072、group_size=128 时，
-            # w13_g_idx 往往就是长度 3072、取值分成 24 组的 [0...0, 1...1, ..., 23...23]。
-            # 若当前模型是 desc_act=false，这些 g_idx 虽然会先按统一接口加载，
-            # 但在 post-load 阶段通常会被替换成空张量，不参与运行时计算。
+            # g_idx 属于量化索引元数据，走专用装载逻辑。
             self._load_g_idx(
                 shard_dim=0,
                 shard_id=shard_id,
@@ -1450,34 +1458,29 @@ class FusedMoE(CustomOp):
             )
             return True if return_success else None
 
-        # -----------------
-        # 特殊量化分支：ModelOpt。
-        # -----------------
+        # ------------------------------- 处理 ModelOpt 量化路径 -------------------------------
         # TODO @dsikka: ModelOpt 后续应收敛到统一的 MoE 装载模式。
         if "ModelOpt" in quant_method_name:
-            # ModelOpt 的命名模式比较特殊，这里按其 scale 约定单独分发。
-            # per-tensor scale 的判断依赖具体变体规则，不适合靠脆弱的字符串匹配硬推。
+            # ModelOpt 的 scale 规则特殊，先读取其内部模式开关。
             uses_weight_scale_2 = self.quant_method.uses_weight_scale_2_pattern()
+            # 从参数属性读取量化粒度类型（CHANNEL/GROUP/BLOCK/TENSOR）。
             quant_method = getattr(param, "quant_method", None)
 
-            # 这里要识别“哪些 scale 实际上是 per-tensor 标量”：
-            # - input_scale 总是 per-tensor
-            # - FP4 往往用 weight_scale_2
-            # - FP8 往往用 weight_scale
-            # - 但 ModelOpt MXFP8 的 BLOCK 量化里，weight_scale 可能是 block scale，
-            #   这时不能误判成 per-tensor 标量
+            # BLOCK 模式下的 weight_scale 可能是 block scale，不能误归类为 per-tensor。
             is_block_weight_scale = (
                     "weight_scale" in weight_name
                     and quant_method == FusedMoeWeightScaleSupported.BLOCK.value
             )
+            # 识别是否为 per-tensor scale 名称（兼容 weight_scale_2 命名变体）。
             is_per_tensor = (
                                 "weight_scale_2" in weight_name
                                 if uses_weight_scale_2
                                 else "weight_scale" in weight_name
                             ) or "input_scale" in weight_name
+            # 去除 block-scale 场景后，剩余才是真正 per-tensor scale。
             is_per_tensor = is_per_tensor and not is_block_weight_scale
             if is_per_tensor:
-                # 标量 scale 直接走 per-tensor 分支。
+                # per-tensor 标量参数走专用装载路径。
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
@@ -1486,14 +1489,14 @@ class FusedMoE(CustomOp):
                 )
                 return True if return_success else None
 
-            # 若 w13_weight_scale 把多份 w13 scale 合并在同一个 loaded_weight 里，
-            # 这里就改走 _load_combined_w13_weight_scale()。
-            # 是否命中这类布局，通过 loaded_weight 与参数的 hidden_out 维对比判断。
+            # 若 w13_weight_scale 使用合并布局存储，则走 combined 分支并按 TP 切片回写。
             if "w13_weight_scale" in weight_name:
+                # loaded_weight_hidden_out 为 checkpoint 的 hidden_out 维长度。
                 loaded_weight_hidden_out = loaded_weight.shape[-2]
+                # param_hidden_out 为运行时全局 hidden_out（本地维 * tp_size）。
                 param_hidden_out = param.data.shape[-2] * self.tp_size
                 if loaded_weight_hidden_out == param_hidden_out:
-                    # 命中“w13 的 scale 合并存储”模式时，按合并布局切分后写入。
+                    # 命中合并布局后，按当前 TP rank 切分并回写到本地视图。
                     self._load_combined_w13_weight_scale(
                         shard_dim=shard_dim,
                         loaded_weight=loaded_weight,
@@ -1502,9 +1505,8 @@ class FusedMoE(CustomOp):
                     )
                     return True if return_success else None
 
-            # 其余 ModelOpt 权重继续复用通用的权重 / group-scale 装载逻辑。
+            # 其余 ModelOpt 权重复用通用权重/group-scale 装载逻辑。
             if "weight" in weight_name:
-                # 其余权重和 group scale 统一复用通用装载逻辑。
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -1514,25 +1516,13 @@ class FusedMoE(CustomOp):
                 )
             return True if return_success else None
 
-        # -----------------
-        # 通用量化分支：scale / zero / offset。
-        # -----------------
-        # scale / zero / offset 等量化附属参数统一走这里。
+        # ------------------------------- 处理 scale/zero/offset 量化附属参数 -------------------------------
+        # 非 ModelOpt 场景下，所有 scale/zero/offset 附属参数统一在此分派。
         if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
-            # 普通量化分支下，根据参数上记录的 quant_method 决定 scale / zp 的装载方式。
+            # 根据参数携带的 quant_method 决定采用哪一种量化附属参数装载规则。
             quant_method = getattr(param, "quant_method", None)
-            # 当前 GPTQ-Marlin routed experts 的典型情况：
-            # - quant_method = GROUP
-            # - 因为 bits=4, group_size=128, desc_act=false
-            # - qzeros 虽然会被正常加载，但在 sym=true 的 GPTQ Marlin 路径下，
-            #   它更多是为了兼容统一的权重接口；kernel 运行时通常不会真正消费它
-            # - 4bit 下 qzeros 还是按 int32 打包存储，一个元素里会装 8 个 4-bit zp
-            # - 若这 8 个 zp 都等于 8，调试器里就会看到大量相同的 -2004318072，
-            #   其无符号位模式其实是 0x88888888
-            # 所以大多数 scales / qzeros 会走下面的 GROUP 分支，
-            # 调 _load_model_weight_or_group_weight_scale(...)。
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
-                # 每通道 scale 与权重矩阵同形分片。
+                # per-channel scale 使用与权重矩阵一致的 shard/TP 规则。
                 self._load_per_channel_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -1544,7 +1534,7 @@ class FusedMoE(CustomOp):
                 FusedMoeWeightScaleSupported.GROUP.value,
                 FusedMoeWeightScaleSupported.BLOCK.value,
             ]:
-                # group / block scale 复用和模型权重一致的 shard 规则。
+                # group/block scale 复用普通权重的切片与 TP 分派规则。
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -1554,7 +1544,7 @@ class FusedMoE(CustomOp):
                     load_full_w2=getattr(param, "load_full_w2", False),
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
-                # 每 tensor scale 只是一组标量。
+                # per-tensor scale 是标量，走标量回写路径。
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
@@ -1562,31 +1552,24 @@ class FusedMoE(CustomOp):
                     expert_id=expert_id,
                 )
             else:
+                # 枚举所有支持类型并抛错，防止静默吞掉未知 quant_method。
                 WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
                 raise ValueError(
                     f"quant method must be one of {WEIGHT_SCALE_SUPPORTED}"
                 )
             return True if return_success else None
 
-        # -----------------
-        # 通用元数据分支：weight_shape。
-        # -----------------
-        # weight_shape 这类元数据参数单独处理。
+        # ------------------------------- 处理 weight_shape 元数据 -------------------------------
         if "weight_shape" in weight_name:
-            # 某些压缩格式会额外保存权重 shape 元数据，按单值参数处理。
+            # weight_shape 不是矩阵权重，按单值参数回写。
             self._load_single_value(
                 param=param, loaded_weight=loaded_weight, expert_id=expert_id
             )
             return True if return_success else None
 
-        # -----------------
-        # 通用权重分支：真实模型权重。
-        # -----------------
-        # 最后兜底处理真正的模型权重张量。
+        # ------------------------------- 处理真实权重兜底路径 -------------------------------
         if "weight" in weight_name:
-            # 当前 experts.w13_qweight / experts.w2_qweight 最终就会走这里，
-            # 再按 shard_id="w1"/"w2"/"w3" 和当前 tp_rank / local expert slot
-            # 切到 expert_data 对应区域。
+            # 普通权重兜底走统一装载器，按 shard_id + TP rank 切到目标视图。
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
@@ -1596,68 +1579,71 @@ class FusedMoE(CustomOp):
             )
             return True if return_success else None
 
-        # -----------------
-        # 收尾：返回兼容结果。
-        # -----------------
-        # return_success=False 时调用方通常不关心结果；这里保留兼容签名。
+        # 未命中任何已知参数类别时，保持历史签名语义：
+        # - return_success=True  返回 False
+        # - return_success=False 返回 None
         return False if return_success else None
 
     def load_weights(
             self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
-        # -----------------
-        # 入口：批量消费一组 expert 权重。
-        # -----------------
-        # self.expert_mapping 负责把 checkpoint 名字映射到 FusedMoE 内部参数名和 shard 信息。
+        # ------------------------------- 校验 expert 映射表是否就绪 -------------------------------
+        # `self.expert_mapping` 定义了 checkpoint 名称到层内参数名、expert_id 与 shard_id 的映射规则。
         if (expert_mapping := self.expert_mapping) is None:
+            # 未提供映射表时无法把 checkpoint 权重路由到层内参数，直接失败。
             raise ValueError(
                 "`self.expert_mapping` must be provided to "
                 "load weights using `self.load_weights`."
             )
 
-        # -----------------
-        # 外层循环：遍历 checkpoint 中的每一份 expert 权重。
-        # -----------------
+        # ------------------------------- 遍历 checkpoint 中的每条专家权重 -------------------------------
+        # `weights` 迭代项格式为 `(expert_name, loaded_weight)`。
         for expert_name, loaded_weight in weights:
-            # 把 checkpoint 中的 expert 权重名补成当前层的全限定名。
+            # 补齐成当前层全限定路径，便于后续与映射项做子串匹配。
             qual_name = f"{self.layer_name}.{expert_name}"
 
-            # -----------------
-            # 映射匹配：找到它在当前层中应落到哪个内部参数。
-            # -----------------
+            # ------------------------------- 按映射表定位目标参数与分片信息 -------------------------------
+            # 映射项格式为 `(param_name, weight_name, expert_id, shard_id)`。
             for param_name, weight_name, expert_id, shard_id in expert_mapping:
+                # 当前映射项不匹配该 checkpoint 名称时直接跳过。
                 if weight_name not in qual_name:
                     continue
+                # 把 checkpoint 路径中的映射锚点替换成真实参数路径，得到目标 `weight_name`。
                 weight_name = qual_name.replace(weight_name, param_name)
+                # 去掉层名前缀，得到可用于 `getattr(self, ...)` 的属性名。
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
+                # 取出当前映射命中的目标参数对象。
                 param = getattr(self, param_name)
 
-                # -----------------
-                # 规范化输入：统一转成可逐 expert 枚举的视图。
-                # -----------------
-                # 3D 权重通常表示 checkpoint 已经把多个 experts fuse 在同一张量里。
+                # ------------------------------- 规范化输入到“可逐 expert 枚举”的形态 -------------------------------
+                # 3D 张量通常表示 checkpoint 已把多个 experts 融合存储，形状常见为 `[E, ...]`。
                 if loaded_weight.dim() == 3:
-                    # 3D 权重表示多个 experts 被 fuse 在一起，需要先拆出当前 shard 视图。
-                    # 对 w1 / w3 来说，这里的 expert_id 会先临时充当 shard_idx，
-                    # 用来从合并布局里拆出对应的半边。
+                    # w1/w3 在部分检查点中可能以合并维存储，需先沿 dim=1 切成两半再取对应 shard。
+                    # 示例：`[E, 2*H, D] --chunk(2, dim=1)--> 2 x [E, H, D]`。
                     if shard_id in {"w1", "w3"}:
+                        # 此处映射表里的 `expert_id` 先临时充当 shard 索引（0 对应 w1，1 对应 w3）。
                         shard_idx = expert_id
+                        # 提取当前 shard 对应的半边权重，仍保持 expert 维在 dim0。
                         experts_shard = loaded_weight.chunk(2, dim=1)[shard_idx]
                     else:
+                        # 非 w1/w3 路径直接复用原 3D 权重。
                         experts_shard = loaded_weight
+                    # 融合权重拆分后，`enumerate` 从 0 开始对应本批内部顺序。
                     start = 0
                 else:
-                    # 单 expert 权重这里补一层假 expert 维，
-                    # 以便和 fused 情况统一走同一套循环。
+                    # 非 3D 权重视为单 expert 权重，补一层假 expert 维做统一处理。
+                    # 示例：`[D_in, D_out] -> [1, D_in, D_out]`。
                     experts_shard = loaded_weight.unsqueeze(0)
+                    # 单 expert 路径使用映射给出的 expert_id 作为起始编号。
                     start = expert_id
 
-                # -----------------
-                # 内层循环：逐个 expert 调用参数级 weight_loader。
-                # -----------------
+                # ------------------------------- 逐 expert 调用参数级装载器 -------------------------------
+                # 按 dim0 解包，得到每个 expert 的局部张量视图。
                 loaded_experts = experts_shard.unbind()
+                # `expert_id` 从 `start` 起步，确保与映射语义一致。
                 for expert_id, loaded_expert in enumerate(loaded_experts, start=start):
-                    # tiered cache 打开时，这里只会真正装入当前映射到 GPU slots 的 experts。
+                    # 委托 `weight_loader` 执行参数级分派与写入；
+                    # tiered-cache 下未驻留 expert 会返回 False。
                     success = self.weight_loader(
                         param=param,
                         loaded_weight=loaded_expert,
@@ -1666,7 +1652,9 @@ class FusedMoE(CustomOp):
                         expert_id=expert_id,
                         return_success=True,
                     )
+                    # 仅在成功装载时记录调试日志并回传该参数名。
                     if success:
+                        # 记录“当前层、当前 shard、当前 expert”三元信息，便于排查加载覆盖情况。
                         logger.debug(
                             "Loaded expert %d of shard %s into %s for layer %s",
                             expert_id,
@@ -1674,6 +1662,7 @@ class FusedMoE(CustomOp):
                             param_name,
                             self.layer_name,
                         )
+                        # 产出被成功写入的参数名，供上游统计/验收使用。
                         yield param_name
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
@@ -1824,16 +1813,13 @@ class FusedMoE(CustomOp):
             num_experts: int,
             num_redundant_experts: int = 0,
     ) -> list[tuple[str, str, int, str]]:
-        # 这是 routed experts 命名映射的最终生成器。
-
+        # ------------------------------- 计算物理专家总数 -------------------------------
+        # 物理专家数 = 逻辑专家数 + 冗余专家数。
         num_physical_experts = num_experts + num_redundant_experts
 
-        # 这一步的意义：
-        # - checkpoint 里的 experts.37.* 中 “37” 通常是 logical expert id
-        # - 运行时当前 rank / EPLB / 冗余专家用的是 physical expert id
-        # 因此要先建一个 physical -> logical 的映射表，后面拼 weight_name 时用 logical id，
-        # 而返回给加载器的 expert_id 则保留 physical id。
-
+        # ------------------------------- 构建 physical -> logical 映射 -------------------------------
+        # checkpoint 专家名通常按 logical expert id 编号；
+        # 运行时装载则使用 physical expert id，因此先构建映射表做桥接。
         physical_to_logical_map = (
             EplbState.build_initial_global_physical_to_logical_map(
                 num_experts,
@@ -1841,38 +1827,43 @@ class FusedMoE(CustomOp):
             )
         )
 
+        # ------------------------------- 探测是否存在 base_layer 命名前缀 -------------------------------
+        # 某些模型结构会把专家参数放在 `experts.base_layer.*` 下，
+        # 这里按参数表自动决定是否追加该前缀。
         base_layer = (
             "base_layer."
             if any(".base_layer." in name for name, _ in model.named_parameters())
             else ""
         )
 
-        # 返回值里最关键的命名规则：
-        # 1. gate_proj / up_proj 都映射到内部的 experts.w13_
-        #    因为内部实现把这两块融合存储成一组 [w1 | w3]
-        # 2. down_proj 映射到内部的 experts.w2_
-        #
-        # shard_id 的语义：
-        # - "w1" -> gate_proj 那半边
-        # - "w2" -> down_proj
-        # - "w3" -> up_proj 那半边
-        #
-        # 因而 “w13” 这个名字并不是说只有一个矩阵，
-        # 而是内部把 w1 和 w3 融合在同一套参数容器里。
-
+        # ------------------------------- 生成最终专家参数映射表 -------------------------------
+        # 返回项格式：`(param_name, weight_name, expert_id, shard_id)`。
+        # 命名规则：
+        # - gate_proj / up_proj -> experts.w13_（w1/w3 融合容器）
+        # - down_proj           -> experts.w2_
+        # shard 语义：
+        # - w1: gate_proj 半边
+        # - w2: down_proj
+        # - w3: up_proj 半边
         return [
-            # (param_name, weight_name, expert_id, shard_id)
             (
-                # 当前模型的参数名
+                # -------------- param key -----------------------------
+                # 生成内部参数名：w1/w3 走 w13_，w2 走 w2_。
                 f"experts.{base_layer}w13_"
                 if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
                 else f"experts.{base_layer}w2_",
-                # 权重文件参数名
+
+                # -------------- checkpoint_key -----------------------
+                # 生成 checkpoint 参数名：使用 logical expert id 拼接专家路径。
                 f"experts.{physical_to_logical_map[expert_id]}.{weight_name}.{base_layer}",
+                # 保留 physical expert id 供后续加载阶段定位本地 expert slot。
                 expert_id,
+                # 写入 shard 标识（w1/w2/w3）。
                 shard_id,
             )
+            # 枚举全部 physical experts。
             for expert_id in range(num_physical_experts)
+            # 每个 expert 生成 w1/w2/w3 三条映射项。
             for shard_id, weight_name in [
                 ("w1", ckpt_gate_proj_name),
                 ("w2", ckpt_down_proj_name),

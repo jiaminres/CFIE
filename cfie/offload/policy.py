@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 PLAN_KEY = "moe_tiered_cache"
 TARGET_OCCUPIED_GPU_BYTES_KEY = "moe_tiered_cache_target_occupied_gpu_bytes"
 MTP_RESERVE_MODE_KEY = "moe_tiered_cache_mtp_reserve_mode"
+LOG_RUNTIME_EVENTS_KEY = "moe_tiered_cache_log_runtime_events"
 GiB = 1 << 30
 # 当前主线已经去掉 NVMe 二级缓存与 staging 过渡区，默认不再为其预留空间。
 DEFAULT_STAGE_BYTES = 0

@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+import json
 import logging
+import os
 from pathlib import Path
+import tempfile
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from cfie.offload.policy import LOG_RUNTIME_EVENTS_KEY
 from cfie_training.config import TrainingProjectConfig
+from cfie_training.predictor.architectures import (
+    FutureExpertPredictor,
+    build_predictor_model,
+    predictor_model_descriptor,
+)
 from cfie_training.predictor.models import (
     CapturedForwardBatch,
     CapturedHiddenStatePayload,
@@ -25,6 +36,7 @@ from cfie_training.predictor.models import (
     PredictorTraceExample,
     PredictorTrainingRunTrace,
 )
+from cfie_training.predictor.trace_store import PredictorTraceTensorStore
 from cfie_training.runtime.data import (
     PredictorBatchPlanner,
     TokenizedDatasetBatchPlanner,
@@ -33,6 +45,185 @@ from cfie_training.runtime.types import BatchShape
 
 if TYPE_CHECKING:
     from cfie.v1.engine.llm_engine import LLMEngine
+
+
+DEFAULT_TRACE_FLUSH_EVERY_STEPS = 16
+
+
+@dataclass(slots=True, frozen=True)
+class PredictorTraceBuildProgress:
+    total_steps: int
+    completed_steps: int
+    example_count: int
+    last_step_examples: int
+    last_step_tokens: int
+    persisted_steps: int
+
+
+@dataclass(slots=True, frozen=True)
+class PredictorTraceWriteResult:
+    profile_name: str
+    example_count: int
+    window_layers: int
+    candidate_experts_per_layer: int
+    executed_experts_per_layer: int
+    output_path: Path
+
+
+@dataclass(slots=True, frozen=True)
+class _ForwardCaptureTraceStep:
+    step_index: int
+    token_count: int
+    examples: tuple[PredictorTraceExample, ...]
+
+
+class _PredictorTraceJsonlWriter:
+    def __init__(
+            self,
+            *,
+            output_path: Path,
+            profile_name: str,
+            window_layers: int,
+            candidate_experts_per_layer: int,
+            executed_experts_per_layer: int,
+    ) -> None:
+        self.output_path = output_path
+        self.profile_name = profile_name
+        self.window_layers = int(window_layers)
+        self.candidate_experts_per_layer = int(candidate_experts_per_layer)
+        self.executed_experts_per_layer = int(executed_experts_per_layer)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.progress_examples_path = output_path.with_name(
+            output_path.name + ".progress.examples.jsonl"
+        )
+        self.progress_state_path = output_path.with_name(
+            output_path.name + ".progress.json"
+        )
+        self._stream = self.progress_examples_path.open("w", encoding="utf-8")
+        self.example_count = 0
+
+    def append_examples(
+            self,
+            examples: tuple[PredictorTraceExample, ...],
+    ) -> None:
+        for example in examples:
+            self._stream.write(
+                json.dumps(example.to_dict(), sort_keys=True) + "\n"
+            )
+            self.example_count += 1
+
+    def flush_progress(
+            self,
+            *,
+            total_steps: int,
+            completed_steps: int,
+    ) -> None:
+        self._stream.flush()
+        os.fsync(self._stream.fileno())
+        self._atomic_write_text(
+            self.progress_state_path,
+            json.dumps(
+                {
+                    "status": "in_progress",
+                    "profile_name": self.profile_name,
+                    "example_count": self.example_count,
+                    "window_layers": self.window_layers,
+                    "candidate_experts_per_layer": (
+                        self.candidate_experts_per_layer
+                    ),
+                    "executed_experts_per_layer": (
+                        self.executed_experts_per_layer
+                    ),
+                    "completed_steps": int(completed_steps),
+                    "total_steps": int(total_steps),
+                    "examples_jsonl": str(self.progress_examples_path),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+        )
+
+    def finalize(self) -> None:
+        self._stream.flush()
+        os.fsync(self._stream.fileno())
+        self._stream.close()
+
+        with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                delete=False,
+                dir=self.output_path.parent,
+                prefix=self.output_path.name + ".",
+                suffix=".tmp",
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write("{\n")
+            handle.write(
+                f'  "profile_name": {json.dumps(self.profile_name)},\n'
+            )
+            handle.write(
+                f'  "example_count": {json.dumps(self.example_count)},\n'
+            )
+            handle.write(
+                f'  "window_layers": {json.dumps(self.window_layers)},\n'
+            )
+            handle.write(
+                "  "
+                f'"candidate_experts_per_layer": '
+                f"{json.dumps(self.candidate_experts_per_layer)},\n"
+            )
+            handle.write(
+                "  "
+                f'"executed_experts_per_layer": '
+                f"{json.dumps(self.executed_experts_per_layer)},\n"
+            )
+            handle.write('  "examples": [\n')
+
+            first = True
+            with self.progress_examples_path.open("r", encoding="utf-8") as source:
+                for line in source:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if not first:
+                        handle.write(",\n")
+                    handle.write("    ")
+                    handle.write(line)
+                    first = False
+
+            handle.write("\n  ]\n}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        os.replace(temp_path, self.output_path)
+        self._cleanup_progress_files()
+
+    def close(self) -> None:
+        if not self._stream.closed:
+            self._stream.close()
+
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str) -> None:
+        with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                delete=False,
+                dir=path.parent,
+                prefix=path.name + ".",
+                suffix=".tmp",
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+
+    def _cleanup_progress_files(self) -> None:
+        for path in (self.progress_examples_path, self.progress_state_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 class PredictorTeacherModelBackend(ABC):
@@ -155,8 +346,11 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
 
     # ------------------------------- 构造训练 teacher 专用 additional_config -------------------------------
     def _resolve_engine_additional_config(self) -> dict[str, Any]:
-        # 当前额外覆盖项留空，后续若训练侧需要加专用开关，再从这里集中注入。
-        return {}
+        return {
+            LOG_RUNTIME_EVENTS_KEY: bool(
+                self._config.teacher_engine.log_runtime_moe_cache_events
+            ),
+        }
 
     # ------------------------------- 按真实有效长度提取 prompt 行 -------------------------------
     @staticmethod
@@ -199,26 +393,14 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
 
     # ------------------------------- 根据真实 prompt 估算引擎容量 -------------------------------
     def _capacity_for_batch(self, batch: BatchShape) -> tuple[int, int, int]:
-        # 容量估算必须基于真实 prompt 长度，
-        # 否则按 padded 长度启动会把 teacher 引擎无谓放大。
-        prompt_rows = self._effective_prompt_rows(batch)
-
-        # `max_model_len` 决定单请求最长上下文，因此取所有 prompt 中的最大长度。
-        max_prompt_len = max(len(prompt_row) for prompt_row in prompt_rows)
-
-        # `max_num_seqs` 直接对应同批并发请求数，也就是本批 prompt 行数。
-        max_num_seqs = max(1, len(prompt_rows))
-
-        # `max_num_batched_tokens` 取本批真实 token 总数，
-        # 让调度器按实际吞吐而不是 padding 后体积规划空间。
-        max_num_batched_tokens = max(
-            1,
-            sum(len(prompt_row) for prompt_row in prompt_rows),
-        )
+        # teacher 引擎容量应锚定 batch/planner 声明的上界，
+        # 而不是被某一步恰好较短的真实样本长度带小。
+        max_num_seqs = batch.samples
+        max_num_batched_tokens = batch.total_tokens
 
         # teacher 请求统一用 `max_tokens=1` 做最小生成，
         # 因此上下文容量还要额外预留 1 个生成位。
-        max_model_len = max_prompt_len + 1
+        max_model_len = batch.tokens_per_sample + 1
         return max_model_len, max_num_seqs, max_num_batched_tokens
 
     # ------------------------------- 构造或扩容 teacher 引擎 -------------------------------
@@ -1027,14 +1209,14 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
         # 缓存 teacher backend，用于按 batch 执行真实前向并抓取中间信号。
         self._teacher_model_backend = teacher_model_backend
 
-    # ------------------------------- 构造 predictor 监督样本 -------------------------------
-    def build_examples(
+    # ------------------------------- 逐 step 构造 predictor 监督样本 -------------------------------
+    def iter_step_examples(
             self,
             *,
             steps: int,
             examples_per_step: int | None = None,
             batch_planner: PredictorBatchPlanner | None = None,
-    ) -> tuple[PredictorTraceExample, ...]:
+    ) -> Iterator[_ForwardCaptureTraceStep]:
         # 至少需要执行 1 个 step，0 step 无法产出任何监督样本。
         if steps < 1:
             raise ValueError("steps must be >= 1")
@@ -1050,8 +1232,7 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
             examples_per_step
         )
 
-        # 累积所有 step 生成的 predictor 监督样本。
-        examples: list[PredictorTraceExample] = []
+        next_example_index = 0
 
         # ------------------------------- 按 step 抓取 teacher 前向并生成样本 -------------------------------
         for step_index in range(steps):
@@ -1079,6 +1260,7 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
 
             # ------------------------------- 选择插入点并提取单条样本 -------------------------------
             # _selected_example_specs 返回具名选点对象；
+            step_examples: list[PredictorTraceExample] = []
             example_spec: PredictorExampleSpec
             for example_spec in self._selected_example_specs(
                     step_index=step_index,
@@ -1115,10 +1297,10 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
                     )
 
                 # ------------------------------- 组装并写入样本 -------------------------------
-                # example_index 使用当前累积长度，保证全局连续递增。
-                examples.append(
+                # example_index 使用全局连续编号，保证跨 step 也稳定递增。
+                step_examples.append(
                     PredictorTraceExample(
-                        example_index=len(examples),
+                        example_index=next_example_index,
                         step_index=step_index,
                         token_index=example_spec.token_index,
                         insertion_layer_index=example_spec.insertion_layer_index,
@@ -1131,6 +1313,29 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
                         future_teacher_topk_ids=tuple(future_teacher_topk_ids),
                     )
                 )
+                next_example_index += 1
+
+            yield _ForwardCaptureTraceStep(
+                step_index=step_index,
+                token_count=token_count,
+                examples=tuple(step_examples),
+            )
+
+    # ------------------------------- 构造 predictor 监督样本 -------------------------------
+    def build_examples(
+            self,
+            *,
+            steps: int,
+            examples_per_step: int | None = None,
+            batch_planner: PredictorBatchPlanner | None = None,
+    ) -> tuple[PredictorTraceExample, ...]:
+        examples: list[PredictorTraceExample] = []
+        for step_result in self.iter_step_examples(
+                steps=steps,
+                examples_per_step=examples_per_step,
+                batch_planner=batch_planner,
+        ):
+            examples.extend(step_result.examples)
         # 返回不可变样本元组，供训练/评估流程直接消费。
         return tuple(examples)
 
@@ -1603,6 +1808,8 @@ class PredictorTrainer:
             tokenizer_path: str | None = None,
             dataset_format: str = "auto",
             dataset_text_key: str = "text",
+            progress_callback: Callable[[PredictorTraceBuildProgress], None]
+            | None = None,
     ) -> PredictorTraceDataset:
         # -------------------- 构造样本批规划器 --------------------
         # batch planner 负责给每个训练 step 产出带真实 token rows 的抽象 batch 形状；
@@ -1616,15 +1823,25 @@ class PredictorTrainer:
             dataset_text_key=dataset_text_key,
         )
 
-        # -------------------- 生成 predictor 监督样本 --------------------
-        # trace builder 会产出每条样本的 hidden_state，
-        # 以及对应 future window 的 teacher top-k experts。
         trace_builder = self._resolve_trace_builder()
-        examples = trace_builder.build_examples(
-            steps=steps,
-            examples_per_step=examples_per_step,
-            batch_planner=batch_planner,
-        )
+        examples: list[PredictorTraceExample] = []
+        for step_result in trace_builder.iter_step_examples(
+                steps=steps,
+                examples_per_step=examples_per_step,
+                batch_planner=batch_planner,
+        ):
+            examples.extend(step_result.examples)
+            if progress_callback is not None:
+                progress_callback(
+                    PredictorTraceBuildProgress(
+                        total_steps=steps,
+                        completed_steps=step_result.step_index + 1,
+                        example_count=len(examples),
+                        last_step_examples=len(step_result.examples),
+                        last_step_tokens=step_result.token_count,
+                        persisted_steps=0,
+                    )
+                )
 
         # -------------------- 打包为数据集对象 --------------------
         # 除了样本本身，还把 teacher/source、窗口长度和预算元信息一起固化下来，
@@ -1639,7 +1856,113 @@ class PredictorTrainer:
             executed_experts_per_layer=(
                 self.config.predictor_routing.executed_experts_per_layer
             ),
-            examples=examples,
+            examples=tuple(examples),
+        )
+
+    def build_trace_dataset_to_json_file(
+            self,
+            *,
+            output_path: str | Path,
+            steps: int,
+            examples_per_step: int | None = None,
+            samples: int = 2,
+            tokens_per_sample: int = 256,
+            dataset_path: str | None = None,
+            tokenizer_path: str | None = None,
+            dataset_format: str = "auto",
+            dataset_text_key: str = "text",
+            flush_every_steps: int = DEFAULT_TRACE_FLUSH_EVERY_STEPS,
+            progress_callback: Callable[[PredictorTraceBuildProgress], None]
+            | None = None,
+    ) -> PredictorTraceWriteResult:
+        batch_planner = self._build_batch_planner(
+            samples=samples,
+            tokens_per_sample=tokens_per_sample,
+            dataset_path=dataset_path,
+            tokenizer_path=tokenizer_path,
+            dataset_format=dataset_format,
+            dataset_text_key=dataset_text_key,
+        )
+        trace_builder = self._resolve_trace_builder()
+        output_path = Path(output_path)
+        flush_every_steps = max(int(flush_every_steps), 0)
+
+        writer = _PredictorTraceJsonlWriter(
+            output_path=output_path,
+            profile_name=self.config.profile_name,
+            window_layers=self.config.predictor_routing.window_layers,
+            candidate_experts_per_layer=(
+                self.config.predictor_routing.candidate_experts_per_layer
+            ),
+            executed_experts_per_layer=(
+                self.config.predictor_routing.executed_experts_per_layer
+            ),
+        )
+        persisted_steps = 0
+        last_step_examples = 0
+        last_step_tokens = 0
+        try:
+            for step_result in trace_builder.iter_step_examples(
+                    steps=steps,
+                    examples_per_step=examples_per_step,
+                    batch_planner=batch_planner,
+            ):
+                writer.append_examples(step_result.examples)
+                completed_steps = step_result.step_index + 1
+                last_step_examples = len(step_result.examples)
+                last_step_tokens = step_result.token_count
+                if (
+                        flush_every_steps > 0
+                        and completed_steps % flush_every_steps == 0
+                ):
+                    writer.flush_progress(
+                        total_steps=steps,
+                        completed_steps=completed_steps,
+                    )
+                    persisted_steps = completed_steps
+                if progress_callback is not None:
+                    progress_callback(
+                        PredictorTraceBuildProgress(
+                            total_steps=steps,
+                            completed_steps=completed_steps,
+                            example_count=writer.example_count,
+                            last_step_examples=last_step_examples,
+                            last_step_tokens=last_step_tokens,
+                            persisted_steps=persisted_steps,
+                        )
+                    )
+
+            writer.flush_progress(
+                total_steps=steps,
+                completed_steps=steps,
+            )
+            persisted_steps = steps
+            if progress_callback is not None:
+                progress_callback(
+                    PredictorTraceBuildProgress(
+                        total_steps=steps,
+                        completed_steps=steps,
+                        example_count=writer.example_count,
+                        last_step_examples=last_step_examples,
+                        last_step_tokens=last_step_tokens,
+                        persisted_steps=persisted_steps,
+                    )
+                )
+            writer.finalize()
+        finally:
+            writer.close()
+
+        return PredictorTraceWriteResult(
+            profile_name=self.config.profile_name,
+            example_count=writer.example_count,
+            window_layers=self.config.predictor_routing.window_layers,
+            candidate_experts_per_layer=(
+                self.config.predictor_routing.candidate_experts_per_layer
+            ),
+            executed_experts_per_layer=(
+                self.config.predictor_routing.executed_experts_per_layer
+            ),
+            output_path=output_path,
         )
 
     def _dataset_tensors(

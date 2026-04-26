@@ -440,6 +440,8 @@ class PredictorCheckpointMetadata:
     input_summary_dim: int
     # predictor 内部隐层宽度。
     hidden_dim: int
+    # predictor 架构签名。
+    model_descriptor: dict[str, Any]
     # predictor 预测的未来窗口层数。
     window_layers: int
     # 未来窗口在层维度上的步长。
@@ -475,6 +477,7 @@ class PredictorCheckpointMetadata:
             "profile_name": self.profile_name,
             "input_summary_dim": self.input_summary_dim,
             "hidden_dim": self.hidden_dim,
+            "model_descriptor": self.model_descriptor,
             "window_layers": self.window_layers,
             "stride_layers": self.stride_layers,
             "num_experts": self.num_experts,
@@ -505,6 +508,7 @@ class PredictorCheckpointMetadata:
             profile_name=str(payload["profile_name"]),
             input_summary_dim=int(payload["input_summary_dim"]),
             hidden_dim=int(payload["hidden_dim"]),
+            model_descriptor=dict(payload.get("model_descriptor", {})),
             window_layers=int(payload["window_layers"]),
             stride_layers=int(payload["stride_layers"]),
             num_experts=int(payload["num_experts"]),

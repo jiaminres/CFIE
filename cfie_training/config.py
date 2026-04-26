@@ -25,6 +25,12 @@ ShardMaterializationMode = Literal["representative", "logical"]
 LogicalCudaExecutionMode = Literal["compact_layer", "full_bucket"]
 TeacherOutputKind = Literal["final_only", "cumulative", "delta"]
 TeacherEngineOffloadBackend = Literal["auto", "uva", "prefetch"]
+PredictorModelArchitecture = Literal[
+    "mlp",
+    "residual_mlp",
+    "query_transformer",
+    "factorized",
+]
 
 
 # 校验字符串字段不能为空。
@@ -360,6 +366,7 @@ class PredictorTeacherEngineConfig:
     cpu_offload_gb: float = 0.0
     moe_cpu_budget_gb: float = 0.0
     moe_cpu_min_free_gb: float = 0.0
+    log_runtime_moe_cache_events: bool = False
 
     def validate(self) -> "PredictorTeacherEngineConfig":
         if not 0.0 < self.gpu_memory_utilization < 1.0:
@@ -562,6 +569,12 @@ class PredictorRoutingConfig:
 class PredictorTrainerConfig:
     input_summary_dim: int = 64
     hidden_dim: int = 128
+    model_architecture: PredictorModelArchitecture = "mlp"
+    model_depth: int = 2
+    model_dropout: float = 0.0
+    model_num_heads: int = 8
+    model_memory_tokens: int = 8
+    model_ffn_multiplier: int = 4
     batch_size: int = 8
     epochs: int = 4
     learning_rate: float = 1e-3
@@ -573,12 +586,26 @@ class PredictorTrainerConfig:
     def validate(self) -> "PredictorTrainerConfig":
         _require_positive_int("input_summary_dim", self.input_summary_dim)
         _require_positive_int("hidden_dim", self.hidden_dim)
+        _require_positive_int("model_depth", self.model_depth)
+        _require_non_negative_float("model_dropout", self.model_dropout)
+        if self.model_dropout >= 1.0:
+            raise ValueError("model_dropout must be in [0, 1)")
+        _require_positive_int("model_num_heads", self.model_num_heads)
+        _require_positive_int("model_memory_tokens", self.model_memory_tokens)
+        _require_positive_int("model_ffn_multiplier", self.model_ffn_multiplier)
         _require_positive_int("batch_size", self.batch_size)
         _require_positive_int("epochs", self.epochs)
         _require_positive_float("learning_rate", self.learning_rate)
         _require_non_negative_float("weight_decay", self.weight_decay)
         _require_positive_int("examples_per_step", self.examples_per_step)
         _require_non_negative_int("seed", self.seed)
+        if (
+                self.model_architecture == "query_transformer"
+                and self.hidden_dim % self.model_num_heads != 0
+        ):
+            raise ValueError(
+                "hidden_dim must be divisible by model_num_heads for query_transformer"
+            )
         return self
 
     # dataclass 初始化后立即校验 predictor trainer 配置。

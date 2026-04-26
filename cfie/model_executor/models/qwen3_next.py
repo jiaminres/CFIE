@@ -1838,15 +1838,6 @@ class Qwen3NextModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # 为 routed experts 生成“checkpoint 名 -> 内部参数名”的标准映射。
 
-        # 对当前 Qwen3.5 语义：
-        # - gate_proj 和 up_proj 会在内部合并到 experts.w13_*
-        # - down_proj          会在内部映射到 experts.w2_*
-        #
-        # 当前本地 checkpoint 还能确定：
-        # - self.config.num_experts = 256
-        # - self.num_redundant_experts 可能因为 EPLB/tiered cache 而非 0
-        #   因此 make_expert_params_mapping(...) 里区分的是 physical expert id
-        #   和 logical expert id，而不是简单 0..255 一一对应。
         return SharedFusedMoE.make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",

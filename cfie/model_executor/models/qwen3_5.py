@@ -458,12 +458,20 @@ class Qwen3_5Model(Qwen3NextModel):
             shard_id: str,
             num_experts: int,
     ) -> bool:
-        # 为当前 rank 的每个本地专家分片加载融合专家权重。
+        # ------------------------------- 初始化目标参数与加载器 -------------------------------
+        # 按映射后的内部参数名取出目标参数对象。
         param = params_dict[name]
+        # 参数对象上挂载了专家专用 weight_loader，返回值用 bool 表示是否实际写入本地 slot。
         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+        # 记录本轮是否至少有一个 expert 在当前 rank 上完成装载。
         loaded_local_expert = False
+
+        # ------------------------------- 逐 expert 分发融合权重 -------------------------------
+        # `loaded_weight` 在融合路径下通常形状为 `[E, ...]`，其中 `E=num_experts`。
         for expert_id in range(num_experts):
+            # 取出当前 expert 的权重切片，形状从 `[E, ...] -> [...]`。
             curr_expert_weight = loaded_weight[expert_id]
+            # 调用参数级 loader：内部会继续按 shard/tiered-cache/TP 规则决定是否写入。
             success = weight_loader(
                 param,
                 curr_expert_weight,
@@ -472,177 +480,146 @@ class Qwen3_5Model(Qwen3NextModel):
                 expert_id,
                 return_success=True,
             )
+            # 只要当前 expert 成功写入本地参数，就把总标记置为 True。
             if success:
                 loaded_local_expert = True
 
+        # 返回本轮是否命中过至少一个本地 expert。
         return loaded_local_expert
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # -----------------
-        # 入口：Qwen3.5 语言主干的手工参数映射入口。
-        # -----------------
-        # 这个方法负责把 HF checkpoint 的原始命名映射到 CFIE/vLLM 内部的融合参数。
-        # 当前主要覆盖四类映射：
-        # - q/k/v -> qkv_proj
-        # - gate/up -> gate_up_proj
-        # - GDN 的 qkvz / ba 融合
-        # - MoE routed experts / fused experts 权重
-        #
-        # 当前本地这份 Qwen3.5-122B-A10B-GPTQ-Int4 checkpoint 的关键上下文：
-        # - text_config.model_type = "qwen3_5_moe_text"
-        # - text_config.hidden_size = 3072
-        # - text_config.num_experts = 256
-        # - text_config.num_experts_per_tok = 8
-        # - quantization_config.quant_method = "gptq"
-        # - bits = 4, group_size = 128, desc_act = false, sym = true
-        # - dynamic 里显式排除了 attn.* / shared_expert.* / mtp.*
-        #
-        # 因而当前大体会分成三条加载路径：
-        # 1. attention / linear-attn / GDN 融合层，多数是 BF16 非量化路径
-        # 2. shared_expert.gate_up_proj / down_proj，多数也是 BF16 非量化路径
-        # 3. routed experts 的 GPTQ Int4 参数，这是下面的主要 MoE 量化加载路径
-
-        # -----------------
-        # 初始化：普通融合层映射表。
-        # -----------------
+        # ------------------------------- 初始化普通融合参数映射表 -------------------------------
+        # 每个映射项格式为 `(内部参数名, checkpoint 子名, 分片标识)`。
         stacked_params_mapping = [
-            # (内部参数名, checkpoint 子名, 分片标识)
-            # 自注意力 q/k/v -> qkv_proj
+            # attention: q/k/v 合并到 qkv_proj。
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
-            # 前馈层 gate/up -> gate_up_proj
+            # FFN: gate/up 合并到 gate_up_proj。
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            # GDN 融合投影
+            # GDN: qkvz 与 ba 两组融合投影。
             ("in_proj_qkvz", "in_proj_qkv", (0, 1, 2)),
             ("in_proj_qkvz", "in_proj_z", 3),
             ("in_proj_ba", "in_proj_b", 0),
             ("in_proj_ba", "in_proj_a", 1),
         ]
 
-        # -----------------
-        # 初始化：参数索引与专家映射。
-        # -----------------
-        # 把当前语言主干里已注册的参数拍平成字典，便于后面按名字直接定位。
+        # ------------------------------- 初始化参数索引与专家映射 -------------------------------
+        # 把当前模块参数拍平成字典，后续按改写后的参数名直接索引。
         params_dict = dict(self.named_parameters())
 
-        # 记录本次真正从 checkpoint 成功初始化过的参数名，最后返回给上层做对账。
+        # 记录本次真正命中并成功加载的参数名，供上层做加载对账。
         loaded_params: set[str] = set()
 
-        # routed experts 默认先按“非融合专家 checkpoint”路径处理；
-        # 若后面发现 checkpoint 实际使用 fused expert 格式，再切换到融合映射表。
+        # 默认按“非融合专家 checkpoint”路径处理 routed experts。
         is_fused_expert = False
 
-        # 非融合专家 checkpoint 的典型映射示例：
-        # - ("experts.w13_", "experts.37.gate_proj.", 37, "w1")
-        # - ("experts.w13_", "experts.37.up_proj.",   37, "w3")
-        # - ("experts.w2_",  "experts.37.down_proj.", 37, "w2")
-        expert_params_mapping = self.get_expert_mapping() # 当前路径
+        # 处理ckpt为非融合专家格式映射表
+        # 获取“checkpoint 专家参数名 -> 内部参数名”的默认专家映射表。
+        expert_params_mapping = self.get_expert_mapping()
 
-        # 融合专家 checkpoint 的专用映射表。
+        # 定义融合专家 checkpoint 的专用映射表。
         fused_expert_params_mapping = [
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
 
-        # 当前 text_config.num_experts = 256。
-        # 这里读取的是“逻辑专家总数”，不是某层当前设备上真实分配的 local expert slots。
-        # local slots / tiered cache 的裁剪发生在 FusedMoE 层内部创建和权重加载阶段。
+        # 读取逻辑专家总数；本地 slot 裁剪在 FusedMoE 内部完成。
         num_experts = (
             self.config.num_experts if hasattr(self.config, "num_experts") else 0
         )
 
-        # -----------------
-        # 主循环：顺序消费 checkpoint 中的每个权重张量。
-        # -----------------
+        # ------------------------------- 顺序消费 checkpoint 权重并按层分发 -------------------------------
         for name, loaded_weight in weights:
-            # rotary_emb.inv_freq 通常不需要从 checkpoint 显式恢复。
+            # rotary_emb.inv_freq 一般由运行时生成，不需要从 checkpoint 恢复。
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # MTP 参数由 qwen3_5_mtp.py 单独负责，这里显式跳过。
+            # mtp.* 权重由 MTP 子模型单独加载，当前主模型路径跳过。
             if name.startswith("mtp."):
                 continue
 
-            # kv-scale 名字在少数量化格式下需要重映射；
-            # 当前 GPTQ Marlin 路径通常不会命中，这里主要保留兼容。
+            # 对少数量化变体兼容 kv-scale 重命名。
             if name.endswith("scale"):
+                # 尝试把旧命名 remap 到当前参数表命名。
                 name = maybe_remap_kv_scale_name(name, params_dict)
+                # 映射失败表示当前模型不需要该 scale，直接跳过。
                 if name is None:
                     continue
 
-            # -----------------
-            # 第一层分发：普通融合层参数。
-            # -----------------
+            # ------------------------------- 第一层分发：普通融合层参数 -------------------------------
             for param_name, weight_name, shard_id in stacked_params_mapping:
+                # 只要看到融合专家命名，就切换后续专家加载映射到 fused 路径。
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
-                    # 一旦看到这种命名，说明 checkpoint 的 experts 采用融合存储格式；
-                    # 后面的专家加载映射要切换到 fused_expert_params_mapping。
-                    is_fused_expert = True # 当前步骤该路径
+                    # 记录当前 checkpoint 使用融合专家格式。
+                    is_fused_expert = True
+                    # 把专家映射切换为 fused 专用映射表。
                     expert_params_mapping = fused_expert_params_mapping
 
+                # 当前映射项不匹配该权重名时继续匹配下一项。
                 if weight_name not in name:
                     continue
 
+                # routed experts 命名留给下一层 MoE 专家分发处理，避免被普通映射提前消费。
                 if "mlp.experts" in name:
-                    # 一旦进入 mlp.experts.*，说明这是 routed experts；
-                    # 不能被普通 gate_up_proj / down_proj 映射提前吃掉，
-                    # 必须留给后面的 MoE 专家加载逻辑处理。
                     continue
 
-                # 把 checkpoint 子名改写成当前模型内部的融合参数名。
+                # -------------- name 从ckpt key 转为 param key --------------
+
+                # 把 checkpoint 子名替换成模型内部融合参数名。
                 name = name.replace(weight_name, param_name)
 
-                # GPTQ checkpoint 常会携带额外 bias，但当前模块未必注册了对应参数；
-                # 这里按 GPTQ 路径直接跳过。
+                # GPTQ 常见额外 bias 若当前未注册对应参数则直接跳过。
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
-                # 跳过位于其他设备上的层。
+                # PP 场景下跳过不在当前 stage 的参数。
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                # 若改写后的名字不在当前模型参数表中，说明它不属于这条普通融合层路径。
+                # 改写后若仍不在参数表中，说明不属于本层普通融合路径。
                 if name not in params_dict:
                     continue
 
+                # 取出目标参数对象。
                 param = params_dict[name]
+                # 取出参数自己的权重装载函数。
                 weight_loader = param.weight_loader
 
-                # 这里真正把外部 shard 名交给具体参数自己的 weight_loader：
-                # - qkv_proj 使用 q/k/v
-                # - gate_up_proj 使用 0/1
-                # - in_proj_qkvz / in_proj_ba 使用 GDN 的融合分片标识
+                # 把 shard 标识交给参数级 loader 执行实际切片与写入。
                 weight_loader(param, loaded_weight, shard_id)
+                # 命中普通融合层后结束第一层分发。
                 break
             else:
-                # -----------------
-                # 第二层分发：MoE expert 参数。
-                # -----------------
-                # 这一层才是当前 122B-A10B-GPTQ-Int4 的主量化权重路径：
-                # - experts.gate_up_proj.* -> experts.w13_weight.*
-                # - experts.down_proj.*    -> experts.w2_weight.*
-                # 这里承接 routed experts 的 qweight / scales / qzeros / g_idx 等参数。
+                # ------------------------------- 第二层分发：MoE 专家参数 -------------------------------
+                # 标记当前权重是否属于专家参数命名空间。
                 is_expert_weight = False
                 for mapping in expert_params_mapping:
+                    # 解包专家映射项：内部参数名、checkpoint 子名、expert id、shard id。
                     param_name, weight_name, expert_id, shard_id = mapping
+                    # 当前映射项不匹配则继续。
                     if weight_name not in name:
                         continue
+                    # 命中后标记为专家权重，避免后续兜底路径误报。
                     is_expert_weight = True
 
-                    # 先把 checkpoint 专家名改写成模型内部参数名。
+                    # -------------- name 从ckpt key 转为 param key --------------
+
+                    # 把专家 checkpoint 名改写成模型内部参数名。
                     name_mapped = name.replace(weight_name, param_name)
 
-                    # 跳过位于其他设备上的层。
+                    # PP 场景下跳过不在当前 stage 的专家参数。
                     if is_pp_missing_parameter(name_mapped, self):
                         continue
 
+                    # 融合专家 checkpoint 路径。
                     if is_fused_expert:
+                        # gate_up 融合权重需要拆成 w1/w3 两半分别加载。
                         if "experts.gate_up_proj" in name:
-                            # 融合专家 checkpoint 会把 gate_up 的 [w1 | w3] 合在一起，
-                            # 这里要先拆开，再分别按 w1 / w3 写入。
+                            # `loaded_weight` 形状从 `[E, 2*H, D]` 沿 `dim=-2` 拆成两份 `[E, H, D]`。
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
+                            # 先加载 w1 半边。
                             success_w1 = self.load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -650,6 +627,7 @@ class Qwen3_5Model(Qwen3NextModel):
                                 "w1",
                                 num_experts,
                             )
+                            # 再加载 w3 半边。
                             success_w3 = self.load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -657,9 +635,10 @@ class Qwen3_5Model(Qwen3NextModel):
                                 "w3",
                                 num_experts,
                             )
+                            # 两半都成功才算本参数加载成功。
                             success = success_w1 and success_w3
                         else:
-                            # down_proj 融合路径不需要再拆分，直接按当前 shard_id 装载。
+                            # down_proj 融合路径无需二次拆分，按当前 shard 直接加载。
                             success = self.load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -667,58 +646,65 @@ class Qwen3_5Model(Qwen3NextModel):
                                 shard_id,
                                 num_experts,
                             )
+                        # 融合专家路径成功后记录最终参数名并结束专家分发。
                         if success:
                             name = name_mapped
                             break
                     else:
-                        # 非融合专家路径会直接调用 FusedMoE.weight_loader(...)。
-                        # 它会继续根据 shard_id / expert_id / quant_method，
-                        # 把 qweight / scales / qzeros / g_idx 写入对应 expert slot。
+                        # 非融合专家路径交给 FusedMoE.weight_loader 处理 qweight/scales/qzeros/g_idx。
                         if (
                                 name_mapped.endswith(".bias")
                                 or name_mapped.endswith("_bias")
                         ) and name_mapped not in params_dict:
+                            # GPTQ 额外 bias 若未注册则跳过。
                             continue
 
+                        # 取出目标专家参数。
                         param = params_dict[name_mapped]
+                        # 取出参数级 loader。
                         weight_loader = param.weight_loader
 
+                        # 调用专家参数 loader，并显式要求返回成功状态。
                         success = weight_loader(
                             param,
                             loaded_weight,
-                            name_mapped,
+                            name_mapped, # param_key
                             shard_id=shard_id,
                             expert_id=expert_id,
                             return_success=True,
                         )
+                    # 专家路径成功后记录映射后的参数名并结束专家分发。
                     if success:
                         name = name_mapped
                         break
                 else:
-                    # -----------------
-                    # 第三层分发：默认参数加载兜底。
-                    # -----------------
-                    # 既不是普通融合层，也不是专家参数时，退回默认 weight_loader。
-                    # 常见包括 norm、embedding、router gate 等普通参数。
+                    # ------------------------------- 第三层分发：默认参数兜底 -------------------------------
+                    # 命中专家命名空间但未在当前 rank 装载时，直接跳过不走兜底。
                     if is_expert_weight:
-                        # 该参数已经确认是专家权重，但未映射到本地 rank，因此直接跳过。
                         continue
+                    # 额外 bias 且未注册参数时跳过。
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    # 跳过 PP 其他 stage 参数。
                     if is_pp_missing_parameter(name, self):
                         continue
+                    # 若参数表中不存在该名称，则记录一次警告并跳过。
                     if name not in params_dict:
                         logger.warning_once(
                             f"Parameter {name} not found in params_dict, skip loading"
                         )
                         continue
+                    # 取出目标参数对象。
                     param = params_dict[name]
+                    # 优先使用参数自带 loader，没有则回退到默认 loader。
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    # 执行兜底参数加载。
                     weight_loader(param, loaded_weight)
-            # 只有真正命中某条加载路径后，才把最终参数名记入 loaded_params。
+            # 只有命中任一路径后，才把最终参数名加入已加载集合。
             loaded_params.add(name)
+        # 返回本次实际加载成功的参数名集合。
         return loaded_params
 
 

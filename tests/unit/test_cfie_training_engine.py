@@ -9,6 +9,7 @@ import math
 import pytest
 import torch
 
+from cfie.offload.policy import LOG_RUNTIME_EVENTS_KEY
 from cfie_training.config import TrainingProjectConfig
 from cfie_training.predictor.trainer import EngineRouterTeacherModelBackend
 from cfie_training.profiles import build_profile_config
@@ -229,7 +230,9 @@ def test_predictor_teacher_backend_uses_dedicated_teacher_engine_config() -> Non
     assert backend._resolve_moe_cpu_budget_gb() == 0.0
     assert backend._resolve_moe_cpu_min_free_gb() == 0.0
     assert backend._resolve_gpu_memory_utilization() == pytest.approx(0.6)
-    assert backend._resolve_engine_additional_config() == {}
+    assert backend._resolve_engine_additional_config() == {
+        LOG_RUNTIME_EVENTS_KEY: False,
+    }
 
     cfg.resource_policy.weight_offload_backend = "cpu"
     cfg.memory_budget.gpu_hot_budget_gb = 1.0
@@ -257,6 +260,7 @@ def test_predictor_teacher_backend_allows_explicit_teacher_engine_overrides() ->
     cfg.teacher_engine.cpu_offload_gb = 12.0
     cfg.teacher_engine.moe_cpu_budget_gb = 24.0
     cfg.teacher_engine.moe_cpu_min_free_gb = 6.0
+    cfg.teacher_engine.log_runtime_moe_cache_events = True
     backend = EngineRouterTeacherModelBackend.create(cfg)
 
     assert backend._resolve_gpu_memory_utilization() == pytest.approx(0.7)
@@ -264,6 +268,33 @@ def test_predictor_teacher_backend_allows_explicit_teacher_engine_overrides() ->
     assert backend._resolve_cpu_offload_gb() == pytest.approx(12.0)
     assert backend._resolve_moe_cpu_budget_gb() == pytest.approx(24.0)
     assert backend._resolve_moe_cpu_min_free_gb() == pytest.approx(6.0)
+    assert backend._resolve_engine_additional_config() == {
+        LOG_RUNTIME_EVENTS_KEY: True,
+    }
+
+
+def test_predictor_teacher_backend_capacity_uses_batch_shape_upper_bound() -> None:
+    cfg = build_profile_config("qwen35-35b-a3b")
+    backend = EngineRouterTeacherModelBackend.create(cfg)
+
+    batch = BatchShape(
+        samples=1,
+        tokens_per_sample=1024,
+        source_kind="tokenized_dataset",
+        dataset_name="short-prompts.jsonl",
+        sample_indices=(0,),
+        loss_token_count=8,
+        token_rows=(tuple(range(1024)),),
+        target_rows=(tuple(range(1, 1025)),),
+        attention_mask_rows=(
+            tuple([1] * 8 + [0] * (1024 - 8)),
+        ),
+        target_attention_mask_rows=(
+            tuple([1] * 8 + [0] * (1024 - 8)),
+        ),
+    )
+
+    assert backend._capacity_for_batch(batch) == (1025, 1, 1024)
 
 
 def test_expert_rotation_scheduler_blends_next_step_prefetch_with_overlap(

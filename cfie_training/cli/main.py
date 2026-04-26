@@ -11,6 +11,10 @@ from typing import Sequence
 
 from cfie_training.config import TrainingProjectConfig
 from cfie_training.predictor import PredictorTraceDataset, PredictorTrainer
+from cfie_training.predictor.trainer import (
+    DEFAULT_TRACE_FLUSH_EVERY_STEPS,
+    PredictorTraceBuildProgress,
+)
 from cfie_training.profiles import (
     DEFAULT_TRAINING_PROFILE,
     SUPPORTED_TRAINING_PROFILES,
@@ -28,6 +32,44 @@ from cfie_training.runtime.types import (
 LOGGER = logging.getLogger("cfie_training.cli")
 
 
+class _PredictorTraceProgressBar:
+    def __init__(self, *, total_steps: int, description: str) -> None:
+        self._bar = None
+        if total_steps < 1 or not sys.stderr.isatty():
+            return
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            return
+
+        self._bar = tqdm(
+            total=total_steps,
+            desc=description,
+            unit="step",
+            dynamic_ncols=True,
+            file=sys.stderr,
+        )
+
+    def update(self, progress: PredictorTraceBuildProgress) -> None:
+        if self._bar is None:
+            return
+        delta = progress.completed_steps - int(self._bar.n)
+        if delta > 0:
+            self._bar.update(delta)
+        postfix = {
+            "examples": progress.example_count,
+            "last_examples": progress.last_step_examples,
+            "last_tokens": progress.last_step_tokens,
+        }
+        if progress.persisted_steps > 0:
+            postfix["flushed"] = progress.persisted_steps
+        self._bar.set_postfix(postfix, refresh=False)
+
+    def close(self) -> None:
+        if self._bar is not None:
+            self._bar.close()
+
+
 def _configure_cli_logging() -> None:
     # 仅在外部尚未配置日志时补一个默认配置，避免覆盖宿主程序已有的日志策略。
     if logging.getLogger().handlers:
@@ -43,6 +85,14 @@ def _emit_stdout(text: str) -> None:
     sys.stdout.write(text)
     if not text.endswith("\n"):
         sys.stdout.write("\n")
+
+
+def _emit_stdout_path(path: Path) -> None:
+    with path.open("r", encoding="utf-8") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), ""):
+            if not chunk:
+                break
+            sys.stdout.write(chunk)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -138,6 +188,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         help="Optional path that receives the captured predictor trace dataset as JSON.",
+    )
+    predictor_trace_parser.add_argument(
+        "--flush-every-steps",
+        type=int,
+        default=DEFAULT_TRACE_FLUSH_EVERY_STEPS,
+        help=(
+            "When --output is set, flush in-progress trace data to disk every N "
+            "capture steps. Use 0 to disable periodic flushes."
+        ),
     )
     # 添加 JSON 输出开关，用于控制是否以 JSON 形式打印 predictor trace 数据集。
     predictor_trace_parser.add_argument(
@@ -722,6 +781,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "predictor-trace" and args.dataset is None:
         parser.error("predictor-trace requires --dataset")
     if (
+            args.command == "predictor-trace"
+            and args.flush_every_steps < 0
+    ):
+        parser.error("predictor-trace --flush-every-steps must be >= 0")
+    if (
             args.command in {"predictor-train", "predictor-eval"}
             and args.trace_input is None
             and args.dataset is None
@@ -791,23 +855,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         trainer = PredictorTrainer(config)
         # predictor-trace 的摘要信息统一走标准日志。
         logger = LOGGER.getChild("predictor.trace")
-        # 构造 predictor trace 数据集。
-        dataset = trainer.build_trace_dataset(
-            steps=args.steps,
-            examples_per_step=args.examples_per_step,
-            samples=args.samples,
-            tokens_per_sample=args.tokens_per_sample,
-            dataset_path=None if args.dataset is None else str(args.dataset),
-            tokenizer_path=None if args.tokenizer is None else str(args.tokenizer),
-            dataset_format=args.dataset_format,
-            dataset_text_key=args.dataset_text_key,
+        progress_bar = _PredictorTraceProgressBar(
+            total_steps=args.steps,
+            description="predictor-trace",
         )
+        try:
+            if args.output is not None:
+                dataset_result = trainer.build_trace_dataset_to_json_file(
+                    output_path=args.output,
+                    steps=args.steps,
+                    examples_per_step=args.examples_per_step,
+                    samples=args.samples,
+                    tokens_per_sample=args.tokens_per_sample,
+                    dataset_path=None if args.dataset is None else str(args.dataset),
+                    tokenizer_path=None if args.tokenizer is None else str(args.tokenizer),
+                    dataset_format=args.dataset_format,
+                    dataset_text_key=args.dataset_text_key,
+                    flush_every_steps=args.flush_every_steps,
+                    progress_callback=progress_bar.update,
+                )
+                if args.json:
+                    _emit_stdout_path(args.output)
+                else:
+                    logger.info(
+                        f"Built {dataset_result.example_count} predictor trace "
+                        f"example(s) for profile {dataset_result.profile_name}."
+                    )
+                    logger.info(
+                        f"window={dataset_result.window_layers} "
+                        f"candidate={dataset_result.candidate_experts_per_layer} "
+                        f"executed={dataset_result.executed_experts_per_layer}"
+                    )
+                    logger.info("saved_trace=%s", args.output)
+                return 0
 
-        # ------------------------------- 按需保存 predictor trace 数据集到磁盘 -------------------------------
-        # 当用户显式指定输出路径时，将生成的数据集写入目标文件。
-        if args.output is not None:
-            # 将 predictor trace 数据集保存为 JSON 文件。
-            dataset.write_json(args.output)
+            # 构造 predictor trace 数据集。
+            dataset = trainer.build_trace_dataset(
+                steps=args.steps,
+                examples_per_step=args.examples_per_step,
+                samples=args.samples,
+                tokens_per_sample=args.tokens_per_sample,
+                dataset_path=None if args.dataset is None else str(args.dataset),
+                tokenizer_path=None if args.tokenizer is None else str(args.tokenizer),
+                dataset_format=args.dataset_format,
+                dataset_text_key=args.dataset_text_key,
+                progress_callback=progress_bar.update,
+            )
+        finally:
+            progress_bar.close()
 
         # ------------------------------- 输出 predictor trace 数据集构造结果 -------------------------------
         # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出结果。
@@ -875,16 +970,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             dataset = PredictorTraceDataset.from_json_file(args.trace_input)
         else:
             # 未提供现成 trace 输入时，现场构造训练所需的 predictor trace 数据集。
-            dataset = trainer.build_trace_dataset(
-                steps=args.steps,
-                examples_per_step=args.examples_per_step,
-                samples=args.samples,
-                tokens_per_sample=args.tokens_per_sample,
-                dataset_path=None if args.dataset is None else str(args.dataset),
-                tokenizer_path=None if args.tokenizer is None else str(args.tokenizer),
-                dataset_format=args.dataset_format,
-                dataset_text_key=args.dataset_text_key,
+            progress_bar = _PredictorTraceProgressBar(
+                total_steps=args.steps,
+                description="predictor-train trace",
             )
+            try:
+                dataset = trainer.build_trace_dataset(
+                    steps=args.steps,
+                    examples_per_step=args.examples_per_step,
+                    samples=args.samples,
+                    tokens_per_sample=args.tokens_per_sample,
+                    dataset_path=None if args.dataset is None else str(args.dataset),
+                    tokenizer_path=None if args.tokenizer is None else str(args.tokenizer),
+                    dataset_format=args.dataset_format,
+                    dataset_text_key=args.dataset_text_key,
+                    progress_callback=progress_bar.update,
+                )
+            finally:
+                progress_bar.close()
 
         # 基于数据集执行训练，并按 step/epoch 输出日志与周期性 checkpoint。
         model, run_trace, optimizer_state_dict = trainer.fit_dataset(
@@ -943,16 +1046,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             dataset = PredictorTraceDataset.from_json_file(args.trace_input)
         else:
             # 未提供现成 trace 输入时，现场构造评估所需的 predictor trace 数据集。
-            dataset = trainer.build_trace_dataset(
-                steps=args.steps,
-                examples_per_step=args.examples_per_step,
-                samples=args.samples,
-                tokens_per_sample=args.tokens_per_sample,
-                dataset_path=None if args.dataset is None else str(args.dataset),
-                tokenizer_path=None if args.tokenizer is None else str(args.tokenizer),
-                dataset_format=args.dataset_format,
-                dataset_text_key=args.dataset_text_key,
+            progress_bar = _PredictorTraceProgressBar(
+                total_steps=args.steps,
+                description="predictor-eval trace",
             )
+            try:
+                dataset = trainer.build_trace_dataset(
+                    steps=args.steps,
+                    examples_per_step=args.examples_per_step,
+                    samples=args.samples,
+                    tokens_per_sample=args.tokens_per_sample,
+                    dataset_path=None if args.dataset is None else str(args.dataset),
+                    tokenizer_path=None if args.tokenizer is None else str(args.tokenizer),
+                    dataset_format=args.dataset_format,
+                    dataset_text_key=args.dataset_text_key,
+                    progress_callback=progress_bar.update,
+                )
+            finally:
+                progress_bar.close()
 
         # ------------------------------- 使用指定 checkpoint 对 trace 数据集执行评估 -------------------------------
         # 基于给定 checkpoint 与评估数据集执行评估。

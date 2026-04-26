@@ -310,6 +310,8 @@ def test_predictor_trace_command_writes_output_file(
         str(dataset_path),
         "--output",
         str(output_path),
+        "--flush-every-steps",
+        "1",
         "--json",
     ])
 

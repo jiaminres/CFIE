@@ -365,40 +365,18 @@ class EplbState:
         num_redundant_experts: int,
     ) -> Sequence[int]:
         """
-        Build an initial expert arrangement using the following structure:
-        [original routed experts, redundant experts]
-
-        Returns:
-            physical_to_logical_map (Sequence[int]): A list of integers,
-                where each integer is the index of the logical expert
-                that the corresponding physical expert maps to.
+        构建初始的全局 physical->logical 映射：
+        [routed experts, redundant experts]
         """
-        # 先为每个 routed/logical expert 分配一个“基础物理槽位”。
-        # 这里直接生成 [0, 1, 2, ..., num_routed_experts - 1]，
-        # 含义是：前 num_routed_experts 个 physical expert 与 logical expert 一一对应。
+        # routed experts 先按一一对应写入前缀映射。
         global_physical_to_logical_map = list(range(num_routed_experts))
 
-        # 再把“冗余 physical expert” 追加到列表末尾。
-        # 这些冗余 expert 不是新的 logical expert，
-        # 而是已有 logical expert 的额外副本，用于 EPLB 等场景。
-        #
-        # 这里通过 i % num_routed_experts 做循环映射：
-        # - 第 1 个冗余 expert 映射到 logical expert 0
-        # - 第 2 个冗余 expert 映射到 logical expert 1
-        # - ...
-        # - 超过 num_routed_experts 后再从 0 重新开始
-        #
-        # 例如：
-        # - num_routed_experts = 4
-        # - num_redundant_experts = 3
-        # 则追加部分为 [0, 1, 2]，
-        # 最终结果是 [0, 1, 2, 3, 0, 1, 2]。
+        # 冗余 experts 追加到末尾，并按轮询映射到已有 logical experts。
         global_physical_to_logical_map += [
             i % num_routed_experts for i in range(num_redundant_experts)
         ]
 
-        # 返回“全局 physical expert id -> logical expert id” 的初始映射表。
-        # 返回长度 = routed experts 数 + 冗余 experts 数。
+        # 返回初始 global physical expert id -> logical expert id 映射。
         return global_physical_to_logical_map
 
     def validate_ep_configuration(self, new_model: MixtureOfExperts):

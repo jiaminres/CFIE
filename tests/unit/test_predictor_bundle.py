@@ -17,7 +17,7 @@ from cfie.predictor import (
     load_predictor_bundle,
     load_predictor_model,
 )
-from cfie_training.predictor import PredictorTrainer
+from cfie_training.predictor import PredictorTraceDataset, PredictorTrainer
 from cfie_training.predictor.trainer import CapturedForwardBatch
 from cfie_training.profiles import build_profile_config
 from cfie_training.runtime.types import BatchShape
@@ -316,6 +316,52 @@ def test_predictor_trainer_prefers_forward_capture_backend(
     assert len(dataset.examples[0].future_layer_indices) == (
         config.predictor_routing.window_layers
     )
+
+
+def test_predictor_trainer_streams_trace_dataset_to_json_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = build_profile_config("qwen35-35b-a3b")
+    trainer = PredictorTrainer(
+        config,
+        teacher_model_backend=_FakeForwardBackend(
+            hidden_dim=config.model_spec.hidden_size,
+            num_layers=config.model_spec.num_hidden_layers,
+            num_experts=config.model_spec.num_experts,
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_build_batch_planner",
+        lambda **_: _FakeTokenBatchPlanner(),
+    )
+
+    output_path = tmp_path / "predictor_trace.json"
+    progress_updates = []
+    result = trainer.build_trace_dataset_to_json_file(
+        output_path=output_path,
+        steps=2,
+        examples_per_step=1,
+        dataset_path="fake.txt",
+        flush_every_steps=1,
+        progress_callback=progress_updates.append,
+    )
+    dataset = PredictorTraceDataset.from_json_file(output_path)
+
+    assert result.output_path == output_path
+    assert result.example_count == 2
+    assert dataset.example_count == 2
+    assert progress_updates
+    assert progress_updates[-1].completed_steps == 2
+    assert progress_updates[-1].persisted_steps == 2
+    assert any(update.persisted_steps == 1 for update in progress_updates)
+    assert not output_path.with_name(
+        output_path.name + ".progress.examples.jsonl"
+    ).exists()
+    assert not output_path.with_name(
+        output_path.name + ".progress.json"
+    ).exists()
 
 
 def test_predictor_trainer_rejects_dataset_config_mismatch(
