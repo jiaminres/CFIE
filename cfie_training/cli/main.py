@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
+import torch
+
 from cfie_training.config import TrainingProjectConfig
 from cfie_training.predictor import PredictorTraceDataset, PredictorTrainer
 from cfie_training.predictor.trainer import (
@@ -93,6 +95,10 @@ def _emit_stdout_path(path: Path) -> None:
             if not chunk:
                 break
             sys.stdout.write(chunk)
+
+
+def _default_predictor_trace_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -964,11 +970,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             checkpoint_save_path = args.resume_checkpoint
 
         # ------------------------------- 构造或加载 predictor 训练所需的 trace 数据集 -------------------------------
-        # 当用户提供现成的 trace 输入文件时，直接从 JSON 文件读取。
-        if args.trace_input is not None:
-            # 从已有 JSON 文件中恢复 predictor trace 数据集。
-            dataset = PredictorTraceDataset.from_json_file(args.trace_input)
-        else:
+        if args.trace_input is None:
             # 未提供现成 trace 输入时，现场构造训练所需的 predictor trace 数据集。
             progress_bar = _PredictorTraceProgressBar(
                 total_steps=args.steps,
@@ -988,19 +990,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             finally:
                 progress_bar.close()
-
-        # 基于数据集执行训练，并按 step/epoch 输出日志与周期性 checkpoint。
-        model, run_trace, optimizer_state_dict = trainer.fit_dataset(
-            dataset,
-            epochs=args.epochs,
-            model=model,
-            optimizer_state_dict=optimizer_state_dict,
-            initial_run_trace=initial_run_trace,
-            logger=logger,
-            log_every_steps=args.log_every_steps,
-            checkpoint_output_path=checkpoint_save_path,
-            checkpoint_every_epochs=args.checkpoint_every_epochs,
-        )
+            model, run_trace, optimizer_state_dict = trainer.fit_dataset(
+                dataset,
+                epochs=args.epochs,
+                model=model,
+                optimizer_state_dict=optimizer_state_dict,
+                initial_run_trace=initial_run_trace,
+                logger=logger,
+                log_every_steps=args.log_every_steps,
+                checkpoint_output_path=checkpoint_save_path,
+                checkpoint_every_epochs=args.checkpoint_every_epochs,
+            )
+        else:
+            model, run_trace, optimizer_state_dict = trainer.fit_trace_file(
+                path=args.trace_input,
+                epochs=args.epochs,
+                model=model,
+                optimizer_state_dict=optimizer_state_dict,
+                initial_run_trace=initial_run_trace,
+                logger=logger,
+                log_every_steps=args.log_every_steps,
+                checkpoint_output_path=checkpoint_save_path,
+                checkpoint_every_epochs=args.checkpoint_every_epochs,
+                device=_default_predictor_trace_device(),
+            )
 
         # ------------------------------- 记录训练后的最终 checkpoint -------------------------------
         # 若本次训练可落盘 checkpoint，则显式记录最终可续训 checkpoint 路径。
@@ -1040,10 +1053,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger = LOGGER.getChild("predictor.eval")
 
         # ------------------------------- 构造或加载 predictor 评估所需的 trace 数据集 -------------------------------
-        # 当用户提供现成的 trace 输入文件时，直接读取该数据集。
+        # 当用户提供现成的 trace 输入文件时，直接走流式 trace store 评估路径，
+        # 避免把大体积 JSON 一次性整体读入内存。
         if args.trace_input is not None:
-            # 从已有 JSON 文件中恢复 predictor trace 数据集。
-            dataset = PredictorTraceDataset.from_json_file(args.trace_input)
+            evaluation = trainer.evaluate_trace_file(
+                path=args.trace_input,
+                checkpoint_path=args.checkpoint,
+                device=_default_predictor_trace_device(),
+            )
         else:
             # 未提供现成 trace 输入时，现场构造评估所需的 predictor trace 数据集。
             progress_bar = _PredictorTraceProgressBar(
@@ -1065,12 +1082,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             finally:
                 progress_bar.close()
 
-        # ------------------------------- 使用指定 checkpoint 对 trace 数据集执行评估 -------------------------------
-        # 基于给定 checkpoint 与评估数据集执行评估。
-        evaluation = trainer.evaluate_checkpoint(
-            checkpoint_path=args.checkpoint,
-            dataset=dataset,
-        )
+            # ------------------------------- 使用指定 checkpoint 对 trace 数据集执行评估 -------------------------------
+            # 基于给定 checkpoint 与评估数据集执行评估。
+            evaluation = trainer.evaluate_checkpoint(
+                checkpoint_path=args.checkpoint,
+                dataset=dataset,
+            )
 
         # ------------------------------- 输出 predictor 评估结果 -------------------------------
         # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出评估结果。

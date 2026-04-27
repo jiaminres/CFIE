@@ -12,6 +12,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,6 +49,8 @@ if TYPE_CHECKING:
 
 
 DEFAULT_TRACE_FLUSH_EVERY_STEPS = 16
+DEFAULT_HARD_TARGET_LOSS_WEIGHT = 0.5
+DEFAULT_ROUTER_DISTILL_LOSS_WEIGHT = 0.5
 
 
 @dataclass(slots=True, frozen=True)
@@ -465,6 +468,8 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
             cpu_offload_gb=cpu_offload_gb,
             # predictor 训练必须把最终 routed experts 带回来，作为 teacher top-k 标签。
             enable_return_routed_experts=True,
+            # 额外回传完整 router logits，供 predictor 训练走 soft-target distillation。
+            enable_return_router_logits=True,
             # teacher 路径强制 eager，减少 cudagraph / 编译态对抓取链路的额外干扰。
             enforce_eager=True,
             # 采样训练 trace 时不需要常规统计日志，避免噪声过多。
@@ -810,6 +815,10 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
         layer_hidden_states: list[list[torch.Tensor]] = [[] for _ in range(num_layers)]
         # layer_id --> 不同req的topk
         layer_teacher_topk_ids: list[list[torch.Tensor]] = [[] for _ in range(num_layers)]
+        # layer_id --> 不同req的router_logits
+        layer_teacher_router_logits: list[list[torch.Tensor]] = [
+            [] for _ in range(num_layers)
+        ]
 
         for request_record in request_records:
             # 先校验当前请求确实拿到了按层 hidden state。
@@ -840,20 +849,39 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
                 raise ValueError(
                     f"predictor capture missing routed experts for request {request_id}"
                 )
+            router_logits = getattr(completion, "router_logits", None)
+            if router_logits is None:
+                raise ValueError(
+                    f"predictor capture missing router logits for request {request_id}"
+                )
 
             # 统一转成 long tensor，便于后续按层切片并拼接到训练监督张量中。
             routed_experts_tensor = torch.as_tensor(
                 routed_experts,
                 dtype=torch.long,
             )
+            router_logits_tensor = torch.as_tensor(
+                router_logits,
+                dtype=torch.float32,
+            )
             if routed_experts_tensor.ndim != 3:
                 raise ValueError(
                     "captured routed experts must have shape "
                     "[num_tokens, num_layers, topk]"  # 期望采样形状
                 )
+            if router_logits_tensor.ndim != 3:
+                raise ValueError(
+                    "captured router logits must have shape "
+                    "[num_tokens, num_layers, num_experts]"
+                )
             if routed_experts_tensor.shape[1] != num_layers:
                 raise ValueError(
                     "captured routed-expert layer count does not match "
+                    "model_spec.num_hidden_layers"
+                )
+            if router_logits_tensor.shape[1] != num_layers:
+                raise ValueError(
+                    "captured router-logit layer count does not match "
                     "model_spec.num_hidden_layers"
                 )
 
@@ -864,6 +892,10 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
                 raise ValueError(
                     "captured routed experts token count does not match prompt length"
                 )
+            if router_logits_tensor.shape[0] != expected_num_tokens:
+                raise ValueError(
+                    "captured router logits token count does not match prompt length"
+                )
 
             # 把当前请求的每层 hidden state 与 top-k 标签分别归档到对应层桶里，
             # 最终形成“按层训练”的监督布局。
@@ -873,6 +905,9 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
                 # layer_teacher_topk_ids将第二维度的layer_index取出来
                 layer_teacher_topk_ids[layer_index].append(
                     routed_experts_tensor[:, layer_index, :]
+                )
+                layer_teacher_router_logits[layer_index].append(
+                    router_logits_tensor[:, layer_index, :]
                 )
 
         # ------------------------------- 拼接层级监督结果并返回 -------------------------------
@@ -895,6 +930,10 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
                 torch.cat(layer_teacher_topk_ids[layer_index], dim=0)
                 for layer_index in range(num_layers)
             ),
+            layer_teacher_router_logits=tuple(
+                torch.cat(layer_teacher_router_logits[layer_index], dim=0)
+                for layer_index in range(num_layers)
+            ),
         )
 
     # ------------------------------- 析构时兜底回收 teacher 引擎 -------------------------------
@@ -903,7 +942,7 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
         self._shutdown_engine()
 
 
-class FutureExpertPredictor(nn.Module):
+class _LegacyHiddenStateFutureExpertPredictor(nn.Module):
     """
     基于当前层 hidden state 预测未来窗口层候选专家分布的轻量 predictor。
 
@@ -1044,7 +1083,7 @@ class FutureExpertPredictor(nn.Module):
         return logits.view(-1, self.window_layers, self.num_experts)
 
 
-HiddenStateFutureExpertPredictor = FutureExpertPredictor
+HiddenStateFutureExpertPredictor = _LegacyHiddenStateFutureExpertPredictor
 
 
 class PredictorTraceBuilderBase:
@@ -1089,17 +1128,16 @@ class PredictorTraceBuilderBase:
 
         # ------------------------------- 预计算可插入层索引集合 -------------------------------
         # 预先生成可选插入层索引集合，避免每步重复计算。
-        # 结束位置使用 num_layers - window_layers，确保每个插入层后面都有完整的
-        # future window 可用于构造监督标签。
+        # 运行时 predictor 会按 stride 触发 window 预测，并在模型尾部自动裁掉越界 future
+        # layers。因此 trace 生成也需要允许尾部半窗/残窗，而不是强制要求完整 window。
         self._insertion_layer_indices = tuple(
-            range(
-                # 从第 0 层开始允许插入 predictor，表示使用该层输出的 hidden state 做预测。
+            layer_index
+            for layer_index in range(
                 0,
-                # 当模型层数不足以容纳 future window 时，上界截断为 0，后续采样阶段会报错。
-                max(self._num_layers - self._window_layers, 0),
-                # 按配置 stride 跳层采样，避免每层都生成监督点造成数据膨胀。
-                self._stride_layers,
+                max(self._num_layers, 0),
+                max(self._stride_layers, 1),
             )
+            if self._future_layer_indices(layer_index)
         )
 
     # ------------------------------- 解析每步样本数量 -------------------------------
@@ -1190,10 +1228,12 @@ class PredictorTraceBuilderBase:
             self,
             insertion_layer_index: int,
     ) -> tuple[int, ...]:
-        # 从插入层<下一层>开始，连续取 window_layers 个 future 层索引。
+        # 运行时 planner 会先按 window_layers 做环形展开，再过滤掉不在当前层之后的尾部回绕层。
+        # 这里直接生成等价的“向后连续、但不越过模型末尾”的 future 层集合。
         return tuple(
             insertion_layer_index + offset + 1
             for offset in range(self._window_layers)
+            if insertion_layer_index + offset + 1 < self._num_layers
         )
 
 
@@ -1286,6 +1326,7 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
                 # 收集未来每层 teacher top-k experts，作为多标签监督目标。
                 # [[layer0_cur_token_topks], [layer1_cur_token_topks]...]
                 future_teacher_topk_ids = []
+                future_teacher_router_logits = []
                 for future_layer_index in future_layer_indices:
                     # teacher 后端已经返回真实前向里的执行专家 top-k，
                     # 这里直接读取即可，避免再从全量 logits 二次推导。
@@ -1295,6 +1336,16 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
                     future_teacher_topk_ids.append(
                         tuple(int(expert_id) for expert_id in teacher_topk.tolist())
                     )
+                    if captured.layer_teacher_router_logits is not None:
+                        teacher_router_logits = captured.layer_teacher_router_logits[
+                            future_layer_index
+                        ][example_spec.token_index].to(dtype=torch.float16)
+                        future_teacher_router_logits.append(
+                            tuple(
+                                float(value)
+                                for value in teacher_router_logits.tolist()
+                            )
+                        )
 
                 # ------------------------------- 组装并写入样本 -------------------------------
                 # example_index 使用全局连续编号，保证跨 step 也稳定递增。
@@ -1311,6 +1362,11 @@ class ForwardCaptureTraceBuilder(PredictorTraceBuilderBase):
                         ),
                         # future top-k 监督信号转为不可变元组结构，避免后续被意外修改。
                         future_teacher_topk_ids=tuple(future_teacher_topk_ids),
+                        future_teacher_router_logits=(
+                            tuple(future_teacher_router_logits)
+                            if future_teacher_router_logits
+                            else None
+                        ),
                     )
                 )
                 next_example_index += 1
@@ -1413,7 +1469,7 @@ class PredictorTrainer:
             dataset_text_key=dataset_text_key,
         )
 
-    def build_model(self) -> FutureExpertPredictor:
+    def build_model(self) -> nn.Module:
         # -------------------- 读取决定 predictor 形状的关键配置 --------------------
         # 输入维度当前直接取 model hidden_size。
         trainer_cfg = self.config.predictor_trainer
@@ -1423,11 +1479,17 @@ class PredictorTrainer:
 
         # model_spec 里的 num_experts 决定每个未来层要预测多少个 expert logit。
         # 这里三类配置共同决定 predictor 的完整张量形状。
-        return FutureExpertPredictor(
+        return build_predictor_model(
             input_dim=self.config.model_spec.hidden_size,
             hidden_dim=trainer_cfg.hidden_dim,
             window_layers=routing_cfg.window_layers,
             num_experts=self.config.model_spec.num_experts,
+            model_architecture=trainer_cfg.model_architecture,
+            model_depth=trainer_cfg.model_depth,
+            model_dropout=trainer_cfg.model_dropout,
+            model_num_heads=trainer_cfg.model_num_heads,
+            model_memory_tokens=trainer_cfg.model_memory_tokens,
+            model_ffn_multiplier=trainer_cfg.model_ffn_multiplier,
         )
 
     @staticmethod
@@ -1542,6 +1604,15 @@ class PredictorTrainer:
             profile_name=run_trace.profile_name,
             input_summary_dim=self.config.model_spec.hidden_size,
             hidden_dim=trainer_cfg.hidden_dim,
+            model_descriptor=predictor_model_descriptor(
+                model_architecture=trainer_cfg.model_architecture,
+                hidden_dim=trainer_cfg.hidden_dim,
+                model_depth=trainer_cfg.model_depth,
+                model_dropout=trainer_cfg.model_dropout,
+                model_num_heads=trainer_cfg.model_num_heads,
+                model_memory_tokens=trainer_cfg.model_memory_tokens,
+                model_ffn_multiplier=trainer_cfg.model_ffn_multiplier,
+            ),
             window_layers=routing_cfg.window_layers,
             stride_layers=routing_cfg.stride_layers,
             num_experts=self.config.model_spec.num_experts,
@@ -1580,6 +1651,24 @@ class PredictorTrainer:
         # predictor 隐层宽度决定中间权重张量形状；这项不一致时，旧权重不能安全复用到当前模型。
         if metadata.hidden_dim != trainer_cfg.hidden_dim:
             mismatches.append("hidden_dim")
+
+        current_model_descriptor = predictor_model_descriptor(
+            model_architecture=trainer_cfg.model_architecture,
+            hidden_dim=trainer_cfg.hidden_dim,
+            model_depth=trainer_cfg.model_depth,
+            model_dropout=trainer_cfg.model_dropout,
+            model_num_heads=trainer_cfg.model_num_heads,
+            model_memory_tokens=trainer_cfg.model_memory_tokens,
+            model_ffn_multiplier=trainer_cfg.model_ffn_multiplier,
+        )
+        metadata_model_descriptor = metadata.model_descriptor
+        if (
+                not metadata_model_descriptor
+                and trainer_cfg.model_architecture == "mlp"
+        ):
+            metadata_model_descriptor = current_model_descriptor
+        if metadata_model_descriptor != current_model_descriptor:
+            mismatches.append("model_descriptor")
 
         # 未来窗口层数决定单条样本要预测多少个未来层；窗口长度变化后，训练标签的结构也会随之变化。
         if metadata.window_layers != routing_cfg.window_layers:
@@ -1723,10 +1812,299 @@ class PredictorTrainer:
                 + ", ".join(resume_mismatches)
             )
 
+    def _validate_trace_store(
+            self,
+            store: PredictorTraceTensorStore,
+            *,
+            resume_run_trace: PredictorTrainingRunTrace | None = None,
+    ) -> None:
+        if store.example_count < 1:
+            raise ValueError("predictor trace store must contain at least 1 example")
+
+        routing_cfg = self.config.predictor_routing
+        cfg_mismatches = []
+        if store.profile_name != self.config.profile_name:
+            cfg_mismatches.append("profile_name")
+        if store.window_layers != routing_cfg.window_layers:
+            cfg_mismatches.append("window_layers")
+        if store.candidate_experts_per_layer != (
+                routing_cfg.candidate_experts_per_layer
+        ):
+            cfg_mismatches.append("candidate_experts_per_layer")
+        if store.executed_experts_per_layer != (
+                routing_cfg.executed_experts_per_layer
+        ):
+            cfg_mismatches.append("executed_experts_per_layer")
+        if store.hidden_size != self.config.model_spec.hidden_size:
+            cfg_mismatches.append("hidden_size")
+        if store.target_topk != self.config.model_spec.num_experts_per_tok:
+            cfg_mismatches.append("target_topk")
+        if cfg_mismatches:
+            raise ValueError(
+                "predictor trace store is incompatible with current config: "
+                + ", ".join(cfg_mismatches)
+            )
+
+        if resume_run_trace is None:
+            return
+
+        resume_mismatches = []
+        if store.profile_name != resume_run_trace.profile_name:
+            resume_mismatches.append("profile_name")
+        if store.example_count != resume_run_trace.example_count:
+            resume_mismatches.append("example_count")
+        if store.candidate_experts_per_layer != (
+                resume_run_trace.candidate_experts_per_layer
+        ):
+            resume_mismatches.append("candidate_experts_per_layer")
+        if store.executed_experts_per_layer != (
+                resume_run_trace.executed_experts_per_layer
+        ):
+            resume_mismatches.append("executed_experts_per_layer")
+        if resume_mismatches:
+            raise ValueError(
+                "predictor resume trace store is incompatible with checkpoint run_trace: "
+                + ", ".join(resume_mismatches)
+            )
+
+    @staticmethod
+    def _masked_mean(
+            values: torch.Tensor,
+            valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        weights = valid_mask.to(device=values.device, dtype=values.dtype)
+        return (values * weights).sum() / weights.sum().clamp_min(1.0)
+
+    @staticmethod
+    def _batch_targets_from_target_ids(
+            target_ids: torch.Tensor,
+            *,
+            num_experts: int,
+    ) -> torch.Tensor:
+        targets = torch.zeros(
+            (
+                int(target_ids.shape[0]),
+                int(target_ids.shape[1]),
+                int(num_experts),
+            ),
+            dtype=torch.float32,
+            device=target_ids.device,
+        )
+        return targets.scatter_(-1, target_ids.long(), 1.0)
+
+    def _compute_predictor_loss(
+            self,
+            *,
+            logits: torch.Tensor,
+            hard_targets: torch.Tensor,
+            future_layer_mask: torch.Tensor,
+            teacher_router_logits: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hard_loss = self._masked_mean(
+            F.binary_cross_entropy_with_logits(
+                logits,
+                hard_targets,
+                reduction="none",
+            ).mean(dim=-1),
+            future_layer_mask,
+        )
+        if teacher_router_logits is None:
+            return hard_loss
+
+        distill_loss = self._masked_mean(
+            F.kl_div(
+                F.log_softmax(logits, dim=-1),
+                F.softmax(teacher_router_logits, dim=-1),
+                reduction="none",
+            ).sum(dim=-1),
+            future_layer_mask,
+        )
+        return (
+            DEFAULT_HARD_TARGET_LOSS_WEIGHT * hard_loss
+            + DEFAULT_ROUTER_DISTILL_LOSS_WEIGHT * distill_loss
+        )
+
+    @staticmethod
+    def _batch_recall_sum_at_budget(
+            *,
+            logits: torch.Tensor,
+            target_ids: torch.Tensor,
+            future_layer_mask: torch.Tensor,
+            budget: int,
+    ) -> tuple[float, int]:
+        predicted = torch.topk(logits, k=int(budget), dim=-1).indices
+        matches = (
+            predicted.unsqueeze(-1) == target_ids.long().unsqueeze(-2)
+        ).any(dim=-1)
+        recall = matches.to(torch.float32).sum(dim=-1) / max(
+            int(target_ids.shape[-1]),
+            1,
+        )
+        valid_mask = future_layer_mask.to(device=recall.device, dtype=recall.dtype)
+        return float((recall * valid_mask).sum().item()), int(valid_mask.sum().item())
+
+    @staticmethod
+    def _move_optimizer_state_to_device(
+            optimizer: torch.optim.Optimizer,
+            device: torch.device,
+    ) -> None:
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device)
+
+    @staticmethod
+    def _index_array(
+            count: int,
+            *,
+            indices: np.ndarray | None = None,
+    ) -> np.ndarray:
+        if indices is None:
+            return np.arange(count, dtype=np.int64)
+        return np.asarray(indices, dtype=np.int64)
+
+    @staticmethod
+    def _store_batch_tensors(
+            store: PredictorTraceTensorStore,
+            *,
+            indices: np.ndarray,
+            device: torch.device,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        batch_features = torch.from_numpy(
+            np.asarray(store.hidden_states[indices], dtype=np.float32)
+        ).to(device=device)
+        batch_layer_indices = torch.from_numpy(
+            np.asarray(store.layer_indices[indices], dtype=np.float32)
+        ).to(device=device)
+        batch_target_ids = torch.from_numpy(
+            np.asarray(store.target_ids[indices], dtype=np.int64)
+        ).to(device=device)
+        batch_future_layer_mask = torch.from_numpy(
+            np.asarray(store.future_layer_mask[indices], dtype=np.bool_)
+        ).to(device=device)
+        batch_teacher_router_logits = (
+            None
+            if store.teacher_router_logits is None
+            else torch.from_numpy(
+                np.asarray(
+                    store.teacher_router_logits[indices],
+                    dtype=np.float32,
+                )
+            ).to(device=device)
+        )
+        return (
+            batch_features,
+            batch_layer_indices,
+            batch_target_ids,
+            batch_future_layer_mask,
+            batch_teacher_router_logits,
+        )
+
+    def _evaluate_trace_store_impl(
+            self,
+            store: PredictorTraceTensorStore,
+            *,
+            model: nn.Module,
+            indices: np.ndarray | None = None,
+            device: str | torch.device = "cpu",
+            batch_size: int | None = None,
+            checkpoint_metadata: PredictorCheckpointMetadata | None = None,
+    ) -> PredictorEvaluationTrace:
+        resolved_indices = self._index_array(store.example_count, indices=indices)
+        if resolved_indices.size < 1:
+            raise ValueError("trace store evaluation requires at least 1 example")
+
+        resolved_device = torch.device(device)
+        resolved_batch_size = min(
+            self.config.predictor_trainer.batch_size
+            if batch_size is None else int(batch_size),
+            int(resolved_indices.size),
+        )
+        routing_cfg = self.config.predictor_routing
+
+        model = model.to(resolved_device)
+        model.eval()
+        total_loss = 0.0
+        total_valid_positions = 0
+        candidate_recall_sum = 0.0
+        candidate_recall_count = 0
+        executed_recall_sum = 0.0
+        executed_recall_count = 0
+
+        with torch.no_grad():
+            for start in range(0, int(resolved_indices.size), resolved_batch_size):
+                batch_indices = resolved_indices[start: start + resolved_batch_size]
+                (
+                    batch_features,
+                    batch_layer_indices,
+                    batch_target_ids,
+                    batch_future_layer_mask,
+                    batch_teacher_router_logits,
+                ) = (
+                    self._store_batch_tensors(
+                        store,
+                        indices=batch_indices,
+                        device=resolved_device,
+                    )
+                )
+                batch_targets = self._batch_targets_from_target_ids(
+                    batch_target_ids,
+                    num_experts=self.config.model_spec.num_experts,
+                )
+                logits = model(batch_features, batch_layer_indices)
+                batch_loss = float(
+                    self._compute_predictor_loss(
+                        logits=logits,
+                        hard_targets=batch_targets,
+                        future_layer_mask=batch_future_layer_mask,
+                        teacher_router_logits=batch_teacher_router_logits,
+                    ).item()
+                )
+                batch_valid_positions = int(batch_future_layer_mask.sum().item())
+                total_loss += batch_loss * batch_valid_positions
+                total_valid_positions += batch_valid_positions
+                candidate_sum, candidate_count = self._batch_recall_sum_at_budget(
+                    logits=logits,
+                    target_ids=batch_target_ids,
+                    future_layer_mask=batch_future_layer_mask,
+                    budget=routing_cfg.candidate_experts_per_layer,
+                )
+                executed_sum, executed_count = self._batch_recall_sum_at_budget(
+                    logits=logits,
+                    target_ids=batch_target_ids,
+                    future_layer_mask=batch_future_layer_mask,
+                    budget=routing_cfg.executed_experts_per_layer,
+                )
+                candidate_recall_sum += candidate_sum
+                candidate_recall_count += candidate_count
+                executed_recall_sum += executed_sum
+                executed_recall_count += executed_count
+
+        return PredictorEvaluationTrace(
+            profile_name=self.config.profile_name,
+            example_count=int(resolved_indices.size),
+            candidate_experts_per_layer=routing_cfg.candidate_experts_per_layer,
+            executed_experts_per_layer=routing_cfg.executed_experts_per_layer,
+            mean_loss=total_loss / max(total_valid_positions, 1),
+            recall_at_candidate_budget=(
+                candidate_recall_sum / max(candidate_recall_count, 1)
+            ),
+            recall_at_executed_budget=(
+                executed_recall_sum / max(executed_recall_count, 1)
+            ),
+            checkpoint_metadata=checkpoint_metadata,
+        )
+
     def save_checkpoint(
             self,
             *,
-            model: FutureExpertPredictor,
+            model: nn.Module,
             run_trace: PredictorTrainingRunTrace,
             path: str | Path,
             optimizer_state_dict: dict[str, Any] | None = None,
@@ -1755,7 +2133,7 @@ class PredictorTrainer:
     def load_checkpoint(
             self,
             path: str | Path,
-    ) -> tuple[FutureExpertPredictor, PredictorCheckpointMetadata]:
+    ) -> tuple[nn.Module, PredictorCheckpointMetadata]:
         # 先读取 checkpoint 原始载荷。
         payload = self._read_checkpoint_payload(path)
         # 再一次性解析权重和 metadata，避免重复读取同一路径。
@@ -1775,7 +2153,7 @@ class PredictorTrainer:
             self,
             path: str | Path,
     ) -> tuple[
-        FutureExpertPredictor,
+        nn.Module,
         PredictorCheckpointMetadata,
         PredictorTrainingRunTrace | None,
         dict[str, Any] | None,
@@ -1965,10 +2343,342 @@ class PredictorTrainer:
             output_path=output_path,
         )
 
+    def load_trace_store(
+            self,
+            path: str | Path,
+            *,
+            cache_dir: str | Path | None = None,
+    ) -> PredictorTraceTensorStore:
+        store = PredictorTraceTensorStore.from_trace_json(
+            path,
+            cache_dir=cache_dir,
+        )
+        self._validate_trace_store(store)
+        return store
+
+    def evaluate_trace_store(
+            self,
+            store: PredictorTraceTensorStore,
+            *,
+            model: nn.Module | None = None,
+            checkpoint_metadata: PredictorCheckpointMetadata | None = None,
+            indices: np.ndarray | None = None,
+            device: str | torch.device = "cpu",
+            batch_size: int | None = None,
+    ) -> PredictorEvaluationTrace:
+        self._validate_trace_store(store)
+        resolved_model = self.build_model() if model is None else model
+        return self._evaluate_trace_store_impl(
+            store,
+            model=resolved_model,
+            indices=indices,
+            device=device,
+            batch_size=batch_size,
+            checkpoint_metadata=checkpoint_metadata,
+        )
+
+    def evaluate_trace_file(
+            self,
+            *,
+            path: str | Path,
+            checkpoint_path: str | Path,
+            cache_dir: str | Path | None = None,
+            indices: np.ndarray | None = None,
+            device: str | torch.device = "cpu",
+            batch_size: int | None = None,
+    ) -> PredictorEvaluationTrace:
+        store = self.load_trace_store(path, cache_dir=cache_dir)
+        model, metadata = self.load_checkpoint(checkpoint_path)
+        return self.evaluate_trace_store(
+            store,
+            model=model,
+            checkpoint_metadata=metadata,
+            indices=indices,
+            device=device,
+            batch_size=batch_size,
+        )
+
+    def fit_trace_store(
+            self,
+            store: PredictorTraceTensorStore,
+            *,
+            epochs: int | None = None,
+            model: nn.Module | None = None,
+            optimizer_state_dict: dict[str, Any] | None = None,
+            initial_run_trace: PredictorTrainingRunTrace | None = None,
+            logger: logging.Logger | None = None,
+            log_every_steps: int | None = None,
+            checkpoint_output_path: str | Path | None = None,
+            checkpoint_every_epochs: int | None = None,
+            indices: np.ndarray | None = None,
+            device: str | torch.device = "cpu",
+            batch_size: int | None = None,
+    ) -> tuple[
+        nn.Module,
+        PredictorTrainingRunTrace,
+        dict[str, Any],
+    ]:
+        self._validate_trace_store(
+            store,
+            resume_run_trace=initial_run_trace,
+        )
+
+        trainer_cfg = self.config.predictor_trainer
+        routing_cfg = self.config.predictor_routing
+        epochs = trainer_cfg.epochs if epochs is None else int(epochs)
+        if epochs < 1:
+            raise ValueError("epochs must be >= 1")
+        if log_every_steps is not None and int(log_every_steps) < 0:
+            raise ValueError("log_every_steps must be >= 0")
+        if checkpoint_output_path is not None and checkpoint_every_epochs is None:
+            checkpoint_every_epochs = 1
+        if checkpoint_every_epochs is not None and int(checkpoint_every_epochs) < 1:
+            raise ValueError("checkpoint_every_epochs must be >= 1")
+
+        resolved_indices = self._index_array(store.example_count, indices=indices)
+        if resolved_indices.size < 1:
+            raise ValueError("trace store training requires at least 1 example")
+
+        torch.manual_seed(trainer_cfg.seed)
+        resolved_device = torch.device(device)
+        resolved_model = self.build_model() if model is None else model
+        resolved_model = resolved_model.to(resolved_device)
+        optimizer = torch.optim.AdamW(
+            resolved_model.parameters(),
+            lr=trainer_cfg.learning_rate,
+            weight_decay=trainer_cfg.weight_decay,
+        )
+        if optimizer_state_dict is not None:
+            optimizer.load_state_dict(optimizer_state_dict)
+            self._move_optimizer_state_to_device(optimizer, resolved_device)
+
+        resolved_batch_size = min(
+            trainer_cfg.batch_size if batch_size is None else int(batch_size),
+            int(resolved_indices.size),
+        )
+        epoch_summaries: list[PredictorEpochSummary] = (
+            []
+            if initial_run_trace is None
+            else list(initial_run_trace.epoch_summaries)
+        )
+        completed_epochs = 0 if initial_run_trace is None else initial_run_trace.epochs
+        global_step = 0
+        interval_loss = 0.0
+        interval_examples = 0
+        interval_steps = 0
+        target_total_epochs = completed_epochs + epochs
+
+        if logger is not None:
+            logger.info(
+                "predictor_train_start profile=%s examples=%d epochs=%d "
+                "batch_size=%d device=%s log_every_steps=%s checkpoint_path=%s "
+                "checkpoint_every_epochs=%s",
+                self.config.profile_name,
+                int(resolved_indices.size),
+                target_total_epochs,
+                resolved_batch_size,
+                resolved_device,
+                0 if log_every_steps is None else int(log_every_steps),
+                None if checkpoint_output_path is None else str(checkpoint_output_path),
+                (
+                    None
+                    if checkpoint_every_epochs is None
+                    else int(checkpoint_every_epochs)
+                ),
+            )
+
+        for epoch_offset in range(epochs):
+            epoch_index = completed_epochs + epoch_offset
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(trainer_cfg.seed + epoch_index)
+            order = torch.randperm(int(resolved_indices.size), generator=generator)
+            total_loss = 0.0
+            total_examples = 0
+
+            resolved_model.train()
+            for start in range(0, int(resolved_indices.size), resolved_batch_size):
+                batch_offsets = order[start: start + resolved_batch_size].numpy()
+                batch_indices = resolved_indices[batch_offsets]
+                (
+                    batch_features,
+                    batch_layer_indices,
+                    batch_target_ids,
+                    batch_future_layer_mask,
+                    batch_teacher_router_logits,
+                ) = (
+                    self._store_batch_tensors(
+                        store,
+                        indices=batch_indices,
+                        device=resolved_device,
+                    )
+                )
+                batch_targets = self._batch_targets_from_target_ids(
+                    batch_target_ids,
+                    num_experts=self.config.model_spec.num_experts,
+                )
+                logits = resolved_model(batch_features, batch_layer_indices)
+                loss = self._compute_predictor_loss(
+                    logits=logits,
+                    hard_targets=batch_targets,
+                    future_layer_mask=batch_future_layer_mask,
+                    teacher_router_logits=batch_teacher_router_logits,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+                batch_valid_positions = int(batch_future_layer_mask.sum().item())
+                batch_loss = float(loss.item())
+                total_loss += batch_loss * batch_valid_positions
+                total_examples += batch_valid_positions
+                global_step += 1
+                interval_loss += batch_loss * batch_valid_positions
+                interval_examples += batch_valid_positions
+                interval_steps += 1
+
+                if (
+                        logger is not None
+                        and log_every_steps is not None
+                        and int(log_every_steps) > 0
+                        and global_step % int(log_every_steps) == 0
+                ):
+                    logger.info(
+                        "predictor_train_step profile=%s epoch=%d/%d "
+                        "global_step=%d interval_steps=%d interval_mean_loss=%.6f",
+                        self.config.profile_name,
+                        epoch_index + 1,
+                        target_total_epochs,
+                        global_step,
+                        interval_steps,
+                        interval_loss / max(interval_examples, 1),
+                    )
+                    interval_loss = 0.0
+                    interval_examples = 0
+                    interval_steps = 0
+
+            evaluation = self._evaluate_trace_store_impl(
+                store,
+                model=resolved_model,
+                indices=resolved_indices,
+                device=resolved_device,
+                batch_size=max(resolved_batch_size, 1),
+            )
+            epoch_summaries.append(
+                PredictorEpochSummary(
+                    epoch_index=epoch_index,
+                    mean_loss=evaluation.mean_loss,
+                    recall_at_candidate_budget=(
+                        evaluation.recall_at_candidate_budget
+                    ),
+                    recall_at_executed_budget=(
+                        evaluation.recall_at_executed_budget
+                    ),
+                )
+            )
+            current_run_trace = PredictorTrainingRunTrace(
+                profile_name=self.config.profile_name,
+                example_count=int(resolved_indices.size),
+                epochs=len(epoch_summaries),
+                candidate_experts_per_layer=(
+                    routing_cfg.candidate_experts_per_layer
+                ),
+                executed_experts_per_layer=(
+                    routing_cfg.executed_experts_per_layer
+                ),
+                epoch_summaries=tuple(epoch_summaries),
+            )
+
+            if logger is not None:
+                logger.info(
+                    "predictor_train_epoch_end profile=%s epoch=%d/%d "
+                    "mean_loss=%.6f recall@candidate=%.4f recall@executed=%.4f",
+                    self.config.profile_name,
+                    current_run_trace.epochs,
+                    target_total_epochs,
+                    current_run_trace.final_mean_loss,
+                    current_run_trace.final_recall_at_candidate_budget,
+                    current_run_trace.final_recall_at_executed_budget,
+                )
+
+            if (
+                    checkpoint_output_path is not None
+                    and checkpoint_every_epochs is not None
+                    and (
+                    current_run_trace.epochs % int(checkpoint_every_epochs) == 0
+                    or epoch_offset == epochs - 1
+            )
+            ):
+                current_optimizer_state_dict = optimizer.state_dict()
+                self.save_checkpoint(
+                    model=resolved_model,
+                    run_trace=current_run_trace,
+                    path=checkpoint_output_path,
+                    optimizer_state_dict=current_optimizer_state_dict,
+                )
+                if logger is not None:
+                    logger.info(
+                        "predictor_train_checkpoint_saved epoch=%d path=%s",
+                        current_run_trace.epochs,
+                        str(checkpoint_output_path),
+                    )
+
+        final_run_trace = PredictorTrainingRunTrace(
+            profile_name=self.config.profile_name,
+            example_count=int(resolved_indices.size),
+            epochs=len(epoch_summaries),
+            candidate_experts_per_layer=routing_cfg.candidate_experts_per_layer,
+            executed_experts_per_layer=routing_cfg.executed_experts_per_layer,
+            epoch_summaries=tuple(epoch_summaries),
+        )
+        return resolved_model, final_run_trace, optimizer.state_dict()
+
+    def fit_trace_file(
+            self,
+            *,
+            path: str | Path,
+            cache_dir: str | Path | None = None,
+            epochs: int | None = None,
+            model: nn.Module | None = None,
+            optimizer_state_dict: dict[str, Any] | None = None,
+            initial_run_trace: PredictorTrainingRunTrace | None = None,
+            logger: logging.Logger | None = None,
+            log_every_steps: int | None = None,
+            checkpoint_output_path: str | Path | None = None,
+            checkpoint_every_epochs: int | None = None,
+            indices: np.ndarray | None = None,
+            device: str | torch.device = "cpu",
+            batch_size: int | None = None,
+    ) -> tuple[
+        nn.Module,
+        PredictorTrainingRunTrace,
+        dict[str, Any],
+    ]:
+        store = self.load_trace_store(path, cache_dir=cache_dir)
+        return self.fit_trace_store(
+            store,
+            epochs=epochs,
+            model=model,
+            optimizer_state_dict=optimizer_state_dict,
+            initial_run_trace=initial_run_trace,
+            logger=logger,
+            log_every_steps=log_every_steps,
+            checkpoint_output_path=checkpoint_output_path,
+            checkpoint_every_epochs=checkpoint_every_epochs,
+            indices=indices,
+            device=device,
+            batch_size=batch_size,
+        )
+
     def _dataset_tensors(
             self,
             dataset: PredictorTraceDataset,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
         # -------------------- 物化特征张量 --------------------
         # 每条样本里的 hidden_state 都是定长 tuple；
         # 这里把它们堆成 [example_count, hidden_size] 的 CPU 浮点张量。
@@ -1995,22 +2705,69 @@ class PredictorTrainer:
             dtype=torch.float32,
             device="cpu",
         )
+        future_layer_mask = torch.zeros(
+            (dataset.example_count, dataset.window_layers),
+            dtype=torch.bool,
+            device="cpu",
+        )
+        has_teacher_router_logits = any(
+            example.future_teacher_router_logits is not None
+            for example in dataset.examples
+        )
+        teacher_router_logits = (
+            torch.zeros(
+                (
+                    dataset.example_count,
+                    dataset.window_layers,
+                    self.config.model_spec.num_experts,
+                ),
+                dtype=torch.float32,
+                device="cpu",
+            )
+            if has_teacher_router_logits
+            else None
+        )
         for example_index, example in enumerate(dataset.examples):
+            future_count = len(example.future_teacher_topk_ids)
+            future_layer_mask[example_index, :future_count] = True
             for future_index, teacher_topk_ids in enumerate(
                     example.future_teacher_topk_ids
             ):
                 # teacher 选中的 top-k experts 位置置为 1；
                 # 这样后续 BCEWithLogitsLoss 就能把它当作多标签监督来训练。
                 targets[example_index, future_index, list(teacher_topk_ids)] = 1.0
+            if teacher_router_logits is not None:
+                if example.future_teacher_router_logits is None:
+                    raise ValueError(
+                        "predictor trace dataset mixes examples with and without "
+                        "future_teacher_router_logits"
+                    )
+                if len(example.future_teacher_router_logits) != future_count:
+                    raise ValueError(
+                        "future_teacher_router_logits length does not match "
+                        "future_teacher_topk_ids length"
+                    )
+                teacher_router_logits[example_index, :future_count] = torch.tensor(
+                    example.future_teacher_router_logits,
+                    dtype=torch.float32,
+                    device="cpu",
+                )
 
         # 返回训练和评估都会复用的特征/标签张量对。
-        return features, layer_indices, targets
+        return (
+            features,
+            layer_indices,
+            targets,
+            future_layer_mask,
+            teacher_router_logits,
+        )
 
     def _mean_recall_at_budget(
             self,
             *,
             logits: torch.Tensor,
             targets: torch.Tensor,
+            future_layer_mask: torch.Tensor,
             budget: int,
     ) -> float:
         # logits: `[batch_size, window_layers, num_experts]`
@@ -2032,7 +2789,12 @@ class PredictorTrainer:
         recall = matches.sum(dim=-1) / denom
 
         # 返回全数据集平均 recall。
-        return float(recall.mean().item())
+        return float(
+            self._masked_mean(
+                recall,
+                future_layer_mask,
+            ).item()
+        )
 
     def evaluate_dataset(
             self,
@@ -2049,7 +2811,13 @@ class PredictorTrainer:
         # 若调用方未传入模型，就按当前配置构造一个新 predictor 实例。
         model = self.build_model() if model is None else model
         # 把 trace 数据集转换成可直接前向的张量形式。
-        features, layer_indices, targets = self._dataset_tensors(dataset)
+        (
+            features,
+            layer_indices,
+            targets,
+            future_layer_mask,
+            teacher_router_logits,
+        ) = self._dataset_tensors(dataset)
 
         # -------------------- 关闭梯度并执行前向评估 --------------------
         with torch.no_grad():
@@ -2057,20 +2825,26 @@ class PredictorTrainer:
             model.eval()
             # 前向得到每个 future layer、每个 expert 的原始 logits。
             logits = model(features, layer_indices)
-            # 标签是多热而不是单类别，因此这里使用 BCEWithLogitsLoss 而不是 softmax CE。
             mean_loss = float(
-                F.binary_cross_entropy_with_logits(logits, targets).item()
+                self._compute_predictor_loss(
+                    logits=logits,
+                    hard_targets=targets,
+                    future_layer_mask=future_layer_mask,
+                    teacher_router_logits=teacher_router_logits,
+                ).item()
             )
             # 按候选预算统计 recall，用来度量“给推理侧预热多少 experts”时的覆盖能力。
             candidate_recall = self._mean_recall_at_budget(
                 logits=logits,
                 targets=targets,
+                future_layer_mask=future_layer_mask,
                 budget=routing_cfg.candidate_experts_per_layer,
             )
             # 按执行预算统计 recall
             executed_recall = self._mean_recall_at_budget(
                 logits=logits,
                 targets=targets,
+                future_layer_mask=future_layer_mask,
                 budget=routing_cfg.executed_experts_per_layer,
             )
 
@@ -2187,7 +2961,13 @@ class PredictorTrainer:
         # features: [example_count, hidden_size]
         # layer_indices: [example_count]
         # targets: [example_count, window_layers, num_experts]
-        features, layer_indices, targets = self._dataset_tensors(dataset)
+        (
+            features,
+            layer_indices,
+            targets,
+            future_layer_mask,
+            teacher_router_logits,
+        ) = self._dataset_tensors(dataset)
 
         # 固定随机种子，保证模型初始化和 epoch 内打乱顺序可复现。
         torch.manual_seed(trainer_cfg.seed)
@@ -2261,7 +3041,7 @@ class PredictorTrainer:
 
             # 累积当前 epoch 的样本加权损失，后面再除以总样本数得到 mean_loss。
             total_loss = 0.0
-            total_examples = 0
+            total_valid_positions = 0
 
             # -------------------- 执行逐 mini-batch 的前向、反向与更新 --------------------
             for start in range(0, dataset.example_count, batch_size):
@@ -2272,12 +3052,25 @@ class PredictorTrainer:
                 batch_features = features.index_select(0, batch_indices)
                 batch_layer_indices = layer_indices.index_select(0, batch_indices)
                 batch_targets = targets.index_select(0, batch_indices)
+                batch_future_layer_mask = future_layer_mask.index_select(
+                    0,
+                    batch_indices,
+                )
+                batch_teacher_router_logits = (
+                    None
+                    if teacher_router_logits is None
+                    else teacher_router_logits.index_select(0, batch_indices)
+                )
 
                 # 前向得到每个 future layer / expert 的 logits。
                 logits = model(batch_features, batch_layer_indices)
 
-                # 目标是多标签预测，因此这里按多热标签计算 BCEWithLogitsLoss。
-                loss = F.binary_cross_entropy_with_logits(logits, batch_targets)
+                loss = self._compute_predictor_loss(
+                    logits=logits,
+                    hard_targets=batch_targets,
+                    future_layer_mask=batch_future_layer_mask,
+                    teacher_router_logits=batch_teacher_router_logits,
+                )
 
                 # 标准训练三步：清梯度、反向传播、参数更新。
                 optimizer.zero_grad(set_to_none=True)
@@ -2285,13 +3078,13 @@ class PredictorTrainer:
                 optimizer.step()
 
                 # 用样本数加权累计 batch loss，避免最后一个不满 batch 时均值失真。
-                batch_count = int(batch_features.shape[0])
+                batch_valid_positions = int(batch_future_layer_mask.sum().item())
                 batch_loss = float(loss.item())
-                total_loss += batch_loss * batch_count
-                total_examples += batch_count
+                total_loss += batch_loss * batch_valid_positions
+                total_valid_positions += batch_valid_positions
                 global_step += 1
-                interval_loss += batch_loss * batch_count
-                interval_examples += batch_count
+                interval_loss += batch_loss * batch_valid_positions
+                interval_examples += batch_valid_positions
                 interval_steps += 1
 
                 # 按固定 step 间隔输出训练日志，避免 predictor 太小时日志刷屏。
@@ -2327,6 +3120,7 @@ class PredictorTrainer:
                 candidate_recall = self._mean_recall_at_budget(
                     logits=all_logits,
                     targets=targets,
+                    future_layer_mask=future_layer_mask,
                     budget=routing_cfg.candidate_experts_per_layer,
                 )
 
@@ -2335,6 +3129,7 @@ class PredictorTrainer:
                 executed_recall = self._mean_recall_at_budget(
                     logits=all_logits,
                     targets=targets,
+                    future_layer_mask=future_layer_mask,
                     budget=routing_cfg.executed_experts_per_layer,
                 )
 
@@ -2345,7 +3140,7 @@ class PredictorTrainer:
             epoch_summaries.append(
                 PredictorEpochSummary(
                     epoch_index=epoch_index,
-                    mean_loss=total_loss / max(total_examples, 1),
+                    mean_loss=total_loss / max(total_valid_positions, 1),
                     recall_at_candidate_budget=candidate_recall,
                     recall_at_executed_budget=executed_recall,
                 )

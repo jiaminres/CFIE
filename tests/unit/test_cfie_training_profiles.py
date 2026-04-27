@@ -83,7 +83,12 @@ def test_qwen35_122b_profile_uses_confirmed_local_model_geometry() -> None:
     assert cfg.execution.activation_policy == "recompute"
     assert cfg.transport.max_staged_file_cache_gb == 16.0
     assert cfg.predictor_routing.window_layers == 8
+    assert cfg.predictor_routing.stride_layers == 4
     assert cfg.predictor_routing.candidate_experts_per_layer == 40
     assert cfg.predictor_routing.executed_experts_per_layer == 8
-    assert cfg.predictor_trainer.hidden_dim == 128
+    assert cfg.predictor_trainer.model_architecture == "factorized"
+    assert cfg.predictor_trainer.hidden_dim == 512
+    assert cfg.predictor_trainer.model_depth == 4
+    assert cfg.predictor_trainer.batch_size == 4096
+    assert cfg.predictor_trainer.epochs == 10
     assert cfg.memory_budget.gpu_hot_budget_gb == 10.0

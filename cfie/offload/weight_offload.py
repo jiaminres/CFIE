@@ -34,15 +34,31 @@ from cfie.offload.policy import (
     get_moe_tiered_cache_plan,
 )
 from cfie.utils.platform_utils import is_pin_memory_available
+from cfie.utils.torch_utils import current_stream
 
 logger = init_logger(__name__)
 
 DEFAULT_PREFILL_BURST_MIN_TOKENS = 8
 DEFAULT_PREFILL_BURST_TOKENS_PER_GPU_SLOT = 4
-DEFAULT_CPU_STATIC_PIN_LIMIT_BYTES = 8 * (1 << 30)
 DEFAULT_CPU_STATIC_PREPROCESS_BATCH_SIZE_CAP = 0
 DEFAULT_CPU_STATIC_PREPROCESS_CPU_RESERVE_BYTES = 1 << 30
 DEFAULT_CPU_STATIC_PREPROCESS_GPU_RESERVE_BYTES = 512 << 20
+
+
+def _tensor_debug_summary(tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return "None"
+    return (
+        f"shape={tuple(tensor.shape)} "
+        f"dtype={tensor.dtype} "
+        f"device={tensor.device} "
+        f"contiguous={tensor.is_contiguous()} "
+        f"pinned={tensor.is_pinned() if tensor.device.type == 'cpu' else False}"
+    )
+
+
+def _debug_layer_key(obj: Any) -> str:
+    return str(getattr(obj, "layer_key", "<unknown-layer>"))
 
 
 def _get_available_cpu_memory_bytes_best_effort() -> int | None:
@@ -237,6 +253,9 @@ class SharedPrefillBurstPool:
 
         # 共享池同一时刻只允许一个 layer 或 request 使用，防止临时张量被并发覆盖。
         self._busy = False
+        # 记录上一轮提交到当前共享池的 GPU 工作完成事件；复用前需要等待它完成，
+        # 否则后续层可能在前一层仍消费 burst 张量时提前覆写这些缓冲区。
+        self._last_use_event: torch.cuda.Event | None = None
 
         # ------------------------------- 按模板层的量化模式分配临时执行张量 -------------------------------
         # 当模板层采用 GPTQ Marlin 量化路径时，需要为量化权重、scale 与辅助索引都准备 burst 张量。
@@ -372,6 +391,21 @@ class SharedPrefillBurstPool:
             self.nbytes / (1 << 20),
         )
 
+    def _supports_reuse_events(self) -> bool:
+        return self._expert_map.device.type == "cuda"
+
+    def _wait_for_previous_use(self) -> None:
+        if self._last_use_event is None or not self._supports_reuse_events():
+            return
+        current_stream().wait_event(self._last_use_event)
+
+    def _record_current_use(self) -> None:
+        if not self._supports_reuse_events():
+            return
+        event = torch.cuda.Event()
+        event.record(current_stream())
+        self._last_use_event = event
+
     @property
     def nbytes(self) -> int:
         # ------------------------------- 统计当前 burst pool 的总字节占用 -------------------------------
@@ -451,6 +485,10 @@ class SharedPrefillBurstPool:
         # 标记当前共享池进入占用状态。
         self._busy = True
         try:
+            # 共享 burst pool 在不同层之间复用时，必须先等待上一轮 GPU 计算真正完成；
+            # 否则 host 侧虽然已经返回，但设备侧仍可能在读取这些张量。
+            self._wait_for_previous_use()
+
             # 每次执行前先清空上一轮残留的“全局 expert -> burst slot”映射。
             self._expert_map.fill_(-1)
 
@@ -482,13 +520,15 @@ class SharedPrefillBurstPool:
                 )
 
             # 通过当前控制器的量化方法，把执行入口直接重定向到 burst proxy layer 上完成实际计算。
-            return controller.quant_method.apply(
+            result = controller.quant_method.apply(
                 layer=self._execution_layer,
                 x=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 shared_experts_input=shared_experts_input,
             )
+            self._record_current_use()
+            return result
         finally:
             # ------------------------------- 释放共享 burst pool 的占用标记 -------------------------------
             # 无论本次执行成功还是失败，都必须清除 busy 标记，允许后续请求继续复用该共享池。
@@ -567,32 +607,14 @@ class LayerTieredExpertCacheController:
         # ------------------------------- 初始化 CPU 侧缓存与缓冲区状态 -------------------------------
         # 若平台支持 pinned memory，则优先使用 pinned CPU memory 以加快 H2D 传输。
         self._use_pinned_cpu = is_pin_memory_available()
-        # 大体积 CPU static mirror 长期 pin 住的收益有限，却容易占满 host-pinned
-        # 预算并干扰后续 CUDA 预处理，因此对 static mirror 单独设置更保守的 pinning
-        # 策略；短生命周期的 raw/staging buffer 仍沿用 self._use_pinned_cpu。
-        self._cpu_static_pin_limit_bytes = int(
-            self.plan.get(
-                "cpu_static_pin_limit_bytes",
-                DEFAULT_CPU_STATIC_PIN_LIMIT_BYTES,
-            )
-        )
         planned_cpu_static_bytes = int(self.plan.get("cpu_static_bytes", 0) or 0)
-        self._use_pinned_cpu_static = self._should_pin_cpu_static_bundles(
-            planned_cpu_static_bytes
-        )
-        if (
-            self._use_pinned_cpu
-            and not self._use_pinned_cpu_static
-            and planned_cpu_static_bytes > 0
-        ):
-            logger.info_once(
-                "Disabling pinned CPU static expert mirror: layer=%s "
-                "cpu_static=%.2f GiB limit=%.2f GiB",
-                self.layer_key,
-                planned_cpu_static_bytes / (1 << 30),
-                self._cpu_static_pin_limit_bytes / (1 << 30),
+        self._use_pinned_cpu_static = bool(self._use_pinned_cpu)
+        if planned_cpu_static_bytes > 0 and not self._use_pinned_cpu_static:
+            raise RuntimeError(
+                f"{self.layer_key}: pinned CPU memory is required for the CPU "
+                "static expert mirror, but pin_memory is unavailable on the "
+                "current platform/runtime."
             )
-
         # 保存已物化到 CPU 常驻内存中的静态 expert bundle。
         self._cpu_static_bundles: dict[int, ExpertBundle] = {}
 
@@ -718,28 +740,6 @@ class LayerTieredExpertCacheController:
     def slot_to_global(self) -> tuple[int, ...]:
         # 对外暴露只读视图，避免调用方直接改写内部 resident 映射。
         return tuple(self._slot_to_global)
-
-    def _should_pin_cpu_static_bundles(
-            self,
-            planned_cpu_static_bytes: int,
-    ) -> bool:
-        # 平台不支持 pinned memory 时，CPU static mirror 自然也不能走该路径。
-        if not getattr(self, "_use_pinned_cpu", False):
-            return False
-
-        # 未声明 CPU static mirror 预算时，退回到普通 pinned CPU 策略。
-        if planned_cpu_static_bytes <= 0:
-            return True
-
-        # 对长期驻留的大体积 static mirror 使用 pageable CPU 内存，避免把大量
-        # host-pinned 预算锁死在静态镜像上，影响后续 GPU 预处理与 DMA 资源。
-        return planned_cpu_static_bytes <= int(
-            getattr(
-                self,
-                "_cpu_static_pin_limit_bytes",
-                DEFAULT_CPU_STATIC_PIN_LIMIT_BYTES,
-            )
-        )
 
     @property
     def prefill_burst_capacity(self) -> int:
@@ -1307,7 +1307,6 @@ class LayerTieredExpertCacheController:
                 group_size=self.group_size,
                 is_a_8bit=self.is_a_8bit,
             )
-
             tensors = {
                 "runtime.w13_qweight": self._to_cpu_static_tensor(repacked_w13),
                 "runtime.w2_qweight": self._to_cpu_static_tensor(repacked_w2),
@@ -1387,8 +1386,7 @@ class LayerTieredExpertCacheController:
         # 将输入张量从原设备分离出来，并转换为位于 CPU 上的 contiguous 张量。
         cpu_tensor = tensor.detach().to(device="cpu").contiguous()
 
-        # ------------------------------- 在无需 pin 或已经是 pinned memory 时直接返回 -------------------------------
-        # 当当前控制器未启用 pinned CPU memory，或者该张量本身已经处于 pinned 状态时，直接返回。
+        # ------------------------------- 对 CPU static runtime 张量强制要求 pinned memory -------------------------------
         use_pinned_cpu_static = bool(
             getattr(
                 self,
@@ -1396,21 +1394,24 @@ class LayerTieredExpertCacheController:
                 getattr(self, "_use_pinned_cpu", False),
             )
         )
-        if not use_pinned_cpu_static or cpu_tensor.is_pinned():
+        if not use_pinned_cpu_static:
+            raise RuntimeError(
+                f"{self.layer_key}: CPU static runtime tensors must be pinned "
+                "to preserve asynchronous H2D copies."
+            )
+        if cpu_tensor.is_pinned():
             return cpu_tensor
 
-        # ------------------------------- 在允许时尝试将 CPU 张量转换为 pinned memory -------------------------------
+        # ------------------------------- 在允许时将 CPU 张量转换为 pinned memory；失败直接报错 -------------------------------
         try:
             # 将当前 CPU 张量转换为 pinned memory 版本，以加快后续 H2D 传输。
             return cpu_tensor.pin_memory()
         except RuntimeError as exc:
-            # 当 pin_memory 失败时，记录一次告警并退回到普通 pageable CPU 张量。
-            logger.warning_once(
-                "Failed to pin runtime-ready CPU expert bundle tensor; "
-                "falling back to pageable CPU memory. error=%s",
-                exc,
-            )
-            return cpu_tensor
+            raise RuntimeError(
+                f"{self.layer_key}: failed to pin CPU static runtime tensor; "
+                "pageable fallback is disallowed because it breaks the "
+                "intended asynchronous H2D path."
+            ) from exc
 
     def _get_source_bundle(self, expert_id: int) -> tuple[ExpertBundle, str]:
         # 先尝试命中 CPU static experts。
@@ -1615,6 +1616,7 @@ class LayerTieredExpertCacheController:
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             target: Any,
     ) -> None:
+        layer_key = _debug_layer_key(self)
         slot_ids = torch.tensor(
             [slot for _expert_id, slot, _bundle, _source in bundles_and_sources],
             dtype=torch.int64,
@@ -1651,41 +1653,62 @@ class LayerTieredExpertCacheController:
                 target_w13_g_idx_sort_indices = target.w13_g_idx_sort_indices
                 target_w2_g_idx_sort_indices = target.w2_g_idx_sort_indices
 
-        ops.moe_batch_load_gptq_runtime_precompiled(
-            slot_ids,
-            self._stack_runtime_ready_cpu_field(
-                bundles_and_sources, "runtime.w13_qweight"
-            ),
-            self._stack_runtime_ready_cpu_field(
-                bundles_and_sources, "runtime.w2_qweight"
-            ),
-            self._stack_runtime_ready_cpu_field(
-                bundles_and_sources, "runtime.w13_scales"
-            ),
-            self._stack_runtime_ready_cpu_field(
-                bundles_and_sources, "runtime.w2_scales"
-            ),
-            self._stack_runtime_ready_cpu_field(
-                bundles_and_sources, "runtime.w13_qzeros"
-            ),
-            self._stack_runtime_ready_cpu_field(
-                bundles_and_sources, "runtime.w2_qzeros"
-            ),
-            target.w13_qweight,
-            target.w2_qweight,
-            target.w13_scales,
-            target.w2_scales,
-            target.w13_qzeros,
-            target.w2_qzeros,
-            w13_g_idx_batch,
-            w2_g_idx_batch,
-            w13_g_idx_sort_indices_batch,
-            w2_g_idx_sort_indices_batch,
-            target_w13_g_idx,
-            target_w2_g_idx,
-            target_w13_g_idx_sort_indices,
-            target_w2_g_idx_sort_indices,
+        w13_qweight_batch = self._stack_runtime_ready_cpu_field(
+            bundles_and_sources, "runtime.w13_qweight"
         )
+        w2_qweight_batch = self._stack_runtime_ready_cpu_field(
+            bundles_and_sources, "runtime.w2_qweight"
+        )
+        w13_scales_batch = self._stack_runtime_ready_cpu_field(
+            bundles_and_sources, "runtime.w13_scales"
+        )
+        w2_scales_batch = self._stack_runtime_ready_cpu_field(
+            bundles_and_sources, "runtime.w2_scales"
+        )
+        w13_qzeros_batch = self._stack_runtime_ready_cpu_field(
+            bundles_and_sources, "runtime.w13_qzeros"
+        )
+        w2_qzeros_batch = self._stack_runtime_ready_cpu_field(
+            bundles_and_sources, "runtime.w2_qzeros"
+        )
+
+        try:
+            ops.moe_batch_load_gptq_runtime_precompiled(
+                slot_ids,
+                w13_qweight_batch,
+                w2_qweight_batch,
+                w13_scales_batch,
+                w2_scales_batch,
+                w13_qzeros_batch,
+                w2_qzeros_batch,
+                target.w13_qweight,
+                target.w2_qweight,
+                target.w13_scales,
+                target.w2_scales,
+                target.w13_qzeros,
+                target.w2_qzeros,
+                w13_g_idx_batch,
+                w2_g_idx_batch,
+                w13_g_idx_sort_indices_batch,
+                w2_g_idx_sort_indices_batch,
+                target_w13_g_idx,
+                target_w2_g_idx,
+                target_w13_g_idx_sort_indices,
+                target_w2_g_idx_sort_indices,
+            )
+        except Exception:
+            logger.exception(
+                "CFIE MoE batch load failed: layer=%s slots=%s "
+                "w13_scales_src=(%s) w2_scales_src=(%s) "
+                "w13_scales_dst=(%s) w2_scales_dst=(%s)",
+                layer_key,
+                slot_ids.tolist(),
+                _tensor_debug_summary(w13_scales_batch),
+                _tensor_debug_summary(w2_scales_batch),
+                _tensor_debug_summary(target.w13_scales),
+                _tensor_debug_summary(target.w2_scales),
+            )
+            raise
 
     def _copy_resident_expert_to_target(
             self,
@@ -1693,6 +1716,7 @@ class LayerTieredExpertCacheController:
             slot: int,
             target: Any,
     ) -> None:
+        layer_key = _debug_layer_key(self)
         # 通过主层的 expert_map 找到该 resident expert 当前位于哪个 GPU slot。
         src_slot = int(self.layer._expert_map[expert_id].item())
         # 若找不到 resident slot，说明调用方状态不一致。
@@ -1842,50 +1866,66 @@ class LayerTieredExpertCacheController:
             bundle: ExpertBundle,
             target: Any,
     ) -> None:
+        layer_key = _debug_layer_key(self)
         tensors = bundle.tensors
-        with torch.no_grad():
-            if self._mode == "gptq_marlin":
-                target.w13_qweight[slot].copy_(
-                    tensors["runtime.w13_qweight"], non_blocking=bundle.pinned
-                )
-                target.w2_qweight[slot].copy_(
-                    tensors["runtime.w2_qweight"], non_blocking=bundle.pinned
-                )
-                target.w13_scales[slot].copy_(
-                    tensors["runtime.w13_scales"], non_blocking=bundle.pinned
-                )
-                target.w2_scales[slot].copy_(
-                    tensors["runtime.w2_scales"], non_blocking=bundle.pinned
-                )
-                target.w13_qzeros[slot].copy_(
-                    tensors["runtime.w13_qzeros"], non_blocking=bundle.pinned
-                )
-                target.w2_qzeros[slot].copy_(
-                    tensors["runtime.w2_qzeros"], non_blocking=bundle.pinned
-                )
-                if hasattr(target, "w13_g_idx") and "runtime.w13_g_idx" in tensors:
-                    target.w13_g_idx[slot].copy_(
-                        tensors["runtime.w13_g_idx"], non_blocking=bundle.pinned
+        try:
+            with torch.no_grad():
+                if self._mode == "gptq_marlin":
+                    target.w13_qweight[slot].copy_(
+                        tensors["runtime.w13_qweight"], non_blocking=bundle.pinned
                     )
-                    target.w2_g_idx[slot].copy_(
-                        tensors["runtime.w2_g_idx"], non_blocking=bundle.pinned
+                    target.w2_qweight[slot].copy_(
+                        tensors["runtime.w2_qweight"], non_blocking=bundle.pinned
                     )
-                    target.w13_g_idx_sort_indices[slot].copy_(
-                        tensors["runtime.w13_g_idx_sort_indices"],
-                        non_blocking=bundle.pinned,
+                    target.w13_scales[slot].copy_(
+                        tensors["runtime.w13_scales"], non_blocking=bundle.pinned
                     )
-                    target.w2_g_idx_sort_indices[slot].copy_(
-                        tensors["runtime.w2_g_idx_sort_indices"],
-                        non_blocking=bundle.pinned,
+                    target.w2_scales[slot].copy_(
+                        tensors["runtime.w2_scales"], non_blocking=bundle.pinned
                     )
-                return
+                    target.w13_qzeros[slot].copy_(
+                        tensors["runtime.w13_qzeros"], non_blocking=bundle.pinned
+                    )
+                    target.w2_qzeros[slot].copy_(
+                        tensors["runtime.w2_qzeros"], non_blocking=bundle.pinned
+                    )
+                    if hasattr(target, "w13_g_idx") and "runtime.w13_g_idx" in tensors:
+                        target.w13_g_idx[slot].copy_(
+                            tensors["runtime.w13_g_idx"], non_blocking=bundle.pinned
+                        )
+                        target.w2_g_idx[slot].copy_(
+                            tensors["runtime.w2_g_idx"], non_blocking=bundle.pinned
+                        )
+                        target.w13_g_idx_sort_indices[slot].copy_(
+                            tensors["runtime.w13_g_idx_sort_indices"],
+                            non_blocking=bundle.pinned,
+                        )
+                        target.w2_g_idx_sort_indices[slot].copy_(
+                            tensors["runtime.w2_g_idx_sort_indices"],
+                            non_blocking=bundle.pinned,
+                        )
+                    return
 
-            target.w13_weight[slot].copy_(
-                tensors["runtime.w13_weight"], non_blocking=bundle.pinned
+                target.w13_weight[slot].copy_(
+                    tensors["runtime.w13_weight"], non_blocking=bundle.pinned
+                )
+                target.w2_weight[slot].copy_(
+                    tensors["runtime.w2_weight"], non_blocking=bundle.pinned
+                )
+        except Exception:
+            logger.exception(
+                "CFIE MoE runtime-ready copy failed: layer=%s slot=%d pinned=%s "
+                "src.w13_scales=(%s) src.w2_scales=(%s) "
+                "dst.w13_scales=(%s) dst.w2_scales=(%s)",
+                layer_key,
+                slot,
+                bundle.pinned,
+                _tensor_debug_summary(tensors.get("runtime.w13_scales")),
+                _tensor_debug_summary(tensors.get("runtime.w2_scales")),
+                _tensor_debug_summary(getattr(target, "w13_scales", None)),
+                _tensor_debug_summary(getattr(target, "w2_scales", None)),
             )
-            target.w2_weight[slot].copy_(
-                tensors["runtime.w2_weight"], non_blocking=bundle.pinned
-            )
+            raise
 
     def _write_quantized_target_slot(
             self,

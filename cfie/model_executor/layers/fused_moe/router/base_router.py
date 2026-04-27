@@ -133,9 +133,12 @@ class BaseRouter(FusedMoERouter):
         # 保存 expert index dtype 的运行时查询回调。
         self.indices_type_getter = indices_type_getter
         # 可选地捕获 EPLB 映射前的逻辑 expert id。
-        self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.capture_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = None
 
-    def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
+    def set_capture_fn(
+        self,
+        capture_fn: Callable[[torch.Tensor, torch.Tensor], None] | None,
+    ) -> None:
         """设置逻辑 routed expert id 的捕获回调。"""
         self.capture_fn = capture_fn
 
@@ -234,7 +237,11 @@ class BaseRouter(FusedMoERouter):
 
         # 若注册了捕获回调，则在 EPLB 映射前记录逻辑 expert ids。
         if self.capture_fn is not None:
-            self.capture_fn(topk_ids)
+            try:
+                self.capture_fn(topk_ids, router_logits)
+            except TypeError:
+                # 兼容仍只接收 topk_ids 的旧测试桩/调用方。
+                self.capture_fn(topk_ids)  # type: ignore[misc]
 
         # 第四步：按需执行 EPLB 逻辑 id -> 物理 id 映射。
         topk_ids = self._apply_eplb_mapping(topk_ids)

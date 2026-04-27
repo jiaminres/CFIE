@@ -366,6 +366,8 @@ class EngineArgs:
     model: str = ModelConfig.model
     # 是否在输出中返回每层路由到的专家信息。
     enable_return_routed_experts: bool = ModelConfig.enable_return_routed_experts
+    # 是否在输出中返回每层完整 router logits。
+    enable_return_router_logits: bool = ModelConfig.enable_return_router_logits
     # 模型权重路径，可与 model 分离指定。
     model_weights: str = ModelConfig.model_weights
     # 对外暴露的服务模型名，可为单个或多个别名。
@@ -797,6 +799,10 @@ class EngineArgs:
         model_group.add_argument(
             "--enable-return-routed-experts",
             **model_kwargs["enable_return_routed_experts"],
+        )
+        model_group.add_argument(
+            "--enable-return-router-logits",
+            **model_kwargs["enable_return_router_logits"],
         )
         model_group.add_argument("--max-logprobs", **model_kwargs["max_logprobs"])
         model_group.add_argument("--logprobs-mode", **model_kwargs["logprobs_mode"])
@@ -1476,6 +1482,7 @@ class EngineArgs:
             allow_deprecated_quantization=self.allow_deprecated_quantization,
             enforce_eager=self.enforce_eager,
             enable_return_routed_experts=self.enable_return_routed_experts,
+            enable_return_router_logits=self.enable_return_router_logits,
             max_logprobs=self.max_logprobs,
             logprobs_mode=self.logprobs_mode,
             disable_sliding_window=self.disable_sliding_window,

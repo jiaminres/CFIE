@@ -33,6 +33,7 @@ class _FakeForwardBackend:
         token_count = batch.total_tokens
         layer_hidden_states = []
         layer_teacher_topk_ids = []
+        layer_teacher_router_logits = []
         hidden_template = torch.arange(
             token_count * self._hidden_dim,
             dtype=torch.float32,
@@ -41,14 +42,22 @@ class _FakeForwardBackend:
             token_count * 8,
             dtype=torch.long,
         ).reshape(token_count, 8) % self._num_experts
+        router_logits_template = torch.arange(
+            token_count * self._num_experts,
+            dtype=torch.float32,
+        ).reshape(token_count, self._num_experts)
         for layer_index in range(self._num_layers):
             layer_hidden_states.append(hidden_template + float(layer_index))
             layer_teacher_topk_ids.append(
                 (teacher_topk_template + layer_index) % self._num_experts
             )
+            layer_teacher_router_logits.append(
+                router_logits_template + float(layer_index)
+            )
         return CapturedForwardBatch(
             layer_hidden_states=tuple(layer_hidden_states),
             layer_teacher_topk_ids=tuple(layer_teacher_topk_ids),
+            layer_teacher_router_logits=tuple(layer_teacher_router_logits),
         )
 
 
@@ -266,6 +275,24 @@ def test_predictor_candidate_planner_builds_window_plan(tmp_path: Path) -> None:
             bundle.schema.executed_experts_per_layer
         )
         assert len(layer_plan.speculative_expert_ids) == 32
+
+
+def test_qwen35_122b_trace_builder_uses_stride4_and_keeps_tail_window() -> None:
+    config = build_profile_config("qwen35-122b-a10b")
+    trainer = PredictorTrainer(
+        config,
+        teacher_model_backend=_FakeForwardBackend(
+            hidden_dim=config.model_spec.hidden_size,
+            num_layers=config.model_spec.num_hidden_layers,
+            num_experts=config.model_spec.num_experts,
+        ),
+    )
+
+    trace_builder = trainer._resolve_trace_builder()
+
+    assert trace_builder._insertion_layer_indices[:4] == (0, 4, 8, 12)
+    assert trace_builder._insertion_layer_indices[-1] == 44
+    assert trace_builder._future_layer_indices(44) == (45, 46, 47)
 
 
 def test_predictor_candidate_planner_rejects_bad_hidden_summary_dim(

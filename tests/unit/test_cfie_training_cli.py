@@ -114,6 +114,10 @@ class _FakePredictorBackend:
             token_count * self._executed_experts,
             dtype=torch.long,
         ).reshape(token_count, self._executed_experts) % self._num_experts
+        router_logits_template = torch.arange(
+            token_count * self._num_experts,
+            dtype=torch.float32,
+        ).reshape(token_count, self._num_experts)
         return CapturedForwardBatch(
             layer_hidden_states=tuple(
                 hidden_template + float(layer_index)
@@ -121,6 +125,10 @@ class _FakePredictorBackend:
             ),
             layer_teacher_topk_ids=tuple(
                 (teacher_topk_template + layer_index) % self._num_experts
+                for layer_index in range(self._num_layers)
+            ),
+            layer_teacher_router_logits=tuple(
+                router_logits_template + float(layer_index)
                 for layer_index in range(self._num_layers)
             ),
         )
@@ -257,6 +265,7 @@ def test_predictor_trace_command_emits_json_dataset(
     assert len(payload["examples"]) == 4
     assert len(payload["examples"][0]["future_layer_indices"]) == 8
     assert len(payload["examples"][0]["future_teacher_topk_ids"][0]) == 8
+    assert len(payload["examples"][0]["future_teacher_router_logits"][0]) == 256
 
 
 def test_predictor_train_command_emits_json_metrics(

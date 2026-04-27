@@ -191,6 +191,8 @@ class ModelConfig:
     以获得更高性能与更好灵活性。"""
     enable_return_routed_experts: bool = False
     """是否返回路由到的专家信息。"""
+    enable_return_router_logits: bool = False
+    """是否返回每层完整 router logits。"""
     max_logprobs: int = 20
     """当 `SamplingParams` 中指定 `logprobs` 时，最多返回多少个 log probability。
     默认值来自 OpenAI Chat Completions API 的默认设置。

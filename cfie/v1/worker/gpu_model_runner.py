@@ -7019,8 +7019,9 @@ class GPUModelRunner(
 
     def init_routed_experts_capturer(self):
         logger.info(
-            "Initializing routed experts capturer, enable_return_routed_experts: %s",
+            "Initializing routed experts capturer, enable_return_routed_experts: %s, enable_return_router_logits: %s",
             self.model_config.enable_return_routed_experts,
+            self.model_config.enable_return_router_logits,
         )
         routed_experts_capturer = RoutedExpertsCapturer.create()
         self.routed_experts_attn_gid = get_routed_experts_attention_group_index(
@@ -7048,8 +7049,17 @@ class GPUModelRunner(
             if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
                 layer_id = module.layer_id
 
-                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
-                    _capturer.capture(_layer_id, topk_ids)
+                def _capture_fn(
+                    topk_ids,
+                    router_logits,
+                    _layer_id=layer_id,
+                    _capturer=capturer,
+                ):
+                    _capturer.capture(
+                        _layer_id,
+                        topk_ids,
+                        router_logits=router_logits,
+                    )
 
                 module.router.set_capture_fn(_capture_fn)
 

@@ -249,16 +249,21 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and cfie_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(cfie_config)
 
-        if self.cfie_config.model_config.enable_return_routed_experts:
+        if (
+            self.cfie_config.model_config.enable_return_routed_experts
+            or self.cfie_config.model_config.enable_return_router_logits
+        ):
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
-                "enable_return_routed_experts does not support context parallelism "
+                "enable_return_routed_experts / enable_return_router_logits "
+                "do not support context parallelism "
                 "(dcp_world_size > 1 or pcp_world_size > 1)"
             )
 
             self.routed_experts_reader = RoutedExpertsReader.create()
 
             assert len(kv_cache_config.kv_cache_groups) > 0, (
-                "enable_return_routed_experts requires at least one kv cache group"
+                "enable_return_routed_experts / enable_return_router_logits "
+                "require at least one kv cache group"
             )
             self.routed_experts_attn_gid = get_routed_experts_attention_group_index(
                 kv_cache_config
@@ -1298,9 +1303,11 @@ class Scheduler(SchedulerInterface):
                 stopped = True
 
             routed_experts = None
+            router_logits = None
             finish_reason = None
             if stopped:
                 routed_experts = self._get_routed_experts(request)
+                router_logits = self._get_router_logits(request)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
@@ -1361,6 +1368,7 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                         num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
+                        router_logits=router_logits,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
@@ -1514,6 +1522,26 @@ class Scheduler(SchedulerInterface):
         ).flatten()[:num_tokens]
 
         return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
+
+    def _get_router_logits(self, request: Request) -> np.ndarray | None:
+        if not self.cfie_config.model_config.enable_return_router_logits:
+            return None
+
+        kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
+        block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
+        num_tokens = request.num_tokens - 1
+
+        block_ids_array = np.array(block_ids, dtype=np.int32)
+        num_blocks = len(block_ids)
+        attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
+        block_size = attn_group.kv_cache_spec.block_size
+        block_offsets = np.arange(0, block_size)
+        slot_mapping = (
+            block_offsets.reshape((1, block_size))
+            + block_ids_array.reshape((num_blocks, 1)) * block_size
+        ).flatten()[:num_tokens]
+
+        return self.routed_experts_reader.get_router_logits(indices=slot_mapping)
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

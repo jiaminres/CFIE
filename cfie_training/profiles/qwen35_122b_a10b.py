@@ -15,6 +15,7 @@ from cfie_training.config import (
     RuntimeQuantizationConfig,
     StateBytesConfig,
     PredictorTeacherEngineConfig,
+    PredictorRoutingConfig,
     TransportConfig,
     TrainingProjectConfig,
 )
@@ -123,13 +124,20 @@ def build_qwen35_122b_a10b_config() -> TrainingProjectConfig:
         ),
         predictor_trainer=PredictorTrainerConfig(
             input_summary_dim=64,
-            hidden_dim=128,
-            batch_size=8,
-            epochs=4,
+            hidden_dim=512,
+            model_architecture="factorized",
+            model_depth=4,
+            model_dropout=0.0,
+            model_ffn_multiplier=4,
+            batch_size=4096,
+            epochs=10,
             learning_rate=1e-3,
             weight_decay=1e-4,
             examples_per_step=4,
             seed=0,
+        ),
+        predictor_routing=PredictorRoutingConfig(
+            stride_layers=4,
         ),
         teacher_engine=PredictorTeacherEngineConfig(
             gpu_memory_utilization=0.55,

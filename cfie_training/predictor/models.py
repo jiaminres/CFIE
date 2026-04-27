@@ -31,6 +31,10 @@ class CapturedForwardBatch:
     # 按层保存 teacher router top-k 专家 id；tuple 长度为 L，每个 tensor 形状为 [T, K]。
     layer_teacher_topk_ids: tuple[torch.Tensor, ...]
 
+    # 按层保存 teacher router logits；tuple 长度为 L，每个 tensor 形状为 [T, E]。
+    # 该字段可选，兼容旧 trace/测试桩；新 trace 路径会优先填充它。
+    layer_teacher_router_logits: tuple[torch.Tensor, ...] | None = None
+
 
 @dataclass(slots=True, frozen=True)
 class CapturedHiddenStatePayload:
@@ -80,6 +84,8 @@ class PredictorCaptureCompletion:
     token_ids: tuple[int, ...]
     # teacher 返回的 routed experts，形状通常为 [seq_len, num_layers, topk]。
     routed_experts: np.ndarray | None
+    # teacher 返回的 router logits，形状通常为 [seq_len, num_layers, num_experts]。
+    router_logits: np.ndarray | None
     # 当前 completion 的结束原因。
     finish_reason: str | None
     # 当前 completion 的 stop 原因。
@@ -97,10 +103,16 @@ class PredictorCaptureCompletion:
             if completion.routed_experts is None
             else np.array(completion.routed_experts, copy=True)
         )
+        router_logits = (
+            None
+            if completion.router_logits is None
+            else np.array(completion.router_logits, copy=True)
+        )
         return cls(
             index=int(completion.index),
             token_ids=tuple(int(token_id) for token_id in completion.token_ids),
             routed_experts=routed_experts,
+            router_logits=router_logits,
             finish_reason=completion.finish_reason,
             stop_reason=completion.stop_reason,
         )
@@ -195,6 +207,8 @@ class PredictorTraceExample:
     hidden_state: tuple[float, ...]
     # 每个未来层对应的 teacher top-k experts。
     future_teacher_topk_ids: tuple[tuple[int, ...], ...]
+    # 每个未来层对应的 teacher router logits。
+    future_teacher_router_logits: tuple[tuple[float, ...], ...] | None = None
 
     # 将单条 predictor trace 样本序列化为字典。
     def to_dict(self) -> dict[str, Any]:
@@ -209,6 +223,16 @@ class PredictorTraceExample:
             "future_teacher_topk_ids": [
                 list(expert_ids) for expert_ids in self.future_teacher_topk_ids
             ],
+            **(
+                {
+                    "future_teacher_router_logits": [
+                        list(layer_logits)
+                        for layer_logits in self.future_teacher_router_logits
+                    ],
+                }
+                if self.future_teacher_router_logits is not None
+                else {}
+            ),
         }
 
     @classmethod
@@ -234,6 +258,14 @@ class PredictorTraceExample:
             future_teacher_topk_ids=tuple(
                 tuple(int(expert_id) for expert_id in expert_ids)
                 for expert_ids in payload["future_teacher_topk_ids"]
+            ),
+            future_teacher_router_logits=(
+                None
+                if payload.get("future_teacher_router_logits") is None
+                else tuple(
+                    tuple(float(value) for value in layer_logits)
+                    for layer_logits in payload["future_teacher_router_logits"]
+                )
             ),
         )
 

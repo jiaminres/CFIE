@@ -772,7 +772,10 @@ class Worker(WorkerBase):
             # 常规模式下直接初始化 KV cache。
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
-        if self.model_config.enable_return_routed_experts:
+        if (
+            self.model_config.enable_return_routed_experts
+            or self.model_config.enable_return_router_logits
+        ):
             # 若需要返回 routed experts，则初始化捕获器。
             self.model_runner.init_routed_experts_capturer()
 

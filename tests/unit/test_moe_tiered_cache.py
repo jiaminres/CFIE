@@ -1925,32 +1925,16 @@ def test_preprocess_quantized_static_bundles_batch_is_runtime_ready(
     )
 
 
-def test_should_pin_cpu_static_bundles_disables_large_static_mirror() -> None:
+def test_to_cpu_static_tensor_requires_static_pin_flag() -> None:
     controller = LayerTieredExpertCacheController.__new__(
         LayerTieredExpertCacheController
     )
-    controller._use_pinned_cpu = True
-    controller._cpu_static_pin_limit_bytes = 8 * (1 << 30)
-
-    assert controller._should_pin_cpu_static_bundles(4 * (1 << 30)) is True
-    assert controller._should_pin_cpu_static_bundles(16 * (1 << 30)) is False
-
-    controller._use_pinned_cpu = False
-    assert controller._should_pin_cpu_static_bundles(4 * (1 << 30)) is False
-
-
-def test_to_cpu_static_tensor_respects_static_pin_flag() -> None:
-    controller = LayerTieredExpertCacheController.__new__(
-        LayerTieredExpertCacheController
-    )
+    controller.layer_key = "model.layers.0.mlp.experts"
     controller._use_pinned_cpu = True
     controller._use_pinned_cpu_static = False
 
-    cpu_tensor = controller._to_cpu_static_tensor(torch.arange(4, dtype=torch.float16))
-
-    assert cpu_tensor.device.type == "cpu"
-    assert cpu_tensor.is_contiguous()
-    assert not cpu_tensor.is_pinned()
+    with pytest.raises(RuntimeError, match="must be pinned"):
+        controller._to_cpu_static_tensor(torch.arange(4, dtype=torch.float16))
 
 
 def test_load_experts_into_slots_uses_single_batch_write_entrypoint() -> None:
@@ -2255,7 +2239,6 @@ def test_write_expert_bundles_uses_gptq_batch_load_op_when_available(
         op_calls["w2_g_idx_sort_indices_src"],
         torch.tensor([[[15, 16]], [[35, 36]]], dtype=torch.int32),
     )
-
 
 def test_get_source_bundle_materializes_cpu_static_expert_lazily() -> None:
     controller = LayerTieredExpertCacheController.__new__(
@@ -2562,6 +2545,80 @@ def test_apply_with_tiered_cache_prefers_prefill_burst() -> None:
     assert controller.run_calls == 1
     assert controller.unique_requested == 4
     assert torch.equal(output, x + 7)
+
+
+def test_shared_prefill_burst_pool_waits_for_previous_gpu_use(monkeypatch) -> None:
+    pool = weight_offload.SharedPrefillBurstPool.__new__(
+        weight_offload.SharedPrefillBurstPool
+    )
+    pool.num_slots = 4
+    pool._busy = False
+    pool._mode = "gptq_marlin"
+    pool._expert_map = torch.full((8,), -1, dtype=torch.int32)
+    pool._last_use_event = "previous-use"
+
+    events: list[tuple[str, object]] = []
+
+    class _FakeStream:
+        def wait_event(self, event: object) -> None:
+            events.append(("wait", event))
+
+    class _FakeEvent:
+        def record(self, stream: object) -> None:
+            events.append(("record", stream))
+
+    class _FakeExecutionLayer:
+        def bind(self, **_: object) -> None:
+            events.append(("bind", None))
+
+    class _FakeQuantMethod:
+        def apply(self, **_: object) -> torch.Tensor:
+            events.append(("apply", None))
+            return torch.tensor([1.0], dtype=torch.float32)
+
+    class _FakeController:
+        def __init__(self) -> None:
+            self.layer_key = "model.layers.0.mlp.experts"
+            self.layer = object()
+            self.quant_method = _FakeQuantMethod()
+            self._log_runtime_events = False
+
+        def _unique_experts(self, topk_ids: torch.Tensor) -> list[int]:
+            del topk_ids
+            return [3, 5]
+
+        def _populate_prefill_burst_pool(
+            self,
+            burst_pool: object,
+            requested: list[int],
+        ) -> weight_offload._PrefillBurstExecutionStats:
+            assert burst_pool is pool
+            events.append(("populate", tuple(requested)))
+            return weight_offload._PrefillBurstExecutionStats()
+
+    pool._execution_layer = _FakeExecutionLayer()
+    monkeypatch.setattr(pool, "_supports_reuse_events", lambda: True)
+    monkeypatch.setattr(weight_offload, "current_stream", lambda: _FakeStream())
+    monkeypatch.setattr(weight_offload.torch.cuda, "Event", lambda: _FakeEvent())
+
+    output = pool.execute(
+        controller=_FakeController(),
+        x=torch.zeros((2, 4), dtype=torch.float32),
+        topk_weights=torch.ones((2, 2), dtype=torch.float32),
+        topk_ids=torch.tensor([[3, 5], [5, 3]], dtype=torch.int64),
+        shared_experts_input=None,
+    )
+
+    assert torch.equal(output, torch.tensor([1.0], dtype=torch.float32))
+    assert events[:4] == [
+        ("wait", "previous-use"),
+        ("populate", (3, 5)),
+        ("bind", None),
+        ("apply", None),
+    ]
+    assert events[4][0] == "record"
+    assert isinstance(pool._last_use_event, _FakeEvent)
+    assert pool._busy is False
 
 
 def test_apply_with_tiered_cache_skips_prefill_burst_for_short_prefill() -> None:

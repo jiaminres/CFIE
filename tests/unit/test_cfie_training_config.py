@@ -48,6 +48,12 @@ def test_training_project_defaults_are_resource_first() -> None:
     assert cfg.predictor_routing.online_expert_source == "cpu_hot_only"
     assert cfg.predictor_trainer.input_summary_dim == 64
     assert cfg.predictor_trainer.hidden_dim == 128
+    assert cfg.predictor_trainer.model_architecture == "mlp"
+    assert cfg.predictor_trainer.model_depth == 2
+    assert cfg.predictor_trainer.model_dropout == 0.0
+    assert cfg.predictor_trainer.model_num_heads == 8
+    assert cfg.predictor_trainer.model_memory_tokens == 8
+    assert cfg.predictor_trainer.model_ffn_multiplier == 4
     assert cfg.predictor_trainer.batch_size == 8
     assert cfg.predictor_trainer.epochs == 4
     assert cfg.predictor_trainer.examples_per_step == 4
@@ -115,6 +121,12 @@ def test_training_project_from_dict_accepts_nested_overrides() -> None:
         "predictor_trainer": {
             "input_summary_dim": 32,
             "hidden_dim": 64,
+            "model_architecture": "query_transformer",
+            "model_depth": 3,
+            "model_dropout": 0.1,
+            "model_num_heads": 8,
+            "model_memory_tokens": 4,
+            "model_ffn_multiplier": 3,
             "batch_size": 4,
             "epochs": 2,
             "examples_per_step": 3,
@@ -149,6 +161,12 @@ def test_training_project_from_dict_accepts_nested_overrides() -> None:
     assert cfg.predictor_routing.selection_mode == "shadow_exact"
     assert cfg.predictor_trainer.input_summary_dim == 32
     assert cfg.predictor_trainer.hidden_dim == 64
+    assert cfg.predictor_trainer.model_architecture == "query_transformer"
+    assert cfg.predictor_trainer.model_depth == 3
+    assert cfg.predictor_trainer.model_dropout == 0.1
+    assert cfg.predictor_trainer.model_num_heads == 8
+    assert cfg.predictor_trainer.model_memory_tokens == 4
+    assert cfg.predictor_trainer.model_ffn_multiplier == 3
     assert cfg.predictor_trainer.batch_size == 4
     assert cfg.predictor_trainer.epochs == 2
     assert cfg.predictor_trainer.examples_per_step == 3

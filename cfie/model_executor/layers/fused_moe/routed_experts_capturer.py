@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 _TMP_DIR = tempfile.gettempdir()
 _LOCK_FILE_PREFIX = os.path.join(_TMP_DIR, "cfie_routed_experts")
 _BUFFER_PREFIX = "cfie_routed_experts_buffer"
+_LOGITS_BUFFER_PREFIX = "cfie_router_logits_buffer"
 
 # Global singleton instances
 _global_experts_capturer: RoutedExpertsCapturer | None = None
@@ -136,8 +137,11 @@ class RoutedExpertsCapturer:
 
     def __init__(self) -> None:
         self._device_buffer: torch.Tensor | None = None
+        self._device_logits_buffer: torch.Tensor | None = None
         self._shm: shared_memory.SharedMemory | None = None
+        self._logits_shm: shared_memory.SharedMemory | None = None
         self._host_buffer_view: np.ndarray | None = None
+        self._host_logits_view: np.ndarray | None = None
         self._lock_file: str | None = None
 
     @classmethod
@@ -176,6 +180,10 @@ class RoutedExpertsCapturer:
         hf_config = cfie_config.model_config.hf_text_config
         num_layers = hf_config.num_hidden_layers
         num_experts_per_tok = hf_config.num_experts_per_tok
+        num_experts = hf_config.num_experts
+        capture_router_logits = bool(
+            cfie_config.model_config.enable_return_router_logits
+        )
 
         # Initialize device buffer
         self._device_buffer = torch.zeros(
@@ -183,6 +191,12 @@ class RoutedExpertsCapturer:
             dtype=torch.int32,
             device=current_platform.device_type,
         )
+        if capture_router_logits:
+            self._device_logits_buffer = torch.zeros(
+                (max_num_batched_tokens, num_layers, num_experts),
+                dtype=torch.float16,
+                device=current_platform.device_type,
+            )
         self.dp_rank = cfie_config.parallel_config.data_parallel_rank
 
         if get_tensor_model_parallel_rank() != 0:
@@ -201,13 +215,36 @@ class RoutedExpertsCapturer:
         self._host_buffer_view = np.ndarray(shape, dtype=np.int32, buffer=self._shm.buf)
         self._host_buffer_view.fill(0)
 
+        if capture_router_logits:
+            logits_shape = (max_num_kv_tokens, num_layers, num_experts)
+            logits_buffer_size = (
+                int(np.prod(logits_shape)) * np.dtype(np.float16).itemsize
+            )
+            logits_shm_name = f"{_LOGITS_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+            self._logits_shm = _create_or_attach_shared_memory(
+                logits_shm_name,
+                logits_buffer_size,
+                self._lock_file,
+            )
+            self._host_logits_view = np.ndarray(
+                logits_shape,
+                dtype=np.float16,
+                buffer=self._logits_shm.buf,
+            )
+            self._host_logits_view.fill(0)
+
         logger.debug(
             "Created shared memory buffer '%s' with shape %s",
             shm_name,
             shape,
         )
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
+    ) -> None:
         """
         Capture expert routing decisions for a specific layer.
 
@@ -236,11 +273,17 @@ class RoutedExpertsCapturer:
         self._device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
             start_loc:end_loc, :
         ]
+        if self._device_logits_buffer is not None and router_logits is not None:
+            self._device_logits_buffer[:token_num_per_dp, layer_id, :].copy_(
+                router_logits[start_loc:end_loc, :].to(dtype=torch.float16)
+            )
 
     def clear_buffer(self) -> None:
         """Clear the device buffer."""
         if self._device_buffer is not None:
             self._device_buffer.zero_()
+        if self._device_logits_buffer is not None:
+            self._device_logits_buffer.zero_()
 
     def save_captured_experts(self, indices: np.ndarray) -> None:
         """
@@ -257,6 +300,8 @@ class RoutedExpertsCapturer:
             return
         if self._device_buffer is None:
             raise RuntimeError("Device buffer not initialized.")
+        if self._device_logits_buffer is not None and self._host_logits_view is None:
+            raise RuntimeError("Router logits shared memory not initialized.")
 
         if indices.size:
             max_index = int(indices.max())
@@ -268,9 +313,14 @@ class RoutedExpertsCapturer:
 
         num_tokens = len(indices)
         data = self._device_buffer[:num_tokens, :, :].cpu().numpy()
+        logits_data = None
+        if self._device_logits_buffer is not None:
+            logits_data = self._device_logits_buffer[:num_tokens, :, :].cpu().numpy()
 
         with _file_lock(self._lock_file):
             self._host_buffer_view[indices, :, :] = data
+            if logits_data is not None and self._host_logits_view is not None:
+                self._host_logits_view[indices, :, :] = logits_data
 
     def cleanup(self) -> None:
         """Explicitly clean up shared memory resources."""
@@ -282,6 +332,17 @@ class RoutedExpertsCapturer:
                 logger.debug("Exception during cleanup for capturer", exc_info=True)
             finally:
                 self._shm = None
+        if self._logits_shm is not None:
+            try:
+                self._logits_shm.close()
+                self._logits_shm.unlink()
+            except Exception:
+                logger.debug(
+                    "Exception during router-logits cleanup for capturer",
+                    exc_info=True,
+                )
+            finally:
+                self._logits_shm = None
 
     def __del__(self) -> None:
         """Clean up shared memory on destruction."""
@@ -300,7 +361,9 @@ class RoutedExpertsReader:
 
     def __init__(self) -> None:
         self._shm: shared_memory.SharedMemory | None = None
+        self._logits_shm: shared_memory.SharedMemory | None = None
         self._host_buffer_view: np.ndarray | None = None
+        self._host_logits_view: np.ndarray | None = None
         self._lock_file: str | None = None
 
     @classmethod
@@ -342,11 +405,17 @@ class RoutedExpertsReader:
             hf_config.num_hidden_layers,
             hf_config.num_experts_per_tok,
         )
+        logits_shape = (
+            max_num_kv_tokens,
+            hf_config.num_hidden_layers,
+            hf_config.num_experts,
+        )
 
         self.dp_rank = cfie_config.parallel_config.data_parallel_rank
         instance_id = cfie_config.instance_id
         self._lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{self.dp_rank}.lock"
         shm_name = f"{_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+        logits_shm_name = f"{_LOGITS_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
 
         with _file_lock(self._lock_file, mode="rb+"):
             # Avoid resource_tracker registering the shared memory
@@ -359,6 +428,19 @@ class RoutedExpertsReader:
             self._host_buffer_view = np.ndarray(
                 shape, dtype=np.int32, buffer=self._shm.buf
             )
+            if cfie_config.model_config.enable_return_router_logits:
+                with patch(
+                    "multiprocessing.resource_tracker.register",
+                    lambda *args, **kwargs: None,
+                ):
+                    self._logits_shm = shared_memory.SharedMemory(
+                        name=logits_shm_name
+                    )
+                self._host_logits_view = np.ndarray(
+                    logits_shape,
+                    dtype=np.float16,
+                    buffer=self._logits_shm.buf,
+                )
 
     def get_routed_experts(self, indices: np.ndarray) -> np.ndarray:
         """
@@ -386,6 +468,26 @@ class RoutedExpertsReader:
         with _file_lock(self._lock_file, mode="rb+"):
             return self._host_buffer_view[indices, :, :].copy()
 
+    def get_router_logits(self, indices: np.ndarray) -> np.ndarray:
+        if self._host_logits_view is None:
+            raise RuntimeError(
+                "Router logits buffer not attached. "
+                "Call attach_buffer() with enable_return_router_logits first."
+            )
+        if self._lock_file is None:
+            raise RuntimeError("Lock file not initialized.")
+
+        if indices.size:
+            max_index = int(indices.max())
+            if max_index >= self._host_logits_view.shape[0]:
+                raise IndexError(
+                    "Router logits buffer is too small for slot_mapping: "
+                    f"max_index={max_index}, buffer_size={self._host_logits_view.shape[0]}"
+                )
+
+        with _file_lock(self._lock_file, mode="rb+"):
+            return self._host_logits_view[indices, :, :].copy()
+
     def cleanup(self) -> None:
         """Explicitly clean up resources (close without unlink)."""
         if self._shm is not None:
@@ -395,6 +497,16 @@ class RoutedExpertsReader:
                 logger.debug("Exception during cleanup for reader", exc_info=True)
             finally:
                 self._shm = None
+        if self._logits_shm is not None:
+            try:
+                self._logits_shm.close()
+            except Exception:
+                logger.debug(
+                    "Exception during router-logits cleanup for reader",
+                    exc_info=True,
+                )
+            finally:
+                self._logits_shm = None
 
     def __del__(self) -> None:
         """Close shared memory on destruction (do not unlink)."""
