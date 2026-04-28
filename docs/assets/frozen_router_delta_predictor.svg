@@ -1,0 +1,233 @@
+<svg width="1520" height="980" viewBox="0 0 1520 980" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1520" y2="980" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FBFF"/>
+      <stop offset="1" stop-color="#F3F6FB"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#EEF5FF"/>
+      <stop offset="1" stop-color="#DCE9FF"/>
+    </linearGradient>
+    <linearGradient id="purple" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#F5F0FF"/>
+      <stop offset="1" stop-color="#E5D8FF"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#EEFFF8"/>
+      <stop offset="1" stop-color="#D6F6E7"/>
+    </linearGradient>
+    <linearGradient id="orange" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#FFF6EC"/>
+      <stop offset="1" stop-color="#FFE4C6"/>
+    </linearGradient>
+    <linearGradient id="gray" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#EDF2F8"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#24324B" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto">
+      <path d="M1 1L13 7L1 13V1Z" fill="#5B6A80"/>
+    </marker>
+  </defs>
+
+  <rect width="1520" height="980" rx="32" fill="url(#bg)"/>
+
+  <text x="74" y="76" fill="#18212F" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="34" font-weight="700">
+    CFIE 当前最佳预测器架构：Frozen Router Delta
+  </text>
+  <text x="74" y="114" fill="#5A6880" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18">
+    Qwen3.5-122B-A10B · 未来窗口 8 层 · 纯 KL 蒸馏 · 屏蔽 layer0 样本
+  </text>
+
+  <rect x="1142" y="52" width="304" height="74" rx="18" fill="#18212F"/>
+  <text x="1170" y="83" fill="#F7FAFF" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18" font-weight="700">
+    当前最佳配置
+  </text>
+  <text x="1170" y="109" fill="#DCE6F4" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15">
+    hidden=384 · depth=4 · lr=1e-3 · min_layer_index=1
+  </text>
+
+  <rect x="56" y="158" width="258" height="470" rx="28" fill="url(#blue)" stroke="#C7D8FF" filter="url(#shadow)"/>
+  <text x="86" y="208" fill="#1C417D" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="28" font-weight="700">
+    插入层输入
+  </text>
+  <rect x="84" y="236" width="202" height="146" rx="22" fill="#FFFFFF" stroke="#D3E0FF"/>
+  <text x="108" y="274" fill="#1C417D" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="22" font-weight="700">
+    隐状态
+  </text>
+  <text x="108" y="314" fill="#243247" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="24" font-weight="600">
+    hₗ ∈ ℝ^3072
+  </text>
+  <text x="108" y="350" fill="#5A6880" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="17">
+    当前插入层 token 表示
+  </text>
+  <rect x="84" y="404" width="202" height="126" rx="22" fill="#F7FAFF" stroke="#D3E0FF"/>
+  <text x="108" y="442" fill="#1C417D" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="22" font-weight="700">
+    层索引特征
+  </text>
+  <text x="108" y="478" fill="#243247" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18">
+    φ(l) = [l, l², sin, cos, ...]
+  </text>
+  <text x="108" y="508" fill="#5A6880" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16">
+    条件化当前位置与相对层位
+  </text>
+  <rect x="84" y="554" width="148" height="42" rx="14" fill="#FFFFFF" stroke="#D3E0FF"/>
+  <text x="111" y="581" fill="#1C417D" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" font-weight="600">
+    token 级样本
+  </text>
+
+  <rect x="366" y="136" width="376" height="492" rx="28" fill="url(#purple)" stroke="#DACBFF" filter="url(#shadow)"/>
+  <text x="398" y="188" fill="#563492" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="28" font-weight="700">
+    可训练增量预测器
+  </text>
+  <text x="398" y="220" fill="#5B6880" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16">
+    负责学习“从当前层到未来 8 层”的 hidden state 增量
+  </text>
+
+  <rect x="416" y="258" width="240" height="54" rx="18" fill="#FFFFFF" stroke="#DECFFF"/>
+  <text x="454" y="292" fill="#563492" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="20" font-weight="700">
+    输入投影 + 特征融合
+  </text>
+
+  <rect x="432" y="340" width="208" height="52" rx="18" fill="#F8F4FF" stroke="#D7C6FF"/>
+  <rect x="442" y="352" width="208" height="52" rx="18" fill="#F4EEFF" stroke="#D7C6FF"/>
+  <rect x="452" y="364" width="208" height="52" rx="18" fill="#EFE6FF" stroke="#D7C6FF"/>
+  <rect x="462" y="376" width="208" height="52" rx="18" fill="#E8DCFF" stroke="#D7C6FF"/>
+  <text x="456" y="409" fill="#563492" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="22" font-weight="700">
+    残差 SwiGLU 块 × 4
+  </text>
+
+  <rect x="416" y="462" width="240" height="54" rx="18" fill="#FFFFFF" stroke="#DECFFF"/>
+  <text x="475" y="496" fill="#563492" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="20" font-weight="700">
+    层归一化
+  </text>
+
+  <rect x="416" y="538" width="240" height="54" rx="18" fill="#FFFFFF" stroke="#DECFFF"/>
+  <text x="471" y="572" fill="#563492" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="20" font-weight="700">
+    ΔH 投影到未来窗口
+  </text>
+
+  <rect x="398" y="612" width="312" height="44" rx="14" fill="#FFFFFF" stroke="#DECFFF"/>
+  <text x="420" y="640" fill="#563492" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18" font-weight="600">
+    ΔH = fθ(hₗ, φ(l)) ∈ ℝ^(8×3072)
+  </text>
+
+  <rect x="786" y="136" width="308" height="492" rx="28" fill="url(#green)" stroke="#BFE7D3" filter="url(#shadow)"/>
+  <text x="818" y="188" fill="#126548" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="28" font-weight="700">
+    未来层隐状态估计
+  </text>
+  <text x="818" y="220" fill="#5B6880" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16">
+    用当前 hidden state 叠加偏置与增量，构造未来窗口表示
+  </text>
+
+  <rect x="850" y="266" width="158" height="58" rx="18" fill="#FFFFFF" stroke="#CBEEDB"/>
+  <rect x="862" y="280" width="158" height="58" rx="18" fill="#F7FFFB" stroke="#CBEEDB"/>
+  <rect x="874" y="294" width="158" height="58" rx="18" fill="#F0FFF8" stroke="#CBEEDB"/>
+  <rect x="886" y="308" width="158" height="58" rx="18" fill="#E8FBF2" stroke="#CBEEDB"/>
+  <text x="922" y="342" fill="#126548" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="21" font-weight="700">
+    ĥₗ₊₁
+  </text>
+  <text x="922" y="374" fill="#126548" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="21" font-weight="700">
+    ĥₗ₊₂
+  </text>
+  <text x="934" y="406" fill="#126548" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="24" font-weight="700">
+    ⋮
+  </text>
+  <text x="922" y="438" fill="#126548" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="21" font-weight="700">
+    ĥₗ₊₈
+  </text>
+
+  <rect x="826" y="486" width="228" height="50" rx="16" fill="#FFFFFF" stroke="#CBEEDB"/>
+  <text x="848" y="518" fill="#126548" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18" font-weight="600">
+    ĥₗ₊ₖ = LN(hₗ + bₖ + Δhₖ)
+  </text>
+  <rect x="860" y="554" width="154" height="40" rx="14" fill="#FFFFFF" stroke="#CBEEDB"/>
+  <text x="891" y="579" fill="#126548" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" font-weight="600">
+    形状：[8, 3072]
+  </text>
+
+  <rect x="1138" y="136" width="326" height="492" rx="28" fill="url(#orange)" stroke="#FFD4A8" filter="url(#shadow)"/>
+  <text x="1170" y="188" fill="#9A5207" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="28" font-weight="700">
+    冻结的 Router Gate
+  </text>
+  <text x="1170" y="220" fill="#5B6880" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16">
+    直接取自主模型第 l+1 … l+8 层，不参与训练
+  </text>
+
+  <rect x="1206" y="266" width="180" height="58" rx="18" fill="#FFFFFF" stroke="#FFD6AE"/>
+  <rect x="1218" y="280" width="180" height="58" rx="18" fill="#FFF9F2" stroke="#FFD6AE"/>
+  <rect x="1230" y="294" width="180" height="58" rx="18" fill="#FFF5EB" stroke="#FFD6AE"/>
+  <rect x="1242" y="308" width="180" height="58" rx="18" fill="#FFF0E2" stroke="#FFD6AE"/>
+  <text x="1268" y="342" fill="#9A5207" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="21" font-weight="700">
+    Gₗ₊₁  ∈ ℝ^(256×3072)
+  </text>
+  <text x="1268" y="374" fill="#9A5207" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="21" font-weight="700">
+    Gₗ₊₂
+  </text>
+  <text x="1306" y="406" fill="#9A5207" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="24" font-weight="700">
+    ⋮
+  </text>
+  <text x="1268" y="438" fill="#9A5207" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="21" font-weight="700">
+    Gₗ₊₈
+  </text>
+
+  <rect x="1198" y="486" width="206" height="50" rx="16" fill="#FFFFFF" stroke="#FFD6AE"/>
+  <text x="1237" y="518" fill="#9A5207" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18" font-weight="600">
+    每层一组 256 个专家打分向量
+  </text>
+  <rect x="1234" y="554" width="134" height="40" rx="14" fill="#FFFFFF" stroke="#FFD6AE"/>
+  <text x="1261" y="579" fill="#9A5207" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" font-weight="600">
+    冻结主模型先验
+  </text>
+
+  <rect x="822" y="684" width="392" height="164" rx="26" fill="url(#gray)" stroke="#D7DFEA" filter="url(#shadow)"/>
+  <text x="854" y="734" fill="#243247" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="28" font-weight="700">
+    逐层匹配打分
+  </text>
+  <rect x="854" y="758" width="328" height="48" rx="16" fill="#FFFFFF" stroke="#D7DFEA"/>
+  <text x="898" y="789" fill="#243247" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="22" font-weight="700">
+    zₖ = ĥₗ₊ₖ · Gₗ₊ₖᵀ
+  </text>
+  <text x="854" y="824" fill="#5B6880" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18">
+    Z = {z₁, z₂, …, z₈}，每个 zₖ ∈ ℝ^256
+  </text>
+
+  <rect x="1262" y="690" width="202" height="150" rx="26" fill="url(#blue)" stroke="#C7D8FF" filter="url(#shadow)"/>
+  <text x="1292" y="736" fill="#1C417D" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="26" font-weight="700">
+    预测路由 logits
+  </text>
+  <text x="1292" y="778" fill="#243247" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18">
+    形状：[T, 8, 256]
+  </text>
+  <rect x="1292" y="796" width="142" height="34" rx="12" fill="#FFFFFF" stroke="#D3E0FF"/>
+  <text x="1315" y="818" fill="#1C417D" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" font-weight="600">
+    Top-K 候选专家
+  </text>
+
+  <rect x="728" y="872" width="252" height="74" rx="20" fill="#F2FBF7" stroke="#C6EAD8"/>
+  <text x="756" y="903" fill="#126548" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="20" font-weight="700">
+    教师 Router Logits
+  </text>
+  <text x="756" y="929" fill="#5B6880" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15">
+    来自 trace 的真实前向路由输出
+  </text>
+
+  <rect x="1032" y="860" width="432" height="92" rx="24" fill="url(#green)" stroke="#BFE7D3" filter="url(#shadow)"/>
+  <text x="1064" y="898" fill="#126548" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="25" font-weight="700">
+    训练目标：KL 蒸馏
+  </text>
+  <text x="1064" y="928" fill="#243247" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18">
+    KL( softmax(Zₛ) ∥ softmax(Zₜ) )，其中 hard=0，distill=1
+  </text>
+
+  <path d="M314 309H366" stroke="#5B6A80" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M314 467H366" stroke="#5B6A80" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M742 382H786" stroke="#5B6A80" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M940 628V684" stroke="#5B6A80" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M1300 628V652C1300 672 1214 672 1214 684" stroke="#5B6A80" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M1214 766H1262" stroke="#5B6A80" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M1363 840V860" stroke="#5B6A80" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M980 909H1032" stroke="#5B6A80" stroke-width="4" marker-end="url(#arrow)"/>
+</svg>

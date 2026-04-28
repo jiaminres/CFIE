@@ -30,6 +30,7 @@ PredictorModelArchitecture = Literal[
     "residual_mlp",
     "query_transformer",
     "factorized",
+    "frozen_router_delta",
 ]
 
 
@@ -579,6 +580,8 @@ class PredictorTrainerConfig:
     epochs: int = 4
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
+    hard_target_loss_weight: float = 0.5
+    router_distill_loss_weight: float = 0.5
     examples_per_step: int = 4
     seed: int = 0
 
@@ -597,8 +600,23 @@ class PredictorTrainerConfig:
         _require_positive_int("epochs", self.epochs)
         _require_positive_float("learning_rate", self.learning_rate)
         _require_non_negative_float("weight_decay", self.weight_decay)
+        _require_non_negative_float(
+            "hard_target_loss_weight",
+            self.hard_target_loss_weight,
+        )
+        _require_non_negative_float(
+            "router_distill_loss_weight",
+            self.router_distill_loss_weight,
+        )
         _require_positive_int("examples_per_step", self.examples_per_step)
         _require_non_negative_int("seed", self.seed)
+        if (
+                self.hard_target_loss_weight
+                + self.router_distill_loss_weight
+        ) <= 0.0:
+            raise ValueError(
+                "hard_target_loss_weight + router_distill_loss_weight must be > 0"
+            )
         if (
                 self.model_architecture == "query_transformer"
                 and self.hidden_dim % self.model_num_heads != 0

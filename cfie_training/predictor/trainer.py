@@ -42,6 +42,7 @@ from cfie_training.runtime.data import (
     PredictorBatchPlanner,
     TokenizedDatasetBatchPlanner,
 )
+from cfie_training.runtime.source import LocalWeightManifest
 from cfie_training.runtime.types import BatchShape
 
 if TYPE_CHECKING:
@@ -49,8 +50,6 @@ if TYPE_CHECKING:
 
 
 DEFAULT_TRACE_FLUSH_EVERY_STEPS = 16
-DEFAULT_HARD_TARGET_LOSS_WEIGHT = 0.5
-DEFAULT_ROUTER_DISTILL_LOSS_WEIGHT = 0.5
 
 
 @dataclass(slots=True, frozen=True)
@@ -1477,6 +1476,26 @@ class PredictorTrainer:
         # routing 配置决定未来窗口层数，也就决定输出张量的第二维大小。
         routing_cfg = self.config.predictor_routing
 
+        frozen_router_weights = None
+        if trainer_cfg.model_architecture == "frozen_router_delta":
+            manifest = LocalWeightManifest(self.config)
+            if not manifest.available:
+                raise ValueError(
+                    "frozen_router_delta requires an available local weight manifest"
+                )
+            router_weight_tensors: list[torch.Tensor] = []
+            for layer_index in range(self.config.model_spec.num_hidden_layers):
+                router_weight = manifest.load_router_gate_tensor(
+                    layer_index,
+                    dtype=torch.float32,
+                )
+                if router_weight is None:
+                    raise ValueError(
+                        f"missing router gate weight for layer {layer_index}"
+                    )
+                router_weight_tensors.append(router_weight.contiguous())
+            frozen_router_weights = torch.stack(router_weight_tensors, dim=0)
+
         # model_spec 里的 num_experts 决定每个未来层要预测多少个 expert logit。
         # 这里三类配置共同决定 predictor 的完整张量形状。
         return build_predictor_model(
@@ -1490,6 +1509,8 @@ class PredictorTrainer:
             model_num_heads=trainer_cfg.model_num_heads,
             model_memory_tokens=trainer_cfg.model_memory_tokens,
             model_ffn_multiplier=trainer_cfg.model_ffn_multiplier,
+            num_layers=self.config.model_spec.num_hidden_layers,
+            frozen_router_weights=frozen_router_weights,
         )
 
     @staticmethod
@@ -1900,6 +1921,9 @@ class PredictorTrainer:
             future_layer_mask: torch.Tensor,
             teacher_router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        trainer_cfg = self.config.predictor_trainer
+        hard_weight = float(trainer_cfg.hard_target_loss_weight)
+        distill_weight = float(trainer_cfg.router_distill_loss_weight)
         hard_loss = self._masked_mean(
             F.binary_cross_entropy_with_logits(
                 logits,
@@ -1909,6 +1933,10 @@ class PredictorTrainer:
             future_layer_mask,
         )
         if teacher_router_logits is None:
+            if hard_weight <= 0.0:
+                raise ValueError(
+                    "teacher_router_logits is required when hard_target_loss_weight=0"
+                )
             return hard_loss
 
         distill_loss = self._masked_mean(
@@ -1919,10 +1947,15 @@ class PredictorTrainer:
             ).sum(dim=-1),
             future_layer_mask,
         )
+        total_weight = hard_weight + distill_weight
+        if total_weight <= 0.0:
+            raise ValueError(
+                "hard_target_loss_weight + router_distill_loss_weight must be > 0"
+            )
         return (
-            DEFAULT_HARD_TARGET_LOSS_WEIGHT * hard_loss
-            + DEFAULT_ROUTER_DISTILL_LOSS_WEIGHT * distill_loss
-        )
+            hard_weight * hard_loss
+            + distill_weight * distill_loss
+        ) / total_weight
 
     @staticmethod
     def _batch_recall_sum_at_budget(
