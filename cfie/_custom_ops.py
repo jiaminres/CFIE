@@ -2903,10 +2903,10 @@ def gptq_marlin_moe_repack(
 
     # ------------------------------- 预分配批量 repack 后的输出张量 -------------------------------
     """
-    qweight原先按行压缩，按行取16个元素，则实际跨越 16/(32/num_bits) = (1 / 2) * num_bits = num_bits / 2 
+    qweight原先按行压缩，按行取16个元素，
+    则实际跨越 [16/(32/num_bits) = (1 / 2) * num_bits = num_bits / 2]行 
     """
     # 为所有 experts 预先分配输出张量；输出形状中的第二维按 16 行一组压缩，
-    # 第三维按 num_bits 对列方向进行展开，作为 Marlin kernel 直接消费的布局。
     output = torch.empty(
         # 相当于把行方向的16一组 沿着列方向展开
         (num_experts, size_k // 16, size_n * (num_bits // 2)),

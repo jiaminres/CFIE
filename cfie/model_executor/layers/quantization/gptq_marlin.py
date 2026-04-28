@@ -887,13 +887,16 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             # gate/up 侧按 hidden_size 维度和 group_size 计算 group 数。
             # gate/up属于列切割, 无需考虑is_k_full的问题
             scales_size13 = hidden_size // self.quant_config.group_size
+
             # down_proj 在 desc_act 场景可能要按 full w2 尺寸处理。
             w2_scales_size = (
                 intermediate_size_full
                 if self.quant_config.desc_act
                 else intermediate_size_per_partition
             )
+
             scales_size2 = w2_scales_size // self.quant_config.group_size
+
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
             # group_size=-1 表示走按通道量化，每个 expert 只保留一组 scales。
@@ -927,7 +930,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             torch.empty(
                 num_experts,
                 intermediate_size_per_partition // self.quant_config.pack_factor,  # 量化方向k维度， k维度切割
-                hidden_size,  #
+                hidden_size,  # n维度
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -1003,6 +1006,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_g_idx", w13_g_idx)
         set_weight_attrs(w13_g_idx, extra_weight_attrs)
+
         # 注册 down_proj 的 g_idx。
         w2_g_idx = torch.nn.Parameter(
             torch.empty(
@@ -1045,76 +1049,73 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer.workspace = marlin_make_workspace_new(device, 4)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # ----------------- 入口：checkpoint 加载完成后的 GPTQ Marlin 后处理 -----------------
-        # 这一阶段会把“按 checkpoint 友好布局保存的参数”转换成 Marlin kernel 真正期望的运行时布局。
-        # 典型工作包括：
-        # - 根据 desc_act 处理 g_idx / 排序索引
-        # - repack qweight
-        # - 重排 scales
-        # - 必要时同步 bias 布局
-
         # ----------------- 基础输入检查 -----------------
-        # 标记当前输入是否为 8-bit 激活类型。
-        # itemsize==1 时，常见就是 int8 / fp8 这类单字节激活。
+        # 判断输入激活是否为 int8/fp8 等 8-bit 类型。
         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
 
-        # Marlin MoE 不支持 W8A8-INT8。
+        # Marlin MoE 不支持 W8A8-INT8。且gptq精度必须是int4
         if is_a_8bit:
             assert self.quant_type == scalar_types.uint4b8, (
                 "W8A8-INT8 is not supported by marlin kernel."
             )
 
-        # ----------------- 特殊输入分支：FP8 激活预处理 -----------------
-        # FP8 输入场景下，需要先对 packed qweight 做额外预处理，并同步缩放 scales。
-        # 这里的预处理不是重新量化，而是把现有 int4 packed 权重整理成
-        # Marlin-FP8 混合路径更适合直接消费的表示。
+        # ----------------- FP8 激活预处理 -----------------
+
+        """
+        fp8激活路径经过巧妙的变化, 实现MMA指令直接计算fp8 * fp8
+        
+        首先将int4b8中间转码:
+        真值 -8 ~ -1 | 0 ~ 7
+        转码 15 ~ 8 | 0 ~ 7
+        
+        marlin_kernel 中间转码 --> fp8 (真值 / 512): 低三位作为尾数, 高一位作为符号位，中间转码高位为1的，尾数+1            
+        """
         if self.input_dtype == torch.float8_e4m3fn:
-            # gate/up 路径的 packed qweight 预处理。
+            # 调整 int4 packed 权重布局，适配 int4-weight + fp8-activation kernel。
             ops.marlin_int4_fp8_preprocess(layer.w13_qweight, inplace=True)
-            # down_proj 路径的 packed qweight 预处理。
             ops.marlin_int4_fp8_preprocess(layer.w2_qweight, inplace=True)
-            # FP8 路径要求 scales 额外乘一个固定缩放因子。
+
+            # FP8 路径下 scales 需要额外缩放。
             layer.w13_scales.data = layer.w13_scales.data * 512
             layer.w2_scales.data = layer.w2_scales.data * 512
 
         # ----------------- g_idx / act-order 后处理 -----------------
         if self.quant_config.desc_act:
-            # desc_act=true 时，运行时需要按 g_idx 的排序结果访问权重。
-            # 因此这里先为每个 expert 计算排序索引，再把 g_idx 自身重排成排序后视图。
+            # desc_act=true 时，repack 需要 g_idx 排序信息。
             num_experts = layer.w13_g_idx.shape[0]
-            # 保存“排序后位置 -> 原始位置”的索引。
+
+            # argsort 索引：sorted_g_idx = original_g_idx[sort_indices]。
             w13_g_idx_sort_indices = torch.empty_like(layer.w13_g_idx)
             w2_g_idx_sort_indices = torch.empty_like(layer.w2_g_idx)
-            # 保存按索引重排后的 g_idx，供后续 repack 直接使用。
+
+            # 保存排序后的 g_idx。
             w13_sorted_g_idx = torch.empty_like(layer.w13_g_idx)
             w2_sorted_g_idx = torch.empty_like(layer.w2_g_idx)
+
             for e in range(num_experts):
-                # 分别为每个 expert 计算 gate/up 与 down_proj 的 g_idx 排序次序。
+                # 分别计算 w13 / w2 的 g_idx 排序索引。
                 w13_g_idx_sort_indices[e] = torch.argsort(layer.w13_g_idx[e]).to(
                     torch.int32
                 )
                 w2_g_idx_sort_indices[e] = torch.argsort(layer.w2_g_idx[e]).to(
                     torch.int32
                 )
-                # 把原始 g_idx 重排成单调有序视图，后续 kernel/repack 会直接依赖它。
+
+                # 按排序索引重排 g_idx。
                 w13_sorted_g_idx[e] = layer.w13_g_idx[e][w13_g_idx_sort_indices[e]]
                 w2_sorted_g_idx[e] = layer.w2_g_idx[e][w2_g_idx_sort_indices[e]]
-            # 用 replace_parameter 覆盖原参数，保留 weight_loader 等运行时属性。
+
+            # 替换为排序后的 g_idx 及其排序索引。
             replace_parameter(layer, "w13_g_idx", w13_sorted_g_idx)
             replace_parameter(layer, "w2_g_idx", w2_sorted_g_idx)
             replace_parameter(layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices)
             replace_parameter(layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices)
         else:
-            # desc_act=false 时，g_idx 相关张量在运行时无实际用途。
-            # 当前 Qwen3.5-122B-A10B-GPTQ-Int4 就是这一路径：
-            # - bits = 4
-            # - group_size = 128
-            # - desc_act = false
-            # - sym = true
-            # 因而 g_idx 虽然会先按统一接口加载，但这里会直接缩成空张量释放运行时负担。
+            # desc_act=false 时 g_idx 无运行时用途，缩成空参数以节省开销。
             num_experts = layer.w13_g_idx.shape[0]
             device = layer.w13_g_idx.device
-            # 仍然保留参数名，但把实体缩成 [num_experts, 0] 的空张量。
+
+            # 保留参数名，但实体为空张量。
             layer.w13_g_idx = torch.nn.Parameter(
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
                 requires_grad=False,
@@ -1133,29 +1134,28 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             )
 
         # ----------------- qweight repack -----------------
-        # 把 checkpoint 里的 packed qweight 重排成 Marlin kernel 直接消费的布局。
-        # 这里传给 repack 的 size_k / size_n 对应“解包前的逻辑矩阵尺寸”，
-        # 而不是当前 packed tensor 的物理 shape。
+        # 将 checkpoint packed qweight 重排为 Marlin kernel 布局。
         marlin_w13_qweight = ops.gptq_marlin_moe_repack(
             layer.w13_qweight,
-            # gate/up 路径若开启 desc_act，会用到事先准备好的排序索引。
             layer.w13_g_idx_sort_indices,
-            # packed 之前的 K 维大小。
+            # 还原 packed 前的逻辑 K 维。
             layer.w13_qweight.shape[1] * self.quant_config.pack_factor,
-            # 逻辑 N 维大小。
+            # 逻辑 N 维。
             layer.w13_qweight.shape[2],
             self.quant_config.quant_type.size_bits,
             is_a_8bit=is_a_8bit,
         )
-        # 用 repack 后的参数替换原始 checkpoint 布局参数。
+
+        # 替换为 repack 后的 qweight。
         replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
 
-        # down_proj 的 qweight 同样做对应的 repack。
+        # down_proj qweight 同样 repack。
         marlin_w2_qweight = ops.gptq_marlin_moe_repack(
             layer.w2_qweight,
             layer.w2_g_idx_sort_indices,
-            # w2 的 K 维在存储上同样是按 pack_factor 压缩过的。
+            # w2 逻辑 K 维。
             layer.w2_qweight.shape[1] * self.quant_config.pack_factor,
+            # w2 逻辑 N 维。
             layer.w2_qweight.shape[2],
             self.quant_config.quant_type.size_bits,
             is_a_8bit=is_a_8bit,
@@ -1163,22 +1163,23 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         replace_parameter(layer, "w2_qweight", marlin_w2_qweight)
 
         # ----------------- modular kernel 兼容别名 -----------------
-        # 给 modular kernel 暴露统一的 w13_weight / w2_weight 访问名。
+        # 暴露统一的 weight 命名。
         layer.w13_weight = layer.w13_qweight
         layer.w2_weight = layer.w2_qweight
 
         # ----------------- scales 重排与输入 scale 提取 -----------------
-        # 把 w13_scales 重排成 Marlin 期望布局。
+        # 重排 w13 scales 为 Marlin 布局。
         marlin_w13_scales = marlin_moe_permute_scales(
             s=layer.w13_scales,
-            # w13 的逻辑 K 维就是当前 TP 分片后的 intermediate_size。
+            # scale permutation 使用当前 TP rank 的 intermediate 分片尺寸。
             size_k=layer.intermediate_size_per_partition,
-            # gate/up 融合后，逻辑 N 维直接取 scales 最后一维。
+            # gate/up 融合后的 N 维。
             size_n=layer.w13_scales.shape[2],
             group_size=self.quant_config.group_size,
             is_a_8bit=is_a_8bit,
         )
-        # INT8 输入且存在多组 scales 时，需要额外提取全局输入 scale。
+
+        # INT8 激活且多组 scale 时，额外提取输入全局 scale。
         if self.input_dtype == torch.int8 and layer.num_groups_w13 > 1:
             marlin_w13_scales, w13_input_global_scale = marlin_act_int8_process_scales(
                 marlin_w13_scales
@@ -1188,25 +1189,26 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 torch.nn.Parameter(w13_input_global_scale, requires_grad=False),
             )
 
-        # 用重排后的 scales 替换原始 checkpoint 布局。
+        # 替换为重排后的 w13 scales。
         replace_parameter(layer, "w13_scales", marlin_w13_scales)
 
-        # down_proj 的 scales 也要按自己的 K/N 语义重排。
+        # 重排 w2 scales。
         marlin_w2_scales = marlin_moe_permute_scales(
             s=layer.w2_scales,
-            # group 量化时，K 维要从“group 数”还原回逻辑输入维；
-            # channel 量化时则退回按 pack_factor 恢复。
+            # 从 group 数还原 w2 的逻辑 K 维。
             size_k=layer.w2_scales.shape[1]
                    * (
                        self.quant_config.group_size
                        if self.quant_config.group_size != -1
                        else self.quant_config.pack_factor
                    ),
+            # w2 逻辑 N 维。
             size_n=layer.w2_scales.shape[2],
             group_size=self.quant_config.group_size,
             is_a_8bit=is_a_8bit,
         )
-        # INT8 输入且存在多组 scales 时，同样提取 w2 的全局输入 scale。
+
+        # INT8 激活且多组 scale 时，提取 w2 输入全局 scale。
         if self.input_dtype == torch.int8 and layer.num_groups_w2 > 1:
             marlin_w2_scales, w2_input_global_scale = marlin_act_int8_process_scales(
                 marlin_w2_scales
@@ -1216,17 +1218,15 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 torch.nn.Parameter(w2_input_global_scale, requires_grad=False),
             )
 
-        # 用重排后的 w2 scales 替换原始参数。
+        # 替换为重排后的 w2 scales。
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
 
         # ----------------- bias 重排 -----------------
-        # 若存在 bias，也同步转成 Marlin 期望布局。
+        # bias 也转成 Marlin 布局。
         if hasattr(layer, "w13_bias") and layer.w13_bias is not None:
-            # w13_bias 对应 gate/up 融合后的偏置。
             layer.w13_bias.data = marlin_permute_bias(layer.w13_bias)
 
         if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
-            # w2_bias 对应 down_proj 偏置。
             layer.w2_bias.data = marlin_permute_bias(layer.w2_bias)
 
     def get_fused_moe_quant_config(

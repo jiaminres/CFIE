@@ -96,7 +96,8 @@ if(CUTLASS_ENABLE_CUBLAS AND NOT TARGET cublas)
   if(WIN32)
     add_library(cublas STATIC IMPORTED GLOBAL)
   else()
-    add_library(cublas SHARED IMPORTED GLOBAL)
+    add_library(cublas SHARED IMPORTED GLOBAL
+            ../../csrc/core/registration.h)
   endif()
 
   add_library(nvidia::cublas ALIAS cublas)

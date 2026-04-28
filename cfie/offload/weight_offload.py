@@ -945,7 +945,7 @@ class LayerTieredExpertCacheController:
             expert_id
             for expert_id in expert_ids
             if expert_id in self._cpu_static_experts
-            and expert_id not in self._cpu_static_bundles
+               and expert_id not in self._cpu_static_bundles
         ]
         if not pending:
             return
@@ -1009,16 +1009,16 @@ class LayerTieredExpertCacheController:
         while low <= high:
             batch_size = (low + high) // 2
             fits_cpu = (
-                cpu_available is None
-                or self._estimate_quantized_cpu_static_preprocess_cpu_bytes(
-                    batch_size
-                ) <= max(0, cpu_available - cpu_reserve)
+                    cpu_available is None
+                    or self._estimate_quantized_cpu_static_preprocess_cpu_bytes(
+                batch_size
+            ) <= max(0, cpu_available - cpu_reserve)
             )
             fits_gpu = (
-                gpu_available is None
-                or self._estimate_quantized_cpu_static_preprocess_gpu_bytes(
-                    batch_size
-                ) <= max(0, gpu_available - gpu_reserve)
+                    gpu_available is None
+                    or self._estimate_quantized_cpu_static_preprocess_gpu_bytes(
+                batch_size
+            ) <= max(0, gpu_available - gpu_reserve)
             )
             if fits_cpu and fits_gpu:
                 best = batch_size
@@ -1071,22 +1071,22 @@ class LayerTieredExpertCacheController:
         w2_qzeros_bytes = int(self.layer.w2_qzeros.element_size())
 
         total_bytes = (
-            2 * (hidden_size // self.pack_factor) * intermediate_size * 4
-            + 2 * int(self.layer.num_groups_w13) * intermediate_size * w13_scale_bytes
-            + 2
-            * int(self.layer.num_groups_w13)
-            * (intermediate_size // self.pack_factor)
-            * w13_qzeros_bytes
-            + (intermediate_size // self.pack_factor) * hidden_size * 4
-            + int(self.layer.num_groups_w2) * hidden_size * w2_scale_bytes
-            + int(self.layer.num_groups_w2)
-            * (hidden_size // self.pack_factor)
-            * w2_qzeros_bytes
+                2 * (hidden_size // self.pack_factor) * intermediate_size * 4
+                + 2 * int(self.layer.num_groups_w13) * intermediate_size * w13_scale_bytes
+                + 2
+                * int(self.layer.num_groups_w13)
+                * (intermediate_size // self.pack_factor)
+                * w13_qzeros_bytes
+                + (intermediate_size // self.pack_factor) * hidden_size * 4
+                + int(self.layer.num_groups_w2) * hidden_size * w2_scale_bytes
+                + int(self.layer.num_groups_w2)
+                * (hidden_size // self.pack_factor)
+                * w2_qzeros_bytes
         )
         if self._gptq_desc_act:
             total_bytes += (
-                2 * hidden_size * int(self.layer.w13_g_idx.element_size())
-                + intermediate_size * int(self.layer.w2_g_idx.element_size())
+                    2 * hidden_size * int(self.layer.w13_g_idx.element_size())
+                    + intermediate_size * int(self.layer.w2_g_idx.element_size())
             )
         return total_bytes
 
@@ -1098,35 +1098,35 @@ class LayerTieredExpertCacheController:
 
     def _estimate_quantized_runtime_bundle_nbytes(self) -> int:
         total_bytes = (
-            self._tensor_nbytes(self.layer.w13_qweight[0])
-            + self._tensor_nbytes(self.layer.w2_qweight[0])
-            + self._tensor_nbytes(self.layer.w13_scales[0])
-            + self._tensor_nbytes(self.layer.w2_scales[0])
-            + self._tensor_nbytes(self.layer.w13_qzeros[0])
-            + self._tensor_nbytes(self.layer.w2_qzeros[0])
+                self._tensor_nbytes(self.layer.w13_qweight[0])
+                + self._tensor_nbytes(self.layer.w2_qweight[0])
+                + self._tensor_nbytes(self.layer.w13_scales[0])
+                + self._tensor_nbytes(self.layer.w2_scales[0])
+                + self._tensor_nbytes(self.layer.w13_qzeros[0])
+                + self._tensor_nbytes(self.layer.w2_qzeros[0])
         )
         if self._gptq_desc_act:
             total_bytes += (
-                self._tensor_nbytes(self.layer.w13_g_idx[0])
-                + self._tensor_nbytes(self.layer.w2_g_idx[0])
-                + self._tensor_nbytes(self.layer.w13_g_idx_sort_indices[0])
-                + self._tensor_nbytes(self.layer.w2_g_idx_sort_indices[0])
+                    self._tensor_nbytes(self.layer.w13_g_idx[0])
+                    + self._tensor_nbytes(self.layer.w2_g_idx[0])
+                    + self._tensor_nbytes(self.layer.w13_g_idx_sort_indices[0])
+                    + self._tensor_nbytes(self.layer.w2_g_idx_sort_indices[0])
             )
         return total_bytes
 
     def _estimate_quantized_gpu_preprocess_output_nbytes(self) -> int:
         total_bytes = (
-            self._tensor_nbytes(self.layer.w13_qweight[0])
-            + self._tensor_nbytes(self.layer.w2_qweight[0])
-            + self._tensor_nbytes(self.layer.w13_scales[0])
-            + self._tensor_nbytes(self.layer.w2_scales[0])
+                self._tensor_nbytes(self.layer.w13_qweight[0])
+                + self._tensor_nbytes(self.layer.w2_qweight[0])
+                + self._tensor_nbytes(self.layer.w13_scales[0])
+                + self._tensor_nbytes(self.layer.w2_scales[0])
         )
         if self._gptq_desc_act:
             total_bytes += (
-                self._tensor_nbytes(self.layer.w13_g_idx[0])
-                + self._tensor_nbytes(self.layer.w2_g_idx[0])
-                + self._tensor_nbytes(self.layer.w13_g_idx_sort_indices[0])
-                + self._tensor_nbytes(self.layer.w2_g_idx_sort_indices[0])
+                    self._tensor_nbytes(self.layer.w13_g_idx[0])
+                    + self._tensor_nbytes(self.layer.w2_g_idx[0])
+                    + self._tensor_nbytes(self.layer.w13_g_idx_sort_indices[0])
+                    + self._tensor_nbytes(self.layer.w2_g_idx_sort_indices[0])
             )
         return total_bytes
 
@@ -1136,9 +1136,9 @@ class LayerTieredExpertCacheController:
     ) -> int:
         raw_bytes_per_expert = self._raw_quantized_nbytes(self._cpu_quantized_raw_buffer)
         return (
-            self._estimate_quantized_checkpoint_source_bundle_nbytes()
-            + batch_size * raw_bytes_per_expert
-            + batch_size * self._estimate_quantized_runtime_bundle_nbytes()
+                self._estimate_quantized_checkpoint_source_bundle_nbytes()
+                + batch_size * raw_bytes_per_expert
+                + batch_size * self._estimate_quantized_runtime_bundle_nbytes()
         )
 
     def _estimate_quantized_cpu_static_preprocess_gpu_bytes(
@@ -1147,8 +1147,8 @@ class LayerTieredExpertCacheController:
     ) -> int:
         raw_bytes_per_expert = self._raw_quantized_nbytes(self._cpu_quantized_raw_buffer)
         return batch_size * (
-            raw_bytes_per_expert
-            + self._estimate_quantized_gpu_preprocess_output_nbytes()
+                raw_bytes_per_expert
+                + self._estimate_quantized_gpu_preprocess_output_nbytes()
         )
 
     def _materialize_quantized_cpu_static_batch(
@@ -2121,26 +2121,26 @@ class LayerTieredExpertCacheController:
         # 当当前字段为 qweight 时，将该张量按列偏移写入 raw.w13_qweight 的对应半区。
         if field_name == "qweight":
             raw.w13_qweight[
-                expert_index,
-                :,
-                offset: offset + tensor.shape[-1],
+            expert_index,
+            :,
+            offset: offset + tensor.shape[-1],
             ].copy_(tensor)
 
         # 当当前字段为 scales 时，将该张量按列偏移写入 raw.w13_scales 的对应半区。
         elif field_name == "scales":
             raw.w13_scales[
-                expert_index,
-                :,
-                offset: offset + tensor.shape[-1],
+            expert_index,
+            :,
+            offset: offset + tensor.shape[-1],
             ].copy_(tensor)
 
         # ------------------------------- 将压缩列数的 qzeros 写入合并后的 w13 对应半区 -------------------------------
         # 当当前字段为 qzeros 时，按 qzeros 专用列偏移写入 raw.w13_qzeros 的对应半区。
         elif field_name == "qzeros":
             raw.w13_qzeros[
-                expert_index,
-                :,
-                qzeros_offset: qzeros_offset + tensor.shape[-1],
+            expert_index,
+            :,
+            qzeros_offset: qzeros_offset + tensor.shape[-1],
             ].copy_(tensor)
 
         # ------------------------------- 将 g_idx 写入 w13 的原始索引缓冲区 -------------------------------
@@ -2698,14 +2698,14 @@ def maybe_enable_tiered_moe_cache(model: nn.Module, cfie_config: Any) -> None:
     # 基于计划中的模型路径创建 safetensors 专家存储，用于后续按层、按专家读取冷数据。
     expert_store = SafetensorExpertStore(plan["model_path"])
 
-    # 读取计划中配置的共享 prefill burst pool 槽位数。
-    prefill_burst_slots = int(plan.get("prefill_burst_slots", 0))
-
     # 记录最终真正挂载 tiered cache controller 的层数。
     enabled_layers = 0
 
     # 记录模型中被标记为应该启用 tiered cache 的 FusedMoE 层数。
     marked_layers = 0
+
+    # 读取计划中配置的共享 prefill burst pool 槽位数。
+    prefill_burst_slots = int(plan.get("prefill_burst_slots", 0))
 
     # 尽量在同一模型内复用一个共享 prefill burst pool，以减少额外显存占用。
     shared_prefill_burst_pool: SharedPrefillBurstPool | None = None

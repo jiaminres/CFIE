@@ -63,9 +63,16 @@ logger = init_logger(__name__)
 
 
 class FusedMoeWeightScaleSupported(Enum):
+    # 整个权重张量或每个 expert 共用一个标量 scale。
     TENSOR = "tensor"
+
+    # 沿单个通道维度给 scale，通常与权重某一轴一一对应。
     CHANNEL = "channel"
+
+    # 沿若干连续元素组成的 group 给 scale。
     GROUP = "group"
+
+    # 沿二维 block 或 kernel 对齐的小块给 scale。
     BLOCK = "block"
 
 
@@ -700,7 +707,7 @@ class FusedMoE(CustomOp):
             is_mxfp4_quant=(
                     quant_config is not None and quant_config.is_mxfp4_quant(prefix, self)
             ),  # False
-        ) # 当前不操作
+        )  # 当前不操作
 
         # 保存最终用于 kernel / 权重布局的 hidden_size。
         self.hidden_size = hidden_size
@@ -1097,9 +1104,7 @@ class FusedMoE(CustomOp):
             tp_rank: int,
             load_full_w2: bool = False,
     ):
-        # 统一装载 group quant 的 weight scale 或普通模型权重。
-        # shard_dim 指定 TP 切分维度，shard_id 表示当前落的是 w1 / w2 / w3 哪一支。
-        # load_full_w2 用于控制 w2 是否保留完整权重而不做 TP 分片。
+
         if shard_id == "w2":
             # w2 是 RowParallel 方向，必要时可选择保留完整权重而不切 TP 分片。
             # act-order / g_idx 场景下，w2 scale 可按 load_full_w2 要求保持不分片。
@@ -1128,11 +1133,11 @@ class FusedMoE(CustomOp):
             loaded_weight: torch.Tensor,
             tp_rank: int,
     ):
-        # 入口：装载 per-channel weight scale。
         # per-channel scale 与真实模型权重使用同一套 TP 切分规则。
+        # per-channel w2装载不用考虑是否分片
         if shard_id == "w2":
             expert_data.copy_(loaded_weight)
-        elif shard_id in ("w1", "w3"):
+        elif shard_id in ("w1", "w3"): # w1,w3装载逻辑和group,block一致
             self._load_w13(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
@@ -1150,19 +1155,22 @@ class FusedMoE(CustomOp):
             tp_rank: int,
             load_full: bool = False,
     ):
-        # 入口：装载 w13。
         # w13 是 gate_proj 与 up_proj 的合并权重，按列并行语义在输出维切分。
         if self.moe_config.is_act_and_mul:  # 默认
             # gated activation 场景下，w13 的同一维度前后两半分别是 w1 / w3。
             shard_size = expert_data.shape[shard_dim] // 2
         else:
             shard_size = expert_data.shape[shard_dim]
+
         # 非 full-load 且 loaded_weight 不是标量时，只截取当前 TP rank 负责的那一片。
         if not load_full and loaded_weight.ndim > 0:  # 默认
             # 按当前 TP rank 只截取自己负责的输出维分片。
             loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
+                shard_dim,
+                shard_size * tp_rank,
+                shard_size
             )
+
         # w1 对应 w13 的前半段。
         if shard_id == "w1":
             expert_data = expert_data.narrow(shard_dim, 0, shard_size)
@@ -1170,6 +1178,7 @@ class FusedMoE(CustomOp):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -1180,15 +1189,16 @@ class FusedMoE(CustomOp):
             tp_rank: int,
             load_full: bool = False,
     ):
-        # 入口：装载 w2。
         # w2 对应 down_proj，按行并行语义在输入维切分。
         shard_size = expert_data.shape[shard_dim]
+
         # 非 full-load 且 loaded_weight 不是标量时，只截取当前 TP rank 负责的那一片。
         if not load_full and loaded_weight.ndim > 0:
             # 按当前 TP rank 只装入自己负责的输入维片段。
             loaded_weight = loaded_weight.narrow(
                 shard_dim, shard_size * tp_rank, shard_size
             )
+
         # w2 没有像 w13 那样的双分支复用，直接整段写入即可。
         expert_data.copy_(loaded_weight)
 
@@ -1286,35 +1296,45 @@ class FusedMoE(CustomOp):
             self,
             param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
-            weight_name: str, # param_key
-            shard_id: str,
+            weight_name: str,  # param_key
+            shard_id: str,  # w1/w2/w3
             expert_id: int,
             return_success: bool = False,
     ) -> bool | None:
         # ------------------------------- 处理 MXFP4 特例直拷贝路径 -------------------------------
+
         # MXFP4 某些检查点直接存 fused-expert 布局，这里按真实切片尺寸直接回写。
         if self.quant_config and self.quant_config.get_name() == "mxfp4":
+            """
+            mxfp4到这里权重格式已经和运行时格式几乎一致
+            这份实现里它根本不在 runtime loader 里；它被当成“上游 checkpoint/导出阶段已经切好”的输入契约。
+            """
             # bias 分支：`loaded_weight` 形状通常为 `[E_ckpt, D]`，
             # 写入 `param.data[:, :dim1]` 对应的局部窗口。
             if "bias" in weight_name:
                 # dim1 表示当前 checkpoint 里 bias 的列宽。
                 dim1 = loaded_weight.shape[1]
+
                 # 把 `[E_ckpt, D]` 拷贝到参数可见窗口 `[E_local, D_local]` 的前缀区域。
                 param.data[:, :dim1].copy_(loaded_weight)
             else:
                 # dim1/dim2 表示当前 checkpoint 里权重的二维矩阵窗口大小。
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
+
                 # 把 `[E_ckpt, D1, D2]` 拷贝到参数张量前缀区域 `[E_local, D1_local, D2_local]`。
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
+
             # 调用方要求返回状态时返回 True；否则保持历史接口返回 None。
             return True if return_success else None
 
         # ------------------------------- 预计算量化上下文与 expert 映射 -------------------------------
         # 记录当前量化方法类名，用于后续分支派发。
         quant_method_name = self.quant_method.__class__.__name__
+
         # 先缓存原始全局 expert id，后续可能要用于全局 scale 回写。
         global_expert_id = expert_id
+
         # 把全局 expert id 映射成当前层当前时刻可见的本地物理 slot。
         expert_id = self._map_global_expert_id_to_local_expert_id(global_expert_id)
 
@@ -1328,6 +1348,7 @@ class FusedMoE(CustomOp):
         # 若当前 expert 未映射到本地 slot 且不是全局 scale 参数，则直接跳过。
         if expert_id == -1 and not use_global_sf:
             return False if return_success else None
+
         # 走到这里后，expert_id 语义即“当前层本地物理 slot id”。
 
         # ------------------------------- 处理压缩格式的转置布局 -------------------------------
@@ -1356,11 +1377,14 @@ class FusedMoE(CustomOp):
 
         # 标记当前参数是否来自 GGUF 权重通路。
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
+
         # 标记当前参数是否是 GGUF 的“weight_type”元数据参数。
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+
         if is_gguf_weight_type:
             # weight_type 走元数据回写，不参与普通矩阵切片与 TP 分片逻辑。
             param.weight_type = loaded_weight.item()
+
             # 元数据参数直接整值复制。
             param.data.copy_(loaded_weight)
             return True if return_success else None
@@ -1368,6 +1392,7 @@ class FusedMoE(CustomOp):
         # ------------------------------- 处理 BitsAndBytes 4bit 特殊路径 -------------------------------
         # BnB 4bit inflight quantization 已提前完成分片，不能再按 TP 规则二次切分。
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+
         if use_bitsandbytes_4bit:
             # BnB 4bit 统一按 dim0 解释 shard 维。
             shard_dim = 0
@@ -1393,6 +1418,8 @@ class FusedMoE(CustomOp):
         # ------------------------------- 推导普通路径的切分维度 -------------------------------
         # 按 shard 类型取默认切分维度。
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+
+        # GPTQ需要转置, w13按照列切分, w2按照行切分
         if is_transposed:
             # 转置布局下切分维需要对调：0 <-> 1。
             shard_dim = int(not shard_dim)
@@ -1404,17 +1431,26 @@ class FusedMoE(CustomOp):
             shard_dim += 1
 
         # ------------------------------- 处理 GGUF 未初始化参数物化 -------------------------------
+
+        """
+        UninitializedParameter表示创建张量时不知道形状，需要加载权重反推
+        """
         # GGUF 某些参数在此时还是 UninitializedParameter，需要先 materialize 成最终局部尺寸。
         if is_gguf_weight and isinstance(param, UninitializedParameter):
+
             # GGUF 未初始化路径要求 checkpoint 提供 full-load 形状信息。
             assert full_load
+
             # 基于 checkpoint 张量形状生成可修改的目标 shape。
             final_shape = list(loaded_weight.shape)
+
             # w1/w3 在运行时共用 w13 容器，因此 hidden_out 维需要扩到 2 倍。
             if shard_id in {"w1", "w3"}:
                 final_shape[1] *= 2
+
             # 按 TP 大小把切分维裁成当前 rank 的局部尺寸。
             final_shape[shard_dim] = final_shape[shard_dim] // self.tp_size
+
             # 以 checkpoint dtype 物化参数存储，确保后续 copy_ 类型一致。
             param.materialize(final_shape, dtype=loaded_weight.dtype)
 
@@ -1423,7 +1459,7 @@ class FusedMoE(CustomOp):
 
         # ------------------------------- 处理 input_scale 标量参数 -------------------------------
         if "input_scale" in weight_name:
-            # input_scale 是标量参数，先对齐到参数设备避免跨设备比较/回写异常。
+            # 先把 checkpoint 中读出的 scale 移到目标参数所在设备
             loaded_weight = loaded_weight.to(param.data.device)
 
             if (
@@ -1431,7 +1467,19 @@ class FusedMoE(CustomOp):
                     and param.data[expert_id] != 1
                     and (param.data[expert_id] - loaded_weight).abs() > 1e-5
             ):
-                # w1/w3 共用输入 scale；若同一 expert 两条路径不一致则立即失败。
+                """
+                compressed 量化路径下，w1(gate_proj) 和 w3(up_proj)
+                接收的是同一个输入 x，因此它们理论上应共享同一个 input_scale。
+                param.data[expert_id] 表示该 expert 当前位置已经保存的 input_scale。
+                loaded_weight 表示这次从 checkpoint 读到的新的 input_scale。
+                param.data[expert_id] != 1 用来判断当前位置是否已经被写过：
+                 - 初始值通常为 1，表示还没有加载过真实 input_scale；
+                 - 如果已经不是 1，说明 w1 或 w3 的另一条分支已经写入过 scale。
+                 因此这里比较旧值和新值：
+                 - 如果二者几乎相等，说明 w1/w3 的 input_scale 一致，可以继续；
+                 - 如果差异超过 1e-5，说明同一个 expert 的 w1/w3 input_scale 冲突，
+                   运行时只能保存一个 scale，无法判断该使用哪一个，所以直接报错。
+                """
                 raise ValueError(
                     "input_scales of w1 and w3 of a layer "
                     f"must be equal. But got {param.data[expert_id]} "
@@ -1460,6 +1508,7 @@ class FusedMoE(CustomOp):
 
         # ------------------------------- 处理 ModelOpt 量化路径 -------------------------------
         # TODO @dsikka: ModelOpt 后续应收敛到统一的 MoE 装载模式。
+
         if "ModelOpt" in quant_method_name:
             # ModelOpt 的 scale 规则特殊，先读取其内部模式开关。
             uses_weight_scale_2 = self.quant_method.uses_weight_scale_2_pattern()
@@ -1521,6 +1570,7 @@ class FusedMoE(CustomOp):
         if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
             # 根据参数携带的 quant_method 决定采用哪一种量化附属参数装载规则。
             quant_method = getattr(param, "quant_method", None)
+
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
                 # per-channel scale 使用与权重矩阵一致的 shard/TP 规则。
                 self._load_per_channel_weight_scale(
@@ -1530,6 +1580,7 @@ class FusedMoE(CustomOp):
                     expert_data=expert_data,
                     tp_rank=self.tp_rank,
                 )
+
             elif quant_method in [
                 FusedMoeWeightScaleSupported.GROUP.value,
                 FusedMoeWeightScaleSupported.BLOCK.value,
@@ -1543,6 +1594,7 @@ class FusedMoE(CustomOp):
                     tp_rank=self.tp_rank,
                     load_full_w2=getattr(param, "load_full_w2", False),
                 )
+
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # per-tensor scale 是标量，走标量回写路径。
                 self._load_per_tensor_weight_scale(
@@ -1551,6 +1603,7 @@ class FusedMoE(CustomOp):
                     loaded_weight=loaded_weight,
                     expert_id=expert_id,
                 )
+
             else:
                 # 枚举所有支持类型并抛错，防止静默吞掉未知 quant_method。
                 WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
