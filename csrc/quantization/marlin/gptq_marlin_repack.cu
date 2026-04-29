@@ -259,6 +259,7 @@ namespace marlin {
                     reinterpret_cast<uint32_t *>(sh_perm_ptr);
 
             // 当前线程抽取的 8 个量化值。
+            // 一个线程负责两列，每列4个元素
             uint32_t vals[8];
 
             // act-order 路径。
@@ -389,6 +390,13 @@ namespace marlin {
                 }
 
                 // 写出一个 packed uint32。
+                // 同一个 th_id 的 4 个 warp 写在连续的 4 个位置：
+                /*
+                 *
+                 * th_id=0: warp0, warp1, warp2, warp3
+                 * th_id=1: warp0, warp1, warp2, warp3
+                 * th_id=2: warp0, warp1, warp2, warp3
+                 */
                 out_ptr[out_offset + th_id * 4 + warp_id] = res;
 
                 // int4 weight + 8-bit 激活路径。

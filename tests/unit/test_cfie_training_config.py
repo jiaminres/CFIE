@@ -56,6 +56,7 @@ def test_training_project_defaults_are_resource_first() -> None:
     assert cfg.predictor_trainer.model_ffn_multiplier == 4
     assert cfg.predictor_trainer.batch_size == 8
     assert cfg.predictor_trainer.epochs == 4
+    assert cfg.predictor_trainer.min_insertion_layer_index == 0
     assert cfg.predictor_trainer.examples_per_step == 4
 
 
@@ -129,6 +130,7 @@ def test_training_project_from_dict_accepts_nested_overrides() -> None:
             "model_ffn_multiplier": 3,
             "batch_size": 4,
             "epochs": 2,
+            "min_insertion_layer_index": 1,
             "examples_per_step": 3,
         },
     })
@@ -169,6 +171,7 @@ def test_training_project_from_dict_accepts_nested_overrides() -> None:
     assert cfg.predictor_trainer.model_ffn_multiplier == 3
     assert cfg.predictor_trainer.batch_size == 4
     assert cfg.predictor_trainer.epochs == 2
+    assert cfg.predictor_trainer.min_insertion_layer_index == 1
     assert cfg.predictor_trainer.examples_per_step == 3
 
 

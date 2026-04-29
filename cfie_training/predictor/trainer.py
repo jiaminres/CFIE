@@ -1642,6 +1642,7 @@ class PredictorTrainer:
             selection_mode=routing_cfg.selection_mode,
             online_expert_source=routing_cfg.online_expert_source,
             allow_candidate_mismatch=routing_cfg.allow_candidate_mismatch,
+            min_insertion_layer_index=trainer_cfg.min_insertion_layer_index,
             example_count=run_trace.example_count,
             epochs=run_trace.epochs,
             final_mean_loss=run_trace.final_mean_loss,
@@ -1690,6 +1691,12 @@ class PredictorTrainer:
             metadata_model_descriptor = current_model_descriptor
         if metadata_model_descriptor != current_model_descriptor:
             mismatches.append("model_descriptor")
+
+        if (
+                metadata.min_insertion_layer_index
+                != trainer_cfg.min_insertion_layer_index
+        ):
+            mismatches.append("min_insertion_layer_index")
 
         # 未来窗口层数决定单条样本要预测多少个未来层；窗口长度变化后，训练标签的结构也会随之变化。
         if metadata.window_layers != routing_cfg.window_layers:
@@ -1807,13 +1814,19 @@ class PredictorTrainer:
 
         # 再汇总数据集与历史 run_trace 的不匹配项。
         resume_mismatches = []
+        effective_example_count = self._filtered_dataset_example_count(dataset)
+        if effective_example_count < 1:
+            raise ValueError(
+                "predictor trace dataset has no examples after applying "
+                "min_insertion_layer_index"
+            )
 
         # profile 变了，说明不是同一条训练主线。
         if dataset.profile_name != resume_run_trace.profile_name:
             resume_mismatches.append("profile_name")
 
-        # 样本规模变了，历史统计就不可直接续用。
-        if dataset.example_count != resume_run_trace.example_count:
+        # 样本规模按最小插入层过滤后的有效样本数对齐。
+        if effective_example_count != resume_run_trace.example_count:
             resume_mismatches.append("example_count")
 
         # 路由预算变了，teacher 标签口径也会变化。
@@ -1870,9 +1883,12 @@ class PredictorTrainer:
             return
 
         resume_mismatches = []
+        effective_example_count = self._filtered_trace_store_example_count(store)
+        if effective_example_count < 1:
+            raise ValueError("trace store training requires at least 1 example")
         if store.profile_name != resume_run_trace.profile_name:
             resume_mismatches.append("profile_name")
-        if store.example_count != resume_run_trace.example_count:
+        if effective_example_count != resume_run_trace.example_count:
             resume_mismatches.append("example_count")
         if store.candidate_experts_per_layer != (
                 resume_run_trace.candidate_experts_per_layer
@@ -1996,6 +2012,82 @@ class PredictorTrainer:
             return np.arange(count, dtype=np.int64)
         return np.asarray(indices, dtype=np.int64)
 
+    def _filter_store_indices_by_min_layer(
+            self,
+            store: PredictorTraceTensorStore,
+            *,
+            indices: np.ndarray,
+    ) -> np.ndarray:
+        min_layer_index = int(self.config.predictor_trainer.min_insertion_layer_index)
+        if min_layer_index <= 0:
+            return indices
+        layer_indices = np.asarray(store.layer_indices, dtype=np.int64)
+        keep_mask = layer_indices[indices] >= min_layer_index
+        return np.asarray(indices[keep_mask], dtype=np.int64)
+
+    def _filtered_dataset_example_count(
+            self,
+            dataset: PredictorTraceDataset,
+    ) -> int:
+        min_layer_index = int(self.config.predictor_trainer.min_insertion_layer_index)
+        if min_layer_index <= 0:
+            return int(dataset.example_count)
+        return sum(
+            1
+            for example in dataset.examples
+            if int(example.insertion_layer_index) >= min_layer_index
+        )
+
+    def _filtered_trace_store_example_count(
+            self,
+            store: PredictorTraceTensorStore,
+    ) -> int:
+        resolved_indices = self._index_array(store.example_count)
+        resolved_indices = self._filter_store_indices_by_min_layer(
+            store,
+            indices=resolved_indices,
+        )
+        return int(resolved_indices.size)
+
+    def _filter_dataset_tensors_by_min_layer(
+            self,
+            *,
+            features: torch.Tensor,
+            layer_indices: torch.Tensor,
+            targets: torch.Tensor,
+            future_layer_mask: torch.Tensor,
+            teacher_router_logits: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        min_layer_index = int(self.config.predictor_trainer.min_insertion_layer_index)
+        if min_layer_index <= 0:
+            return (
+                features,
+                layer_indices,
+                targets,
+                future_layer_mask,
+                teacher_router_logits,
+            )
+
+        keep_mask = layer_indices >= float(min_layer_index)
+        if not bool(keep_mask.any().item()):
+            raise ValueError(
+                "predictor trace dataset has no examples after applying "
+                "min_insertion_layer_index"
+            )
+        return (
+            features[keep_mask],
+            layer_indices[keep_mask],
+            targets[keep_mask],
+            future_layer_mask[keep_mask],
+            None if teacher_router_logits is None else teacher_router_logits[keep_mask],
+        )
+
     @staticmethod
     def _store_batch_tensors(
             store: PredictorTraceTensorStore,
@@ -2050,6 +2142,10 @@ class PredictorTrainer:
             checkpoint_metadata: PredictorCheckpointMetadata | None = None,
     ) -> PredictorEvaluationTrace:
         resolved_indices = self._index_array(store.example_count, indices=indices)
+        resolved_indices = self._filter_store_indices_by_min_layer(
+            store,
+            indices=resolved_indices,
+        )
         if resolved_indices.size < 1:
             raise ValueError("trace store evaluation requires at least 1 example")
 
@@ -2469,6 +2565,10 @@ class PredictorTrainer:
             raise ValueError("checkpoint_every_epochs must be >= 1")
 
         resolved_indices = self._index_array(store.example_count, indices=indices)
+        resolved_indices = self._filter_store_indices_by_min_layer(
+            store,
+            indices=resolved_indices,
+        )
         if resolved_indices.size < 1:
             raise ValueError("trace store training requires at least 1 example")
 
@@ -2851,6 +2951,47 @@ class PredictorTrainer:
             future_layer_mask,
             teacher_router_logits,
         ) = self._dataset_tensors(dataset)
+        (
+            features,
+            layer_indices,
+            targets,
+            future_layer_mask,
+            teacher_router_logits,
+        ) = self._filter_dataset_tensors_by_min_layer(
+            features=features,
+            layer_indices=layer_indices,
+            targets=targets,
+            future_layer_mask=future_layer_mask,
+            teacher_router_logits=teacher_router_logits,
+        )
+        example_count = int(features.shape[0])
+        (
+            features,
+            layer_indices,
+            targets,
+            future_layer_mask,
+            teacher_router_logits,
+        ) = self._filter_dataset_tensors_by_min_layer(
+            features=features,
+            layer_indices=layer_indices,
+            targets=targets,
+            future_layer_mask=future_layer_mask,
+            teacher_router_logits=teacher_router_logits,
+        )
+        (
+            features,
+            layer_indices,
+            targets,
+            future_layer_mask,
+            teacher_router_logits,
+        ) = self._filter_dataset_tensors_by_min_layer(
+            features=features,
+            layer_indices=layer_indices,
+            targets=targets,
+            future_layer_mask=future_layer_mask,
+            teacher_router_logits=teacher_router_logits,
+        )
+        example_count = int(features.shape[0])
 
         # -------------------- 关闭梯度并执行前向评估 --------------------
         with torch.no_grad():
@@ -2885,7 +3026,7 @@ class PredictorTrainer:
         # 把本次评估的 loss、recall 和可选 checkpoint 元信息固化为 trace，供日志和导出使用。
         return PredictorEvaluationTrace(
             profile_name=self.config.profile_name,
-            example_count=dataset.example_count,
+            example_count=int(features.shape[0]),
             candidate_experts_per_layer=routing_cfg.candidate_experts_per_layer,
             executed_experts_per_layer=routing_cfg.executed_experts_per_layer,
             mean_loss=mean_loss,
@@ -2926,7 +3067,7 @@ class PredictorTrainer:
     def _build_run_trace(
             self,
             *,
-            dataset: PredictorTraceDataset,
+            example_count: int,
             epoch_summaries: list[PredictorEpochSummary],
     ) -> PredictorTrainingRunTrace:
         # 读取当前 routing 配置，保证轨迹里的预算口径和当前训练一致。
@@ -2934,7 +3075,7 @@ class PredictorTrainer:
         # 基于当前数据集和累计 epoch 汇总构造完整训练轨迹。
         return PredictorTrainingRunTrace(
             profile_name=self.config.profile_name,
-            example_count=dataset.example_count,
+            example_count=int(example_count),
             epochs=len(epoch_summaries),
             candidate_experts_per_layer=(
                 routing_cfg.candidate_experts_per_layer
@@ -3001,6 +3142,20 @@ class PredictorTrainer:
             future_layer_mask,
             teacher_router_logits,
         ) = self._dataset_tensors(dataset)
+        (
+            features,
+            layer_indices,
+            targets,
+            future_layer_mask,
+            teacher_router_logits,
+        ) = self._filter_dataset_tensors_by_min_layer(
+            features=features,
+            layer_indices=layer_indices,
+            targets=targets,
+            future_layer_mask=future_layer_mask,
+            teacher_router_logits=teacher_router_logits,
+        )
+        example_count = int(features.shape[0])
 
         # 固定随机种子，保证模型初始化和 epoch 内打乱顺序可复现。
         torch.manual_seed(trainer_cfg.seed)
@@ -3020,7 +3175,7 @@ class PredictorTrainer:
             optimizer.load_state_dict(optimizer_state_dict)
 
         # batch_size 不能超过样本总数，避免最后构造空 batch。
-        batch_size = min(trainer_cfg.batch_size, dataset.example_count)
+        batch_size = min(trainer_cfg.batch_size, example_count)
 
         # epoch_summaries 既承载本轮训练结果，也在续训场景下承接历史轨迹。
         epoch_summaries: list[PredictorEpochSummary] = (
@@ -3047,7 +3202,7 @@ class PredictorTrainer:
                 "batch_size=%d log_every_steps=%s checkpoint_path=%s "
                 "checkpoint_every_epochs=%s",
                 self.config.profile_name,
-                dataset.example_count,
+                example_count,
                 target_total_epochs,
                 batch_size,
                 0 if log_every_steps is None else int(log_every_steps),
@@ -3070,14 +3225,14 @@ class PredictorTrainer:
             generator.manual_seed(trainer_cfg.seed + epoch_index)
 
             # 形状是[example_count]
-            order = torch.randperm(dataset.example_count, generator=generator)
+            order = torch.randperm(example_count, generator=generator)
 
             # 累积当前 epoch 的样本加权损失，后面再除以总样本数得到 mean_loss。
             total_loss = 0.0
             total_valid_positions = 0
 
             # -------------------- 执行逐 mini-batch 的前向、反向与更新 --------------------
-            for start in range(0, dataset.example_count, batch_size):
+            for start in range(0, example_count, batch_size):
                 # 根据打乱后的顺序切出当前 mini-batch 的样本索引。
                 batch_indices = order[start: start + batch_size]
 
@@ -3179,7 +3334,7 @@ class PredictorTrainer:
                 )
             )
             current_run_trace = self._build_run_trace(
-                dataset=dataset,
+                example_count=example_count,
                 epoch_summaries=epoch_summaries,
             )
 
@@ -3225,7 +3380,7 @@ class PredictorTrainer:
         # 2) 完整训练轨迹 run_trace
         # 3) 优化器状态，便于后续继续续训
         final_run_trace = self._build_run_trace(
-            dataset=dataset,
+            example_count=example_count,
             epoch_summaries=epoch_summaries,
         )
         return (

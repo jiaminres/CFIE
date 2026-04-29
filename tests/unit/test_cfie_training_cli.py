@@ -292,7 +292,7 @@ def test_predictor_train_command_emits_json_metrics(
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["profile_name"] == "qwen35-35b-a3b"
-    assert payload["example_count"] == 4
+    assert payload["example_count"] == 3
     assert payload["epochs"] == 2
     assert payload["candidate_experts_per_layer"] == 40
     assert payload["executed_experts_per_layer"] == 8
@@ -344,7 +344,7 @@ def test_predictor_train_command_accepts_trace_input(
     trace_code = main([
         "predictor-trace",
         "--steps",
-        "1",
+        "2",
         "--examples-per-step",
         "1",
         "--dataset",
@@ -384,7 +384,7 @@ def test_predictor_train_command_writes_checkpoint_only(
     code = main([
         "predictor-train",
         "--steps",
-        "1",
+        "2",
         "--examples-per-step",
         "1",
         "--epochs",
@@ -425,7 +425,7 @@ def test_predictor_train_command_accepts_resume_checkpoint(
     first_code = main([
         "predictor-train",
         "--steps",
-        "1",
+        "2",
         "--examples-per-step",
         "1",
         "--epochs",
@@ -445,7 +445,7 @@ def test_predictor_train_command_accepts_resume_checkpoint(
         "--resume-checkpoint",
         str(checkpoint_path),
         "--steps",
-        "1",
+        "2",
         "--examples-per-step",
         "1",
         "--epochs",
@@ -475,7 +475,7 @@ def test_predictor_train_command_accepts_init_checkpoint_warm_start(
     first_code = main([
         "predictor-train",
         "--steps",
-        "1",
+        "2",
         "--examples-per-step",
         "1",
         "--epochs",
@@ -495,7 +495,7 @@ def test_predictor_train_command_accepts_init_checkpoint_warm_start(
         "--init-from-checkpoint",
         str(checkpoint_path),
         "--steps",
-        "1",
+        "2",
         "--examples-per-step",
         "1",
         "--epochs",
@@ -510,111 +510,6 @@ def test_predictor_train_command_accepts_init_checkpoint_warm_start(
     assert payload["epochs"] == 1
     assert len(payload["epoch_summaries"]) == 1
     assert payload["epoch_summaries"][0]["epoch_index"] == 0
-
-
-def test_predictor_inspect_command_emits_checkpoint_metadata(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _install_fake_predictor_runtime(monkeypatch)
-    dataset_path = _write_text_dataset(tmp_path, "predictor-inspect.txt")
-    checkpoint_path = tmp_path / "predictor.ckpt"
-
-    train_code = main([
-        "predictor-train",
-        "--steps",
-        "1",
-        "--examples-per-step",
-        "1",
-        "--epochs",
-        "1",
-        "--dataset",
-        str(dataset_path),
-        "--checkpoint-output",
-        str(checkpoint_path),
-        "--json",
-    ])
-
-    assert train_code == 0
-    capsys.readouterr()
-
-    code = main([
-        "predictor-inspect",
-        "--checkpoint",
-        str(checkpoint_path),
-        "--json",
-    ])
-
-    assert code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["checkpoint_kind"] == "cfie_predictor_checkpoint"
-    assert payload["profile_name"] == "qwen35-35b-a3b"
-    assert payload["window_layers"] == 8
-    assert payload["candidate_experts_per_layer"] == 40
-
-
-def test_predictor_eval_command_emits_json_metrics(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _install_fake_predictor_runtime(monkeypatch)
-    dataset_path = _write_text_dataset(tmp_path, "predictor-eval.txt")
-    checkpoint_path = tmp_path / "predictor.ckpt"
-    trace_path = tmp_path / "predictor_trace.json"
-
-    train_code = main([
-        "predictor-train",
-        "--steps",
-        "1",
-        "--examples-per-step",
-        "1",
-        "--epochs",
-        "1",
-        "--dataset",
-        str(dataset_path),
-        "--checkpoint-output",
-        str(checkpoint_path),
-        "--json",
-    ])
-
-    assert train_code == 0
-    capsys.readouterr()
-
-    trace_code = main([
-        "predictor-trace",
-        "--steps",
-        "1",
-        "--examples-per-step",
-        "1",
-        "--dataset",
-        str(dataset_path),
-        "--output",
-        str(trace_path),
-        "--json",
-    ])
-
-    assert trace_code == 0
-    capsys.readouterr()
-
-    code = main([
-        "predictor-eval",
-        "--checkpoint",
-        str(checkpoint_path),
-        "--trace-input",
-        str(trace_path),
-        "--json",
-    ])
-
-    assert code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["profile_name"] == "qwen35-35b-a3b"
-    assert payload["example_count"] == 1
-    assert payload["mean_loss"] >= 0.0
-    assert 0.0 <= payload["recall_at_candidate_budget"] <= 1.0
-    assert 0.0 <= payload["recall_at_executed_budget"] <= 1.0
-    assert payload["checkpoint_metadata"]["checkpoint_kind"] == "cfie_predictor_checkpoint"
 
 
 def test_predictor_train_command_accepts_dataset_backed_batches(
@@ -649,80 +544,10 @@ def test_predictor_train_command_accepts_dataset_backed_batches(
     payload = json.loads(capsys.readouterr().out)
     assert checkpoint_path.exists()
     assert payload["profile_name"] == "qwen35-35b-a3b"
-    assert payload["example_count"] == 2
+    assert payload["example_count"] == 1
     assert payload["epochs"] == 1
     assert payload["final_mean_loss"] >= 0.0
     assert 0.0 <= payload["final_recall_at_candidate_budget"] <= 1.0
-
-
-def test_predictor_eval_command_accepts_dataset_backed_batches(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _install_fake_predictor_runtime(monkeypatch)
-    dataset_path = _write_text_dataset(tmp_path, "predictor_eval.txt")
-    checkpoint_path = tmp_path / "predictor.ckpt"
-
-    train_code = main([
-        "predictor-train",
-        "--steps",
-        "2",
-        "--examples-per-step",
-        "1",
-        "--epochs",
-        "1",
-        "--samples",
-        "2",
-        "--tokens-per-sample",
-        "32",
-        "--dataset",
-        str(dataset_path),
-        "--checkpoint-output",
-        str(checkpoint_path),
-        "--json",
-    ])
-
-    assert train_code == 0
-    capsys.readouterr()
-
-    code = main([
-        "predictor-eval",
-        "--checkpoint",
-        str(checkpoint_path),
-        "--steps",
-        "2",
-        "--examples-per-step",
-        "1",
-        "--samples",
-        "2",
-        "--tokens-per-sample",
-        "32",
-        "--dataset",
-        str(dataset_path),
-        "--json",
-    ])
-
-    assert code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["profile_name"] == "qwen35-35b-a3b"
-    assert payload["example_count"] == 2
-    assert payload["mean_loss"] >= 0.0
-    assert 0.0 <= payload["recall_at_candidate_budget"] <= 1.0
-    assert 0.0 <= payload["recall_at_executed_budget"] <= 1.0
-    assert payload["checkpoint_metadata"]["checkpoint_kind"] == "cfie_predictor_checkpoint"
-
-
-def test_predictor_eval_command_requires_trace_or_dataset(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    with pytest.raises(SystemExit) as excinfo:
-        main(["predictor-eval", "--checkpoint", "predictor.ckpt", "--json"])
-    assert excinfo.value.code == 2
-    assert (
-        "predictor-eval requires --trace-input or --dataset"
-        in capsys.readouterr().err
-    )
 
 
 def test_train_command_requires_dataset_without_resume(

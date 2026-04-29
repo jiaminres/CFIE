@@ -490,6 +490,8 @@ class PredictorCheckpointMetadata:
     online_expert_source: str
     # 是否允许候选集合不完全匹配。
     allow_candidate_mismatch: bool
+    # 训练时最小允许的插入层号。
+    min_insertion_layer_index: int
     # 训练时使用的数据集样本总数。
     example_count: int
     # checkpoint 保存时累计完成的 epoch 数。
@@ -518,6 +520,7 @@ class PredictorCheckpointMetadata:
             "selection_mode": self.selection_mode,
             "online_expert_source": self.online_expert_source,
             "allow_candidate_mismatch": self.allow_candidate_mismatch,
+            "min_insertion_layer_index": self.min_insertion_layer_index,
             "example_count": self.example_count,
             "epochs": self.epochs,
             "final_mean_loss": self.final_mean_loss,
@@ -554,6 +557,9 @@ class PredictorCheckpointMetadata:
             online_expert_source=str(payload["online_expert_source"]),
             allow_candidate_mismatch=bool(
                 payload.get("allow_candidate_mismatch", True)
+            ),
+            min_insertion_layer_index=int(
+                payload.get("min_insertion_layer_index", 0)
             ),
             example_count=int(payload["example_count"]),
             epochs=int(payload["epochs"]),

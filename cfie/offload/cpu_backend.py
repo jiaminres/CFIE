@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 
@@ -15,69 +16,269 @@ logger = init_logger(__name__)
 
 @dataclass(slots=True)
 class ExpertBundle:
-    # bundle 内每个张量按相对名字索引，通常对应一个完整 expert 的若干参数。
     tensors: dict[str, torch.Tensor]
-    # 记录整个 bundle 的总字节数，便于 cache 做容量控制。
     nbytes: int
-    # 标记 bundle 是否已经放在 pinned CPU memory 上。
     pinned: bool = False
-    # 标记 bundle 是否已经转换成运行时 kernel 可直接消费的格式。
-    # 对 GPTQ Marlin MoE 来说，这意味着 w13/w2 已合并，qweight 已 repack，
-    # scale 已 permute；运行时 miss 时只需要 H2D 拷贝到 resident slot。
     runtime_ready: bool = False
+    storage: torch.Tensor | None = None
+    storage_offset_bytes: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class PackedExpertTensorSpec:
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
 
 
 def bundle_nbytes(tensors: dict[str, torch.Tensor]) -> int:
-    # 按所有张量的元素数 * 单元素字节数求和，得到 bundle 总大小。
     return int(sum(tensor.numel() * tensor.element_size() for tensor in tensors.values()))
+
+
+def _normalize_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    cpu_tensor = tensor.detach()
+    if cpu_tensor.device.type != "cpu":
+        cpu_tensor = cpu_tensor.to(device="cpu")
+    return cpu_tensor.contiguous()
+
+
+def allocate_packed_cpu_tensor_views(
+    specs: Sequence[PackedExpertTensorSpec],
+    *,
+    pin_memory: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ordered_specs = tuple(specs)
+    total_bytes = int(
+        sum(
+            int(torch.Size(spec.shape).numel())
+            * torch.empty((), dtype=spec.dtype).element_size()
+            for spec in ordered_specs
+        )
+    )
+    storage = torch.empty(
+        total_bytes,
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=bool(pin_memory),
+    )
+    views: dict[str, torch.Tensor] = {}
+    offset = 0
+    for spec in ordered_specs:
+        numel = int(torch.Size(spec.shape).numel())
+        itemsize = torch.empty((), dtype=spec.dtype).element_size()
+        num_bytes = numel * itemsize
+        view = storage[offset: offset + num_bytes].view(spec.dtype).view(spec.shape)
+        views[spec.name] = view
+        offset += num_bytes
+    return storage, views
+
+
+def pack_cpu_tensor_dict(
+    tensors: dict[str, torch.Tensor],
+    *,
+    pin_memory: bool = False,
+    runtime_ready: bool = False,
+) -> ExpertBundle:
+    ordered_items = list(tensors.items())
+    storage, packed_views = allocate_packed_cpu_tensor_views(
+        [
+            PackedExpertTensorSpec(
+                name=name,
+                shape=tuple(tensor.shape),
+                dtype=tensor.dtype,
+            )
+            for name, tensor in ordered_items
+        ],
+        pin_memory=pin_memory,
+    )
+    for name, tensor in ordered_items:
+        packed_views[name].copy_(_normalize_cpu_tensor(tensor))
+    return ExpertBundle(
+        tensors=packed_views,
+        nbytes=bundle_nbytes(packed_views),
+        pinned=bool(storage.is_pinned()),
+        runtime_ready=runtime_ready,
+        storage=storage,
+        storage_offset_bytes=0,
+    )
+
+
+def pack_batched_cpu_tensor_dicts_by_expert(
+    batched_tensors: dict[str, torch.Tensor],
+    *,
+    pin_memory: bool = False,
+    runtime_ready: bool = False,
+) -> list[ExpertBundle]:
+    if not batched_tensors:
+        return []
+
+    ordered_items = list(batched_tensors.items())
+    batch_size = int(ordered_items[0][1].shape[0])
+    for name, tensor in ordered_items:
+        if int(tensor.shape[0]) != batch_size:
+            raise ValueError(
+                "batched expert tensors must share the same batch dimension, "
+                f"but {name!r} has batch={tensor.shape[0]} vs expected {batch_size}"
+            )
+
+    per_expert_specs = [
+        PackedExpertTensorSpec(
+            name=name,
+            shape=tuple(tensor.shape[1:]),
+            dtype=tensor.dtype,
+        )
+        for name, tensor in ordered_items
+    ]
+    per_expert_bytes = int(
+        sum(
+            int(torch.Size(spec.shape).numel())
+            * torch.empty((), dtype=spec.dtype).element_size()
+            for spec in per_expert_specs
+        )
+    )
+    storage = torch.empty(
+        batch_size * per_expert_bytes,
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=bool(pin_memory),
+    )
+
+    bundles: list[ExpertBundle] = []
+    for expert_index in range(batch_size):
+        expert_slice = storage[
+            expert_index * per_expert_bytes: (expert_index + 1) * per_expert_bytes
+        ]
+        views: dict[str, torch.Tensor] = {}
+        offset = 0
+        for name, batched_tensor in ordered_items:
+            source = _normalize_cpu_tensor(batched_tensor[expert_index])
+            num_bytes = int(source.numel() * source.element_size())
+            view = expert_slice[offset: offset + num_bytes].view(source.dtype).view(
+                source.shape
+            )
+            view.copy_(source)
+            views[name] = view
+            offset += num_bytes
+        bundles.append(
+            ExpertBundle(
+                tensors=views,
+                nbytes=per_expert_bytes,
+                pinned=bool(storage.is_pinned()),
+                runtime_ready=runtime_ready,
+                storage=storage,
+                storage_offset_bytes=expert_index * per_expert_bytes,
+            )
+        )
+    return bundles
+
+
+def pack_cpu_bundles_by_expert(
+    bundles: Sequence[ExpertBundle],
+    *,
+    pin_memory: bool = False,
+    runtime_ready: bool | None = None,
+) -> list[ExpertBundle]:
+    if not bundles:
+        return []
+
+    first_bundle = bundles[0]
+    ordered_names = list(first_bundle.tensors.keys())
+    per_expert_specs = [
+        PackedExpertTensorSpec(
+            name=name,
+            shape=tuple(first_bundle.tensors[name].shape),
+            dtype=first_bundle.tensors[name].dtype,
+        )
+        for name in ordered_names
+    ]
+    per_expert_bytes = int(
+        sum(
+            int(torch.Size(spec.shape).numel())
+            * torch.empty((), dtype=spec.dtype).element_size()
+            for spec in per_expert_specs
+        )
+    )
+    storage = torch.empty(
+        len(bundles) * per_expert_bytes,
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=bool(pin_memory),
+    )
+
+    packed_bundles: list[ExpertBundle] = []
+    resolved_runtime_ready = (
+        all(bundle.runtime_ready for bundle in bundles)
+        if runtime_ready is None
+        else bool(runtime_ready)
+    )
+    for expert_index, bundle in enumerate(bundles):
+        if list(bundle.tensors.keys()) != ordered_names:
+            raise ValueError("all expert bundles must share the same tensor fields")
+        expert_slice = storage[
+            expert_index * per_expert_bytes: (expert_index + 1) * per_expert_bytes
+        ]
+        views: dict[str, torch.Tensor] = {}
+        offset = 0
+        for spec in per_expert_specs:
+            source = _normalize_cpu_tensor(bundle.tensors[spec.name])
+            if source.dtype != spec.dtype or tuple(source.shape) != spec.shape:
+                raise ValueError(
+                    "all expert bundles must share the same tensor shapes and dtypes"
+                )
+            num_bytes = int(source.numel() * source.element_size())
+            view = expert_slice[offset: offset + num_bytes].view(source.dtype).view(
+                source.shape
+            )
+            view.copy_(source)
+            views[spec.name] = view
+            offset += num_bytes
+        packed_bundles.append(
+            ExpertBundle(
+                tensors=views,
+                nbytes=per_expert_bytes,
+                pinned=bool(storage.is_pinned()),
+                runtime_ready=resolved_runtime_ready,
+                storage=storage,
+                storage_offset_bytes=expert_index * per_expert_bytes,
+            )
+        )
+    return packed_bundles
 
 
 class PinnedExpertCache:
     """Simple LRU cache for cold experts kept in CPU memory."""
 
     def __init__(self, capacity_bytes: int):
-        # 记录 CPU cache 的最大容量；负值统一收敛到 0。
         self.capacity_bytes = max(0, int(capacity_bytes))
-        # current_bytes 跟踪当前 cache 中已占用的总字节数。
         self.current_bytes = 0
-        # OrderedDict 以插入/访问顺序维护 LRU 队列，键为 (layer_name, expert_id)。
         self._entries: OrderedDict[tuple[str, int], ExpertBundle] = OrderedDict()
 
     def contains(self, key: tuple[str, int]) -> bool:
-        # 仅检查 key 是否已经缓存在 CPU 中。
         return key in self._entries
 
     def get(self, key: tuple[str, int]) -> ExpertBundle | None:
-        # 读取 bundle；未命中时返回 None。
         bundle = self._entries.get(key)
         if bundle is None:
             return None
-        # 命中后把该项移动到队尾，表示最近使用过。
         self._entries.move_to_end(key)
         return bundle
 
     def put(self, key: tuple[str, int], tensors: dict[str, torch.Tensor]) -> ExpertBundle:
-        # 插入前先尝试把 bundle 规范化到 CPU/pinned memory 上。
-        bundle = ExpertBundle(
-            tensors=self._maybe_pin_bundle(tensors),
-            nbytes=bundle_nbytes(tensors),
-            pinned=is_pin_memory_available(),
+        bundle = pack_cpu_tensor_dict(
+            tensors,
+            pin_memory=is_pin_memory_available(),
         )
-        # 单个 bundle 本身就超过容量时，不进入 LRU，只把结果原样返回给调用方。
         if bundle.nbytes > self.capacity_bytes:
             return bundle
 
-        # 若 key 已存在，先弹出旧值，避免重复计算 current_bytes。
         existing = self._entries.pop(key, None)
         if existing is not None:
             self.current_bytes -= existing.nbytes
 
-        # 按 LRU 顺序持续驱逐最旧项，直到能容纳新 bundle。
         while self._entries and self.current_bytes + bundle.nbytes > self.capacity_bytes:
             _, evicted = self._entries.popitem(last=False)
             self.current_bytes -= evicted.nbytes
 
-        # 把新 bundle 放到队尾，并更新总占用。
         self._entries[key] = bundle
         self.current_bytes += bundle.nbytes
         return bundle
@@ -85,17 +286,10 @@ class PinnedExpertCache:
     def _maybe_pin_bundle(
         self, tensors: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        # 平台不支持 pinned memory 时，直接返回原始 tensors。
         if not is_pin_memory_available():
             return tensors
 
-        # 否则逐张量确保其位于 CPU、是连续内存，并尽量 pin 住。
-        pinned_tensors: dict[str, torch.Tensor] = {}
-        for name, tensor in tensors.items():
-            cpu_tensor = tensor.contiguous()
-            if cpu_tensor.device.type != "cpu":
-                cpu_tensor = cpu_tensor.to(device="cpu")
-            if not cpu_tensor.is_pinned():
-                cpu_tensor = cpu_tensor.pin_memory()
-            pinned_tensors[name] = cpu_tensor
-        return pinned_tensors
+        return pack_cpu_tensor_dict(
+            tensors,
+            pin_memory=True,
+        ).tensors

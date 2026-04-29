@@ -582,6 +582,7 @@ class PredictorTrainerConfig:
     weight_decay: float = 1e-4
     hard_target_loss_weight: float = 0.5
     router_distill_loss_weight: float = 0.5
+    min_insertion_layer_index: int = 0
     examples_per_step: int = 4
     seed: int = 0
 
@@ -607,6 +608,10 @@ class PredictorTrainerConfig:
         _require_non_negative_float(
             "router_distill_loss_weight",
             self.router_distill_loss_weight,
+        )
+        _require_non_negative_int(
+            "min_insertion_layer_index",
+            self.min_insertion_layer_index,
         )
         _require_positive_int("examples_per_step", self.examples_per_step)
         _require_non_negative_int("seed", self.seed)

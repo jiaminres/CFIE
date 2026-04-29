@@ -1,15 +1,23 @@
-"""Predictor deployment bundle loading for CFIE inference runtime."""
+"""Predictor runtime loading helpers for CFIE inference."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from typing import Any
 
+from safetensors import safe_open
 import torch
-import torch.nn as nn
 
+from cfie_training.predictor.architectures import (
+    FutureExpertPredictor,
+    build_predictor_model,
+)
+from cfie_training.predictor.models import (
+    PredictorCheckpointMetadata,
+    PredictorTrainingRunTrace,
+)
 
 _BUNDLE_KIND = "cfie_predictor_deployment_bundle"
 _SCHEMA_KIND = "cfie_predictor_runtime_schema"
@@ -20,60 +28,44 @@ _DEFAULT_MANIFEST_FILE = "predictor_bundle.json"
 
 
 def _require_non_empty_string(name: str, value: Any) -> str:
-    # 统一校验字符串字段，避免运行时再处理空值。
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
-    # 返回去首尾空白后的稳定值。
     return value.strip()
 
 
 def _require_int(name: str, value: Any, *, allow_zero: bool = False) -> int:
-    # 先把输入统一收敛成整数。
     parsed = int(value)
-    # 再校验是否满足正整数约束。
     lower_bound = 0 if allow_zero else 1
     if parsed < lower_bound:
         comparator = ">=" if allow_zero else ">"
         raise ValueError(f"{name} must be {comparator} 0")
-    # 返回已经校验过的整数值。
     return parsed
 
 
 def _require_float(name: str, value: Any) -> float:
-    # 将数值字段统一转成浮点，便于后续做区间校验。
     return float(value)
 
 
 def _require_ratio(name: str, value: Any) -> float:
-    # 先解析成浮点值。
     parsed = _require_float(name, value)
-    # recall 这类指标必须落在 [0, 1]。
     if parsed < 0.0 or parsed > 1.0:
         raise ValueError(f"{name} must be within [0, 1]")
-    # 返回已校验值。
     return parsed
 
 
 def _read_json_object(path: Path, *, description: str) -> dict[str, Any]:
-    # 文件必须存在，否则 bundle 不完整。
     if not path.is_file():
         raise FileNotFoundError(f"{description} file does not exist: {path}")
-    # 读取并解析 JSON 文本。
     payload = json.loads(path.read_text(encoding="utf-8"))
-    # 顶层必须是对象，不能是数组或标量。
     if not isinstance(payload, dict):
         raise ValueError(f"{description} JSON must decode to an object")
-    # 返回原始对象字典。
     return payload
 
 
 def _resolve_manifest_path(bundle_path: str | Path) -> Path:
-    # 允许直接传 bundle 目录或 manifest 文件。
     resolved = Path(bundle_path)
     if resolved.is_dir():
-        # 目录输入时，默认寻找约定文件名的 manifest。
         resolved = resolved / _DEFAULT_MANIFEST_FILE
-    # 返回最终 manifest 路径。
     return resolved
 
 
@@ -91,19 +83,17 @@ class PredictorRuntimeSchema:
     selection_mode: str
     online_expert_source: str
     allow_candidate_mismatch: bool
+    model_descriptor: dict[str, Any] = field(default_factory=dict)
+    min_insertion_layer_index: int = 0
 
-    # 校验 runtime schema 的结构与候选池约束。
     def validate(self) -> "PredictorRuntimeSchema":
-        # schema kind 必须与训练侧导出契约一致。
         if self.schema_kind != _SCHEMA_KIND:
             raise ValueError(
                 f"schema_kind must be {_SCHEMA_KIND!r}, got {self.schema_kind!r}"
             )
-        # 关键来源字段必须非空，便于后续做跨文件一致性校验。
         _require_non_empty_string("profile_name", self.profile_name)
         _require_non_empty_string("selection_mode", self.selection_mode)
         _require_non_empty_string("online_expert_source", self.online_expert_source)
-        # 维度与窗口字段都必须为正。
         _require_int("input_summary_dim", self.input_summary_dim)
         _require_int("predictor_hidden_dim", self.predictor_hidden_dim)
         _require_int("window_layers", self.window_layers)
@@ -117,7 +107,13 @@ class PredictorRuntimeSchema:
             "executed_experts_per_layer",
             self.executed_experts_per_layer,
         )
-        # 执行预算不能超过候选预算，也不能超过模型 expert 总数。
+        _require_int(
+            "min_insertion_layer_index",
+            self.min_insertion_layer_index,
+            allow_zero=True,
+        )
+        if not isinstance(self.model_descriptor, dict):
+            raise ValueError("model_descriptor must be a dictionary")
         if self.candidate_experts_per_layer < self.executed_experts_per_layer:
             raise ValueError(
                 "candidate_experts_per_layer must be >= executed_experts_per_layer"
@@ -126,12 +122,9 @@ class PredictorRuntimeSchema:
             raise ValueError(
                 "candidate_experts_per_layer must be <= num_experts"
             )
-        # 返回自身，便于链式使用。
         return self
 
-    # 将 runtime schema 转成字典，供测试与调试输出使用。
     def to_dict(self) -> dict[str, Any]:
-        # 直接返回稳定字段映射。
         return {
             "schema_kind": self.schema_kind,
             "profile_name": self.profile_name,
@@ -145,12 +138,12 @@ class PredictorRuntimeSchema:
             "selection_mode": self.selection_mode,
             "online_expert_source": self.online_expert_source,
             "allow_candidate_mismatch": self.allow_candidate_mismatch,
+            "model_descriptor": dict(self.model_descriptor),
+            "min_insertion_layer_index": self.min_insertion_layer_index,
         }
 
     @classmethod
-    # 从字典恢复 runtime schema，并立即做约束校验。
     def from_dict(cls, payload: dict[str, Any]) -> "PredictorRuntimeSchema":
-        # 逐字段完成类型归一化。
         schema = cls(
             schema_kind=str(payload.get("schema_kind", _SCHEMA_KIND)),
             profile_name=str(payload["profile_name"]),
@@ -170,16 +163,16 @@ class PredictorRuntimeSchema:
             allow_candidate_mismatch=bool(
                 payload.get("allow_candidate_mismatch", True)
             ),
+            model_descriptor=dict(payload.get("model_descriptor", {})),
+            min_insertion_layer_index=int(
+                payload.get("min_insertion_layer_index", 0)
+            ),
         )
-        # 返回已通过校验的 schema。
         return schema.validate()
 
     @classmethod
-    # 从 JSON 文件恢复 runtime schema。
     def from_json_file(cls, path: str | Path) -> "PredictorRuntimeSchema":
-        # 先读取 JSON 对象。
         payload = _read_json_object(Path(path), description="predictor schema")
-        # 再按字典格式恢复。
         return cls.from_dict(payload)
 
 
@@ -193,21 +186,15 @@ class PredictorMetricsSummary:
     final_recall_at_candidate_budget: float
     final_recall_at_executed_budget: float
 
-    # 校验 metrics 摘要的基础结构和指标区间。
     def validate(self) -> "PredictorMetricsSummary":
-        # metrics kind 必须与训练侧导出格式一致。
         if self.metrics_kind != _METRICS_KIND:
             raise ValueError(
                 f"metrics_kind must be {_METRICS_KIND!r}, got {self.metrics_kind!r}"
             )
-        # 关键来源字段必须可用于跨文件对齐。
         _require_non_empty_string("profile_name", self.profile_name)
-        # 样本数与 epoch 数允许为 0，但不能为负。
         _require_int("example_count", self.example_count, allow_zero=True)
         _require_int("epochs", self.epochs, allow_zero=True)
-        # loss 只要求能解析成浮点。
         _require_float("final_mean_loss", self.final_mean_loss)
-        # recall 指标必须落在标准比例区间。
         _require_ratio(
             "final_recall_at_candidate_budget",
             self.final_recall_at_candidate_budget,
@@ -216,12 +203,9 @@ class PredictorMetricsSummary:
             "final_recall_at_executed_budget",
             self.final_recall_at_executed_budget,
         )
-        # 返回自身，便于链式使用。
         return self
 
-    # 将 metrics 摘要转成字典。
     def to_dict(self) -> dict[str, Any]:
-        # 直接返回稳定字段映射。
         return {
             "metrics_kind": self.metrics_kind,
             "profile_name": self.profile_name,
@@ -237,9 +221,7 @@ class PredictorMetricsSummary:
         }
 
     @classmethod
-    # 从字典恢复 metrics 摘要。
     def from_dict(cls, payload: dict[str, Any]) -> "PredictorMetricsSummary":
-        # 逐字段完成类型归一化。
         summary = cls(
             metrics_kind=str(payload.get("metrics_kind", _METRICS_KIND)),
             profile_name=str(payload["profile_name"]),
@@ -253,15 +235,11 @@ class PredictorMetricsSummary:
                 payload["final_recall_at_executed_budget"]
             ),
         )
-        # 返回已通过校验的 metrics 对象。
         return summary.validate()
 
     @classmethod
-    # 从 JSON 文件恢复 metrics 摘要。
     def from_json_file(cls, path: str | Path) -> "PredictorMetricsSummary":
-        # 先读取 JSON 对象。
         payload = _read_json_object(Path(path), description="predictor metrics")
-        # 再按字典格式恢复。
         return cls.from_dict(payload)
 
 
@@ -278,17 +256,13 @@ class PredictorDeploymentManifest:
     metrics_kind: str
     metrics_file: str
 
-    # 校验 manifest 中的 bundle 类型与文件引用。
     def validate(self) -> "PredictorDeploymentManifest":
-        # bundle kind 必须与训练侧导出契约一致。
         if self.bundle_kind != _BUNDLE_KIND:
             raise ValueError(
                 f"bundle_kind must be {_BUNDLE_KIND!r}, got {self.bundle_kind!r}"
             )
-        # 顶层来源字段必须非空。
         _require_non_empty_string("profile_name", self.profile_name)
         _require_non_empty_string("source_checkpoint", self.source_checkpoint)
-        # 每个子文件及其语义标签都必须完整。
         if self.weights_kind != _WEIGHTS_KIND:
             raise ValueError(
                 f"weights_kind must be {_WEIGHTS_KIND!r}, got {self.weights_kind!r}"
@@ -308,12 +282,9 @@ class PredictorDeploymentManifest:
         _require_non_empty_string("weights_file", self.weights_file)
         _require_non_empty_string("schema_file", self.schema_file)
         _require_non_empty_string("metrics_file", self.metrics_file)
-        # 返回自身，便于链式使用。
         return self
 
-    # 将 manifest 转成字典。
     def to_dict(self) -> dict[str, Any]:
-        # 直接返回稳定字段映射。
         return {
             "bundle_kind": self.bundle_kind,
             "profile_name": self.profile_name,
@@ -328,9 +299,7 @@ class PredictorDeploymentManifest:
         }
 
     @classmethod
-    # 从字典恢复 manifest。
     def from_dict(cls, payload: dict[str, Any]) -> "PredictorDeploymentManifest":
-        # 逐字段完成类型归一化。
         manifest = cls(
             bundle_kind=str(payload.get("bundle_kind", _BUNDLE_KIND)),
             profile_name=str(payload["profile_name"]),
@@ -343,117 +312,12 @@ class PredictorDeploymentManifest:
             metrics_kind=str(payload["metrics_kind"]),
             metrics_file=str(payload["metrics_file"]),
         )
-        # 返回已通过校验的 manifest。
         return manifest.validate()
 
     @classmethod
-    # 从 JSON 文件恢复 manifest。
     def from_json_file(cls, path: str | Path) -> "PredictorDeploymentManifest":
-        # 先读取 JSON 对象。
         payload = _read_json_object(Path(path), description="predictor manifest")
-        # 再按字典格式恢复。
         return cls.from_dict(payload)
-
-
-class FutureExpertPredictor(nn.Module):
-    def __init__(
-        self,
-        *,
-        input_dim: int,
-        hidden_dim: int,
-        window_layers: int,
-        num_experts: int,
-    ) -> None:
-        super().__init__()
-        self.window_layers = window_layers
-        self.num_experts = num_experts
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.layer_proj = nn.Sequential(
-            nn.Linear(6, hidden_dim),
-            nn.SiLU(),
-        )
-        self.net = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, window_layers * num_experts),
-        )
-
-    @staticmethod
-    def _normalize_hidden_state(hidden_state: torch.Tensor) -> torch.Tensor:
-        if hidden_state.ndim == 1:
-            return hidden_state.unsqueeze(0)
-        if hidden_state.ndim != 2:
-            raise ValueError("hidden_state must be rank-1 or rank-2")
-        return hidden_state
-
-    @staticmethod
-    def _normalize_layer_index(
-        layer_index: int | torch.Tensor,
-        *,
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if isinstance(layer_index, int):
-            return torch.full(
-                (batch_size,),
-                int(layer_index),
-                dtype=torch.float32,
-                device=device,
-            )
-        if layer_index.ndim == 0:
-            return torch.full(
-                (batch_size,),
-                int(layer_index.item()),
-                dtype=torch.float32,
-                device=device,
-            )
-        if layer_index.ndim != 1 or int(layer_index.shape[0]) != batch_size:
-            raise ValueError("layer_index must be scalar or match batch size")
-        return layer_index.to(device=device, dtype=torch.float32)
-
-    @staticmethod
-    def _layer_features(layer_index: torch.Tensor) -> torch.Tensor:
-        layer_index = layer_index.unsqueeze(-1)
-        return torch.cat(
-            (
-                layer_index,
-                layer_index.square(),
-                torch.sin(layer_index * 0.1),
-                torch.cos(layer_index * 0.1),
-                torch.sin(layer_index * 0.01),
-                torch.cos(layer_index * 0.01),
-            ),
-            dim=-1,
-        )
-
-    def forward(
-        self,
-        hidden_state: torch.Tensor,
-        layer_index: int | torch.Tensor,
-    ) -> torch.Tensor:
-        reference_param = next(self.parameters(), None)
-        target_device = (
-            hidden_state.device if reference_param is None else reference_param.device
-        )
-        target_dtype = (
-            hidden_state.dtype if reference_param is None else reference_param.dtype
-        )
-        hidden_state = self._normalize_hidden_state(hidden_state).to(
-            device=target_device,
-            dtype=target_dtype,
-        )
-        layer_index = self._normalize_layer_index(
-            layer_index,
-            batch_size=int(hidden_state.shape[0]),
-            device=target_device,
-        )
-        layer_index = layer_index.to(dtype=target_dtype)
-        fused_hidden = self.input_proj(hidden_state) + self.layer_proj(
-            self._layer_features(layer_index)
-        )
-        logits = self.net(fused_hidden)
-        return logits.view(-1, self.window_layers, self.num_experts)
 
 
 HiddenStateFutureExpertPredictor = FutureExpertPredictor
@@ -462,27 +326,73 @@ HiddenStateFutureExpertPredictor = FutureExpertPredictor
 @dataclass(slots=True, frozen=True)
 class LoadedPredictorBundle:
     bundle_dir: Path
-    manifest_path: Path
-    manifest: PredictorDeploymentManifest
+    manifest_path: Path | None
+    manifest: PredictorDeploymentManifest | None
     schema: PredictorRuntimeSchema
     metrics: PredictorMetricsSummary
     weights_path: Path
     state_dict: dict[str, torch.Tensor]
+    checkpoint_metadata: PredictorCheckpointMetadata | None = None
 
-    # 根据 runtime schema 重建 predictor 模块并加载权重。
-    def build_model(self, *, device: str | torch.device = "cpu") -> FutureExpertPredictor:
+    def build_model(
+        self,
+        *,
+        device: str | torch.device = "cpu",
+        base_model_path: str | Path | None = None,
+        num_layers: int | None = None,
+    ) -> FutureExpertPredictor:
         model_dtype = next(iter(self.state_dict.values())).dtype
-        # 先按 schema 恢复与训练侧同构的模型。
-        model = FutureExpertPredictor(
+        model_descriptor = dict(self.schema.model_descriptor)
+        if not model_descriptor and self.checkpoint_metadata is not None:
+            model_descriptor = dict(self.checkpoint_metadata.model_descriptor)
+
+        model_architecture = str(model_descriptor.get("architecture", "mlp"))
+        model_hidden_dim = int(
+            model_descriptor.get("hidden_dim", self.schema.predictor_hidden_dim)
+        )
+        model_depth = int(model_descriptor.get("depth", 2))
+        model_dropout = float(model_descriptor.get("dropout", 0.0))
+        model_num_heads = int(model_descriptor.get("num_heads", 1))
+        model_memory_tokens = int(model_descriptor.get("memory_tokens", 0))
+        model_ffn_multiplier = int(model_descriptor.get("ffn_multiplier", 4))
+        resolved_num_layers = int(
+            num_layers
+            if num_layers is not None
+            else model_descriptor.get("num_layers", 0) or 0
+        )
+
+        frozen_router_weights = None
+        if model_architecture == "frozen_router_delta":
+            if base_model_path is None:
+                raise ValueError(
+                    "base_model_path is required for frozen_router_delta runtime loading"
+                )
+            if resolved_num_layers < 1:
+                raise ValueError(
+                    "num_layers is required for frozen_router_delta runtime loading"
+                )
+            frozen_router_weights = _load_router_gate_weights(
+                base_model_path,
+                num_layers=resolved_num_layers,
+                dtype=torch.float32,
+            )
+
+        model = build_predictor_model(
             input_dim=self.schema.input_summary_dim,
-            hidden_dim=self.schema.predictor_hidden_dim,
+            hidden_dim=model_hidden_dim,
             window_layers=self.schema.window_layers,
             num_experts=self.schema.num_experts,
+            model_architecture=model_architecture,
+            model_depth=model_depth,
+            model_dropout=model_dropout,
+            model_num_heads=model_num_heads,
+            model_memory_tokens=model_memory_tokens,
+            model_ffn_multiplier=model_ffn_multiplier,
+            num_layers=resolved_num_layers if resolved_num_layers > 0 else None,
+            frozen_router_weights=frozen_router_weights,
         )
         model.to(dtype=model_dtype)
-        # 再把导出的 state_dict 严格加载回模型。
         model.load_state_dict(self.state_dict, strict=True)
-        # 最后切到目标设备并设为 eval 模式。
         model.to(device=device, dtype=model_dtype)
         model.eval()
         return model
@@ -495,17 +405,12 @@ def _load_weights_payload(
     expected_profile_name: str,
     map_location: str | torch.device,
 ) -> dict[str, torch.Tensor]:
-    # 权重文件必须存在，否则 bundle 不完整。
     if not weights_path.is_file():
         raise FileNotFoundError(f"predictor weights file does not exist: {weights_path}")
-    # 在指定设备映射上读取导出的权重载荷。
     payload = torch.load(weights_path, map_location=map_location)
-    # 顶层必须是字典。
     if not isinstance(payload, dict):
         raise ValueError("predictor weights payload must decode to a dictionary")
 
-    # -----------------
-    # 先校验顶层元信息。
     weights_kind = str(payload.get("weights_kind", ""))
     if weights_kind != expected_weights_kind:
         raise ValueError(
@@ -520,26 +425,237 @@ def _load_weights_payload(
             "predictor bundle profile_name mismatch between manifest and weights payload"
         )
 
-    # -----------------
-    # 再校验 state_dict 内容。
     state_dict = payload.get("model_state_dict")
     if not isinstance(state_dict, dict):
         raise ValueError("predictor weights payload is missing model_state_dict")
     normalized_state_dict: dict[str, torch.Tensor] = {}
     for name, tensor in state_dict.items():
-        # 参数名必须是非空字符串。
         normalized_name = _require_non_empty_string("state_dict key", name)
-        # 参数值必须是张量。
         if not torch.is_tensor(tensor):
             raise ValueError(
                 f"predictor state_dict entry {normalized_name!r} must be a tensor"
             )
         normalized_state_dict[normalized_name] = tensor
-    # 不能出现空的 state_dict。
     if not normalized_state_dict:
         raise ValueError("predictor model_state_dict must not be empty")
-    # 返回已校验的 state_dict。
     return normalized_state_dict
+
+
+def _build_metrics_summary_from_checkpoint(
+    metadata: PredictorCheckpointMetadata,
+    run_trace: PredictorTrainingRunTrace | None,
+) -> PredictorMetricsSummary:
+    if run_trace is not None:
+        return PredictorMetricsSummary(
+            metrics_kind=_METRICS_KIND,
+            profile_name=run_trace.profile_name,
+            example_count=run_trace.example_count,
+            epochs=run_trace.epochs,
+            final_mean_loss=run_trace.final_mean_loss,
+            final_recall_at_candidate_budget=(
+                run_trace.final_recall_at_candidate_budget
+            ),
+            final_recall_at_executed_budget=(
+                run_trace.final_recall_at_executed_budget
+            ),
+        ).validate()
+    return PredictorMetricsSummary(
+        metrics_kind=_METRICS_KIND,
+        profile_name=metadata.profile_name,
+        example_count=metadata.example_count,
+        epochs=metadata.epochs,
+        final_mean_loss=metadata.final_mean_loss,
+        final_recall_at_candidate_budget=(
+            metadata.final_recall_at_candidate_budget
+        ),
+        final_recall_at_executed_budget=(
+            metadata.final_recall_at_executed_budget
+        ),
+    ).validate()
+
+
+def _build_runtime_schema_from_checkpoint(
+    metadata: PredictorCheckpointMetadata,
+) -> PredictorRuntimeSchema:
+    return PredictorRuntimeSchema(
+        schema_kind=_SCHEMA_KIND,
+        profile_name=metadata.profile_name,
+        input_summary_dim=metadata.input_summary_dim,
+        predictor_hidden_dim=metadata.hidden_dim,
+        window_layers=metadata.window_layers,
+        stride_layers=metadata.stride_layers,
+        num_experts=metadata.num_experts,
+        candidate_experts_per_layer=metadata.candidate_experts_per_layer,
+        executed_experts_per_layer=metadata.executed_experts_per_layer,
+        selection_mode=metadata.selection_mode,
+        online_expert_source=metadata.online_expert_source,
+        allow_candidate_mismatch=metadata.allow_candidate_mismatch,
+        model_descriptor=dict(metadata.model_descriptor),
+        min_insertion_layer_index=metadata.min_insertion_layer_index,
+    ).validate()
+
+
+def _read_checkpoint_payload(
+    checkpoint_path: Path,
+    *,
+    map_location: str | torch.device,
+) -> dict[str, Any]:
+    payload = torch.load(checkpoint_path, map_location=map_location)
+    if not isinstance(payload, dict):
+        raise ValueError("predictor checkpoint must decode to a dictionary")
+    return payload
+
+
+def _load_predictor_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> LoadedPredictorBundle:
+    resolved_path = Path(checkpoint_path).resolve()
+    payload = _read_checkpoint_payload(resolved_path, map_location=map_location)
+
+    metadata_payload = payload.get("metadata")
+    if not isinstance(metadata_payload, dict):
+        raise ValueError("predictor checkpoint is missing metadata")
+    metadata = PredictorCheckpointMetadata.from_dict(metadata_payload)
+
+    run_trace_payload = payload.get("run_trace")
+    run_trace = None
+    if run_trace_payload is not None:
+        if not isinstance(run_trace_payload, dict):
+            raise ValueError("predictor checkpoint run_trace must be a dictionary")
+        run_trace = PredictorTrainingRunTrace.from_dict(run_trace_payload)
+
+    state_dict = payload.get("model_state_dict")
+    if not isinstance(state_dict, dict):
+        raise ValueError("predictor checkpoint is missing model_state_dict")
+    normalized_state_dict: dict[str, torch.Tensor] = {}
+    for name, tensor in state_dict.items():
+        normalized_name = _require_non_empty_string("state_dict key", name)
+        if not torch.is_tensor(tensor):
+            raise ValueError(
+                f"predictor state_dict entry {normalized_name!r} must be a tensor"
+            )
+        normalized_state_dict[normalized_name] = tensor
+    if not normalized_state_dict:
+        raise ValueError("predictor model_state_dict must not be empty")
+
+    return LoadedPredictorBundle(
+        bundle_dir=resolved_path.parent,
+        manifest_path=None,
+        manifest=None,
+        schema=_build_runtime_schema_from_checkpoint(metadata),
+        metrics=_build_metrics_summary_from_checkpoint(metadata, run_trace),
+        weights_path=resolved_path,
+        state_dict=normalized_state_dict,
+        checkpoint_metadata=metadata,
+    )
+
+
+def _read_safetensors_weight_map(model_dir: Path) -> dict[str, str]:
+    index_path = model_dir / "model.safetensors.index.json"
+    if not index_path.is_file():
+        return {}
+    payload = _read_json_object(index_path, description="model safetensors index")
+    weight_map = payload.get("weight_map", {})
+    if not isinstance(weight_map, dict):
+        raise ValueError("model safetensors index weight_map must be an object")
+    return {str(name): str(file_name) for name, file_name in weight_map.items()}
+
+
+def _candidate_router_gate_tensor_names(layer_index: int) -> tuple[str, ...]:
+    return (
+        f"model.language_model.layers.{layer_index}.mlp.gate.weight",
+        f"model.layers.{layer_index}.mlp.gate.weight",
+    )
+
+
+def _load_router_gate_weights(
+    base_model_path: str | Path,
+    *,
+    num_layers: int,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    model_dir = Path(base_model_path).expanduser().resolve()
+    if not model_dir.is_dir():
+        raise FileNotFoundError(f"base model path does not exist: {model_dir}")
+
+    weight_map = _read_safetensors_weight_map(model_dir)
+    router_weights: list[torch.Tensor | None] = [None] * int(num_layers)
+
+    if weight_map:
+        requests_by_file: dict[str, list[tuple[int, str]]] = {}
+        for layer_index in range(int(num_layers)):
+            tensor_name = next(
+                (
+                    candidate_name
+                    for candidate_name in _candidate_router_gate_tensor_names(layer_index)
+                    if candidate_name in weight_map
+                ),
+                None,
+            )
+            if tensor_name is None:
+                raise ValueError(
+                    f"missing router gate weight for layer {layer_index} under {model_dir}"
+                )
+            requests_by_file.setdefault(weight_map[tensor_name], []).append(
+                (layer_index, tensor_name)
+            )
+
+        for file_name, requests in requests_by_file.items():
+            file_path = model_dir / file_name
+            if not file_path.is_file():
+                raise FileNotFoundError(
+                    f"router gate shard file does not exist: {file_path}"
+                )
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                for layer_index, tensor_name in requests:
+                    router_weights[layer_index] = handle.get_tensor(tensor_name).to(
+                        dtype=dtype
+                    ).contiguous()
+    else:
+        safetensor_files = sorted(model_dir.glob("*.safetensors"))
+        if len(safetensor_files) != 1:
+            raise FileNotFoundError(
+                "router gate tensor lookup requires model.safetensors.index.json "
+                "or a single .safetensors file"
+            )
+        with safe_open(safetensor_files[0], framework="pt", device="cpu") as handle:
+            handle_keys = set(handle.keys())
+            for layer_index in range(int(num_layers)):
+                tensor_name = next(
+                    (
+                        candidate_name
+                        for candidate_name in _candidate_router_gate_tensor_names(
+                            layer_index
+                        )
+                        if candidate_name in handle_keys
+                    ),
+                    None,
+                )
+                if tensor_name is None:
+                    raise ValueError(
+                        f"missing router gate weight for layer {layer_index} under "
+                        f"{safetensor_files[0]}"
+                    )
+                router_weights[layer_index] = handle.get_tensor(tensor_name).to(
+                    dtype=dtype
+                ).contiguous()
+
+    if any(router_weight is None for router_weight in router_weights):
+        missing_layers = [
+            layer_index
+            for layer_index, router_weight in enumerate(router_weights)
+            if router_weight is None
+        ]
+        raise ValueError(
+            f"failed to load router gate weights for layers: {missing_layers}"
+        )
+
+    return torch.stack(
+        [router_weight for router_weight in router_weights if router_weight is not None],
+        dim=0,
+    )
 
 
 def load_predictor_bundle(
@@ -547,31 +663,21 @@ def load_predictor_bundle(
     *,
     map_location: str | torch.device = "cpu",
 ) -> LoadedPredictorBundle:
-    # 先把输入解析成实际 manifest 路径。
     manifest_path = _resolve_manifest_path(bundle_path)
-    # 读取并校验 manifest。
     manifest = PredictorDeploymentManifest.from_json_file(manifest_path)
-    # 以 manifest 所在目录作为 bundle 根目录。
     bundle_dir = manifest_path.parent.resolve()
 
-    # -----------------
-    # 读取 schema 与 metrics，并检查 kind/来源是否一致。
     schema = PredictorRuntimeSchema.from_json_file(bundle_dir / manifest.schema_file)
     metrics = PredictorMetricsSummary.from_json_file(bundle_dir / manifest.metrics_file)
     if schema.schema_kind != manifest.schema_kind:
         raise ValueError("predictor bundle schema_kind mismatch")
     if metrics.metrics_kind != manifest.metrics_kind:
         raise ValueError("predictor bundle metrics_kind mismatch")
-
-    # -----------------
-    # 校验 profile/source 是否跨文件一致。
     if schema.profile_name != manifest.profile_name:
         raise ValueError("predictor bundle profile_name mismatch between manifest and schema")
     if metrics.profile_name != manifest.profile_name:
         raise ValueError("predictor bundle profile_name mismatch between manifest and metrics")
 
-    # -----------------
-    # 最后读取权重载荷并返回完整 bundle。
     weights_path = (bundle_dir / manifest.weights_file).resolve()
     state_dict = _load_weights_payload(
         weights_path,
@@ -587,6 +693,7 @@ def load_predictor_bundle(
         metrics=metrics,
         weights_path=weights_path,
         state_dict=state_dict,
+        checkpoint_metadata=None,
     )
 
 
@@ -595,10 +702,17 @@ def load_predictor_model(
     *,
     map_location: str | torch.device = "cpu",
     device: str | torch.device = "cpu",
+    base_model_path: str | Path | None = None,
+    num_layers: int | None = None,
 ) -> tuple[FutureExpertPredictor, LoadedPredictorBundle]:
-    # 先读取并校验完整 bundle。
-    bundle = load_predictor_bundle(bundle_path, map_location=map_location)
-    # 再基于 bundle 恢复 predictor 模块。
-    model = bundle.build_model(device=device)
-    # 把模型和 bundle 一起返回，便于后续 candidate planning 接入。
+    resolved_path = Path(bundle_path)
+    if resolved_path.is_dir() or resolved_path.suffix.lower() == ".json":
+        bundle = load_predictor_bundle(bundle_path, map_location=map_location)
+    else:
+        bundle = _load_predictor_checkpoint(bundle_path, map_location=map_location)
+    model = bundle.build_model(
+        device=device,
+        base_model_path=base_model_path,
+        num_layers=num_layers,
+    )
     return model, bundle

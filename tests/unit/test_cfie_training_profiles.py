@@ -53,7 +53,14 @@ def test_qwen35_35b_profile_uses_confirmed_local_model_geometry() -> None:
     assert cfg.predictor_routing.candidate_experts_per_layer == 40
     assert cfg.predictor_routing.executed_experts_per_layer == 8
     assert cfg.predictor_trainer.input_summary_dim == 64
-    assert cfg.predictor_trainer.hidden_dim == 128
+    assert cfg.predictor_trainer.model_architecture == "frozen_router_delta"
+    assert cfg.predictor_trainer.hidden_dim == 384
+    assert cfg.predictor_trainer.model_depth == 4
+    assert cfg.predictor_trainer.epochs == 200
+    assert cfg.predictor_trainer.hard_target_loss_weight == 0.0
+    assert cfg.predictor_trainer.router_distill_loss_weight == 1.0
+    assert cfg.predictor_trainer.min_insertion_layer_index == 1
+    assert cfg.predictor_trainer.batch_size == 4096
     assert cfg.predictor_trainer.examples_per_step == 4
     assert cfg.memory_budget.gpu_hot_budget_gb == 6.0
 
@@ -86,9 +93,12 @@ def test_qwen35_122b_profile_uses_confirmed_local_model_geometry() -> None:
     assert cfg.predictor_routing.stride_layers == 4
     assert cfg.predictor_routing.candidate_experts_per_layer == 40
     assert cfg.predictor_routing.executed_experts_per_layer == 8
-    assert cfg.predictor_trainer.model_architecture == "factorized"
-    assert cfg.predictor_trainer.hidden_dim == 512
+    assert cfg.predictor_trainer.model_architecture == "frozen_router_delta"
+    assert cfg.predictor_trainer.hidden_dim == 384
     assert cfg.predictor_trainer.model_depth == 4
+    assert cfg.predictor_trainer.epochs == 200
+    assert cfg.predictor_trainer.hard_target_loss_weight == 0.0
+    assert cfg.predictor_trainer.router_distill_loss_weight == 1.0
+    assert cfg.predictor_trainer.min_insertion_layer_index == 1
     assert cfg.predictor_trainer.batch_size == 4096
-    assert cfg.predictor_trainer.epochs == 10
     assert cfg.memory_budget.gpu_hot_budget_gb == 10.0

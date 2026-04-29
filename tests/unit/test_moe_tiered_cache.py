@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -19,9 +20,16 @@ from cfie.model_executor.layers.fused_moe.oracle.unquantized import (
 from cfie.model_executor.layers.fused_moe.runner.default_moe_runner import (
     DefaultMoERunner,
 )
-from cfie.offload.cpu_backend import ExpertBundle, PinnedExpertCache
+from cfie.offload.cpu_backend import (
+    ExpertBundle,
+    PinnedExpertCache,
+    pack_cpu_tensor_dict,
+)
 from cfie.offload.nvme_backend import SafetensorExpertStore
-from cfie.offload.weight_offload import LayerTieredExpertCacheController
+from cfie.offload.weight_offload import (
+    LayerTieredExpertCacheController,
+    SharedPrefillBurstPool,
+)
 from cfie.offload.policy import (
     PLAN_KEY,
     MTP_RESERVE_MODE_KEY,
@@ -1716,7 +1724,7 @@ def test_preprocess_unquantized_static_bundle_is_runtime_ready(monkeypatch) -> N
     monkeypatch.setattr(
         controller,
         "_to_cpu_static_tensor",
-        lambda tensor: tensor.detach().to(device="cpu").contiguous(),
+        lambda tensor, *, pin_memory=None: tensor.detach().to(device="cpu").contiguous(),
     )
 
     checkpoint_bundle = ExpertBundle(
@@ -1783,7 +1791,7 @@ def test_preprocess_quantized_static_bundles_batch_is_runtime_ready(
     monkeypatch.setattr(
         controller,
         "_to_cpu_static_tensor",
-        lambda tensor: tensor.detach().to(device="cpu").contiguous(),
+        lambda tensor, *, pin_memory=None: tensor.detach().to(device="cpu").contiguous(),
     )
 
     repack_calls: list[torch.Tensor] = []
@@ -1925,7 +1933,7 @@ def test_preprocess_quantized_static_bundles_batch_is_runtime_ready(
     )
 
 
-def test_to_cpu_static_tensor_requires_static_pin_flag() -> None:
+def test_to_cpu_static_tensor_can_skip_pin_for_temporary_cpu_staging() -> None:
     controller = LayerTieredExpertCacheController.__new__(
         LayerTieredExpertCacheController
     )
@@ -1933,8 +1941,13 @@ def test_to_cpu_static_tensor_requires_static_pin_flag() -> None:
     controller._use_pinned_cpu = True
     controller._use_pinned_cpu_static = False
 
-    with pytest.raises(RuntimeError, match="must be pinned"):
-        controller._to_cpu_static_tensor(torch.arange(4, dtype=torch.float16))
+    cpu_tensor = controller._to_cpu_static_tensor(
+        torch.arange(4, dtype=torch.float16)
+    )
+
+    assert cpu_tensor.device.type == "cpu"
+    assert cpu_tensor.is_contiguous()
+    assert not cpu_tensor.is_pinned()
 
 
 def test_load_experts_into_slots_uses_single_batch_write_entrypoint() -> None:
@@ -1990,6 +2003,7 @@ def test_write_expert_bundles_uses_unquantized_batch_load_op_when_available(
         LayerTieredExpertCacheController
     )
     controller._mode = "unquantized"
+    controller._runtime_load_strategy = "dense_batch"
     fallback_calls = []
     op_calls: dict[str, object] = {}
 
@@ -2079,6 +2093,7 @@ def test_write_expert_bundles_uses_gptq_batch_load_op_when_available(
         LayerTieredExpertCacheController
     )
     controller._mode = "gptq_marlin"
+    controller._runtime_load_strategy = "dense_batch"
     fallback_calls = []
     op_calls: dict[str, object] = {}
 
@@ -2240,6 +2255,226 @@ def test_write_expert_bundles_uses_gptq_batch_load_op_when_available(
         torch.tensor([[[15, 16]], [[35, 36]]], dtype=torch.int32),
     )
 
+
+def test_write_expert_bundles_uses_sparse_direct_for_small_resident_runtime_loads_in_auto_mode(
+    monkeypatch,
+) -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller._mode = "gptq_marlin"
+    controller._runtime_load_strategy = "auto"
+    controller._runtime_sparse_direct_max_experts = 4
+
+    batch_calls: list[bool] = []
+    monkeypatch.setattr(
+        weight_offload.ops,
+        "has_precompiled_moe_batch_load_gptq_runtime",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        weight_offload.ops,
+        "moe_batch_load_gptq_runtime_precompiled",
+        lambda *args, **kwargs: batch_calls.append(True),
+    )
+
+    bundles_and_sources = [
+        (
+            1,
+            0,
+            ExpertBundle(
+                tensors={
+                    "runtime.w13_qweight": torch.tensor([[1, 2]], dtype=torch.int32),
+                    "runtime.w2_qweight": torch.tensor([[3, 4]], dtype=torch.int32),
+                    "runtime.w13_scales": torch.tensor([[1.0, 2.0]], dtype=torch.float16),
+                    "runtime.w2_scales": torch.tensor([[3.0, 4.0]], dtype=torch.float16),
+                    "runtime.w13_qzeros": torch.tensor([[5, 6]], dtype=torch.int32),
+                    "runtime.w2_qzeros": torch.tensor([[7, 8]], dtype=torch.int32),
+                },
+                nbytes=24,
+                pinned=False,
+                runtime_ready=True,
+            ),
+            "cpu_static",
+        ),
+        (
+            4,
+            2,
+            ExpertBundle(
+                tensors={
+                    "runtime.w13_qweight": torch.tensor([[21, 22]], dtype=torch.int32),
+                    "runtime.w2_qweight": torch.tensor([[23, 24]], dtype=torch.int32),
+                    "runtime.w13_scales": torch.tensor([[5.0, 6.0]], dtype=torch.float16),
+                    "runtime.w2_scales": torch.tensor([[7.0, 8.0]], dtype=torch.float16),
+                    "runtime.w13_qzeros": torch.tensor([[25, 26]], dtype=torch.int32),
+                    "runtime.w2_qzeros": torch.tensor([[27, 28]], dtype=torch.int32),
+                },
+                nbytes=24,
+                pinned=False,
+                runtime_ready=True,
+            ),
+            "cpu_static",
+        ),
+    ]
+    target = SimpleNamespace(
+        w13_qweight=torch.zeros((4, 1, 2), dtype=torch.int32),
+        w2_qweight=torch.zeros((4, 1, 2), dtype=torch.int32),
+        w13_scales=torch.zeros((4, 1, 2), dtype=torch.float16),
+        w2_scales=torch.zeros((4, 1, 2), dtype=torch.float16),
+        w13_qzeros=torch.zeros((4, 1, 2), dtype=torch.int32),
+        w2_qzeros=torch.zeros((4, 1, 2), dtype=torch.int32),
+    )
+
+    controller._write_expert_bundles(bundles_and_sources, target)
+
+    assert batch_calls == []
+    assert torch.equal(target.w13_qweight[0], torch.tensor([[1, 2]], dtype=torch.int32))
+    assert torch.equal(target.w13_qweight[2], torch.tensor([[21, 22]], dtype=torch.int32))
+    assert torch.equal(target.w2_scales[0], torch.tensor([[3.0, 4.0]], dtype=torch.float16))
+    assert torch.equal(target.w2_qzeros[2], torch.tensor([[27, 28]], dtype=torch.int32))
+
+
+def test_resolve_runtime_load_strategy_defaults_to_sparse_direct(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("CFIE_MOE_RUNTIME_LOAD_STRATEGY", raising=False)
+    assert weight_offload._resolve_runtime_load_strategy() == "sparse_direct"
+
+
+def test_resolve_runtime_load_strategy_invalid_value_falls_back_to_sparse_direct(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CFIE_MOE_RUNTIME_LOAD_STRATEGY", "invalid")
+    assert weight_offload._resolve_runtime_load_strategy() == "sparse_direct"
+
+
+def test_write_expert_bundles_keeps_dense_batch_for_prefill_target_in_auto_mode(
+    monkeypatch,
+) -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller._mode = "gptq_marlin"
+    controller._runtime_load_strategy = "auto"
+    controller._runtime_sparse_direct_max_experts = 4
+
+    direct_calls: list[bool] = []
+    controller._copy_runtime_ready_bundle_direct = (
+        lambda *args, **kwargs: direct_calls.append(True)
+    )
+    op_calls: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        weight_offload.ops,
+        "has_precompiled_moe_batch_load_gptq_runtime",
+        lambda: True,
+    )
+
+    def _fake_batch_load(
+        slot_ids: torch.Tensor,
+        w13_qweight_src: torch.Tensor,
+        w2_qweight_src: torch.Tensor,
+        w13_scales_src: torch.Tensor,
+        w2_scales_src: torch.Tensor,
+        w13_qzeros_src: torch.Tensor,
+        w2_qzeros_src: torch.Tensor,
+        w13_qweight_dst: torch.Tensor,
+        w2_qweight_dst: torch.Tensor,
+        w13_scales_dst: torch.Tensor,
+        w2_scales_dst: torch.Tensor,
+        w13_qzeros_dst: torch.Tensor,
+        w2_qzeros_dst: torch.Tensor,
+        w13_g_idx_src: torch.Tensor | None,
+        w2_g_idx_src: torch.Tensor | None,
+        w13_g_idx_sort_indices_src: torch.Tensor | None,
+        w2_g_idx_sort_indices_src: torch.Tensor | None,
+        w13_g_idx_dst: torch.Tensor | None,
+        w2_g_idx_dst: torch.Tensor | None,
+        w13_g_idx_sort_indices_dst: torch.Tensor | None,
+        w2_g_idx_sort_indices_dst: torch.Tensor | None,
+    ) -> None:
+        del (
+            w13_qweight_dst,
+            w2_qweight_dst,
+            w13_scales_dst,
+            w2_scales_dst,
+            w13_qzeros_dst,
+            w2_qzeros_dst,
+            w13_g_idx_src,
+            w2_g_idx_src,
+            w13_g_idx_sort_indices_src,
+            w2_g_idx_sort_indices_src,
+            w13_g_idx_dst,
+            w2_g_idx_dst,
+            w13_g_idx_sort_indices_dst,
+            w2_g_idx_sort_indices_dst,
+        )
+        op_calls["slot_ids"] = slot_ids.clone()
+        op_calls["w13_qweight_src"] = w13_qweight_src.clone()
+        op_calls["w2_qweight_src"] = w2_qweight_src.clone()
+        op_calls["w13_scales_src"] = w13_scales_src.clone()
+        op_calls["w2_scales_src"] = w2_scales_src.clone()
+        op_calls["w13_qzeros_src"] = w13_qzeros_src.clone()
+        op_calls["w2_qzeros_src"] = w2_qzeros_src.clone()
+
+    monkeypatch.setattr(
+        weight_offload.ops,
+        "moe_batch_load_gptq_runtime_precompiled",
+        _fake_batch_load,
+    )
+
+    bundles_and_sources = [
+        (
+            1,
+            0,
+            ExpertBundle(
+                tensors={
+                    "runtime.w13_qweight": torch.tensor([[1, 2]], dtype=torch.int32),
+                    "runtime.w2_qweight": torch.tensor([[3, 4]], dtype=torch.int32),
+                    "runtime.w13_scales": torch.tensor([[1.0, 2.0]], dtype=torch.float16),
+                    "runtime.w2_scales": torch.tensor([[3.0, 4.0]], dtype=torch.float16),
+                    "runtime.w13_qzeros": torch.tensor([[5, 6]], dtype=torch.int32),
+                    "runtime.w2_qzeros": torch.tensor([[7, 8]], dtype=torch.int32),
+                },
+                nbytes=24,
+                pinned=False,
+                runtime_ready=True,
+            ),
+            "cpu_static",
+        ),
+        (
+            4,
+            2,
+            ExpertBundle(
+                tensors={
+                    "runtime.w13_qweight": torch.tensor([[21, 22]], dtype=torch.int32),
+                    "runtime.w2_qweight": torch.tensor([[23, 24]], dtype=torch.int32),
+                    "runtime.w13_scales": torch.tensor([[5.0, 6.0]], dtype=torch.float16),
+                    "runtime.w2_scales": torch.tensor([[7.0, 8.0]], dtype=torch.float16),
+                    "runtime.w13_qzeros": torch.tensor([[25, 26]], dtype=torch.int32),
+                    "runtime.w2_qzeros": torch.tensor([[27, 28]], dtype=torch.int32),
+                },
+                nbytes=24,
+                pinned=False,
+                runtime_ready=True,
+            ),
+            "cpu_static",
+        ),
+    ]
+    target = SharedPrefillBurstPool.__new__(SharedPrefillBurstPool)
+    target.w13_qweight = torch.zeros((4, 1, 2), dtype=torch.int32)
+    target.w2_qweight = torch.zeros((4, 1, 2), dtype=torch.int32)
+    target.w13_scales = torch.zeros((4, 1, 2), dtype=torch.float16)
+    target.w2_scales = torch.zeros((4, 1, 2), dtype=torch.float16)
+    target.w13_qzeros = torch.zeros((4, 1, 2), dtype=torch.int32)
+    target.w2_qzeros = torch.zeros((4, 1, 2), dtype=torch.int32)
+
+    controller._write_expert_bundles(bundles_and_sources, target)
+
+    assert direct_calls == []
+    assert torch.equal(op_calls["slot_ids"], torch.tensor([0, 2], dtype=torch.int64))
+
+
 def test_get_source_bundle_materializes_cpu_static_expert_lazily() -> None:
     controller = LayerTieredExpertCacheController.__new__(
         LayerTieredExpertCacheController
@@ -2332,7 +2567,9 @@ def test_init_cpu_fixed_pools_routes_gptq_static_eager_materialization_to_batch(
     controller._prefill_burst_min_tokens = 8
 
     eager_calls: list[tuple[int, ...]] = []
-    controller._allocate_quantized_raw_buffer = lambda batch_size=1: object()
+    controller._allocate_quantized_raw_buffer = (
+        lambda batch_size=1, **_kwargs: object()
+    )
     controller._raw_quantized_nbytes = lambda _raw: 6
     controller._materialize_cpu_static_bundles_eager = (
         lambda expert_ids: eager_calls.append(tuple(expert_ids))
@@ -2343,6 +2580,231 @@ def test_init_cpu_fixed_pools_routes_gptq_static_eager_materialization_to_batch(
     assert controller._cpu_static_experts == frozenset({3, 4})
     assert controller._cpu_buffer_bytes == 6
     assert eager_calls == [(3, 4)]
+
+
+def test_init_cpu_fixed_pools_packs_layer_wide_when_runtime_needs_pinned() -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller.layer = SimpleNamespace(global_num_experts=8)
+    controller.layer_key = "model.layers.0.mlp.experts"
+    controller.plan = {
+        "initial_cpu_experts": (3, 4),
+        "cpu_static_preprocess_batch_size": 8,
+    }
+    controller._mode = "gptq_marlin"
+    controller._cpu_static_bundles = {}
+    controller._cpu_stage_bundle = None
+    controller._cpu_static_experts = frozenset()
+    controller._cpu_buffer_bytes = 0
+    controller._use_pinned_cpu = True
+    controller._use_pinned_cpu_static = True
+    controller.prefill_burst_pool = None
+    controller._prefill_burst_min_tokens = 8
+    controller._allocate_quantized_raw_buffer = (
+        lambda batch_size=1, **_kwargs: object()
+    )
+    controller._raw_quantized_nbytes = lambda _raw: 6
+
+    controller._materialize_cpu_static_bundles_eager = lambda expert_ids: (
+        controller._cpu_static_bundles.update(
+            {
+                expert_id: pack_cpu_tensor_dict(
+                    {
+                        "runtime.w13_qweight": torch.tensor(
+                            [[expert_id, expert_id + 1]],
+                            dtype=torch.int32,
+                        )
+                    },
+                    runtime_ready=True,
+                )
+                for expert_id in expert_ids
+            }
+        )
+    )
+
+    pack_calls: list[bool] = []
+    controller._pack_cpu_static_bundles_layer_wide = (
+        lambda *, pin_memory: pack_calls.append(pin_memory)
+    )
+
+    controller._init_cpu_fixed_pools()
+
+    assert pack_calls == [True]
+
+
+def test_init_cpu_fixed_pools_falls_back_to_pageable_layer_wide_pack_after_pinned_oom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        weight_offload,
+        "_PINNED_LAYER_PACKING_EXHAUSTED",
+        False,
+    )
+
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller.layer = SimpleNamespace(global_num_experts=8)
+    controller.layer_key = "model.layers.0.mlp.experts"
+    controller.device = torch.device("cuda:0")
+    controller.plan = {
+        "initial_cpu_experts": (3, 4),
+        "cpu_static_preprocess_batch_size": 8,
+    }
+    controller._mode = "gptq_marlin"
+    controller._cpu_static_bundles = {}
+    controller._cpu_stage_bundle = None
+    controller._cpu_static_experts = frozenset()
+    controller._cpu_buffer_bytes = 0
+    controller._use_pinned_cpu = True
+    controller._use_pinned_cpu_static = True
+    controller.prefill_burst_pool = None
+    controller._prefill_burst_min_tokens = 8
+    controller._allocate_quantized_raw_buffer = (
+        lambda batch_size=1, **_kwargs: object()
+    )
+    controller._raw_quantized_nbytes = lambda _raw: 6
+    controller._materialize_cpu_static_bundles_eager = lambda expert_ids: (
+        controller._cpu_static_bundles.update(
+            {
+                expert_id: pack_cpu_tensor_dict(
+                    {
+                        "runtime.w13_qweight": torch.tensor(
+                            [[expert_id, expert_id + 1]],
+                            dtype=torch.int32,
+                        )
+                    },
+                    runtime_ready=True,
+                )
+                for expert_id in expert_ids
+            }
+        )
+    )
+
+    pack_calls: list[bool] = []
+
+    def _pack_cpu_static_bundles_layer_wide(*, pin_memory: bool) -> None:
+        pack_calls.append(pin_memory)
+        if pin_memory:
+            raise RuntimeError("CUDA error: out of memory")
+
+    controller._pack_cpu_static_bundles_layer_wide = (
+        _pack_cpu_static_bundles_layer_wide
+    )
+
+    synchronize_calls: list[torch.device] = []
+    empty_cache_calls: list[bool] = []
+
+    with patch("cfie.offload.weight_offload.torch.cuda.synchronize") as synchronize:
+        synchronize.side_effect = lambda device=None: synchronize_calls.append(
+            torch.device("cuda:0" if device is None else device)
+        )
+        with patch(
+            "cfie.offload.weight_offload.torch.accelerator.empty_cache"
+        ) as empty_cache:
+            empty_cache.side_effect = lambda: empty_cache_calls.append(True)
+            controller._init_cpu_fixed_pools()
+
+    assert pack_calls == [True, False]
+    assert weight_offload._PINNED_LAYER_PACKING_EXHAUSTED is True
+    assert synchronize_calls == [torch.device("cuda:0")]
+    assert empty_cache_calls == [True]
+
+
+def test_init_cpu_fixed_pools_skips_pinned_layer_wide_pack_after_global_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        weight_offload,
+        "_PINNED_LAYER_PACKING_EXHAUSTED",
+        True,
+    )
+
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller.layer = SimpleNamespace(global_num_experts=8)
+    controller.layer_key = "model.layers.0.mlp.experts"
+    controller.plan = {
+        "initial_cpu_experts": (3, 4),
+        "cpu_static_preprocess_batch_size": 8,
+    }
+    controller._mode = "gptq_marlin"
+    controller._cpu_static_bundles = {}
+    controller._cpu_stage_bundle = None
+    controller._cpu_static_experts = frozenset()
+    controller._cpu_buffer_bytes = 0
+    controller._use_pinned_cpu = True
+    controller._use_pinned_cpu_static = True
+    controller.prefill_burst_pool = None
+    controller._prefill_burst_min_tokens = 8
+    controller._allocate_quantized_raw_buffer = (
+        lambda batch_size=1, **_kwargs: object()
+    )
+    controller._raw_quantized_nbytes = lambda _raw: 6
+    controller._materialize_cpu_static_bundles_eager = lambda expert_ids: (
+        controller._cpu_static_bundles.update(
+            {
+                expert_id: pack_cpu_tensor_dict(
+                    {
+                        "runtime.w13_qweight": torch.tensor(
+                            [[expert_id, expert_id + 1]],
+                            dtype=torch.int32,
+                        )
+                    },
+                    runtime_ready=True,
+                )
+                for expert_id in expert_ids
+            }
+        )
+    )
+
+    pack_calls: list[bool] = []
+    controller._pack_cpu_static_bundles_layer_wide = (
+        lambda *, pin_memory: pack_calls.append(pin_memory)
+    )
+
+    controller._init_cpu_fixed_pools()
+
+    assert pack_calls == [False]
+
+
+def test_runtime_requires_pinned_cpu_remains_true_when_static_pin_is_disabled() -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller._use_pinned_cpu = True
+    controller._use_pinned_cpu_static = False
+
+    assert controller._runtime_requires_pinned_cpu() is True
+
+
+def test_pack_cpu_static_bundles_layer_wide_best_effort_uses_pageable_storage_when_static_pin_is_disabled(
+) -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller._use_pinned_cpu = True
+    controller._use_pinned_cpu_static = False
+    controller._cpu_static_bundles = {
+        3: pack_cpu_tensor_dict(
+            {"runtime.w13_qweight": torch.tensor([[3, 4]], dtype=torch.int32)},
+            runtime_ready=True,
+        ),
+        5: pack_cpu_tensor_dict(
+            {"runtime.w13_qweight": torch.tensor([[5, 6]], dtype=torch.int32)},
+            runtime_ready=True,
+        ),
+    }
+    pack_calls: list[bool] = []
+    controller._pack_cpu_static_bundles_layer_wide = (
+        lambda *, pin_memory: pack_calls.append(pin_memory)
+    )
+
+    controller._pack_cpu_static_bundles_layer_wide_best_effort()
+
+    assert pack_calls == [False]
 
 
 def test_resolve_cpu_static_preprocess_batch_size_uses_memory_headroom() -> None:
@@ -2367,6 +2829,198 @@ def test_resolve_cpu_static_preprocess_batch_size_uses_memory_headroom() -> None
     assert batch_size == 6
 
 
+def test_is_cuda_oom_error_follows_exception_chain() -> None:
+    try:
+        try:
+            raise RuntimeError("CUDA error: out of memory")
+        except RuntimeError as exc:
+            raise RuntimeError("failed to pin CPU static runtime tensor") from exc
+    except RuntimeError as exc:
+        assert weight_offload._is_cuda_oom_error(exc)
+
+
+def test_build_quantized_runtime_bundles_share_packed_storage() -> None:
+    runtime_tensors = {
+        "runtime.w13_qweight": torch.tensor(
+            [[[1, 2]], [[11, 12]]],
+            dtype=torch.int32,
+        ),
+        "runtime.w2_qweight": torch.tensor(
+            [[[3, 4]], [[13, 14]]],
+            dtype=torch.int32,
+        ),
+    }
+
+    bundles = LayerTieredExpertCacheController._build_quantized_runtime_bundles(
+        runtime_tensors
+    )
+
+    assert len(bundles) == 2
+    assert bundles[0].runtime_ready
+    assert bundles[0].storage is bundles[1].storage
+    assert bundles[1].storage_offset_bytes == bundles[0].nbytes
+    assert torch.equal(
+        bundles[0].tensors["runtime.w13_qweight"],
+        runtime_tensors["runtime.w13_qweight"][0],
+    )
+    assert torch.equal(
+        bundles[1].tensors["runtime.w2_qweight"],
+        runtime_tensors["runtime.w2_qweight"][1],
+    )
+
+
+def test_pack_cpu_static_bundles_layer_wide_merges_experts() -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller.layer_key = "model.layers.0.mlp.experts"
+    controller._cpu_static_bundles = {
+        5: pack_cpu_tensor_dict(
+            {"runtime.w13_qweight": torch.tensor([[5, 6]], dtype=torch.int32)},
+            runtime_ready=True,
+        ),
+        3: pack_cpu_tensor_dict(
+            {"runtime.w13_qweight": torch.tensor([[3, 4]], dtype=torch.int32)},
+            runtime_ready=True,
+        ),
+    }
+
+    controller._pack_cpu_static_bundles_layer_wide(pin_memory=False)
+
+    bundle3 = controller._cpu_static_bundles[3]
+    bundle5 = controller._cpu_static_bundles[5]
+    assert bundle3.storage is bundle5.storage
+    assert bundle3.storage_offset_bytes == 0
+    assert bundle5.storage_offset_bytes == bundle3.nbytes
+    assert torch.equal(
+        bundle3.tensors["runtime.w13_qweight"],
+        torch.tensor([[3, 4]], dtype=torch.int32),
+    )
+    assert torch.equal(
+        bundle5.tensors["runtime.w13_qweight"],
+        torch.tensor([[5, 6]], dtype=torch.int32),
+    )
+
+
+def test_view_packed_runtime_ready_cpu_field_returns_shared_view() -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    runtime_tensors = {
+        "runtime.w13_qweight": torch.tensor(
+            [[[1, 2]], [[11, 12]]],
+            dtype=torch.int32,
+        ),
+        "runtime.w2_qweight": torch.tensor(
+            [[[3, 4]], [[13, 14]]],
+            dtype=torch.int32,
+        ),
+    }
+    bundles = LayerTieredExpertCacheController._build_quantized_runtime_bundles(
+        runtime_tensors
+    )
+    bundles_and_sources = [
+        (3, 0, bundles[0], "cpu_static"),
+        (5, 1, bundles[1], "cpu_static"),
+    ]
+
+    packed_view = controller._view_packed_runtime_ready_cpu_field(
+        bundles_and_sources,
+        "runtime.w13_qweight",
+    )
+
+    assert packed_view is not None
+    assert packed_view.untyped_storage().data_ptr() == (
+        bundles[0].storage.untyped_storage().data_ptr()
+    )
+    assert torch.equal(packed_view, runtime_tensors["runtime.w13_qweight"])
+
+
+def test_stack_runtime_ready_cpu_field_bulk_copies_unpinned_packed_view() -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller._runtime_requires_pinned_cpu = lambda: True
+    packed_view = torch.tensor(
+        [[[1, 2]], [[11, 12]]],
+        dtype=torch.int32,
+    )
+    controller._view_packed_runtime_ready_cpu_field = (
+        lambda _bundles_and_sources, _field_name: packed_view
+    )
+    batch = torch.empty_like(packed_view)
+    batch_calls: list[tuple[str, tuple[int, ...], int, bool]] = []
+
+    def _get_runtime_ready_batch_buffer(
+        field_name: str,
+        first_tensor: torch.Tensor,
+        batch_size: int,
+        *,
+        pin_memory: bool,
+    ) -> torch.Tensor:
+        batch_calls.append(
+            (
+                field_name,
+                tuple(first_tensor.shape),
+                batch_size,
+                pin_memory,
+            )
+        )
+        return batch
+
+    controller._get_runtime_ready_batch_buffer = _get_runtime_ready_batch_buffer
+    dummy_bundle = ExpertBundle(
+        tensors={},
+        nbytes=0,
+        pinned=False,
+        runtime_ready=True,
+    )
+
+    stacked = controller._stack_runtime_ready_cpu_field(
+        [
+            (3, 0, dummy_bundle, "cpu_static"),
+            (5, 1, dummy_bundle, "cpu_static"),
+        ],
+        "runtime.w13_qweight",
+    )
+
+    assert stacked is batch
+    assert torch.equal(stacked, packed_view)
+    assert batch_calls == [("runtime.w13_qweight", (1, 2), 2, True)]
+
+
+def test_prepare_waits_for_pending_prefetch_before_loading() -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller.layer_key = "model.layers.0.mlp.experts"
+    controller.num_slots = 4
+    controller._step = 0
+    controller._access_count = [0] * 8
+    controller._last_used_step = [0] * 8
+
+    call_order: list[object] = []
+    controller._wait_for_pending_prefetch = lambda: call_order.append("wait")
+    controller._normalize_requested_experts = lambda _topk_ids: [1, 3]
+    controller._build_load_plan = lambda requested: (
+        call_order.append(("build", tuple(requested))) or [(1, 0)]
+    )
+    controller._load_experts_into_slots = (
+        lambda assignments: call_order.append(("load", tuple(assignments)))
+    )
+
+    controller.prepare(torch.tensor([[1, 3]], dtype=torch.long))
+
+    assert call_order == [
+        "wait",
+        ("build", (1, 3)),
+        ("load", ((1, 0),)),
+    ]
+    assert controller._step == 1
+    assert controller._access_count[1] == 1
+    assert controller._access_count[3] == 1
+
+
 def test_materialize_quantized_cpu_static_batch_streams_source_bundles() -> None:
     controller = LayerTieredExpertCacheController.__new__(
         LayerTieredExpertCacheController
@@ -2377,7 +3031,7 @@ def test_materialize_quantized_cpu_static_batch_streams_source_bundles() -> None
     assemble_calls: list[tuple[int, int]] = []
     register_calls: list[tuple[int, str]] = []
 
-    controller._allocate_quantized_raw_buffer = lambda batch_size=1: {
+    controller._allocate_quantized_raw_buffer = lambda batch_size=1, **_kwargs: {
         "batch_size": batch_size
     }
 
@@ -2408,13 +3062,27 @@ def test_materialize_quantized_cpu_static_batch_streams_source_bundles() -> None
             dtype=torch.int32,
         )
     }
-    controller._build_quantized_runtime_bundle = (
-        lambda runtime_tensors, expert_index: ExpertBundle(
-            tensors={"runtime.weight": runtime_tensors["runtime.weight"][expert_index]},
-            nbytes=4,
-            pinned=False,
-            runtime_ready=True,
-        )
+    controller._build_quantized_runtime_bundles = (
+        lambda runtime_tensors, **_kwargs: [
+            ExpertBundle(
+                tensors={"runtime.weight": runtime_tensors["runtime.weight"][0]},
+                nbytes=4,
+                pinned=False,
+                runtime_ready=True,
+            ),
+            ExpertBundle(
+                tensors={"runtime.weight": runtime_tensors["runtime.weight"][1]},
+                nbytes=4,
+                pinned=False,
+                runtime_ready=True,
+            ),
+            ExpertBundle(
+                tensors={"runtime.weight": runtime_tensors["runtime.weight"][2]},
+                nbytes=4,
+                pinned=False,
+                runtime_ready=True,
+            ),
+        ]
     )
     controller._register_cpu_static_bundle = (
         lambda expert_id, bundle, *, eager: register_calls.append(
@@ -2427,6 +3095,56 @@ def test_materialize_quantized_cpu_static_batch_streams_source_bundles() -> None
     assert load_calls == [3, 5, 7]
     assert assemble_calls == [(0, 3), (1, 5), (2, 7)]
     assert register_calls == [(3, 100), (5, 200), (7, 300)]
+
+
+def test_materialize_cpu_static_bundles_eager_retries_with_smaller_batches() -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller.layer_key = "model.layers.0.mlp.experts"
+    controller.device = torch.device("cuda:0")
+    controller._mode = "gptq_marlin"
+    controller._cpu_static_experts = frozenset({0, 1, 2, 3})
+    controller._cpu_static_bundles = {}
+    controller._cpu_static_preprocess_batch_size_cap = 0
+
+    attempted_batches: list[tuple[int, ...]] = []
+
+    def _materialize_quantized_cpu_static_batch(expert_ids: list[int]) -> None:
+        attempted_batches.append(tuple(expert_ids))
+        if len(expert_ids) > 2:
+            raise RuntimeError("CUDA error: out of memory")
+        for expert_id in expert_ids:
+            controller._cpu_static_bundles[expert_id] = ExpertBundle(
+                tensors={"runtime.weight": torch.tensor([expert_id])},
+                nbytes=4,
+                pinned=False,
+                runtime_ready=True,
+            )
+
+    controller._materialize_quantized_cpu_static_batch = (
+        _materialize_quantized_cpu_static_batch
+    )
+    controller._resolve_cpu_static_preprocess_batch_size = lambda _requested: 4
+
+    synchronize_calls: list[torch.device] = []
+    empty_cache_calls: list[bool] = []
+
+    with patch("cfie.offload.weight_offload.torch.cuda.synchronize") as synchronize:
+        synchronize.side_effect = lambda device=None: synchronize_calls.append(
+            torch.device("cuda:0" if device is None else device)
+        )
+        with patch(
+            "cfie.offload.weight_offload.torch.accelerator.empty_cache"
+        ) as empty_cache:
+            empty_cache.side_effect = lambda: empty_cache_calls.append(True)
+            controller._materialize_cpu_static_bundles_eager((0, 1, 2, 3))
+
+    assert attempted_batches == [(0, 1, 2, 3), (0, 1), (2, 3)]
+    assert controller._cpu_static_preprocess_batch_size_cap == 2
+    assert set(controller._cpu_static_bundles) == {0, 1, 2, 3}
+    assert synchronize_calls == [torch.device("cuda:0")]
+    assert empty_cache_calls == [True]
 
 
 def test_init_cpu_fixed_pools_materializes_static_experts_eagerly() -> None:

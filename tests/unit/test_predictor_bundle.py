@@ -1,14 +1,23 @@
-"""Predictor deployment bundle loading tests."""
+"""Predictor runtime bundle and checkpoint loading tests."""
 
 from __future__ import annotations
 
 from dataclasses import replace
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from safetensors.torch import save_file
 import torch
 
+from cfie.model_executor.model_loader import utils as model_loader_utils
+from cfie.model_executor.models.qwen3_5_predictor import (
+    PredictorForwardState,
+    PredictorLayerRoutingState,
+    Qwen3_5PredictorModel,
+    Qwen3_5MoePredictorProcessingInfo,
+)
 from cfie.predictor import (
     PredictorCandidatePlanner,
     PredictorDeploymentManifest,
@@ -17,10 +26,17 @@ from cfie.predictor import (
     load_predictor_bundle,
     load_predictor_model,
 )
+from cfie.predictor.planner import CandidateLayerPlan
 from cfie_training.predictor import PredictorTraceDataset, PredictorTrainer
+from cfie_training.predictor.architectures import build_predictor_model
+from cfie_training.predictor.models import PredictorCheckpointMetadata
 from cfie_training.predictor.trainer import CapturedForwardBatch
 from cfie_training.profiles import build_profile_config
 from cfie_training.runtime.types import BatchShape
+from cfie.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
+from cfie.transformers_utils.configs.qwen3_5_moe_predictor import (
+    Qwen3_5MoePredictorConfig,
+)
 
 
 class _FakeForwardBackend:
@@ -76,27 +92,39 @@ class _FakeTokenBatchPlanner:
         )
 
 
-def _build_predictor_bundle(tmp_path: Path) -> Path:
-    # 构造一份最小可训练的 predictor 配置。
-    config = build_profile_config("qwen35-35b-a3b")
-    trainer = PredictorTrainer(
-        config,
-        teacher_model_backend=_FakeForwardBackend(
-            hidden_dim=config.model_spec.hidden_size,
-            num_layers=config.model_spec.num_hidden_layers,
-            num_experts=config.model_spec.num_experts,
-        ),
-    )
-    trainer._build_batch_planner = lambda **_: _FakeTokenBatchPlanner()
-    # 生成最小 trace 数据集并执行一轮训练。
-    dataset = trainer.build_trace_dataset(
-        steps=1,
-        examples_per_step=1,
-        dataset_path="fake.txt",
-    )
-    model, run_trace, _ = trainer.fit_dataset(dataset, epochs=1)
+def _build_training_test_config(profile_name: str = "qwen35-35b-a3b"):
+    config = build_profile_config(profile_name)
+    config.predictor_trainer.min_insertion_layer_index = 0
+    return config
 
-    # 将训练结果保存为 checkpoint，并手工组装一份最小 bundle。
+
+def _build_test_predictor_model(
+    *,
+    architecture: str = "mlp",
+    num_layers: int | None = None,
+    frozen_router_weights: torch.Tensor | None = None,
+):
+    config = build_profile_config("qwen35-35b-a3b")
+    return build_predictor_model(
+        input_dim=16,
+        hidden_dim=24,
+        window_layers=config.predictor_routing.window_layers,
+        num_experts=64,
+        model_architecture=architecture,
+        model_depth=2,
+        model_dropout=0.0,
+        model_num_heads=1,
+        model_memory_tokens=1,
+        model_ffn_multiplier=2,
+        num_layers=num_layers,
+        frozen_router_weights=frozen_router_weights,
+    ).eval()
+
+
+def _build_predictor_bundle(tmp_path: Path) -> Path:
+    config = build_profile_config("qwen35-35b-a3b")
+    model = _build_test_predictor_model()
+
     checkpoint_path = tmp_path / "predictor.ckpt"
     bundle_dir = tmp_path / "bundle"
     bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -104,20 +132,15 @@ def _build_predictor_bundle(tmp_path: Path) -> Path:
     schema_path = bundle_dir / "predictor_schema.json"
     metrics_path = bundle_dir / "predictor_metrics.json"
     manifest_path = bundle_dir / "predictor_bundle.json"
-    trainer.save_checkpoint(
-        model=model,
-        run_trace=run_trace,
-        path=checkpoint_path,
-    )
 
     schema = PredictorRuntimeSchema(
         schema_kind="cfie_predictor_runtime_schema",
         profile_name=config.profile_name,
-        input_summary_dim=config.model_spec.hidden_size,
-        predictor_hidden_dim=config.predictor_trainer.hidden_dim,
+        input_summary_dim=16,
+        predictor_hidden_dim=24,
         window_layers=config.predictor_routing.window_layers,
         stride_layers=config.predictor_routing.stride_layers,
-        num_experts=config.model_spec.num_experts,
+        num_experts=64,
         candidate_experts_per_layer=(
             config.predictor_routing.candidate_experts_per_layer
         ),
@@ -127,19 +150,17 @@ def _build_predictor_bundle(tmp_path: Path) -> Path:
         selection_mode=config.predictor_routing.selection_mode,
         online_expert_source=config.predictor_routing.online_expert_source,
         allow_candidate_mismatch=config.predictor_routing.allow_candidate_mismatch,
+        model_descriptor=model.model_descriptor(),
+        min_insertion_layer_index=config.predictor_trainer.min_insertion_layer_index,
     ).validate()
     metrics = PredictorMetricsSummary(
         metrics_kind="cfie_predictor_metrics_summary",
-        profile_name=run_trace.profile_name,
-        example_count=run_trace.example_count,
-        epochs=run_trace.epochs,
-        final_mean_loss=run_trace.final_mean_loss,
-        final_recall_at_candidate_budget=(
-            run_trace.final_recall_at_candidate_budget
-        ),
-        final_recall_at_executed_budget=(
-            run_trace.final_recall_at_executed_budget
-        ),
+        profile_name=config.profile_name,
+        example_count=32,
+        epochs=1,
+        final_mean_loss=0.1,
+        final_recall_at_candidate_budget=0.75,
+        final_recall_at_executed_budget=0.5,
     ).validate()
     manifest = PredictorDeploymentManifest(
         bundle_kind="cfie_predictor_deployment_bundle",
@@ -174,8 +195,139 @@ def _build_predictor_bundle(tmp_path: Path) -> Path:
         json.dumps(manifest.to_dict(), indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    # 返回 bundle 目录，供测试继续加载。
     return bundle_dir
+
+
+def _build_predictor_checkpoint(tmp_path: Path) -> Path:
+    config = build_profile_config("qwen35-35b-a3b")
+    model = _build_test_predictor_model()
+    metadata = PredictorCheckpointMetadata(
+        checkpoint_kind="cfie_predictor_checkpoint",
+        profile_name=config.profile_name,
+        input_summary_dim=16,
+        hidden_dim=24,
+        model_descriptor=model.model_descriptor(),
+        window_layers=config.predictor_routing.window_layers,
+        stride_layers=config.predictor_routing.stride_layers,
+        num_experts=64,
+        candidate_experts_per_layer=(
+            config.predictor_routing.candidate_experts_per_layer
+        ),
+        executed_experts_per_layer=(
+            config.predictor_routing.executed_experts_per_layer
+        ),
+        selection_mode=config.predictor_routing.selection_mode,
+        online_expert_source=config.predictor_routing.online_expert_source,
+        allow_candidate_mismatch=config.predictor_routing.allow_candidate_mismatch,
+        min_insertion_layer_index=config.predictor_trainer.min_insertion_layer_index,
+        example_count=32,
+        epochs=1,
+        final_mean_loss=0.1,
+        final_recall_at_candidate_budget=0.75,
+        final_recall_at_executed_budget=0.5,
+    )
+    checkpoint_path = tmp_path / "predictor.ckpt"
+    torch.save(
+        {
+            "metadata": metadata.to_dict(),
+            "model_state_dict": model.state_dict(),
+        },
+        checkpoint_path,
+    )
+    return checkpoint_path
+
+
+def _write_fake_router_base_model(
+    tmp_path: Path,
+    *,
+    num_layers: int,
+    num_experts: int,
+    input_dim: int,
+) -> tuple[Path, torch.Tensor]:
+    model_dir = tmp_path / "base_model"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    tensors = {
+        f"model.layers.{layer_index}.mlp.gate.weight": (
+            torch.arange(
+                num_experts * input_dim,
+                dtype=torch.float32,
+            ).reshape(num_experts, input_dim)
+            + float(layer_index)
+        )
+        for layer_index in range(num_layers)
+    }
+    save_file(tensors, model_dir / "model.safetensors")
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {name: "model.safetensors" for name in tensors},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    router_weights = torch.stack(
+        [
+            tensors[f"model.layers.{layer_index}.mlp.gate.weight"]
+            for layer_index in range(num_layers)
+        ],
+        dim=0,
+    )
+    return model_dir, router_weights
+
+
+def _build_frozen_router_delta_checkpoint(
+    tmp_path: Path,
+) -> tuple[Path, Path, torch.nn.Module]:
+    config = build_profile_config("qwen35-35b-a3b")
+    num_layers = 12
+    base_model_dir, router_weights = _write_fake_router_base_model(
+        tmp_path,
+        num_layers=num_layers,
+        num_experts=64,
+        input_dim=16,
+    )
+    model = _build_test_predictor_model(
+        architecture="frozen_router_delta",
+        num_layers=num_layers,
+        frozen_router_weights=router_weights,
+    )
+    metadata = PredictorCheckpointMetadata(
+        checkpoint_kind="cfie_predictor_checkpoint",
+        profile_name=config.profile_name,
+        input_summary_dim=16,
+        hidden_dim=24,
+        model_descriptor=model.model_descriptor(),
+        window_layers=config.predictor_routing.window_layers,
+        stride_layers=config.predictor_routing.stride_layers,
+        num_experts=64,
+        candidate_experts_per_layer=(
+            config.predictor_routing.candidate_experts_per_layer
+        ),
+        executed_experts_per_layer=(
+            config.predictor_routing.executed_experts_per_layer
+        ),
+        selection_mode=config.predictor_routing.selection_mode,
+        online_expert_source=config.predictor_routing.online_expert_source,
+        allow_candidate_mismatch=config.predictor_routing.allow_candidate_mismatch,
+        min_insertion_layer_index=config.predictor_trainer.min_insertion_layer_index,
+        example_count=32,
+        epochs=1,
+        final_mean_loss=0.1,
+        final_recall_at_candidate_budget=0.75,
+        final_recall_at_executed_budget=0.5,
+    )
+    checkpoint_path = tmp_path / "frozen_router_delta.ckpt"
+    torch.save(
+        {
+            "metadata": metadata.to_dict(),
+            "model_state_dict": model.state_dict(),
+        },
+        checkpoint_path,
+    )
+    return checkpoint_path, base_model_dir, model
 
 
 def test_load_predictor_bundle_reads_bundle_directory(tmp_path: Path) -> None:
@@ -190,6 +342,7 @@ def test_load_predictor_bundle_reads_bundle_directory(tmp_path: Path) -> None:
     assert bundle.schema.window_layers == 8
     assert bundle.schema.candidate_experts_per_layer == 40
     assert bundle.schema.executed_experts_per_layer == 8
+    assert bundle.schema.model_descriptor["architecture"] == "mlp"
     assert bundle.weights_path.name == "predictor_weights.pt"
     assert "input_proj.weight" in bundle.state_dict
 
@@ -208,6 +361,49 @@ def test_load_predictor_model_rebuilds_predictor_module(tmp_path: Path) -> None:
         bundle.schema.window_layers,
         bundle.schema.num_experts,
     )
+
+
+def test_load_predictor_model_rebuilds_predictor_module_from_checkpoint(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = _build_predictor_checkpoint(tmp_path)
+
+    model, bundle = load_predictor_model(checkpoint_path)
+    outputs = model(
+        torch.zeros(2, bundle.schema.input_summary_dim, dtype=torch.float32),
+        torch.tensor([0.0, 7.0], dtype=torch.float32),
+    )
+
+    assert bundle.manifest is None
+    assert bundle.checkpoint_metadata is not None
+    assert bundle.schema.model_descriptor["architecture"] == "mlp"
+    assert tuple(outputs.shape) == (
+        2,
+        bundle.schema.window_layers,
+        bundle.schema.num_experts,
+    )
+
+
+def test_load_predictor_model_rebuilds_frozen_router_delta_from_checkpoint(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path, base_model_dir, reference_model = (
+        _build_frozen_router_delta_checkpoint(tmp_path)
+    )
+    hidden_state = torch.randn(2, 16, dtype=torch.float32)
+    layer_index = torch.tensor([1.0, 3.0], dtype=torch.float32)
+
+    loaded_model, bundle = load_predictor_model(
+        checkpoint_path,
+        base_model_path=base_model_dir,
+        num_layers=12,
+    )
+
+    expected = reference_model(hidden_state, layer_index)
+    actual = loaded_model(hidden_state, layer_index)
+
+    assert bundle.schema.model_descriptor["architecture"] == "frozen_router_delta"
+    assert torch.allclose(actual, expected)
 
 
 def test_load_predictor_model_preserves_bundle_weight_dtype(
@@ -314,10 +510,101 @@ def test_predictor_candidate_planner_rejects_bad_hidden_summary_dim(
         )
 
 
+def test_model_loader_promotes_qwen_moe_to_predictor_runtime_override() -> None:
+    class _FakeRegistry:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def resolve_model_cls(self, architectures, model_config):
+            del model_config
+            arch_tuple = tuple(architectures)
+            self.calls.append(arch_tuple)
+            if arch_tuple == ("Qwen3_5MoePredictorForConditionalGeneration",):
+                return torch.nn.Module, "Qwen3_5MoePredictorForConditionalGeneration"
+            return torch.nn.Module, "Qwen3_5MoeForConditionalGeneration"
+
+    registry = _FakeRegistry()
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            predictor_checkpoint_path="predictor.ckpt",
+            predictor_bundle_path=None,
+        ),
+        hf_text_config=SimpleNamespace(
+            predictor_checkpoint_path=None,
+            predictor_bundle_path=None,
+        ),
+        registry=registry,
+        _get_transformers_backend_cls=lambda: "TransformersModel",
+        model_impl="cfie",
+        convert_type="none",
+    )
+
+    _model_cls, arch = model_loader_utils._get_model_architecture(model_config)
+
+    assert arch == "Qwen3_5MoePredictorForConditionalGeneration"
+    assert registry.calls == [
+        ("Qwen3_5MoeForConditionalGeneration",),
+        ("Qwen3_5MoePredictorForConditionalGeneration",),
+    ]
+
+
+def test_qwen35_predictor_schedule_routing_state_prefetches_future_experts() -> None:
+    prefetch_calls: list[tuple[int, ...]] = []
+    controller = SimpleNamespace(
+        prefetch=lambda expert_ids: prefetch_calls.append(tuple(expert_ids))
+    )
+    future_layer = SimpleNamespace(
+        mlp=SimpleNamespace(
+            experts=SimpleNamespace(_cfie_tiered_cache_controller=controller)
+        )
+    )
+    model = Qwen3_5PredictorModel.__new__(Qwen3_5PredictorModel)
+    model.predictor_forward_state = PredictorForwardState()
+    model._predictor_decoder_layer = (
+        lambda *, layer_index: future_layer if layer_index == 12 else None
+    )
+    routing_state = PredictorLayerRoutingState(
+        insertion_layer_index=8,
+        layer_plan=CandidateLayerPlan(
+            future_layer_index=12,
+            predicted_executed_expert_ids=(5, 7),
+            candidate_expert_ids=(5, 7, 11),
+            candidate_scores=(0.9, 0.8, 0.7),
+        ),
+    )
+
+    model._schedule_predictor_routing_state(routing_state)
+
+    assert model.predictor_forward_state.pending_layer_plans[12] is routing_state
+    assert prefetch_calls == [(5, 7)]
+
+
+def test_predictor_processing_info_coerces_base_moe_config() -> None:
+    hf_config = Qwen3_5MoeConfig()
+    hf_config.predictor_checkpoint_path = "predictor.ckpt"
+    hf_config.predictor_map_location = "cpu"
+    hf_config.predictor_device = "cpu"
+    hf_config.text_config.predictor_checkpoint_path = "predictor.ckpt"
+    hf_config.text_config.predictor_map_location = "cpu"
+    hf_config.text_config.predictor_device = "cpu"
+
+    info = Qwen3_5MoePredictorProcessingInfo.__new__(
+        Qwen3_5MoePredictorProcessingInfo
+    )
+    info.ctx = SimpleNamespace(get_hf_config=lambda *args, **kwargs: hf_config)
+
+    coerced = info.get_hf_config()
+
+    assert isinstance(coerced, Qwen3_5MoePredictorConfig)
+    assert coerced.predictor_checkpoint_path == "predictor.ckpt"
+    assert coerced.text_config.predictor_checkpoint_path == "predictor.ckpt"
+
+
 def test_predictor_trainer_prefers_forward_capture_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = build_profile_config("qwen35-35b-a3b")
+    config = _build_training_test_config()
     trainer = PredictorTrainer(
         config,
         teacher_model_backend=_FakeForwardBackend(
@@ -349,7 +636,7 @@ def test_predictor_trainer_streams_trace_dataset_to_json_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = build_profile_config("qwen35-35b-a3b")
+    config = _build_training_test_config()
     trainer = PredictorTrainer(
         config,
         teacher_model_backend=_FakeForwardBackend(
@@ -394,7 +681,7 @@ def test_predictor_trainer_streams_trace_dataset_to_json_file(
 def test_predictor_trainer_rejects_dataset_config_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = build_profile_config("qwen35-35b-a3b")
+    config = _build_training_test_config()
     trainer = PredictorTrainer(
         config,
         teacher_model_backend=_FakeForwardBackend(
@@ -426,7 +713,7 @@ def test_predictor_trainer_rejects_dataset_config_mismatch(
 def test_predictor_trainer_rejects_resume_run_trace_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = build_profile_config("qwen35-35b-a3b")
+    config = _build_training_test_config()
     trainer = PredictorTrainer(
         config,
         teacher_model_backend=_FakeForwardBackend(

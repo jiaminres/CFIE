@@ -12,7 +12,7 @@ from typing import Sequence
 import torch
 
 from cfie_training.config import TrainingProjectConfig
-from cfie_training.predictor import PredictorTraceDataset, PredictorTrainer
+from cfie_training.predictor import PredictorTrainer
 from cfie_training.predictor.trainer import (
     DEFAULT_TRACE_FLUSH_EVERY_STEPS,
     PredictorTraceBuildProgress,
@@ -115,8 +115,6 @@ def build_parser() -> argparse.ArgumentParser:
     # 注册 predictor 教师轨迹采样命令，用于构造 predictor 训练所需的教师轨迹样本。
     # ------------------------------- 注册 predictor 子命令族 -------------------------------
     #
-    # predictor-trace -> predictor-train -> predictor-eval。
-    # predictor-inspect 作为 checkpoint 元信息检查辅助命令。
     #
     # ------------------------------- 注册 predictor-trace 子命令 -------------------------------
     predictor_trace_parser = subparsers.add_parser(
@@ -340,119 +338,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # 注册 predictor checkpoint 元信息检查命令，用于查看 checkpoint 中保存的基础元数据。
-    # ------------------------------- 注册 predictor-inspect 辅助子命令 -------------------------------
-    predictor_inspect_parser = subparsers.add_parser(
-        "predictor-inspect",
-        help="Inspect predictor checkpoint metadata.",
-    )
-    # 添加 checkpoint 路径参数，该参数必填，用于指定需要检查的 predictor checkpoint。
-    predictor_inspect_parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        required=True,
-        help="Predictor checkpoint to inspect.",
-    )
-    # 添加 JSON 输出开关，用于控制是否以 JSON 形式输出 checkpoint 元数据。
-    predictor_inspect_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit the predictor checkpoint metadata as JSON.",
-    )
-
-    # 注册 predictor 评估命令，用于在教师轨迹上评估指定 predictor checkpoint。
-    # ------------------------------- 注册 predictor-eval 子命令 -------------------------------
-    predictor_eval_parser = subparsers.add_parser(
-        "predictor-eval",
-        help="Evaluate a predictor checkpoint on teacher traces.",
-    )
-    # 添加配置文件路径参数，用于从外部 JSON 文件加载评估配置。
-    predictor_eval_parser.add_argument(
-        "--config",
-        type=Path,
-        help="Optional JSON config file.",
-    )
-    # 添加训练档位参数，在未提供配置文件时选择内置训练档位。
-    predictor_eval_parser.add_argument(
-        "--profile",
-        choices=SUPPORTED_TRAINING_PROFILES,
-        default=DEFAULT_TRAINING_PROFILE,
-        help="Training profile to use when --config is not provided.",
-    )
-    # 添加 checkpoint 路径参数，该参数必填，用于指定待评估的 predictor checkpoint。
-    predictor_eval_parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        required=True,
-        help="Predictor checkpoint to evaluate.",
-    )
-    # 添加轨迹输入文件参数，用于直接复用已有 predictor trace 数据进行评估。
-    predictor_eval_parser.add_argument(
-        "--trace-input",
-        type=Path,
-        help="Optional predictor trace dataset JSON used instead of recapturing traces.",
-    )
-    # 添加规划步数参数，用于指定构造评估轨迹时使用的 planning step 数量。
-    predictor_eval_parser.add_argument(
-        "--steps",
-        type=int,
-        default=2,
-        help="Number of planning steps used to build evaluation traces.",
-    )
-    # 添加每步样本数覆盖参数，用于显式指定每个评估 step 生成多少条轨迹样本。
-    predictor_eval_parser.add_argument(
-        "--examples-per-step",
-        type=int,
-        default=None,
-        help="Optional override for the number of evaluation trace examples per step.",
-    )
-    # 添加每个评估轨迹采集步骤的基础样本数参数。
-    predictor_eval_parser.add_argument(
-        "--samples",
-        type=int,
-        default=2,
-        help="Base samples per evaluation trace-capture step.",
-    )
-    # 添加每个评估样本的 token 数参数，用于控制评估轨迹长度。
-    predictor_eval_parser.add_argument(
-        "--tokens-per-sample",
-        type=int,
-        default=256,
-        help="Tokens per sample used during evaluation trace capture.",
-    )
-    # 添加数据集路径参数，用于从文本文件或 JSONL 文件构造 token 化评估批次。
-    predictor_eval_parser.add_argument(
-        "--dataset",
-        type=Path,
-        help="Text or JSONL dataset file used to build tokenized evaluation batches.",
-    )
-    # 添加 tokenizer 路径参数，未指定时默认使用训练档位对应的模型路径。
-    predictor_eval_parser.add_argument(
-        "--tokenizer",
-        type=Path,
-        help="Optional tokenizer path. Defaults to the training profile model path.",
-    )
-    # 添加数据集格式参数，用于声明数据集格式或启用自动识别。
-    predictor_eval_parser.add_argument(
-        "--dataset-format",
-        choices=("auto", "text", "jsonl"),
-        default="auto",
-        help="Dataset file format. Defaults to auto-detect from extension.",
-    )
-    # 添加 JSONL 文本字段名参数，用于指定从 JSONL 的哪个字段中读取评估文本。
-    predictor_eval_parser.add_argument(
-        "--dataset-text-key",
-        default="text",
-        help="JSONL text field to read when --dataset-format jsonl is used.",
-    )
-    # 添加 JSON 输出开关，用于控制是否输出 predictor 评估轨迹。
-    predictor_eval_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit the predictor evaluation trace as JSON.",
-    )
-
-    # ------------------------------- 注册训练基座校验、模拟、启动估算与训练命令 -------------------------------
-    # 注册配置校验命令，用于检查训练项目配置是否合法。
     validate_parser = subparsers.add_parser(
         "validate",
         help="Validate the training project configuration.",
@@ -792,7 +677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         parser.error("predictor-trace --flush-every-steps must be >= 0")
     if (
-            args.command in {"predictor-train", "predictor-eval"}
+            args.command == "predictor-train"
             and args.trace_input is None
             and args.dataset is None
     ):
@@ -813,45 +698,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("predictor-train --checkpoint-every-epochs must be >= 1")
 
     # ------------------------------- 处理独立于通用配置加载的 predictor checkpoint 检查命令 -------------------------------
-    # 当命令为 predictor-inspect 时，直接读取 checkpoint 元信息，而不走通用配置加载流程。
-    if args.command == "predictor-inspect":
-        # predictor-inspect 的摘要信息统一走标准日志。
-        logger = LOGGER.getChild("predictor.inspect")
-        # 读取指定 predictor checkpoint 的元信息。
-        metadata = PredictorTrainer.read_checkpoint_metadata(args.checkpoint)
-
-        # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出 checkpoint 元信息。
-        if args.json:
-            # 将 checkpoint 元信息转换为字典后，以格式化 JSON 方式输出。
-            _emit_stdout(json.dumps(metadata.to_dict(), indent=2, sort_keys=True))
-        else:
-            # 输出 checkpoint 的基础身份信息与来源信息。
-            logger.info(
-                f"checkpoint_kind={metadata.checkpoint_kind} "
-                f"profile={metadata.profile_name}"
-            )
-            # 输出模型结构相关元信息。
-            logger.info(
-                f"input_summary_dim={metadata.input_summary_dim} "
-                f"hidden_dim={metadata.hidden_dim} "
-                f"window={metadata.window_layers} "
-                f"stride={metadata.stride_layers} "
-                f"num_experts={metadata.num_experts}"
-            )
-            # 输出训练轮数、最终损失与召回指标等结果信息。
-            logger.info(
-                f"candidate={metadata.candidate_experts_per_layer} "
-                f"executed={metadata.executed_experts_per_layer} "
-                f"epochs={metadata.epochs} "
-                f"final_loss={metadata.final_mean_loss:.6f} "
-                f"recall@candidate={metadata.final_recall_at_candidate_budget:.4f}"
-            )
-
-        # 当前命令执行成功，返回 0。
-        return 0
-
-    # ------------------------------- 加载其余命令共享的通用训练配置 -------------------------------
-    # 对除独立命令外的其余命令，统一按标准方式加载训练配置。
     config = _load_config(args)
 
     # ------------------------------- 处理 predictor trace 数据集构造命令 -------------------------------
@@ -1045,73 +891,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     # ------------------------------- 处理 predictor 评估命令 -------------------------------
-    # 当命令为 predictor-eval 时，执行 checkpoint 评估流程。
-    if args.command == "predictor-eval":
-        # 基于当前配置创建 predictor 训练器。
-        trainer = PredictorTrainer(config)
-        # predictor-eval 的摘要信息统一走标准日志。
-        logger = LOGGER.getChild("predictor.eval")
-
-        # ------------------------------- 构造或加载 predictor 评估所需的 trace 数据集 -------------------------------
-        # 当用户提供现成的 trace 输入文件时，直接走流式 trace store 评估路径，
-        # 避免把大体积 JSON 一次性整体读入内存。
-        if args.trace_input is not None:
-            evaluation = trainer.evaluate_trace_file(
-                path=args.trace_input,
-                checkpoint_path=args.checkpoint,
-                device=_default_predictor_trace_device(),
-            )
-        else:
-            # 未提供现成 trace 输入时，现场构造评估所需的 predictor trace 数据集。
-            progress_bar = _PredictorTraceProgressBar(
-                total_steps=args.steps,
-                description="predictor-eval trace",
-            )
-            try:
-                dataset = trainer.build_trace_dataset(
-                    steps=args.steps,
-                    examples_per_step=args.examples_per_step,
-                    samples=args.samples,
-                    tokens_per_sample=args.tokens_per_sample,
-                    dataset_path=None if args.dataset is None else str(args.dataset),
-                    tokenizer_path=None if args.tokenizer is None else str(args.tokenizer),
-                    dataset_format=args.dataset_format,
-                    dataset_text_key=args.dataset_text_key,
-                    progress_callback=progress_bar.update,
-                )
-            finally:
-                progress_bar.close()
-
-            # ------------------------------- 使用指定 checkpoint 对 trace 数据集执行评估 -------------------------------
-            # 基于给定 checkpoint 与评估数据集执行评估。
-            evaluation = trainer.evaluate_checkpoint(
-                checkpoint_path=args.checkpoint,
-                dataset=dataset,
-            )
-
-        # ------------------------------- 输出 predictor 评估结果 -------------------------------
-        # 根据用户是否指定 --json，选择 JSON 或摘要文本方式输出评估结果。
-        if args.json:
-            # 输出完整评估结果的 JSON 表示。
-            _emit_stdout(evaluation.to_json())
-        else:
-            # 输出评估完成信息与样本规模。
-            logger.info(
-                f"Evaluated predictor for profile {evaluation.profile_name} on "
-                f"{evaluation.example_count} trace example(s)."
-            )
-            # 输出平均损失与不同预算下的召回率指标。
-            logger.info(
-                f"loss={evaluation.mean_loss:.6f} "
-                f"recall@candidate={evaluation.recall_at_candidate_budget:.4f} "
-                f"recall@executed={evaluation.recall_at_executed_budget:.4f}"
-            )
-
-        # 当前命令执行成功，返回 0。
-        return 0
-
-    # ------------------------------- 处理训练配置校验命令 -------------------------------
-    # 当命令为 validate 时，只需确认配置能够通过校验。
     if args.command == "validate":
         # 根据用户是否指定 --json，选择输出完整配置或简短确认信息。
         if args.json:

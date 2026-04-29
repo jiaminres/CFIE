@@ -222,15 +222,22 @@ def build_qwen35_35b_a3b_config() -> TrainingProjectConfig:
             # 输入摘要向量维度。
             input_summary_dim=64,
             # predictor 隐藏层维度。
-            hidden_dim=128,
+            hidden_dim=384,
+            model_architecture="frozen_router_delta",
+            model_depth=4,
+            model_dropout=0.0,
+            model_ffn_multiplier=4,
             # predictor 训练批大小。
-            batch_size=8,
+            batch_size=4096,
             # predictor 默认训练轮数。
-            epochs=4,
+            epochs=200,
             # predictor 训练学习率。
             learning_rate=1e-3,
             # predictor 权重衰减系数。
             weight_decay=1e-4,
+            hard_target_loss_weight=0.0,
+            router_distill_loss_weight=1.0,
+            min_insertion_layer_index=1,
             # 每一步默认构造的样本数。
             examples_per_step=4,
             # 合成轨迹噪声幅度。

@@ -15,11 +15,13 @@ class Qwen3_5MoePredictorTextConfig(Qwen3_5MoeTextConfig):
     def __init__(
         self,
         predictor_bundle_path: str | None = None,
+        predictor_checkpoint_path: str | None = None,
         predictor_map_location: str = "cpu",
         predictor_device: str = "cpu",
         **kwargs,
     ):
         self.predictor_bundle_path = predictor_bundle_path
+        self.predictor_checkpoint_path = predictor_checkpoint_path
         self.predictor_map_location = predictor_map_location
         self.predictor_device = predictor_device
         super().__init__(**kwargs)
@@ -46,11 +48,13 @@ class Qwen3_5MoePredictorConfig(Qwen3_5MoeConfig):
         vision_end_token_id=248054,
         tie_word_embeddings=False,
         predictor_bundle_path: str | None = None,
+        predictor_checkpoint_path: str | None = None,
         predictor_map_location: str = "cpu",
         predictor_device: str = "cpu",
         **kwargs,
     ):
         self.predictor_bundle_path = predictor_bundle_path
+        self.predictor_checkpoint_path = predictor_checkpoint_path
         self.predictor_map_location = predictor_map_location
         self.predictor_device = predictor_device
         super().__init__(

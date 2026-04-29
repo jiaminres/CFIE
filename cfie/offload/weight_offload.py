@@ -26,7 +26,15 @@ from cfie.model_executor.layers.quantization.gptq_marlin import GPTQMarlinMoEMet
 from cfie.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_moe_permute_scales,
 )
-from cfie.offload.cpu_backend import ExpertBundle, bundle_nbytes
+from cfie.offload.cpu_backend import (
+    ExpertBundle,
+    PackedExpertTensorSpec,
+    allocate_packed_cpu_tensor_views,
+    bundle_nbytes,
+    pack_cpu_bundles_by_expert,
+    pack_batched_cpu_tensor_dicts_by_expert,
+    pack_cpu_tensor_dict,
+)
 from cfie.offload.nvme_backend import SafetensorExpertStore
 from cfie.offload.policy import (
     LOG_RUNTIME_EVENTS_KEY,
@@ -43,6 +51,42 @@ DEFAULT_PREFILL_BURST_TOKENS_PER_GPU_SLOT = 4
 DEFAULT_CPU_STATIC_PREPROCESS_BATCH_SIZE_CAP = 0
 DEFAULT_CPU_STATIC_PREPROCESS_CPU_RESERVE_BYTES = 1 << 30
 DEFAULT_CPU_STATIC_PREPROCESS_GPU_RESERVE_BYTES = 512 << 20
+DEFAULT_PINNED_CPU_STATIC_LIMIT_BYTES = 8 << 30
+DEFAULT_RUNTIME_SPARSE_DIRECT_MAX_EXPERTS = 16
+_PINNED_LAYER_PACKING_EXHAUSTED = False
+
+
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        message = str(current).lower()
+        if (
+            "out of memory" in message
+            or "cudaerrormemoryallocation" in message
+            or ("memory allocation" in message and "cuda" in message)
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _synchronize_torch_device_best_effort(
+    device: torch.device | str | None,
+) -> None:
+    if device is None:
+        return
+    try:
+        resolved = torch.device(device)
+    except (TypeError, RuntimeError, ValueError):
+        return
+    if resolved.type != "cuda":
+        return
+    try:
+        torch.cuda.synchronize(resolved)
+    except (RuntimeError, TypeError, ValueError):
+        return
 
 
 def _tensor_debug_summary(tensor: torch.Tensor | None) -> str:
@@ -59,6 +103,37 @@ def _tensor_debug_summary(tensor: torch.Tensor | None) -> str:
 
 def _debug_layer_key(obj: Any) -> str:
     return str(getattr(obj, "layer_key", "<unknown-layer>"))
+
+
+def _resolve_runtime_load_strategy() -> str:
+    strategy = os.getenv(
+        "CFIE_MOE_RUNTIME_LOAD_STRATEGY",
+        "sparse_direct",
+    ).strip().lower()
+    if strategy in {"auto", "dense_batch", "sparse_direct"}:
+        return strategy
+    logger.warning(
+        "Unknown CFIE_MOE_RUNTIME_LOAD_STRATEGY=%r; "
+        "falling back to 'sparse_direct'",
+        strategy,
+    )
+    return "sparse_direct"
+
+
+def _resolve_runtime_sparse_direct_max_experts() -> int:
+    raw = os.getenv("CFIE_MOE_RUNTIME_SPARSE_DIRECT_MAX_EXPERTS", "").strip()
+    if not raw:
+        return DEFAULT_RUNTIME_SPARSE_DIRECT_MAX_EXPERTS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid CFIE_MOE_RUNTIME_SPARSE_DIRECT_MAX_EXPERTS=%r; "
+            "falling back to %d",
+            raw,
+            DEFAULT_RUNTIME_SPARSE_DIRECT_MAX_EXPERTS,
+        )
+        return DEFAULT_RUNTIME_SPARSE_DIRECT_MAX_EXPERTS
 
 
 def _get_available_cpu_memory_bytes_best_effort() -> int | None:
@@ -609,12 +684,25 @@ class LayerTieredExpertCacheController:
         self._use_pinned_cpu = is_pin_memory_available()
         planned_cpu_static_bytes = int(self.plan.get("cpu_static_bytes", 0) or 0)
         self._use_pinned_cpu_static = bool(self._use_pinned_cpu)
-        if planned_cpu_static_bytes > 0 and not self._use_pinned_cpu_static:
-            raise RuntimeError(
-                f"{self.layer_key}: pinned CPU memory is required for the CPU "
-                "static expert mirror, but pin_memory is unavailable on the "
-                "current platform/runtime."
+        if (
+                self._use_pinned_cpu_static
+                and planned_cpu_static_bytes > DEFAULT_PINNED_CPU_STATIC_LIMIT_BYTES
+        ):
+            self._use_pinned_cpu_static = False
+            logger.info(
+                "Disabling pinned CPU static expert mirror: layer=%s "
+                "cpu_static=%.2f GiB limit=%.2f GiB",
+                self.layer_key,
+                planned_cpu_static_bytes / (1 << 30),
+                DEFAULT_PINNED_CPU_STATIC_LIMIT_BYTES / (1 << 30),
             )
+        if planned_cpu_static_bytes > 0 and not self._use_pinned_cpu_static:
+            if not self._use_pinned_cpu:
+                raise RuntimeError(
+                    f"{self.layer_key}: pinned CPU memory is required for the CPU "
+                    "static expert mirror, but pin_memory is unavailable on the "
+                    "current platform/runtime."
+                )
         # 保存已物化到 CPU 常驻内存中的静态 expert bundle。
         self._cpu_static_bundles: dict[int, ExpertBundle] = {}
 
@@ -632,6 +720,13 @@ class LayerTieredExpertCacheController:
 
         # 非量化路径下用于在 CPU 侧暂存并重组原始专家权重的 raw buffer。
         self._cpu_unquantized_raw_buffer: _RawUnquantizedExpertWeights | None = None
+        self._cpu_runtime_batch_buffers: dict[str, torch.Tensor] = {}
+        self._prefetch_stream: torch.cuda.Stream | None = None
+        self._pending_prefetch_event: torch.cuda.Event | None = None
+        self._runtime_load_strategy = _resolve_runtime_load_strategy()
+        self._runtime_sparse_direct_max_experts = (
+            _resolve_runtime_sparse_direct_max_experts()
+        )
 
         # ------------------------------- 计算 prefill burst 的最小 token 触发阈值 -------------------------------
         # 优先读取计划中显式配置的 burst 最小 token 阈值。
@@ -734,6 +829,9 @@ class LayerTieredExpertCacheController:
 
         # ------------------------------- 初始化 CPU 常驻 expert 池与原始权重缓冲区 -------------------------------
         # 根据当前计划与权重模式初始化 CPU 侧固定 expert 池和原始权重缓冲区。
+        if self.device.type == "cuda":
+            self._prefetch_stream = torch.cuda.Stream(device=self.device)
+
         self._init_cpu_fixed_pools()
 
     @property
@@ -776,6 +874,7 @@ class LayerTieredExpertCacheController:
         # 没有共享 burst pool 时，说明该层不支持/未启用该执行路径。
         if self.prefill_burst_pool is None:
             raise RuntimeError(f"{self.layer_key}: prefill burst pool is not available")
+        self._wait_for_pending_prefetch()
         # 真正执行逻辑下沉给共享 burst pool。
         return self.prefill_burst_pool.execute(
             controller=self,
@@ -785,9 +884,74 @@ class LayerTieredExpertCacheController:
             shared_experts_input=shared_experts_input,
         )
 
+    def _wait_for_pending_prefetch(self) -> None:
+        pending_event = self._pending_prefetch_event
+        if pending_event is None or self.device.type != "cuda":
+            return
+        current_stream().wait_event(pending_event)
+        self._pending_prefetch_event = None
+
+    def _record_pending_prefetch(self) -> None:
+        if self._prefetch_stream is None or self.device.type != "cuda":
+            return
+        event = torch.cuda.Event()
+        event.record(self._prefetch_stream)
+        self._pending_prefetch_event = event
+
+    def _normalize_requested_experts(
+            self,
+            expert_ids: torch.Tensor | list[int] | tuple[int, ...],
+    ) -> list[int]:
+        if torch.is_tensor(expert_ids):
+            requested = self._unique_experts(expert_ids)
+        else:
+            requested = []
+            seen: set[int] = set()
+            for expert_id in expert_ids:
+                parsed = int(expert_id)
+                if parsed < 0 or parsed in seen:
+                    continue
+                requested.append(parsed)
+                seen.add(parsed)
+        if len(requested) <= self.num_slots:
+            return requested
+        return requested[: self.num_slots]
+
+    def _build_load_plan(
+            self,
+            requested: list[int],
+    ) -> list[tuple[int, int]]:
+        protected = set(requested)
+        load_plan: list[tuple[int, int]] = []
+        for expert_id in requested:
+            if self._is_resident(expert_id):
+                continue
+            slot = self._choose_victim_slot(protected)
+            load_plan.append((expert_id, slot))
+            protected.add(expert_id)
+        return load_plan
+
+    def prefetch(
+            self,
+            expert_ids: torch.Tensor | list[int] | tuple[int, ...],
+    ) -> None:
+        requested = self._normalize_requested_experts(expert_ids)
+        if not requested:
+            return
+        load_plan = self._build_load_plan(requested)
+        if not load_plan:
+            return
+        if self._prefetch_stream is None:
+            self._load_experts_into_slots(load_plan)
+            return
+        with torch.cuda.stream(self._prefetch_stream):
+            self._load_experts_into_slots(load_plan)
+        self._record_pending_prefetch()
+
     def prepare(self, topk_ids: torch.Tensor) -> None:
+        self._wait_for_pending_prefetch()
         # ----------------- 解析本次请求的唯一 experts 集合 -----------------
-        requested = self._unique_experts(topk_ids)
+        requested = self._normalize_requested_experts(topk_ids)
         # 没有 routed experts 时无需做任何事。
         if not requested:
             return
@@ -804,22 +968,7 @@ class LayerTieredExpertCacheController:
             self._access_count[expert_id] += 1
             self._last_used_step[expert_id] = self._step
 
-        # 当前请求里的 experts 不能在同一轮 prepare 中被驱逐。
-        protected = set(requested)
-        # 先把本轮缺失 experts 聚合成一个批量加载计划。
-        # 这样 Python 主流程不再把“选 slot / 取 CPU bundle / 写 GPU slot”散成多段，
-        # 后续可直接把该批量入口替换成真正的 C++/CUDA H2D 加载算子。
-        load_plan: list[tuple[int, int]] = []
-        for expert_id in requested:
-            # 已经常驻在 GPU resident slots 中的 expert 直接跳过。
-            if self._is_resident(expert_id):
-                continue
-            # 为缺失 expert 选一个可替换 slot。
-            slot = self._choose_victim_slot(protected)
-            load_plan.append((expert_id, slot))
-            protected.add(expert_id)
-
-        # 再统一执行本轮专家换入。
+        load_plan = self._build_load_plan(requested)
         if load_plan:
             self._load_experts_into_slots(load_plan)
 
@@ -937,6 +1086,88 @@ class LayerTieredExpertCacheController:
 
         return bundle
 
+    def _pack_cpu_static_bundles_layer_wide(
+            self,
+            *,
+            pin_memory: bool,
+    ) -> None:
+        if not self._cpu_static_bundles:
+            return
+
+        expert_ids = sorted(self._cpu_static_bundles)
+        bundles = [self._cpu_static_bundles[expert_id] for expert_id in expert_ids]
+        if not all(bundle.runtime_ready for bundle in bundles):
+            raise RuntimeError(
+                f"{self.layer_key}: layer-wide CPU static packing requires "
+                "runtime-ready expert bundles"
+            )
+
+        if (
+                len(bundles) >= 2
+                and all(bundle.storage is bundles[0].storage for bundle in bundles)
+                and bundles[0].pinned == pin_memory
+        ):
+            expected_stride = int(bundles[0].nbytes)
+            if all(
+                    int(bundle.storage_offset_bytes) == index * expected_stride
+                    for index, bundle in enumerate(bundles)
+            ):
+                return
+
+        packed_bundles = pack_cpu_bundles_by_expert(
+            bundles,
+            pin_memory=pin_memory,
+            runtime_ready=True,
+        )
+        self._cpu_static_bundles = {
+            expert_id: packed_bundle
+            for expert_id, packed_bundle in zip(
+                expert_ids,
+                packed_bundles,
+                strict=True,
+            )
+        }
+        logger.info(
+            "Packed layer CPU static experts into contiguous storage: "
+            "layer=%s experts=%d pinned=%s bytes=%.2f MiB",
+            self.layer_key,
+            len(expert_ids),
+            pin_memory,
+            sum(bundle.nbytes for bundle in packed_bundles) / (1 << 20),
+        )
+
+    def _pack_cpu_static_bundles_layer_wide_best_effort(self) -> None:
+        global _PINNED_LAYER_PACKING_EXHAUSTED
+
+        if not self._cpu_static_bundles:
+            return
+
+        if not bool(getattr(self, "_use_pinned_cpu_static", False)):
+            self._pack_cpu_static_bundles_layer_wide(pin_memory=False)
+            return
+
+        if _PINNED_LAYER_PACKING_EXHAUSTED:
+            self._pack_cpu_static_bundles_layer_wide(pin_memory=False)
+            return
+
+        try:
+            self._pack_cpu_static_bundles_layer_wide(pin_memory=True)
+            return
+        except Exception as exc:
+            if not _is_cuda_oom_error(exc):
+                raise
+            _PINNED_LAYER_PACKING_EXHAUSTED = True
+            _synchronize_torch_device_best_effort(getattr(self, "device", None))
+            torch.accelerator.empty_cache()
+            logger.warning(
+                "Pinned layer-wide CPU static packing exhausted; falling back "
+                "to pageable contiguous storage: layer=%s experts=%d",
+                self.layer_key,
+                len(self._cpu_static_bundles),
+            )
+
+        self._pack_cpu_static_bundles_layer_wide(pin_memory=False)
+
     def _materialize_cpu_static_bundles_eager(
             self,
             expert_ids: tuple[int, ...],
@@ -963,7 +1194,49 @@ class LayerTieredExpertCacheController:
 
         for start in range(0, len(pending), batch_size):
             batch_expert_ids = pending[start:start + batch_size]
-            self._materialize_quantized_cpu_static_batch(batch_expert_ids)
+            self._materialize_quantized_cpu_static_batch_with_retry(
+                batch_expert_ids
+            )
+
+    def _materialize_quantized_cpu_static_batch_with_retry(
+            self,
+            expert_ids: list[int],
+    ) -> None:
+        if not expert_ids:
+            return
+
+        try:
+            self._materialize_quantized_cpu_static_batch(expert_ids)
+            return
+        except Exception as exc:
+            if not _is_cuda_oom_error(exc) or len(expert_ids) <= 1:
+                raise
+
+            _synchronize_torch_device_best_effort(getattr(self, "device", None))
+            torch.accelerator.empty_cache()
+
+            next_cap = max(1, len(expert_ids) // 2)
+            configured_cap = int(
+                getattr(self, "_cpu_static_preprocess_batch_size_cap", 0) or 0
+            )
+            if configured_cap <= 0 or next_cap < configured_cap:
+                self._cpu_static_preprocess_batch_size_cap = next_cap
+
+            logger.warning(
+                "Retrying CPU static preprocess with smaller batch: layer=%s "
+                "failed=%d next_cap=%d",
+                self.layer_key,
+                len(expert_ids),
+                next_cap,
+            )
+
+        split_index = max(1, len(expert_ids) // 2)
+        self._materialize_quantized_cpu_static_batch_with_retry(
+            expert_ids[:split_index]
+        )
+        self._materialize_quantized_cpu_static_batch_with_retry(
+            expert_ids[split_index:]
+        )
 
     def _resolve_cpu_static_preprocess_batch_size(
             self,
@@ -1158,7 +1431,10 @@ class LayerTieredExpertCacheController:
         if not expert_ids:
             return
 
-        raw = self._allocate_quantized_raw_buffer(batch_size=len(expert_ids))
+        raw = self._allocate_quantized_raw_buffer(
+            batch_size=len(expert_ids),
+            pin_memory=False,
+        )
         for expert_index, expert_id in enumerate(expert_ids):
             bundle = self._load_source_expert_bundle(expert_id)
             self._assemble_raw_weights(
@@ -1170,13 +1446,18 @@ class LayerTieredExpertCacheController:
 
         runtime_tensors = self._preprocess_quantized_raw_batch(raw)
         del raw
-        for expert_index, expert_id in enumerate(expert_ids):
+        runtime_bundles = self._build_quantized_runtime_bundles(
+            runtime_tensors,
+            pin_memory=False,
+        )
+        for expert_id, runtime_bundle in zip(expert_ids, runtime_bundles, strict=False):
             self._register_cpu_static_bundle(
                 expert_id,
-                self._build_quantized_runtime_bundle(runtime_tensors, expert_index),
+                runtime_bundle,
                 eager=True,
             )
         del runtime_tensors
+        del runtime_bundles
 
     def _preprocess_cpu_static_bundle(self, bundle: ExpertBundle) -> ExpertBundle:
         # 已经是 runtime-ready 的 bundle 不重复处理。
@@ -1208,7 +1489,10 @@ class LayerTieredExpertCacheController:
         if len(bundles) == 1:
             raw = self._assemble_raw_weights(bundles[0])
         else:
-            raw = self._allocate_quantized_raw_buffer(batch_size=len(bundles))
+            raw = self._allocate_quantized_raw_buffer(
+                batch_size=len(bundles),
+                pin_memory=False,
+            )
             for expert_index, bundle in enumerate(bundles):
                 self._assemble_raw_weights(
                     bundle,
@@ -1217,13 +1501,10 @@ class LayerTieredExpertCacheController:
                 )
 
         runtime_tensors = self._preprocess_quantized_raw_batch(raw)
-        return [
-            self._build_quantized_runtime_bundle(
-                runtime_tensors,
-                expert_index,
-            )
-            for expert_index in range(len(bundles))
-        ]
+        return self._build_quantized_runtime_bundles(
+            runtime_tensors,
+            pin_memory=False,
+        )
 
     def _preprocess_quantized_raw_batch(
             self,
@@ -1308,12 +1589,30 @@ class LayerTieredExpertCacheController:
                 is_a_8bit=self.is_a_8bit,
             )
             tensors = {
-                "runtime.w13_qweight": self._to_cpu_static_tensor(repacked_w13),
-                "runtime.w2_qweight": self._to_cpu_static_tensor(repacked_w2),
-                "runtime.w13_scales": self._to_cpu_static_tensor(permuted_w13_scales),
-                "runtime.w2_scales": self._to_cpu_static_tensor(permuted_w2_scales),
-                "runtime.w13_qzeros": self._to_cpu_static_tensor(raw_gpu.w13_qzeros),
-                "runtime.w2_qzeros": self._to_cpu_static_tensor(raw_gpu.w2_qzeros),
+                "runtime.w13_qweight": self._to_cpu_static_tensor(
+                    repacked_w13,
+                    pin_memory=False,
+                ),
+                "runtime.w2_qweight": self._to_cpu_static_tensor(
+                    repacked_w2,
+                    pin_memory=False,
+                ),
+                "runtime.w13_scales": self._to_cpu_static_tensor(
+                    permuted_w13_scales,
+                    pin_memory=False,
+                ),
+                "runtime.w2_scales": self._to_cpu_static_tensor(
+                    permuted_w2_scales,
+                    pin_memory=False,
+                ),
+                "runtime.w13_qzeros": self._to_cpu_static_tensor(
+                    raw_gpu.w13_qzeros,
+                    pin_memory=False,
+                ),
+                "runtime.w2_qzeros": self._to_cpu_static_tensor(
+                    raw_gpu.w2_qzeros,
+                    pin_memory=False,
+                ),
             }
             if (
                     w13_sorted_g_idx is not None
@@ -1323,21 +1622,26 @@ class LayerTieredExpertCacheController:
                 tensors.update(
                     {
                         "runtime.w13_g_idx": self._to_cpu_static_tensor(
-                            w13_sorted_g_idx
+                            w13_sorted_g_idx,
+                            pin_memory=False,
                         ),
                         "runtime.w2_g_idx": self._to_cpu_static_tensor(
-                            w2_sorted_g_idx
+                            w2_sorted_g_idx,
+                            pin_memory=False,
                         ),
                         "runtime.w13_g_idx_sort_indices": self._to_cpu_static_tensor(
-                            w13_g_idx_sort_indices
+                            w13_g_idx_sort_indices,
+                            pin_memory=False,
                         ),
                         "runtime.w2_g_idx_sort_indices": self._to_cpu_static_tensor(
-                            w2_g_idx_sort_indices
+                            w2_g_idx_sort_indices,
+                            pin_memory=False,
                         ),
                     }
                 )
             return tensors
         finally:
+            _synchronize_torch_device_best_effort(getattr(self, "device", None))
             del raw_gpu
             del repacked_w13
             del repacked_w2
@@ -1350,19 +1654,18 @@ class LayerTieredExpertCacheController:
             gc.collect()
             torch.accelerator.empty_cache()
 
-    @staticmethod
-    def _build_quantized_runtime_bundle(
+    @classmethod
+    def _build_quantized_runtime_bundles(
+            cls,
             runtime_tensors: dict[str, torch.Tensor],
-            expert_index: int,
-    ) -> ExpertBundle:
-        tensors = {
-            field_name: tensor[expert_index]
-            for field_name, tensor in runtime_tensors.items()
-        }
-        return ExpertBundle(
-            tensors=tensors,
-            nbytes=bundle_nbytes(tensors),
-            pinned=all(tensor.is_pinned() for tensor in tensors.values()),
+            *,
+            pin_memory: bool = False,
+    ) -> list[ExpertBundle]:
+        if not runtime_tensors:
+            return []
+        return pack_batched_cpu_tensor_dicts_by_expert(
+            runtime_tensors,
+            pin_memory=pin_memory,
             runtime_ready=True,
         )
 
@@ -1371,34 +1674,200 @@ class LayerTieredExpertCacheController:
     ) -> ExpertBundle:
         raw = self._assemble_unquantized_weights(bundle)
         tensors = {
-            "runtime.w13_weight": self._to_cpu_static_tensor(raw.w13_weight[0]),
-            "runtime.w2_weight": self._to_cpu_static_tensor(raw.w2_weight[0]),
+            "runtime.w13_weight": self._to_cpu_static_tensor(
+                raw.w13_weight[0],
+                pin_memory=False,
+            ),
+            "runtime.w2_weight": self._to_cpu_static_tensor(
+                raw.w2_weight[0],
+                pin_memory=False,
+            ),
         }
-        return ExpertBundle(
-            tensors=tensors,
-            nbytes=bundle_nbytes(tensors),
-            pinned=all(tensor.is_pinned() for tensor in tensors.values()),
+        return pack_cpu_tensor_dict(
+            tensors,
+            pin_memory=False,
             runtime_ready=True,
         )
 
-    def _to_cpu_static_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _runtime_requires_pinned_cpu(self) -> bool:
+        return bool(getattr(self, "_use_pinned_cpu", False))
+
+    def _allocate_runtime_ready_stage_bundle(
+            self,
+            *,
+            pin_memory: bool,
+    ) -> ExpertBundle:
+        if self._mode == "gptq_marlin":
+            specs = [
+                PackedExpertTensorSpec(
+                    name="runtime.w13_qweight",
+                    shape=tuple(self.layer.w13_qweight.shape[1:]),
+                    dtype=self.layer.w13_qweight.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="runtime.w2_qweight",
+                    shape=tuple(self.layer.w2_qweight.shape[1:]),
+                    dtype=self.layer.w2_qweight.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="runtime.w13_scales",
+                    shape=tuple(self.layer.w13_scales.shape[1:]),
+                    dtype=self.layer.w13_scales.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="runtime.w2_scales",
+                    shape=tuple(self.layer.w2_scales.shape[1:]),
+                    dtype=self.layer.w2_scales.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="runtime.w13_qzeros",
+                    shape=tuple(self.layer.w13_qzeros.shape[1:]),
+                    dtype=self.layer.w13_qzeros.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="runtime.w2_qzeros",
+                    shape=tuple(self.layer.w2_qzeros.shape[1:]),
+                    dtype=self.layer.w2_qzeros.dtype,
+                ),
+            ]
+            if hasattr(self.layer, "w13_g_idx"):
+                specs.extend(
+                    (
+                        PackedExpertTensorSpec(
+                            name="runtime.w13_g_idx",
+                            shape=tuple(self.layer.w13_g_idx.shape[1:]),
+                            dtype=self.layer.w13_g_idx.dtype,
+                        ),
+                        PackedExpertTensorSpec(
+                            name="runtime.w2_g_idx",
+                            shape=tuple(self.layer.w2_g_idx.shape[1:]),
+                            dtype=self.layer.w2_g_idx.dtype,
+                        ),
+                        PackedExpertTensorSpec(
+                            name="runtime.w13_g_idx_sort_indices",
+                            shape=tuple(self.layer.w13_g_idx_sort_indices.shape[1:]),
+                            dtype=self.layer.w13_g_idx_sort_indices.dtype,
+                        ),
+                        PackedExpertTensorSpec(
+                            name="runtime.w2_g_idx_sort_indices",
+                            shape=tuple(self.layer.w2_g_idx_sort_indices.shape[1:]),
+                            dtype=self.layer.w2_g_idx_sort_indices.dtype,
+                        ),
+                    )
+                )
+        else:
+            specs = [
+                PackedExpertTensorSpec(
+                    name="runtime.w13_weight",
+                    shape=tuple(self.layer.w13_weight.shape[1:]),
+                    dtype=self.layer.w13_weight.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="runtime.w2_weight",
+                    shape=tuple(self.layer.w2_weight.shape[1:]),
+                    dtype=self.layer.w2_weight.dtype,
+                ),
+            ]
+
+        storage, tensors = allocate_packed_cpu_tensor_views(
+            specs,
+            pin_memory=pin_memory,
+        )
+        return ExpertBundle(
+            tensors=tensors,
+            nbytes=bundle_nbytes(tensors),
+            pinned=bool(storage.is_pinned()),
+            runtime_ready=True,
+            storage=storage,
+            storage_offset_bytes=0,
+        )
+
+    def _ensure_runtime_ready_stage_bundle(self) -> ExpertBundle:
+        stage_bundle = getattr(self, "_cpu_stage_bundle", None)
+        if stage_bundle is not None:
+            return stage_bundle
+        stage_bundle = self._allocate_runtime_ready_stage_bundle(pin_memory=True)
+        self._cpu_stage_bundle = stage_bundle
+        self._cpu_buffer_bytes = int(getattr(self, "_cpu_buffer_bytes", 0)) + int(
+            stage_bundle.nbytes
+        )
+        return stage_bundle
+
+    def _copy_runtime_ready_bundle_tensors(
+            self,
+            source_bundle: ExpertBundle,
+            target_bundle: ExpertBundle,
+    ) -> None:
+        for field_name, source_tensor in source_bundle.tensors.items():
+            target_bundle.tensors[field_name].copy_(source_tensor)
+
+    def _get_runtime_ready_batch_buffer(
+            self,
+            field_name: str,
+            first_tensor: torch.Tensor,
+            batch_size: int,
+            *,
+            pin_memory: bool,
+    ) -> torch.Tensor:
+        buffers = getattr(self, "_cpu_runtime_batch_buffers", None)
+        if buffers is None:
+            buffers = {}
+            self._cpu_runtime_batch_buffers = buffers
+
+        existing = buffers.get(field_name)
+        batch_shape = (batch_size, *first_tensor.shape)
+        if (
+                existing is not None
+                and existing.dtype == first_tensor.dtype
+                and tuple(existing.shape[1:]) == tuple(first_tensor.shape)
+                and existing.shape[0] >= batch_size
+                and (not pin_memory or existing.is_pinned())
+        ):
+            return existing[:batch_size]
+
+        batch_kwargs: dict[str, Any] = {
+            "device": "cpu",
+            "dtype": first_tensor.dtype,
+        }
+        if pin_memory:
+            batch_kwargs["pin_memory"] = True
+        try:
+            batch = torch.empty(batch_shape, **batch_kwargs)
+        except RuntimeError as exc:
+            if pin_memory:
+                raise RuntimeError(
+                    f"{self.layer_key}: failed to allocate pinned CPU staging "
+                    f"buffer for {field_name}"
+                ) from exc
+            batch = torch.empty(batch_shape, device="cpu", dtype=first_tensor.dtype)
+        buffers[field_name] = batch
+        return batch
+
+    def _to_cpu_static_tensor(
+            self,
+            tensor: torch.Tensor,
+            *,
+            pin_memory: bool | None = None,
+    ) -> torch.Tensor:
         # ------------------------------- 先将输入张量转换为 CPU 上的连续张量 -------------------------------
         # 将输入张量从原设备分离出来，并转换为位于 CPU 上的 contiguous 张量。
         cpu_tensor = tensor.detach().to(device="cpu").contiguous()
+        _synchronize_torch_device_best_effort(tensor.device)
 
         # ------------------------------- 对 CPU static runtime 张量强制要求 pinned memory -------------------------------
-        use_pinned_cpu_static = bool(
-            getattr(
-                self,
-                "_use_pinned_cpu_static",
-                getattr(self, "_use_pinned_cpu", False),
+        use_pinned_cpu_static = (
+            bool(pin_memory)
+            if pin_memory is not None
+            else bool(
+                getattr(
+                    self,
+                    "_use_pinned_cpu_static",
+                    getattr(self, "_use_pinned_cpu", False),
+                )
             )
         )
         if not use_pinned_cpu_static:
-            raise RuntimeError(
-                f"{self.layer_key}: CPU static runtime tensors must be pinned "
-                "to preserve asynchronous H2D copies."
-            )
+            return cpu_tensor
         if cpu_tensor.is_pinned():
             return cpu_tensor
 
@@ -1406,7 +1875,9 @@ class LayerTieredExpertCacheController:
         try:
             # 将当前 CPU 张量转换为 pinned memory 版本，以加快后续 H2D 传输。
             return cpu_tensor.pin_memory()
-        except RuntimeError as exc:
+        except Exception as exc:
+            if _is_cuda_oom_error(exc):
+                raise
             raise RuntimeError(
                 f"{self.layer_key}: failed to pin CPU static runtime tensor; "
                 "pageable fallback is disallowed because it breaks the "
@@ -1446,15 +1917,15 @@ class LayerTieredExpertCacheController:
         # 一次调度完成 N 个 resident GPU slots 的 H2D 覆盖。
         self._write_expert_bundles(bundles_and_sources, self.layer)
 
+        log_runtime_events = bool(getattr(self, "_log_runtime_events", False))
         for expert_id, slot, _bundle, source in bundles_and_sources:
             # 覆盖 resident 映射表；旧 expert 若存在则在这里被驱逐。
             self._install_mapping(expert_id, slot)
             # 增加累计加载计数。
             self._total_loads += 1
             # 仅在前几次或每 100 次动态换入时打日志。
-            if (
-                    self._log_runtime_events
-                    and (self._total_loads <= 8 or self._total_loads % 100 == 0)
+            if log_runtime_events and (
+                self._total_loads <= 8 or self._total_loads % 100 == 0
             ):
                 logger.info(
                     "Tiered MoE cache event: layer=%s load=%d batch=%d source=%s "
@@ -1477,6 +1948,7 @@ class LayerTieredExpertCacheController:
     ) -> _PrefillBurstExecutionStats:
         # 统计本轮 burst pool 中不同来源的命中情况。
         stats = _PrefillBurstExecutionStats()
+        bundles_and_sources: list[tuple[int, int, ExpertBundle, str]] = []
         # 逐个 requested expert 填满 burst pool 的临时 slots。
         for slot, expert_id in enumerate(requested):
             # 已经 resident 的 expert 直接从主 GPU slots 拷到 burst pool。
@@ -1486,13 +1958,136 @@ class LayerTieredExpertCacheController:
                 continue
             # 非 resident 的 expert 则先从 CPU static 或 NVMe staging 获取来源 bundle。
             bundle, source = self._get_source_bundle(expert_id)
-            # 再把来源 bundle 写入 burst pool 的临时 slot。
-            self._write_expert_bundle(slot, bundle, pool)
+            bundles_and_sources.append((expert_id, slot, bundle, source))
             if source == "nvme_stage":
                 stats.nvme_loads += 1
             else:
                 stats.cpu_hits += 1
+        if bundles_and_sources:
+            self._write_expert_bundles(bundles_and_sources, pool)
         return stats
+
+    @staticmethod
+    def _is_prefill_burst_target(target: Any) -> bool:
+        return isinstance(target, SharedPrefillBurstPool)
+
+    def _should_use_sparse_direct_runtime_load(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            target: Any,
+    ) -> bool:
+        if not bundles_and_sources:
+            return False
+
+        strategy = str(getattr(self, "_runtime_load_strategy", "sparse_direct"))
+        if strategy == "dense_batch":
+            return False
+        if strategy == "sparse_direct":
+            return True
+
+        if self._is_prefill_burst_target(target):
+            return False
+        return len(bundles_and_sources) <= int(
+            getattr(
+                self,
+                "_runtime_sparse_direct_max_experts",
+                DEFAULT_RUNTIME_SPARSE_DIRECT_MAX_EXPERTS,
+            )
+        )
+
+    def _copy_runtime_ready_bundle_direct(
+            self,
+            slot: int,
+            bundle: ExpertBundle,
+            target: Any,
+    ) -> None:
+        layer_key = _debug_layer_key(self)
+        tensors = bundle.tensors
+        try:
+            with torch.no_grad():
+                if self._mode == "gptq_marlin":
+                    target.w13_qweight[slot].copy_(
+                        tensors["runtime.w13_qweight"],
+                        non_blocking=bundle.pinned,
+                    )
+                    target.w2_qweight[slot].copy_(
+                        tensors["runtime.w2_qweight"],
+                        non_blocking=bundle.pinned,
+                    )
+                    target.w13_scales[slot].copy_(
+                        tensors["runtime.w13_scales"],
+                        non_blocking=bundle.pinned,
+                    )
+                    target.w2_scales[slot].copy_(
+                        tensors["runtime.w2_scales"],
+                        non_blocking=bundle.pinned,
+                    )
+                    target.w13_qzeros[slot].copy_(
+                        tensors["runtime.w13_qzeros"],
+                        non_blocking=bundle.pinned,
+                    )
+                    target.w2_qzeros[slot].copy_(
+                        tensors["runtime.w2_qzeros"],
+                        non_blocking=bundle.pinned,
+                    )
+                    if hasattr(target, "w13_g_idx") and "runtime.w13_g_idx" in tensors:
+                        target.w13_g_idx[slot].copy_(
+                            tensors["runtime.w13_g_idx"],
+                            non_blocking=bundle.pinned,
+                        )
+                        target.w2_g_idx[slot].copy_(
+                            tensors["runtime.w2_g_idx"],
+                            non_blocking=bundle.pinned,
+                        )
+                        target.w13_g_idx_sort_indices[slot].copy_(
+                            tensors["runtime.w13_g_idx_sort_indices"],
+                            non_blocking=bundle.pinned,
+                        )
+                        target.w2_g_idx_sort_indices[slot].copy_(
+                            tensors["runtime.w2_g_idx_sort_indices"],
+                            non_blocking=bundle.pinned,
+                        )
+                    return
+
+                target.w13_weight[slot].copy_(
+                    tensors["runtime.w13_weight"],
+                    non_blocking=bundle.pinned,
+                )
+                target.w2_weight[slot].copy_(
+                    tensors["runtime.w2_weight"],
+                    non_blocking=bundle.pinned,
+                )
+        except Exception:
+            logger.exception(
+                "CFIE MoE sparse direct copy failed: layer=%s slot=%d pinned=%s "
+                "src.w13_scales=(%s) src.w2_scales=(%s) "
+                "dst.w13_scales=(%s) dst.w2_scales=(%s)",
+                layer_key,
+                slot,
+                bundle.pinned,
+                _tensor_debug_summary(tensors.get("runtime.w13_scales")),
+                _tensor_debug_summary(tensors.get("runtime.w2_scales")),
+                _tensor_debug_summary(getattr(target, "w13_scales", None)),
+                _tensor_debug_summary(getattr(target, "w2_scales", None)),
+            )
+            raise
+
+    def _try_write_runtime_ready_bundles_sparse_direct(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            target: Any,
+    ) -> bool:
+        if not bundles_and_sources:
+            return False
+        bundles = [bundle for _expert_id, _slot, bundle, _source in bundles_and_sources]
+        if not all(bundle.runtime_ready for bundle in bundles):
+            return False
+        if not self._should_use_sparse_direct_runtime_load(bundles_and_sources, target):
+            return False
+
+        for _expert_id, slot, bundle, _source in bundles_and_sources:
+            self._copy_runtime_ready_bundle_direct(slot, bundle, target)
+        return True
 
     def _write_expert_bundles(
             self,
@@ -1502,6 +2097,10 @@ class LayerTieredExpertCacheController:
         # 当前实现先提供批量加载语义边界：同一轮 prepare 中缺失的 experts 聚合到这里统一处理。
         # 若 bundle 已经是 runtime-ready，运行时只做 CPU -> GPU slot 拷贝，不再重复 w13/w2 合并、
         # GPTQ Marlin repack 或 scale permute。
+        if self._try_write_runtime_ready_bundles_sparse_direct(
+                bundles_and_sources, target
+        ):
+            return
         if self._try_write_runtime_ready_bundles_batch(
                 bundles_and_sources, target
         ):
@@ -1540,30 +2139,145 @@ class LayerTieredExpertCacheController:
 
         return False
 
+    @staticmethod
+    def _order_runtime_ready_bundles_for_batch_write(
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+    ) -> list[tuple[int, int, ExpertBundle, str]]:
+        return sorted(
+            bundles_and_sources,
+            key=lambda item: (
+                1 if item[2].storage is None else 0,
+                -1 if item[2].storage is None else id(item[2].storage),
+                int(getattr(item[2], "storage_offset_bytes", 0)),
+                item[1],
+            ),
+        )
+
+    def _view_packed_runtime_ready_cpu_field(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            field_name: str,
+    ) -> torch.Tensor | None:
+        if not bundles_and_sources:
+            return None
+
+        bundles = [bundle for _expert_id, _slot, bundle, _source in bundles_and_sources]
+        first_bundle = bundles[0]
+        first_tensor = first_bundle.tensors[field_name]
+        storage = first_bundle.storage
+        if storage is None or storage.device.type != "cpu":
+            return None
+
+        base_storage_ptr = storage.data_ptr()
+        base_field_offset_bytes = (
+            first_tensor.data_ptr()
+            - (base_storage_ptr + int(first_bundle.storage_offset_bytes))
+        )
+        if base_field_offset_bytes < 0:
+            return None
+
+        tensor_signature = (
+            first_tensor.dtype,
+            tuple(first_tensor.shape),
+            tuple(first_tensor.stride()),
+        )
+        per_bundle_bytes = int(first_bundle.nbytes)
+        offsets = [int(first_bundle.storage_offset_bytes)]
+        for bundle in bundles[1:]:
+            if bundle.storage is None or bundle.storage.data_ptr() != base_storage_ptr:
+                return None
+            if int(bundle.nbytes) != per_bundle_bytes:
+                return None
+            tensor = bundle.tensors[field_name]
+            if (
+                    tensor.dtype,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+            ) != tensor_signature:
+                return None
+            field_offset_bytes = (
+                tensor.data_ptr()
+                - (bundle.storage.data_ptr() + int(bundle.storage_offset_bytes))
+            )
+            if field_offset_bytes != base_field_offset_bytes:
+                return None
+            offsets.append(int(bundle.storage_offset_bytes))
+
+        if len(offsets) >= 2:
+            stride_bytes = offsets[1] - offsets[0]
+            if stride_bytes <= 0:
+                return None
+            if any(
+                    offsets[index] - offsets[index - 1] != stride_bytes
+                    for index in range(2, len(offsets))
+            ):
+                return None
+        else:
+            stride_bytes = per_bundle_bytes
+
+        itemsize = first_tensor.element_size()
+        if base_field_offset_bytes % itemsize != 0 or stride_bytes % itemsize != 0:
+            return None
+
+        field_num_bytes = int(first_tensor.numel() * itemsize)
+        last_field_end = (
+            offsets[0]
+            + base_field_offset_bytes
+            + (len(offsets) - 1) * stride_bytes
+            + field_num_bytes
+        )
+        if last_field_end > int(storage.numel()):
+            return None
+
+        typed_base = storage[offsets[0] + base_field_offset_bytes:].view(
+            first_tensor.dtype
+        )
+        return torch.as_strided(
+            typed_base,
+            size=(len(bundles), *first_tensor.shape),
+            stride=(stride_bytes // itemsize, *first_tensor.stride()),
+        )
+
     def _stack_runtime_ready_cpu_field(
             self,
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             field_name: str,
     ) -> torch.Tensor:
+        require_pinned_batch = self._runtime_requires_pinned_cpu()
+        packed_view = self._view_packed_runtime_ready_cpu_field(
+            bundles_and_sources,
+            field_name,
+        )
+        if packed_view is not None:
+            if packed_view.is_pinned() or not require_pinned_batch:
+                return packed_view
+            batch = self._get_runtime_ready_batch_buffer(
+                field_name,
+                packed_view[0],
+                len(bundles_and_sources),
+                pin_memory=True,
+            )
+            batch.copy_(packed_view)
+            return batch
+
         field_tensors = [
             bundle.tensors[field_name]
             for _expert_id, _slot, bundle, _source in bundles_and_sources
         ]
         first = field_tensors[0]
-        batch_shape = (len(field_tensors), *first.shape)
-        use_pinned_batch = all(
-            tensor.device.type == "cpu" and tensor.is_pinned()
-            for tensor in field_tensors
+        use_pinned_batch = (
+            require_pinned_batch
+            or all(
+                tensor.device.type == "cpu" and tensor.is_pinned()
+                for tensor in field_tensors
+            )
         )
-
-        batch_kwargs: dict[str, Any] = {"device": "cpu", "dtype": first.dtype}
-        if use_pinned_batch:
-            batch_kwargs["pin_memory"] = True
-        try:
-            batch = torch.empty(batch_shape, **batch_kwargs)
-        except RuntimeError:
-            batch_kwargs.pop("pin_memory", None)
-            batch = torch.empty(batch_shape, **batch_kwargs)
+        batch = self._get_runtime_ready_batch_buffer(
+            field_name,
+            first,
+            len(field_tensors),
+            pin_memory=use_pinned_batch,
+        )
 
         for batch_idx, tensor in enumerate(field_tensors):
             cpu_tensor = (
@@ -1593,6 +2307,9 @@ class LayerTieredExpertCacheController:
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             target: Any,
     ) -> None:
+        bundles_and_sources = self._order_runtime_ready_bundles_for_batch_write(
+            bundles_and_sources
+        )
         slot_ids = torch.tensor(
             [slot for _expert_id, slot, _bundle, _source in bundles_and_sources],
             dtype=torch.int64,
@@ -1616,6 +2333,9 @@ class LayerTieredExpertCacheController:
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             target: Any,
     ) -> None:
+        bundles_and_sources = self._order_runtime_ready_bundles_for_batch_write(
+            bundles_and_sources
+        )
         layer_key = _debug_layer_key(self)
         slot_ids = torch.tensor(
             [slot for _expert_id, slot, _bundle, _source in bundles_and_sources],
@@ -1867,50 +2587,65 @@ class LayerTieredExpertCacheController:
             target: Any,
     ) -> None:
         layer_key = _debug_layer_key(self)
-        tensors = bundle.tensors
+        source_bundle = bundle
+        if not bundle.pinned and self._runtime_requires_pinned_cpu():
+            stage_bundle = self._ensure_runtime_ready_stage_bundle()
+            self._copy_runtime_ready_bundle_tensors(bundle, stage_bundle)
+            source_bundle = stage_bundle
+        tensors = source_bundle.tensors
         try:
             with torch.no_grad():
                 if self._mode == "gptq_marlin":
                     target.w13_qweight[slot].copy_(
-                        tensors["runtime.w13_qweight"], non_blocking=bundle.pinned
+                        tensors["runtime.w13_qweight"],
+                        non_blocking=source_bundle.pinned,
                     )
                     target.w2_qweight[slot].copy_(
-                        tensors["runtime.w2_qweight"], non_blocking=bundle.pinned
+                        tensors["runtime.w2_qweight"],
+                        non_blocking=source_bundle.pinned,
                     )
                     target.w13_scales[slot].copy_(
-                        tensors["runtime.w13_scales"], non_blocking=bundle.pinned
+                        tensors["runtime.w13_scales"],
+                        non_blocking=source_bundle.pinned,
                     )
                     target.w2_scales[slot].copy_(
-                        tensors["runtime.w2_scales"], non_blocking=bundle.pinned
+                        tensors["runtime.w2_scales"],
+                        non_blocking=source_bundle.pinned,
                     )
                     target.w13_qzeros[slot].copy_(
-                        tensors["runtime.w13_qzeros"], non_blocking=bundle.pinned
+                        tensors["runtime.w13_qzeros"],
+                        non_blocking=source_bundle.pinned,
                     )
                     target.w2_qzeros[slot].copy_(
-                        tensors["runtime.w2_qzeros"], non_blocking=bundle.pinned
+                        tensors["runtime.w2_qzeros"],
+                        non_blocking=source_bundle.pinned,
                     )
                     if hasattr(target, "w13_g_idx") and "runtime.w13_g_idx" in tensors:
                         target.w13_g_idx[slot].copy_(
-                            tensors["runtime.w13_g_idx"], non_blocking=bundle.pinned
+                            tensors["runtime.w13_g_idx"],
+                            non_blocking=source_bundle.pinned,
                         )
                         target.w2_g_idx[slot].copy_(
-                            tensors["runtime.w2_g_idx"], non_blocking=bundle.pinned
+                            tensors["runtime.w2_g_idx"],
+                            non_blocking=source_bundle.pinned,
                         )
                         target.w13_g_idx_sort_indices[slot].copy_(
                             tensors["runtime.w13_g_idx_sort_indices"],
-                            non_blocking=bundle.pinned,
+                            non_blocking=source_bundle.pinned,
                         )
                         target.w2_g_idx_sort_indices[slot].copy_(
                             tensors["runtime.w2_g_idx_sort_indices"],
-                            non_blocking=bundle.pinned,
+                            non_blocking=source_bundle.pinned,
                         )
                     return
 
                 target.w13_weight[slot].copy_(
-                    tensors["runtime.w13_weight"], non_blocking=bundle.pinned
+                    tensors["runtime.w13_weight"],
+                    non_blocking=source_bundle.pinned,
                 )
                 target.w2_weight[slot].copy_(
-                    tensors["runtime.w2_weight"], non_blocking=bundle.pinned
+                    tensors["runtime.w2_weight"],
+                    non_blocking=source_bundle.pinned,
                 )
         except Exception:
             logger.exception(
@@ -1919,7 +2654,7 @@ class LayerTieredExpertCacheController:
                 "dst.w13_scales=(%s) dst.w2_scales=(%s)",
                 layer_key,
                 slot,
-                bundle.pinned,
+                source_bundle.pinned,
                 _tensor_debug_summary(tensors.get("runtime.w13_scales")),
                 _tensor_debug_summary(tensors.get("runtime.w2_scales")),
                 _tensor_debug_summary(getattr(target, "w13_scales", None)),
@@ -2299,6 +3034,7 @@ class LayerTieredExpertCacheController:
         # ------------------------------- 初始化 CPU 侧 staging bundle 状态 -------------------------------
         # 当前主线路径不再单独维护 staging bundle，因此这里显式置为 None。
         self._cpu_stage_bundle = None
+        self._cpu_runtime_batch_buffers = {}
 
         # ------------------------------- 按当前权重模式初始化 CPU 侧原始权重缓冲区 -------------------------------
         # 当当前控制器工作在 GPTQ Marlin 模式下时，分配量化原始权重缓冲区。
@@ -2319,8 +3055,15 @@ class LayerTieredExpertCacheController:
                 self._cpu_unquantized_raw_buffer
             )
 
+
+
         # ------------------------------- 按计划将 CPU 常驻 expert 预热到内存中 -------------------------------
         self._materialize_cpu_static_bundles_eager(cpu_static_experts)
+        if self._cpu_static_bundles and all(
+                bundle.runtime_ready
+                for bundle in self._cpu_static_bundles.values()
+        ):
+            self._pack_cpu_static_bundles_layer_wide_best_effort()
 
         # ------------------------------- 在持有 CPU 缓存或缓冲区时输出初始化日志 -------------------------------
         # 当当前控制器确实持有 CPU 静态 bundle 或 staging bundle 时，输出初始化日志。
@@ -2331,12 +3074,139 @@ class LayerTieredExpertCacheController:
                 self.layer_key,
                 len(self._cpu_static_bundles),
                 len(self._cpu_static_experts),
-                False,
+                self._cpu_stage_bundle is not None,
                 self._cpu_buffer_bytes / (1 << 20),
                 self.prefill_burst_min_tokens,
             )
 
     def _allocate_source_bundle(self) -> ExpertBundle:
+        if self._mode == "gptq_marlin":
+            specs: list[PackedExpertTensorSpec] = [
+                PackedExpertTensorSpec(
+                    name="slot.gate_proj.qweight",
+                    shape=(
+                        self.layer.hidden_size // self.pack_factor,
+                        self.layer.intermediate_size_per_partition,
+                    ),
+                    dtype=torch.int32,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.gate_proj.scales",
+                    shape=(
+                        self.layer.num_groups_w13,
+                        self.layer.intermediate_size_per_partition,
+                    ),
+                    dtype=self.layer.w13_scales.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.gate_proj.qzeros",
+                    shape=(
+                        self.layer.num_groups_w13,
+                        self.layer.intermediate_size_per_partition // self.pack_factor,
+                    ),
+                    dtype=self.layer.w13_qzeros.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.up_proj.qweight",
+                    shape=(
+                        self.layer.hidden_size // self.pack_factor,
+                        self.layer.intermediate_size_per_partition,
+                    ),
+                    dtype=torch.int32,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.up_proj.scales",
+                    shape=(
+                        self.layer.num_groups_w13,
+                        self.layer.intermediate_size_per_partition,
+                    ),
+                    dtype=self.layer.w13_scales.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.up_proj.qzeros",
+                    shape=(
+                        self.layer.num_groups_w13,
+                        self.layer.intermediate_size_per_partition // self.pack_factor,
+                    ),
+                    dtype=self.layer.w13_qzeros.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.down_proj.qweight",
+                    shape=(
+                        self.layer.intermediate_size_per_partition // self.pack_factor,
+                        self.layer.hidden_size,
+                    ),
+                    dtype=torch.int32,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.down_proj.scales",
+                    shape=(self.layer.num_groups_w2, self.layer.hidden_size),
+                    dtype=self.layer.w2_scales.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.down_proj.qzeros",
+                    shape=(
+                        self.layer.num_groups_w2,
+                        self.layer.hidden_size // self.pack_factor,
+                    ),
+                    dtype=self.layer.w2_qzeros.dtype,
+                ),
+            ]
+            if self._gptq_desc_act:
+                specs.extend(
+                    (
+                        PackedExpertTensorSpec(
+                            name="slot.gate_proj.g_idx",
+                            shape=(self.layer.hidden_size,),
+                            dtype=self.layer.w13_g_idx.dtype,
+                        ),
+                        PackedExpertTensorSpec(
+                            name="slot.up_proj.g_idx",
+                            shape=(self.layer.hidden_size,),
+                            dtype=self.layer.w13_g_idx.dtype,
+                        ),
+                        PackedExpertTensorSpec(
+                            name="slot.down_proj.g_idx",
+                            shape=(self.layer.intermediate_size_per_partition,),
+                            dtype=self.layer.w2_g_idx.dtype,
+                        ),
+                    )
+                )
+        else:
+            specs = [
+                PackedExpertTensorSpec(
+                    name="slot.gate_proj.weight",
+                    shape=(
+                        self.layer.intermediate_size_per_partition,
+                        self.layer.hidden_size,
+                    ),
+                    dtype=self.layer.w13_weight.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.up_proj.weight",
+                    shape=(
+                        self.layer.intermediate_size_per_partition,
+                        self.layer.hidden_size,
+                    ),
+                    dtype=self.layer.w13_weight.dtype,
+                ),
+                PackedExpertTensorSpec(
+                    name="slot.down_proj.weight",
+                    shape=(
+                        self.layer.hidden_size,
+                        self.layer.intermediate_size_per_partition,
+                    ),
+                    dtype=self.layer.w2_weight.dtype,
+                ),
+            ]
+
+        storage, tensors = allocate_packed_cpu_tensor_views(specs)
+        return ExpertBundle(
+            tensors=tensors,
+            nbytes=bundle_nbytes(tensors),
+            pinned=False,
+            storage=storage,
+        )
         # ------------------------------- 为 checkpoint 形态 expert 分配临时 source bundle 容器 -------------------------------
         # 这个 bundle 只用于承接 safetensors 中的 gate/up/down 原始字段，随后会被一次性预处理成
         # runtime-ready CPU static bundle。长期驻留的 CPU static mirror 不再保存 checkpoint 形态，
@@ -2499,10 +3369,19 @@ class LayerTieredExpertCacheController:
     def _allocate_quantized_raw_buffer(
             self,
             batch_size: int = 1,
+            *,
+            pin_memory: bool | None = None,
     ) -> _RawExpertWeights:
         # ------------------------------- 为量化路径分配单 expert 级 CPU 原始权重缓冲区 -------------------------------
         # 构造 CPU 侧张量分配参数；当平台支持时启用 pinned memory 以加速后续 H2D 传输。
-        cpu_tensor_args = {"device": "cpu", "pin_memory": self._use_pinned_cpu}
+        cpu_tensor_args = {
+            "device": "cpu",
+            "pin_memory": (
+                self._use_pinned_cpu
+                if pin_memory is None
+                else bool(pin_memory)
+            ),
+        }
 
         # 返回面向量化路径的单 expert 原始权重缓冲区对象。
         return _RawExpertWeights(

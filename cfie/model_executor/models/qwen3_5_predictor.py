@@ -31,7 +31,10 @@ from cfie.predictor import (
 )
 from cfie.sequence import IntermediateTensors
 from cfie.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
-from cfie.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
+from cfie.transformers_utils.configs.qwen3_5_moe import (
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+)
 from cfie.transformers_utils.configs.qwen3_5_moe_predictor import (
     Qwen3_5MoePredictorConfig,
     Qwen3_5MoePredictorTextConfig,
@@ -168,6 +171,7 @@ class PredictorRuntimeState:
 class PredictorLayerRoutingState:
     insertion_layer_index: int
     layer_plan: CandidateLayerPlan
+    online_expert_state: PredictorOnlineExpertState | None = None
 
 
 @dataclass(slots=True)
@@ -215,9 +219,61 @@ class PredictorForwardState:
         )
 
 
+def _coerce_predictor_hf_config(
+        hf_config: Qwen3_5MoePredictorConfig | Qwen3_5MoeConfig,
+) -> Qwen3_5MoePredictorConfig:
+    if isinstance(hf_config, Qwen3_5MoePredictorConfig):
+        return hf_config
+    if not isinstance(hf_config, Qwen3_5MoeConfig):
+        raise TypeError(
+            "predictor runtime expects either Qwen3_5MoeConfig or "
+            "Qwen3_5MoePredictorConfig"
+        )
+
+    predictor_bundle_path = getattr(hf_config, "predictor_bundle_path", None)
+    predictor_checkpoint_path = getattr(hf_config, "predictor_checkpoint_path", None)
+    predictor_map_location = getattr(hf_config, "predictor_map_location", "cpu")
+    predictor_device = getattr(hf_config, "predictor_device", "cpu")
+
+    text_config = getattr(hf_config, "text_config", None)
+    text_payload = (
+        text_config.to_dict()
+        if text_config is not None and hasattr(text_config, "to_dict")
+        else {}
+    )
+    text_payload.update(
+        {
+            "predictor_bundle_path": getattr(
+                text_config, "predictor_bundle_path", predictor_bundle_path
+            ),
+            "predictor_checkpoint_path": getattr(
+                text_config, "predictor_checkpoint_path", predictor_checkpoint_path
+            ),
+            "predictor_map_location": getattr(
+                text_config, "predictor_map_location", predictor_map_location
+            ),
+            "predictor_device": getattr(
+                text_config, "predictor_device", predictor_device
+            ),
+        }
+    )
+
+    payload = hf_config.to_dict()
+    payload.update(
+        {
+            "predictor_bundle_path": predictor_bundle_path,
+            "predictor_checkpoint_path": predictor_checkpoint_path,
+            "predictor_map_location": predictor_map_location,
+            "predictor_device": predictor_device,
+            "text_config": text_payload,
+        }
+    )
+    return Qwen3_5MoePredictorConfig(**payload)
+
+
 class Qwen3_5MoePredictorProcessingInfo(Qwen3_5MoeProcessingInfo):
     def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen3_5MoePredictorConfig)
+        return _coerce_predictor_hf_config(self.ctx.get_hf_config())
 
 
 class Qwen3_5PredictorSparseMoeBlock(Qwen3NextSparseMoeBlock):
@@ -389,7 +445,11 @@ class Qwen3_5PredictorDecoderLayer(Qwen3_5DecoderLayer):
             quant_config: QuantizationConfig | None,
             prefix: str,
     ) -> nn.Module:
-        if config.model_type == "qwen3_5_moe_predictor_text":
+        if (
+                config.model_type == "qwen3_5_moe_predictor_text"
+                or getattr(config, "predictor_bundle_path", None)
+                or getattr(config, "predictor_checkpoint_path", None)
+        ):
             return Qwen3_5PredictorSparseMoeBlock(
                 cfie_config=cfie_config,
                 prefix=prefix,
@@ -448,6 +508,48 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
                 layer.mlp.bind_active_layer_plan(None)
                 layer.mlp.bind_active_online_expert_state(None)
 
+    def _effective_predictor_min_insertion_layer_index(self) -> int:
+        runtime_state = self.predictor_runtime
+        if runtime_state is None:
+            return 0
+        return max(
+            int(runtime_state.schema.min_insertion_layer_index),
+            int(runtime_state.schema.stride_layers),
+        )
+
+    @staticmethod
+    def _predictor_online_state_from_layer_plan(
+            layer_plan: CandidateLayerPlan,
+    ) -> PredictorOnlineExpertState:
+        executed_expert_ids = tuple(layer_plan.predicted_executed_expert_ids)
+        candidate_expert_ids = tuple(layer_plan.candidate_expert_ids)
+        return PredictorOnlineExpertState(
+            source="predictor_window_plan",
+            active_expert_ids=executed_expert_ids,
+            prefetched_expert_ids=executed_expert_ids,
+            hot_expert_ids=candidate_expert_ids,
+            prefetch_priority_expert_ids=executed_expert_ids,
+        )
+
+    def _schedule_predictor_routing_state(
+            self,
+            routing_state: PredictorLayerRoutingState,
+    ) -> None:
+        self.predictor_forward_state.upsert_pending_layer_plan(routing_state)
+        future_layer = self._predictor_decoder_layer(
+            layer_index=routing_state.layer_plan.future_layer_index
+        )
+        if future_layer is None:
+            return
+        controller = getattr(
+            future_layer.mlp.experts,
+            "_cfie_tiered_cache_controller",
+            None,
+        )
+        if controller is None:
+            return
+        controller.prefetch(routing_state.layer_plan.predicted_executed_expert_ids)
+
     def _restore_predictor_pp_state(
             self,
             intermediate_tensors: IntermediateTensors | None,
@@ -471,7 +573,8 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
             and self.start_layer <= routing_state.layer_plan.future_layer_index
             < self.config.num_hidden_layers
         )
-        self.predictor_forward_state.restore_pending_layer_plans(restored_plans)
+        for routing_state in restored_plans:
+            self._schedule_predictor_routing_state(routing_state)
 
     def _predictor_decoder_layer(
             self,
@@ -539,6 +642,8 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
         runtime_state = self.predictor_runtime
         if runtime_state is None:
             return
+        if layer_idx < self._effective_predictor_min_insertion_layer_index():
+            return
         stride_layers = max(int(runtime_state.schema.stride_layers), 1)
         if layer_idx % stride_layers != 0:
             return
@@ -567,10 +672,13 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
         )
         self.predictor_forward_state.emitted_window_plans.append(window_plan)
         for layer_plan in window_plan.layer_plans:
-            self.predictor_forward_state.upsert_pending_layer_plan(
+            self._schedule_predictor_routing_state(
                 PredictorLayerRoutingState(
                     insertion_layer_index=layer_idx,
                     layer_plan=layer_plan,
+                    online_expert_state=self._predictor_online_state_from_layer_plan(
+                        layer_plan
+                    ),
                 )
             )
 
@@ -606,15 +714,22 @@ class Qwen3_5PredictorModel(Qwen3_5Model):
                 )
 
             if isinstance(layer, Qwen3_5PredictorDecoderLayer):
-                layer.bind_active_layer_plan(
-                    self.predictor_forward_state.pending_layer_plans.pop(
-                        layer_idx,
-                        None,
+                active_routing_state = self.predictor_forward_state.pending_layer_plans.pop(
+                    layer_idx,
+                    None,
+                )
+                layer.bind_active_layer_plan(active_routing_state)
+                if (
+                        active_routing_state is not None
+                        and active_routing_state.online_expert_state is not None
+                ):
+                    active_online_expert_state = (
+                        active_routing_state.online_expert_state
                     )
-                )
-                active_online_expert_state, _ = self._resolve_online_expert_state(
-                    insertion_layer_index=layer_idx
-                )
+                else:
+                    active_online_expert_state, _ = self._resolve_online_expert_state(
+                        insertion_layer_index=layer_idx
+                    )
                 layer.bind_active_online_expert_state(active_online_expert_state)
 
             hidden_states, residual = layer(
@@ -677,20 +792,31 @@ class Qwen3_5MoePredictorForCausalLM(Qwen3_5MoeForCausalLM):
         super().__init__(cfie_config=cfie_config, prefix=prefix)
         self.predictor_runtime: PredictorRuntimeState | None = None
 
-        predictor_config = cfie_config.model_config.hf_config
-        bundle_path = getattr(predictor_config, "predictor_bundle_path", None)
-        if bundle_path:
+        predictor_hf_config = cfie_config.model_config.hf_config
+        predictor_text_config = cfie_config.model_config.hf_text_config
+        bundle_path = getattr(
+            predictor_hf_config,
+            "predictor_bundle_path",
+            getattr(predictor_text_config, "predictor_bundle_path", None),
+        )
+        checkpoint_path = getattr(
+            predictor_hf_config,
+            "predictor_checkpoint_path",
+            getattr(predictor_text_config, "predictor_checkpoint_path", None),
+        )
+        if bundle_path or checkpoint_path:
             self.load_predictor_runtime(
                 bundle_path=bundle_path,
+                checkpoint_path=checkpoint_path,
                 map_location=getattr(
-                    predictor_config,
+                    predictor_hf_config,
                     "predictor_map_location",
-                    "cpu",
+                    getattr(predictor_text_config, "predictor_map_location", "cpu"),
                 ),
                 device=getattr(
-                    predictor_config,
+                    predictor_hf_config,
                     "predictor_device",
-                    "cpu",
+                    getattr(predictor_text_config, "predictor_device", "cpu"),
                 ),
             )
 
@@ -740,17 +866,23 @@ class Qwen3_5MoePredictorForCausalLM(Qwen3_5MoeForCausalLM):
     def load_predictor_runtime(
             self,
             *,
-            bundle_path: str | Path,
+            bundle_path: str | Path | None = None,
+            checkpoint_path: str | Path | None = None,
             map_location: str = "cpu",
             device: str = "cpu",
     ) -> PredictorRuntimeState:
+        predictor_path = bundle_path or checkpoint_path
+        if predictor_path is None:
+            raise ValueError("either bundle_path or checkpoint_path is required")
         predictor_model, bundle = load_predictor_model(
-            bundle_path,
+            predictor_path,
             map_location=map_location,
             device=device,
+            base_model_path=self.model_config.model,
+            num_layers=self.model.config.num_hidden_layers,
         )
         runtime_state = PredictorRuntimeState(
-            bundle_path=Path(bundle_path).resolve(),
+            bundle_path=Path(predictor_path).resolve(),
             bundle=bundle,
             planner=PredictorCandidatePlanner(
                 schema=bundle.schema,
