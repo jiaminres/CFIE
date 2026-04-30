@@ -486,7 +486,7 @@ endmacro()
 function (define_extension_target MOD_NAME)
   cmake_parse_arguments(PARSE_ARGV 1
     ARG
-    "WITH_SOABI"
+    "WITH_SOABI;NO_INSTALL"
     "DESTINATION;LANGUAGE;USE_SABI"
     "SOURCES;ARCHITECTURES;COMPILE_FLAGS;INCLUDE_DIRECTORIES;LIBRARIES")
 
@@ -553,8 +553,10 @@ function (define_extension_target MOD_NAME)
     target_link_libraries(${MOD_NAME} PRIVATE torch ${TORCH_LIBRARIES} ${ARG_LIBRARIES})
   endif()
 
-  install(
-    TARGETS ${MOD_NAME}
-    LIBRARY DESTINATION ${ARG_DESTINATION}
-    COMPONENT ${MOD_NAME})
+  if (NOT ARG_NO_INSTALL)
+    install(
+      TARGETS ${MOD_NAME}
+      LIBRARY DESTINATION ${ARG_DESTINATION}
+      COMPONENT ${MOD_NAME})
+  endif()
 endfunction()

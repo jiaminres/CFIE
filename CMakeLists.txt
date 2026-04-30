@@ -410,6 +410,100 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     WITH_SOABI)
 endif()
 
+# ------------------------------- 独立算子验证目标 -------------------------------
+# 组件验证阶段的目标不要并入 _C / _moe_C，避免为了试验单个算子反复重编整个运行时扩展。
+option(CFIE_BUILD_OP_VALIDATION_TARGETS
+  "Build standalone operator validation targets outside of the runtime extensions."
+  OFF)
+set(CFIE_OP_VALIDATION_OUTPUT_DIR "${CMAKE_BINARY_DIR}/op_validation" CACHE PATH
+  "Output directory for standalone operator validation targets.")
+
+function(cfie_add_op_validation_extension TARGET_NAME)
+  cmake_parse_arguments(PARSE_ARGV 1
+    ARG
+    ""
+    "LANGUAGE;USE_SABI"
+    "SOURCES;ARCHITECTURES;COMPILE_FLAGS;INCLUDE_DIRECTORIES;LIBRARIES")
+
+  if(NOT ARG_LANGUAGE)
+    set(ARG_LANGUAGE ${VLLM_GPU_LANG})
+  endif()
+
+  if(NOT ARG_USE_SABI)
+    set(ARG_USE_SABI 3)
+  endif()
+
+  define_extension_target(
+    ${TARGET_NAME}
+    DESTINATION cfie
+    LANGUAGE ${ARG_LANGUAGE}
+    SOURCES ${ARG_SOURCES}
+    COMPILE_FLAGS ${ARG_COMPILE_FLAGS}
+    ARCHITECTURES ${ARG_ARCHITECTURES}
+    INCLUDE_DIRECTORIES ${ARG_INCLUDE_DIRECTORIES}
+    LIBRARIES ${ARG_LIBRARIES}
+    USE_SABI ${ARG_USE_SABI}
+    WITH_SOABI
+    NO_INSTALL)
+
+  set_target_properties(${TARGET_NAME} PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY "${CFIE_OP_VALIDATION_OUTPUT_DIR}"
+    EXCLUDE_FROM_ALL TRUE
+    LIBRARY_OUTPUT_DIRECTORY "${CFIE_OP_VALIDATION_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${CFIE_OP_VALIDATION_OUTPUT_DIR}"
+    FOLDER "op_validation")
+
+  if(WIN32)
+    cfie_apply_windows_extension_hygiene(${TARGET_NAME})
+  endif()
+
+  if(TARGET cfie_op_validation_targets)
+    add_dependencies(cfie_op_validation_targets ${TARGET_NAME})
+  endif()
+endfunction()
+
+if(CFIE_BUILD_OP_VALIDATION_TARGETS)
+  message(STATUS "Enabling standalone operator validation targets.")
+  file(MAKE_DIRECTORY "${CFIE_OP_VALIDATION_OUTPUT_DIR}")
+  add_custom_target(cfie_op_validation_targets
+    COMMENT "Build standalone CFIE operator validation targets.")
+
+  # 所有组件级验证算子统一放在 csrc/op_validation 下，单独编成一个独立扩展。
+  # 后续新增待验证 .cpp / .cu 文件时，无需再修改目标定义。
+  file(GLOB_RECURSE CFIE_OP_VALIDATION_SRC CONFIGURE_DEPENDS
+    "csrc/op_validation/*.cpp"
+    "csrc/op_validation/*.cc"
+    "csrc/op_validation/*.cu")
+
+  set(CFIE_OP_VALIDATION_GPU_SRC ${CFIE_OP_VALIDATION_SRC})
+  list(FILTER CFIE_OP_VALIDATION_GPU_SRC INCLUDE REGEX "\\.(cu|hip)$")
+
+  if(CFIE_OP_VALIDATION_GPU_SRC)
+    set(CFIE_OP_VALIDATION_LANGUAGE ${VLLM_GPU_LANG})
+    set(CFIE_OP_VALIDATION_ARCHITECTURES ${VLLM_GPU_ARCHES})
+    set(CFIE_OP_VALIDATION_COMPILE_FLAGS ${VLLM_GPU_FLAGS})
+
+    if(VLLM_GPU_LANG STREQUAL "CUDA")
+      set_gencode_flags_for_srcs(
+        SRCS "${CFIE_OP_VALIDATION_GPU_SRC}"
+        CUDA_ARCHS "${CUDA_ARCHS}")
+    endif()
+  else()
+    set(CFIE_OP_VALIDATION_LANGUAGE CXX)
+    set(CFIE_OP_VALIDATION_ARCHITECTURES)
+    set(CFIE_OP_VALIDATION_COMPILE_FLAGS)
+  endif()
+
+  cfie_add_op_validation_extension(
+    opcheck_C
+    LANGUAGE ${CFIE_OP_VALIDATION_LANGUAGE}
+    SOURCES ${CFIE_OP_VALIDATION_SRC}
+    COMPILE_FLAGS ${CFIE_OP_VALIDATION_COMPILE_FLAGS}
+    ARCHITECTURES ${CFIE_OP_VALIDATION_ARCHITECTURES}
+    INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
+    INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR})
+endif()
+
 # ------------------------------- 定义主扩展 _C 的基础源码集合 -------------------------------
 # VLLM_EXT_SRC 先放所有平台共享的核心算子、量化算子和 torch binding。
 
