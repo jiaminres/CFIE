@@ -50,7 +50,7 @@ dataset
   -> PredictorTraceDataset
   -> predictor-train
   -> checkpoint
-  -> predictor-eval
+  -> checkpoint
 ```
 
 ### 4.2 当前隔离事实
@@ -75,7 +75,6 @@ dataset
 - `tests/unit/test_cfie_training_cli.py -k predictor`
 - `tests/unit/test_predictor_capture_resolution.py`
 - `tests/unit/test_routed_experts_buffer_size.py`
-- `tests/unit/test_cfie_training_engine.py -k predictor_teacher_backend_maps_training_offload_policy`
 - `predictor-train --profile qwen35-35b-a3b --steps 1 --examples-per-step 1 --samples 1 --tokens-per-sample 16 --epochs 1`
 - `predictor-trace --profile qwen35-122b-a10b --steps 1 --examples-per-step 1 --samples 1 --tokens-per-sample 16`
 - `predictor-train --profile qwen35-122b-a10b --steps 1 --examples-per-step 1 --samples 1 --tokens-per-sample 16 --epochs 1`

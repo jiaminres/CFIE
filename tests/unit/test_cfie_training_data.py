@@ -37,7 +37,9 @@ def test_tokenized_dataset_batch_planner_reads_text_dataset(tmp_path) -> None:
     assert first_batch.source_kind == "tokenized_dataset"
     assert first_batch.dataset_name == "train.txt"
     assert first_batch.sample_indices == (0, 1)
-    assert first_batch.loss_token_count == 32
+    assert first_batch.has_target_attention_mask_rows
+    assert first_batch.loss_token_count == first_batch.valid_loss_token_count
+    assert 0 < first_batch.loss_token_count <= 32
     assert len(first_batch.token_rows) == 2
     assert len(first_batch.target_rows) == 2
     assert all(len(row) == 16 for row in first_batch.token_rows)
@@ -71,5 +73,7 @@ def test_tokenized_dataset_batch_planner_reads_jsonl_dataset(tmp_path) -> None:
 
     assert batch.dataset_name == "train.jsonl"
     assert batch.sample_indices == (0, 1)
-    assert batch.loss_token_count == 24
+    assert batch.has_target_attention_mask_rows
+    assert batch.loss_token_count == batch.valid_loss_token_count
+    assert 0 < batch.loss_token_count <= 24
     assert all(len(row) == 12 for row in batch.token_rows)

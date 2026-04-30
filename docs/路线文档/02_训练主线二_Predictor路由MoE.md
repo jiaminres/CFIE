@@ -58,8 +58,6 @@ Predictor 训练侧现在要解决的是三件事：
 
 - `predictor-trace` 必须传 `--dataset`
 - `predictor-train` 必须传 `--trace-input` 或 `--dataset`
-- `predictor-eval` 必须传 `--trace-input` 或 `--dataset`
-
 也就是说，Predictor 训练侧现在只认真实文本数据，不再走 synthetic fallback。
 
 ## 4. Teacher 采集链路
@@ -119,31 +117,23 @@ flowchart LR
 
 因此，普通 `chat` / `generate` 链路默认不应受到 predictor 训练代码影响。
 
-## 7. 三个 CLI 的工程顺序
+## 7. CLI 工程顺序
 
-当前 Predictor 训练流程建议按下面顺序执行：
+当前 Predictor 训练侧只保留两条命令：
 
 1. `predictor-trace`
    - 作用：从真实 dataset + 真实 teacher 前向采集训练样本
 2. `predictor-train`
    - 作用：训练 predictor，并输出 checkpoint
-3. `predictor-eval`
-   - 作用：在 trace 数据上验证 loss 与 recall
+
+推荐顺序也是先 `predictor-trace`，后 `predictor-train`。
 
 ## 8. 当前验收口径
 
-当前 Predictor 训练侧的正确验收口径是：
+当前 Predictor 训练侧的验收口径是：
 
-- 单测通过；
-- teacher trace 明确复用引擎；
-- 量化模型路径不再回退；
-- 训练与普通推理隔离开；
-- 35B / 122B 的真实训练 smoke 与普通推理回归，以 `05_Predictor工程化落地追踪.md` 作为动态总账。
-
-按当前代码与总账文档，已经可以稳定确认：
-
-- Predictor 相关单测已完成当前主线回归；
-- `35B` 真实 predictor 训练 smoke 已完成；
-- `122B` 真实 predictor 训练 smoke 已完成；
-- 普通推理回归已完成，训练侧 capture 默认关闭，未污染普通推理配置；
-- 当前剩余未完全收口的训练侧事项，主要是 `tests/unit/test_cfie_training_cli.py` 全量执行仍会在现环境超时。
+- predictor 相关单测通过；
+- teacher trace 明确复用推理引擎；
+- 量化模型路径不再静默回退；
+- 训练 capture 与普通推理隔离；
+- 35B / 122B 的真实 smoke 与推理回归，统一以 `05_Predictor工程化落地追踪.md` 作为动态总账。
