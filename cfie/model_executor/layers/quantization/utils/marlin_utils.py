@@ -365,99 +365,82 @@ def marlin_sort_g_idx(g_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def get_scale_perms():
     # -------------------------------------------------------------
-    # 1) 构造 scale_perm
+    # 1) 构造 grouped-scale 使用的 64 元素 permutation
     # -------------------------------------------------------------
-    # 最终会得到一个长度 64 的排列列表。
+    # 这一套规则可视作把一个 8x8 小块按“列优先”顺序展开：
+    # - 原始是按行连续编号
+    # - 重排后变成同一列的元素先相邻
     #
-    # 外层 i 从 0 到 7
-    # 内层 j 从 0 到 7
-    #
-    # 每次 append 的元素是：
-    #   i + 8 * j
-    #
-    # 也就是说，对一个逻辑上长度为 64 的块，
-    # 原始顺序如果是：
-    #   [0, 1, 2, 3, ..., 63]
-    #
-    # 那么 scale_perm 会把它重排成：
-    #   [0, 8, 16, 24, 32, 40, 48, 56,
-    #    1, 9, 17, 25, 33, 41, 49, 57,
-    #    2, 10, 18, 26, 34, 42, 50, 58,
-    #    ...
-    #    7, 15, 23, 31, 39, 47, 55, 63]
-    #
-    # 这本质上是在做一个 8x8 小块的“转置式重排”：
-    # - 把原本按行连续的顺序
-    # - 改成按列连续的顺序
-    #
-    # 形象地看：
-    #
-    # 原始按行编号的 8x8:
-    #   0   1   2   3   4   5   6   7
-    #   8   9  10  11  12  13  14  15
-    #   16 17  18  19  20  21  22  23
-    #   ...
-    #   56 57  58  59  60  61  62  63
-    #
-    # 重排后按列读取顺序：
-    #   0,8,16,24,32,40,48,56,
-    #   1,9,17,25,33,41,49,57,
-    #   ...
+    # 它用于“多 group + 非 8bit A”路径。
     scale_perm: list[int] = []
     for i in range(8):
         scale_perm.extend([i + 8 * j for j in range(8)])
 
     # -------------------------------------------------------------
-    # 2) 构造 scale_perm_single
+    # 2) 构造 single-scale / A=8bit 使用的 32 元素 permutation
     # -------------------------------------------------------------
-    # 这一套最终长度是 32。
+    # 这套规则不是完整的行主序，也不是完整的列主序，
+    # 而是按“两列一组 + 行间交错”的方式排列：
     #
-    # 外层 i 从 0 到 3
-    # 每一轮固定生成 8 个元素：
-    #   2*i + [0, 1, 8, 9, 16, 17, 24, 25]
-    #
-    # 展开来看：
-    #
-    # i = 0:
-    #   [0, 1, 8, 9, 16, 17, 24, 25]
-    #
-    # i = 1:
-    #   [2, 3, 10, 11, 18, 19, 26, 27]
-    #
-    # i = 2:
-    #   [4, 5, 12, 13, 20, 21, 28, 29]
-    #
-    # i = 3:
-    #   [6, 7, 14, 15, 22, 23, 30, 31]
-    #
-    # 所以最终结果是：
     #   [0,1,8,9,16,17,24,25,
     #    2,3,10,11,18,19,26,27,
     #    4,5,12,13,20,21,28,29,
     #    6,7,14,15,22,23,30,31]
     #
-    # 这可以理解成：
-    # - 针对一个 4 x 8 的二维块（或等价的 32 元素块）
-    # - 不是完全按单列取，也不是完全按单行取
-    # - 而是按“每次取两列，再跨行跳”的方式重排
-    #
-    # 它更像是为了适配某种更细粒度的 Tensor Core / MMA 读取模式。
+    # 它用于：
+    # - 单 group / channel-scale 路径
+    # - A=int8 / fp8 时的特殊读取路径
     scale_perm_single: list[int] = []
     for i in range(4):
         scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
 
-    # 返回两套 permutation
+    # -------------------------------------------------------------
+    # 3) 返回两套 permutation
+    # -------------------------------------------------------------
     return scale_perm, scale_perm_single
 
 
 def marlin_permute_scales(
-        s: torch.Tensor, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
+        s: torch.Tensor,
+        size_k: int,
+        size_n: int,
+        group_size: int,
+        is_a_8bit: bool = False
 ) -> torch.Tensor:
+    # -------------------------------------------------------------
+    # 1) 读取 Marlin 的两套 scale 重排模板
+    # -------------------------------------------------------------
+    # - scale_perm        : 多 group、非 8bit A 路径
+    # - scale_perm_single : 单 group / A=8bit 路径
+    #
+    # 这一步不会改变 scale 的数学含义，
+    # 只是准备后续使用哪种物理布局重排规则。
     scale_perm, scale_perm_single = get_scale_perms()
+    # -------------------------------------------------------------
+    # 2) 判断当前 scales 是否属于“多 group”布局
+    # -------------------------------------------------------------
+    # group_size < size_k 表示：
+    # - K 维不止一个量化组
+    # - 当前 scales 是真正的 grouped scales
+    #
+    # 这时若 A 不是 8bit，则按长度 64 的 grouped permutation 重排。
+    #
+    # 其余情况统一走 scale_perm_single：
+    # - group_size == size_k：整条 K 维只有 1 个 group
+    # - group_size == -1    ：channel / single-scale 特例
+    # - is_a_8bit == True   ：A=int8/fp8 时，Marlin 的读取布局不同
+    #
     if group_size < size_k and group_size != -1 and not is_a_8bit:
+        # 把输入视作若干个长度 64 的小块，
+        # 对每个小块内部按 grouped-scale 规则做 permutation。
         s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
     else:
+        # 把输入视作若干个长度 32 的小块，
+        # 对每个小块内部按 single-scale / A=8bit 规则做 permutation。
         s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+
+    # -------------------------------------------------------------
+    # 3) 重新整理回 [num_rows, size_n] 的二维视图
     s = s.reshape((-1, size_n)).contiguous()
 
     return s
@@ -478,15 +461,38 @@ def marlin_act_int8_process_scales(s: torch.Tensor):
 
 
 def marlin_moe_permute_scales(
-        s: torch.Tensor, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
+        s: torch.Tensor,
+        size_k: int,
+        size_n: int,
+        group_size: int,
+        is_a_8bit: bool = False
 ):
+    # -------------------------------------------------------------
+    # 1) MoE 版本的输入语义
+    # -------------------------------------------------------------
+    # s 的形状通常为：
+    #   [num_experts, num_groups_or_rows, size_n]
+    #
+    # 与普通线性层相比，只是在最前面多了一维 expert 维。
+    # 每个 expert 的 scales 都需要各自独立地转成 Marlin 布局。
     num_experts = s.shape[0]
+
+    # -------------------------------------------------------------
+    # 2) 预分配输出
+    # -------------------------------------------------------------
+    # scale permutation 不改变每个 expert 的张量 shape，
+    # 因此这里直接按输入形状创建输出缓冲区。
     output = torch.empty(
         (num_experts, s.shape[1], s.shape[2]),
         device=s.device,
         dtype=s.dtype,
     )
 
+    # -------------------------------------------------------------
+    # 3) 逐 expert 调用普通的 scale 重排逻辑
+    # -------------------------------------------------------------
+    # 这里没有做跨 expert 的混排；
+    # 它只是一个“沿 expert 维循环调用 marlin_permute_scales(...)”的薄封装。
     for e in range(num_experts):
         output[e] = marlin_permute_scales(s[e], size_k, size_n, group_size, is_a_8bit)
     return output

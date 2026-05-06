@@ -27,7 +27,7 @@ namespace marlin {
 
         /*
          * 非8_bit: 16 * 64 每 block
-         * 8_bit: 8 * 32 每 block
+         * 8_bit: 32 * 32 每 block
          * */
         // 8-bit 激活时，N tile 减半。
         constexpr int target_tile_n_size = tile_n_size / (is_a_8bit ? 2 : 1);
@@ -355,7 +355,7 @@ namespace marlin {
                         // 普通激活路径取第二个 N 半区。
                     } else {
 
-                        // 从第二个半区抽取量化值。
+                        // 从第二个N半区抽取量化值。
                         vals[4 + i] = (b2_vals[cur_int] >> (cur_pos * num_bits)) & mask;
                     }
                 }
@@ -403,6 +403,36 @@ namespace marlin {
             } else if constexpr (is_a_8bit && num_bits == 4) {
 
                 // Marlin int4 + 8-bit 激活打包顺序。
+                /*
+                 * Marlin int4 + 8-bit activation 的专用打包顺序。
+                 *
+                 * 这一分支与普通 int4 路径的关键区别：
+                 * - 普通路径的 vals[] 更接近按 K 偏移 [0, 1, 8, 9, ...] 取数
+                 * - 本分支的 vals[] 先取前半块的连续 K 偏移 [0, 1, 2, 3]
+                 *   再取后半块对应位置 [16, 17, 18, 19]
+                 *
+                 * 以一个 32x32 逻辑 tile 为例，单个线程在交错前看到的
+                 * vals[0..7] 可理解为：
+                 *
+                 * +---------+--------+-----------------------------------+
+                 * | th_id%4 | tc_row | vals[0..7] 对应的逻辑 K 行        |
+                 * +---------+--------+-----------------------------------+
+                 * |   0     |   0    | 0,1,2,3,16,17,18,19              |
+                 * |   1     |   4    | 4,5,6,7,20,21,22,23              |
+                 * |   2     |   8    | 8,9,10,11,24,25,26,27            |
+                 * |   3     |   12   | 12,13,14,15,28,29,30,31          |
+                 * +---------+--------+-----------------------------------+
+                 *
+                 * 但写入 uint32 时不会按这个顺序直接打包，而是通过 pack_idx
+                 * 先做“前半块/后半块交错”：
+                 *
+                 *   交错前:   0, 1, 2, 3, 16, 17, 18, 19
+                 *   pack_idx: 0, 4, 1, 5,  2,  6,  3,  7
+                 *   交错后:   0,16, 1,17,  2, 18,  3, 19
+                 *
+                 * 最终这 8 个 int4 nibble 会按“交错后”的顺序，依次落入同一个
+                 * uint32 的 bit[3:0], bit[7:4], ..., bit[31:28]。
+                 */
                 int pack_idx[8] = {0, 4, 1, 5, 2, 6, 3, 7};
 
                 // 初始化 packed 输出值。
@@ -418,6 +448,14 @@ namespace marlin {
                     res |= vals[pack_idx[i]] << (i * 4);
                 }
 
+                /*
+                *
+                * th_id=0: warp0, warp1, warp2, warp3
+                * th_id=1: warp0, warp1, warp2, warp3
+                * th_id=2: warp0, warp1, warp2, warp3
+                * ...
+                * th_id=31: warp0, warp1, warp2, warp3
+                */
                 // 写出一个 packed uint32。
                 out_ptr[out_offset + th_id * 4 + warp_id] = res;
 
@@ -523,10 +561,10 @@ namespace marlin {
 
 // 根据 num_bits / has_perm / is_a_8bit 选择模板实例并启动 kernel。
 
-#define CALL_IF(NUM_BITS, HAS_PERM, IS_A_8BIT)                              \
+#define CALL_IF(NUM_BITS, HAS_PERM, IS_A_8BIT)                             \
   else if (num_bits == NUM_BITS && has_perm == HAS_PERM &&                  \
            is_a_8bit == IS_A_8BIT) {                                        \
-    cudaFuncSetAttribute(                                                   \
+    cudaFuncSetAttribute(                                                    \
         marlin::gptq_marlin_repack_kernel<marlin::repack_threads, NUM_BITS, \
                                           HAS_PERM, IS_A_8BIT>,             \
         cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);       \

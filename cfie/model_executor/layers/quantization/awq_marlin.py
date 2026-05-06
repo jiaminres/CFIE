@@ -609,10 +609,10 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
         # Alias for modular kernel
         layer.w2_weight = layer.w2_qweight
 
-        # Why does this take the intermediate size for size_k?
+        # w13 的 group 轴对应隐藏维 K=hidden_size，而不是 intermediate 维。
         marlin_w13_scales = marlin_moe_permute_scales(
             s=layer.w13_scales,
-            size_k=layer.intermediate_size_per_partition,
+            size_k=layer.hidden_size,
             size_n=layer.w13_scales.shape[2],
             group_size=self.quant_config.group_size,
             is_a_8bit=is_a_8bit,
