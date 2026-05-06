@@ -863,6 +863,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         # ----------------- 基础输入与运行模式 -----------------
         # 把当前输入激活 dtype 回写到 layer，供后续执行路径使用。
         layer.input_dtype = self.input_dtype  # None
+
         # itemsize==1 通常表示 int8 / fp8 这类 8-bit 激活输入。
         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
 
@@ -1171,8 +1172,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         # 重排 w13 scales 为 Marlin 布局。
         marlin_w13_scales = marlin_moe_permute_scales(
             s=layer.w13_scales,
-            # scale permutation 使用当前 TP rank 的 intermediate 分片尺寸。
-            size_k=layer.intermediate_size_per_partition,
+            # w13 的 group 轴对应隐藏维 K=hidden_size，而不是 intermediate 维。
+            size_k=layer.hidden_size,
             # gate/up 融合后的 N 维。
             size_n=layer.w13_scales.shape[2],
             group_size=self.quant_config.group_size,
