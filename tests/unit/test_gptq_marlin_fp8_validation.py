@@ -16,6 +16,9 @@ from cfie.op_validation.gptq_marlin_fp8 import (
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
+if torch.cuda.get_device_capability() < (8, 9):
+    pytest.skip("FP8 MMA validation requires SM89+", allow_module_level=True)
+
 
 def _dequantize_reference(
     qweight: torch.Tensor,
@@ -162,6 +165,15 @@ def test_gptq_marlin_fp8_validation_forward_and_backward() -> None:
         size_n=size_n,
         group_size=group_size,
     )
+
+    # 校验模块只保留一份 forward Marlin qweight，但为反向额外准备 row-major scales。
+    assert module.marlin_qweight.shape == (size_k // 16, size_n * 2)
+    assert module.marlin_scales.shape == (num_groups, size_n)
+    assert module.marlin_scales_bwd.shape == (num_groups, size_n)
+    assert module.marlin_scales_bwd.data_ptr() != module.marlin_scales.data_ptr()
+
+    # 校验反向 scales 保留原始 row-major [num_groups, N] 布局和原始数值。
+    torch.testing.assert_close(module.marlin_scales_bwd, scales, atol=0, rtol=0)
 
     # 构造输入激活 `x: [B, K]`，并开启输入梯度跟踪。
     x = (

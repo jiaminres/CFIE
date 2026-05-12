@@ -3490,62 +3490,95 @@ def scaled_fp8_quant(
         group_shape: tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize input tensor to FP8 and return quantized tensor and scale.
+    将二维输入张量量化为平台 FP8 dtype，并返回量化结果与实际使用的 scale。
 
-    This function supports both static and dynamic quantization: If you
-    provide the scale, it will use static scaling and if you omit it,
-    the scale will be determined dynamically. The function also allows
-    optional padding of the output tensors for downstream kernels that
-    will benefit from padding.
+    该函数支持动态量化与静态量化两条路径：
+    - `scale is None` 时，由底层算子根据输入动态生成 scale。
+    - `scale is not None` 时，复用调用方传入的静态 scale。
+    - `num_token_padding` 用于为下游 kernel 扩展输出第一维容量。
 
     Args:
-        input: The input tensor to be quantized to FP8 (must be 2D: [M, N])
-        scale: Optional scaling factor for the FP8 quantization. Supports:
-            - 0D or [1]: per-tensor scaling
-            - 1D: requires explicit group_shape to disambiguate per-channel
-              vs per-token (use (-1, 1) for per-channel, (1, -1) for per-token)
-            - 2D [M/group_m, N/group_n]: group scaling (e.g. [M, N/128] for
-              DeepSeek-style (1,128) groups, or [M/128, N/128] for (128,128))
-        scale_ub: Optional upper bound for scaling factor in dynamic
-            per token case
-        num_token_padding: If specified, pad the first dimension
-            of the output to at least this value.
-        use_per_token_if_dynamic: Whether to do per_tensor or per_token
-            in the dynamic quantization case.
-        group_shape: Optional tuple (group_m, group_n) specifying the group
-            shape for static quantization. Use -1 for "full extent" (e.g.,
-            (-1, -1) for per-tensor, (-1, 1) for per-channel, etc.)
-            Required for 1D scales; optional for 2D scales.
+        input: 待量化输入张量，必须是二维 `[M, N]`。
+        scale: 可选静态 scale，支持 per-tensor、per-channel、
+            per-token 与 group scaling。
+        num_token_padding: 可选输出 token 维 padding 下界，用于把输出第一维扩展到
+            `max(num_token_padding, M)`。
+        scale_ub: 动态 per-token scale 的可选上界，用于限制 scale 过大。
+        use_per_token_if_dynamic: 动态量化时是否生成 per-token scale。
+        output: 可选预分配 FP8 输出张量，提供时必须已经具备正确 dtype。
+        group_shape: 静态量化时的 group 形状 `(group_m, group_n)`，
+            用于解释一维或二维 scale 的广播粒度。
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: The output tensor in FP8 and
-            scaling factor.
+        tuple[torch.Tensor, torch.Tensor]: FP8 输出张量与对应 scale。
     """
-    # This code assumes batch_dim and num_tokens are flattened
+    # ------------------------------- 校验输入形状并确定输出元数据 -------------------------------
+
+    # 当前底层 FP8 量化算子只接收展平后的二维输入 `input: [M, N]`。
     assert input.ndim == 2
+
+    # 记录默认输出形状，初始与输入 `input: [M, N]` 保持一致。
     shape: tuple[int, int] | torch.Size = input.shape
-    # For ROCm on MI300, the output fp8 dtype is torch.float_e3m3fnuz
+
+    # 从当前平台读取 FP8 dtype，CUDA 通常为 e4m3，ROCm MI300 可为 e3m3fnuz。
     out_dtype: torch.dtype = current_platform.fp8_dtype()
+
+    # ------------------------------- 处理可选 token padding -------------------------------
+
+    # 若调用方要求 padding，则只扩展输出第一维 token 数，不改变特征维 `N`。
     if num_token_padding:
+
+        # 输出形状从 `[M, N]` 调整为 `[max(num_token_padding, M), N]`。
         shape = (max(num_token_padding, input.shape[0]), shape[1])
+
+    # ------------------------------- 准备 FP8 输出张量 -------------------------------
+
+    # 未传入预分配输出时，在输入同设备上按最终形状创建 FP8 输出。
     if output is None:
+
+        # `output: [M_pad, N]`，其中 `M_pad` 可能等于原始 `M` 或 padding 后长度。
         output = torch.empty(shape, device=input.device, dtype=out_dtype)
     else:
+
+        # 预分配输出路径不支持额外 padding，避免调用方传入张量形状与内部扩展规则冲突。
         assert num_token_padding is None, "padding not supported if output passed in"
+
+        # 预分配输出必须使用当前平台 FP8 dtype，否则底层量化写入会产生 dtype 不匹配。
         assert output.dtype == out_dtype
 
+    # ------------------------------- 执行动态或静态 FP8 量化 -------------------------------
+
+    # `scale is None` 表示由底层算子根据 `input: [M, N]` 动态计算 scale。
     if scale is None:
+
+        # 动态 per-token 路径为每个 token 行生成独立 scale，形状为 `[M_pad, 1]`。
         if use_per_token_if_dynamic:
+
+            # 分配 per-token scale 缓冲区，供底层算子写入每行输入对应的 scale。
             scale = torch.empty((shape[0], 1), device=input.device, dtype=torch.float32)
+
+            # 调用底层动态 per-token 量化算子，把 `input: [M, N]` 写入 `output: [M_pad, N]`。
             torch.ops._C.dynamic_per_token_scaled_fp8_quant(
-                output, input, scale, scale_ub
+                output,
+                input,
+                scale,
+                scale_ub
             )
         else:
+
+            # 分配 per-tensor scale 缓冲区，整块 `input: [M, N]` 共享一个 scale。
             scale = torch.empty(1, device=input.device, dtype=torch.float32)
+
+            # 调用底层动态 per-tensor 量化算子，把共享 scale 写入 `scale: [1]`。
             torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
     else:
+
+        # 静态路径复用调用方传入的 scale，并由 `group_shape` 决定 scale 的广播粒度。
         torch.ops._C.static_scaled_fp8_quant(output, input, scale, group_shape)
 
+    # ------------------------------- 返回量化结果 -------------------------------
+
+    # 返回 FP8 输出张量 `output: [M_pad, N]` 与本次实际使用的 scale。
     return output, scale
 
 

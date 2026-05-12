@@ -276,16 +276,16 @@ def marlin_moe_intermediate_size(w1_packed: torch.Tensor, w2_packed: torch.Tenso
 
 
 def marlin_make_workspace_new(
-        device: torch.device, max_blocks_per_sm: int = 1
+    device: torch.device, max_blocks_per_sm: int = 1
 ) -> torch.Tensor:
-    # In the new marlin kernel, we use the num of threadblocks as workspace
-    # size. The num of threadblocks is sms_count * max_blocks_per_sm.
+    """Allocate workspace for Marlin kernels.
+
+    The workspace length equals the number of launched thread blocks:
+    ``num_sms * max_blocks_per_sm``.
+    """
     sms = num_compute_units(device.index)
     return torch.zeros(
-        sms * max_blocks_per_sm,
-        dtype=torch.int,
-        device=device,
-        requires_grad=False
+        sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
     )
 
 
@@ -321,82 +321,34 @@ def marlin_make_empty_g_idx(device: torch.device) -> torch.Tensor:
 
 
 def marlin_sort_g_idx(g_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # 对 g_idx 做升序排序，返回“排序后的 g_idx”以及“排序索引”
-    #
-    # g_idx 的语义（结合 Marlin / act-order 路径）通常是：
-    #   shape = [K]
-    #   g_idx[k] 表示第 k 个 K 位置当前对应哪个 quant group
-    #
-    # torch.argsort(g_idx) 返回的不是排序后的值，
-    # 而是“如果想把 g_idx 排序，原始元素应该按什么顺序取”的索引。
-    #
-    # 例如：
-    #   g_idx = [1, 0, 0, 1]
-    #
-    # 那么：
-    #   torch.argsort(g_idx) = [1, 2, 0, 3]
-    #
-    # 含义是：
-    #   原始 g_idx 按索引 [1,2,0,3] 取出后，会得到 [0,0,1,1]
-    #
-    # .to(torch.int) 是把索引转成 int32，方便后续 C++/CUDA kernel 使用。
-    g_idx_sort_indices = torch.argsort(g_idx).to(torch.int)
+    """Sort act-order group ids and return the sort permutation.
 
-    # 返回两个东西：
-    #
-    # 1) g_idx[g_idx_sort_indices]
-    #    也就是“排好序后的 g_idx”
-    #
-    #    继续上面的例子：
-    #      g_idx = [1, 0, 0, 1]
-    #      g_idx_sort_indices = [1, 2, 0, 3]
-    #      g_idx[g_idx_sort_indices] = [0, 0, 1, 1]
-    #
-    #    它表示：同一个 group 的 K 位置被聚拢到一起了。
-    #
-    # 2) g_idx_sort_indices
-    #    也就是“从原始 K 顺序到按 group 排序后的顺序”的索引表
-    #
-    #    后续通常会用于：
-    #    - qweight 的 repack
-    #    - act-order 相关的 kernel 路径
+    Args:
+        g_idx: Group id per local K position, shape ``[K]``.
+
+    Returns:
+        A tuple ``(sorted_g_idx, sort_indices)`` where
+        ``sorted_g_idx = g_idx[sort_indices]``.
+    """
+    g_idx_sort_indices = torch.argsort(g_idx).to(torch.int)
     return g_idx[g_idx_sort_indices], g_idx_sort_indices
 
 
 def get_scale_perms():
-    # -------------------------------------------------------------
-    # 1) 构造 grouped-scale 使用的 64 元素 permutation
-    # -------------------------------------------------------------
-    # 这一套规则可视作把一个 8x8 小块按“列优先”顺序展开：
-    # - 原始是按行连续编号
-    # - 重排后变成同一列的元素先相邻
-    #
-    # 它用于“多 group + 非 8bit A”路径。
+    """Build scale permutations used by Marlin layouts.
+
+    Returns:
+        A tuple ``(scale_perm, scale_perm_single)`` where:
+        - ``scale_perm`` is used for grouped scales.
+        - ``scale_perm_single`` is used for single-group/channelwise layouts
+          and 8-bit-activation paths.
+    """
     scale_perm: list[int] = []
     for i in range(8):
         scale_perm.extend([i + 8 * j for j in range(8)])
-
-    # -------------------------------------------------------------
-    # 2) 构造 single-scale / A=8bit 使用的 32 元素 permutation
-    # -------------------------------------------------------------
-    # 这套规则不是完整的行主序，也不是完整的列主序，
-    # 而是按“两列一组 + 行间交错”的方式排列：
-    #
-    #   [0,1,8,9,16,17,24,25,
-    #    2,3,10,11,18,19,26,27,
-    #    4,5,12,13,20,21,28,29,
-    #    6,7,14,15,22,23,30,31]
-    #
-    # 它用于：
-    # - 单 group / channel-scale 路径
-    # - A=int8 / fp8 时的特殊读取路径
     scale_perm_single: list[int] = []
     for i in range(4):
         scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
-
-    # -------------------------------------------------------------
-    # 3) 返回两套 permutation
-    # -------------------------------------------------------------
     return scale_perm, scale_perm_single
 
 
@@ -407,42 +359,18 @@ def marlin_permute_scales(
         group_size: int,
         is_a_8bit: bool = False
 ) -> torch.Tensor:
-    # -------------------------------------------------------------
-    # 1) 读取 Marlin 的两套 scale 重排模板
-    # -------------------------------------------------------------
-    # - scale_perm        : 多 group、非 8bit A 路径
-    # - scale_perm_single : 单 group / A=8bit 路径
-    #
-    # 这一步不会改变 scale 的数学含义，
-    # 只是准备后续使用哪种物理布局重排规则。
+    """Permute scales into the memory layout expected by Marlin kernels.
+
+    For grouped quantization (``group_size < size_k`` and ``group_size != -1``)
+    with non-8-bit activations, use the grouped permutation. Otherwise use the
+    single-group/channelwise permutation.
+    """
     scale_perm, scale_perm_single = get_scale_perms()
-    # -------------------------------------------------------------
-    # 2) 判断当前 scales 是否属于“多 group”布局
-    # -------------------------------------------------------------
-    # group_size < size_k 表示：
-    # - K 维不止一个量化组
-    # - 当前 scales 是真正的 grouped scales
-    #
-    # 这时若 A 不是 8bit，则按长度 64 的 grouped permutation 重排。
-    #
-    # 其余情况统一走 scale_perm_single：
-    # - group_size == size_k：整条 K 维只有 1 个 group
-    # - group_size == -1    ：channel / single-scale 特例
-    # - is_a_8bit == True   ：A=int8/fp8 时，Marlin 的读取布局不同
-    #
     if group_size < size_k and group_size != -1 and not is_a_8bit:
-        # 把输入视作若干个长度 64 的小块，
-        # 对每个小块内部按 grouped-scale 规则做 permutation。
         s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
     else:
-        # 把输入视作若干个长度 32 的小块，
-        # 对每个小块内部按 single-scale / A=8bit 规则做 permutation。
         s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
-
-    # -------------------------------------------------------------
-    # 3) 重新整理回 [num_rows, size_n] 的二维视图
     s = s.reshape((-1, size_n)).contiguous()
-
     return s
 
 
@@ -690,23 +618,28 @@ def maybe_warn_marlin_atomic_add_env():
 def should_use_atomic_add_reduce(
         m: int, n: int, k: int, device: torch.device, dtype: torch.dtype
 ) -> bool:
-    # the performance of atomicAdd is better than global reduce
-    # only when m*n is small and k is large
+    # atomicAdd reduce 只在输出列较小且 K 维较大时可能快于全局 reduce。
     if n >= 2048 or k < 2048 or device.type != "cuda":
+        # 非 CUDA、输出列过大或 K 维不足时，直接保持默认全局 reduce 路径。
         return False
 
-    # disable atomicAdd reduce by default,
-    # one can enable it with VLLM_MARLIN_USE_ATOMIC_ADD=1
+    # atomicAdd reduce 默认关闭，需要显式设置 VLLM_MARLIN_USE_ATOMIC_ADD=1。
     if not envs.VLLM_MARLIN_USE_ATOMIC_ADD:
+        # 未开启实验开关时输出一次提示，并避免改变默认执行路径。
         maybe_warn_marlin_atomic_add_env()
+        # 返回 False 让调用方继续使用普通 Marlin reduce。
         return False
 
-    # sm8x doesn't support atomicAdd + bfloat16 natively
+    # 读取当前 GPU 架构，用于判断 BF16 atomicAdd 是否有原生支持。
     device_capability = torch.cuda.get_device_capability(device)
+    # SM90 之前没有原生 BF16 atomicAdd，BF16 输入不能启用该优化。
     if device_capability[0] < 9 and dtype == torch.bfloat16:
+        # 对不支持的架构给出性能提示，避免用户误以为开关未生效。
         maybe_warn_marlin_atomic_add(device, dtype)
+        # 回退到全局 reduce，保证 BF16 路径兼容 SM8x。
         return False
 
+    # 通过规模、环境变量和架构检查后，允许 Marlin 使用 atomicAdd reduce。
     return True
 
 

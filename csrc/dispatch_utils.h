@@ -6,8 +6,11 @@
 
 #include <torch/all.h>
 
-// Need a special dispatch case macro since we will nest the FP8 dispatch.
-// Instead of the usual 'scalar_t', this names the dispatched type 'fp8_t'.
+// `TYPE` 这类参数是运行时 dtype 枚举，例如 `at::ScalarType::Half`。
+// dispatch 宏的职责是把运行时枚举转换成编译期 C++ 类型别名，供模板 kernel 实例化。
+// 输入浮点类型默认命名为 `scalar_t`，表示 `input.data_ptr<scalar_t>()` 的真实元素类型。
+// FP8 输出类型单独命名为 `fp8_t`，避免嵌套 dispatch 时和输入的 `scalar_t` 混淆。
+// 这里需要一个专门的 FP8 case 宏，因为 per-token FP8 量化会先分派输入 dtype，再嵌套分派输出 FP8 dtype。
 #define AT_DISPATCH_FP8_CASE(enum_type, ...) \
   AT_PRIVATE_CASE_TYPE_USING_HINT(enum_type, fp8_t, __VA_ARGS__)
 

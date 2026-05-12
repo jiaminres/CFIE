@@ -37,7 +37,7 @@
 
   <rect width="1800" height="1040" fill="url(#bg)"/>
   <text x="70" y="62" class="title">Qwen3.5-122B 训练基座：分层容量与热参数轮转</text>
-  <text x="70" y="94" class="subtitle">目标：全量 FP32 主参数落盘，CPU 承载当前训练热参数与优化器，GPU 只保留前向影子、GPTQ 冷专家缓存和梯度桶。</text>
+  <text x="70" y="94" class="subtitle">目标：全量 FP32 主参数落盘，CPU 承载当前训练热参数、优化器与全量 GPTQ 冷专家缓存，GPU 只保留前向影子、resident cache 和梯度桶。</text>
 
   <!-- Lanes -->
   <rect x="50" y="120" width="1700" height="270" rx="28" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
@@ -144,9 +144,9 @@
     <text x="300" y="900" class="tiny">训练窗口结束写回 hot 参数</text>
 
     <rect x="730" y="815" width="330" height="100" rx="18" fill="#ffffff" stroke="#fde68a"/>
-    <text x="760" y="850" class="card-title">GPTQ Int4 缓存文件</text>
-    <text x="760" y="878" class="card-body">按 quant layout hash 复用</text>
-    <text x="760" y="900" class="tiny">支持 mmap，降低 CPU 常驻压力</text>
+    <text x="760" y="850" class="card-title">Adam FP8 状态文件</text>
+    <text x="760" y="878" class="card-body">m / v + block scale shard</text>
+    <text x="760" y="900" class="tiny">训练窗口结束随 FP32 刷盘</text>
 
     <rect x="1190" y="815" width="330" height="100" rx="18" fill="#ffffff" stroke="#fde68a"/>
     <text x="1220" y="850" class="card-title">训练进度文件</text>
@@ -181,12 +181,11 @@
   <rect x="690" y="430" width="204" height="28" rx="14" fill="#ecfdf5" stroke="#86efac"/>
   <text x="704" y="449" class="tiny">训练后重新量化 GPTQ MoE</text>
 
-  <path class="flow flow-orange flow-dash" d="M 1030 573 C 1110 655, 1080 745, 1015 815"/>
-  <rect x="1060" y="642" width="190" height="28" rx="14" fill="#fffbeb" stroke="#fbbf24"/>
-  <text x="1074" y="661" class="tiny">写回更新后的 GPTQ cache</text>
-
   <path class="flow flow-orange" d="M 655 681 C 600 745, 520 765, 435 815"/>
-  <text x="530" y="795" class="tiny">窗口结束刷盘</text>
+  <text x="530" y="795" class="tiny">窗口结束刷盘 FP32</text>
+
+  <path class="flow flow-orange" d="M 1312 681 C 1190 750, 1040 785, 895 815"/>
+  <text x="1020" y="775" class="tiny">窗口结束刷盘 Adam</text>
 
   <path class="flow flow-orange" d="M 1312 681 C 1312 730, 1338 780, 1355 815"/>
   <text x="1368" y="755" class="tiny">写训练进度</text>
@@ -197,11 +196,7 @@
   <path class="flow flow-dash flow-green" d="M 1490 210 C 1410 390, 590 415, 345 465"/>
   <text x="1430" y="300" class="tiny">峰值反馈：缩 bucket / hot set / activation segment</text>
 
-  <path class="flow flow-orange" d="M 860 815 C 800 735, 805 640, 865 573"/>
-  <rect x="705" y="704" width="162" height="28" rx="14" fill="#fffbeb" stroke="#fbbf24"/>
-  <text x="719" y="723" class="tiny">mmap / 后台量化缓存</text>
-
   <!-- Footer notes -->
   <rect x="220" y="985" width="1290" height="34" rx="17" fill="#e2e8f0"/>
-  <text x="250" y="1008" class="tiny">默认策略：4 个 GPU 梯度 bucket 环；非当前训练 experts 走 GPTQ Int4 前向；训练窗口结束先刷 FP32 / Adam / GPTQ，再原子记录 step、epoch 与数据游标。</text>
+  <text x="250" y="1008" class="tiny">默认策略：4 个 GPU 梯度 bucket 环；非当前训练 experts 走 GPTQ Int4 前向；GPTQ 全量缓存在 CPU 常驻，训练窗口结束只刷 FP32 / Adam，再原子记录 step、epoch 与数据游标。</text>
 </svg>

@@ -8,7 +8,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "SymInt size_k, SymInt size_n, int group_size, bool transpose) -> Tensor");
   m.def(
       "gptq_marlin_fp8_bwd_input(Tensor grad_output_fp8, "
-      "Tensor grad_output_scales, Tensor qweight_fwd, Tensor scales_fwd, "
+      "Tensor grad_output_scales, Tensor qweight_fwd, Tensor scales_bwd, "
       "SymInt size_k, SymInt size_n, int group_size) -> Tensor");
 }
 

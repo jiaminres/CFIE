@@ -660,13 +660,18 @@ torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
 
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 
+// 使用调用方传入的静态 scale 把 `input: [..., d]` 量化到 `out: [..., d]`。
+// `group_shape` 用于解释 1D/2D scale 在 token 维和 hidden 维上的覆盖粒度。
 void static_scaled_fp8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor const& scale,
     std::optional<std::tuple<int64_t, int64_t>> group_shape = std::nullopt);
 
+// 动态计算整块 `input: [..., d]` 的 per-tensor scale，并写回 `scale: [1]`。
 void dynamic_scaled_fp8_quant(torch::Tensor& out, torch::Tensor const& input,
                               torch::Tensor& scale);
 
+// 动态计算每个 token 行的 scale，并把结果写入 `scale: [M, 1]`。
+// `scale_ub` 是可选上界，用于限制单行 absmax 过大导致的 scale 膨胀。
 void dynamic_per_token_scaled_fp8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor& scale,
     std::optional<torch::Tensor> const& scale_ub);

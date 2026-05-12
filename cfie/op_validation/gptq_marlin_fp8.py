@@ -156,6 +156,9 @@ class _PreparedValidationWeight:
     # 已按 Marlin 布局重排的 group scales。
     marlin_scales: torch.Tensor
 
+    # 反向 dInput 路径使用的 row-major group scales: [num_groups, N]。
+    marlin_scales_bwd: torch.Tensor
+
     # Marlin kernel 所需的临时 workspace。
     workspace: torch.Tensor
 
@@ -178,6 +181,7 @@ class _GPTQMarlinFP8LinearFn(torch.autograd.Function):
         x: torch.Tensor,
         marlin_qweight: torch.Tensor,
         marlin_scales: torch.Tensor,
+        marlin_scales_bwd: torch.Tensor,
         workspace: torch.Tensor,
         bias: torch.Tensor | None,
         g_idx: torch.Tensor,
@@ -237,8 +241,8 @@ class _GPTQMarlinFP8LinearFn(torch.autograd.Function):
 
         # ------------------------------- 保存反向所需状态 -------------------------------
 
-        # 反向只需要 `marlin_qweight` 与 `marlin_scales` 来恢复 `dInput`。
-        ctx.save_for_backward(marlin_qweight, marlin_scales)
+        # 反向只复用同一份 packed qweight，并改用反向专用 scale 布局恢复 dInput。
+        ctx.save_for_backward(marlin_qweight, marlin_scales_bwd)
 
         # 记录原始输入形状，以便把二维 `dInput: [M, K]` 恢复回 `[..., K]`。
         ctx.input_shape = x.shape
@@ -256,8 +260,8 @@ class _GPTQMarlinFP8LinearFn(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         # ------------------------------- 取回反向依赖的冻结权重状态 -------------------------------
 
-        # 取回前向保存的 Marlin 权重与 scale，供反向算子使用。
-        marlin_qweight, marlin_scales = ctx.saved_tensors
+        # 取回前向保存的 packed qweight 与反向专用 scales。
+        marlin_qweight, marlin_scales_bwd = ctx.saved_tensors
 
         # ------------------------------- 展平上游梯度并量化为 FP8 -------------------------------
 
@@ -280,7 +284,7 @@ class _GPTQMarlinFP8LinearFn(torch.autograd.Function):
             grad_output_fp8,
             grad_output_scales,
             marlin_qweight,
-            marlin_scales,
+            marlin_scales_bwd,
             ctx.input_shape[-1],
             grad_output_2d.shape[-1],
             ctx.group_size,
@@ -292,7 +296,20 @@ class _GPTQMarlinFP8LinearFn(torch.autograd.Function):
         grad_input = grad_input.reshape(ctx.input_shape).to(ctx.input_dtype)
 
         # 当前验证路径只回传输入 `x` 的梯度，其余参数统一视为冻结常量。
-        return grad_input, None, None, None, None, None, None, None, None, None, None
+        return (
+            grad_input,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 # ------------------------------- 验证专用线性层模块 -------------------------------
@@ -331,6 +348,9 @@ class GPTQMarlinFP8Linear(torch.nn.Module):
 
         # 注册已重排的 Marlin scales，验证期间其值固定不参与梯度更新。
         self.register_buffer("marlin_scales", prepared.marlin_scales)
+
+        # 注册反向 dInput 专用 scales，保持 qweight 单份但允许 scale 使用反向布局。
+        self.register_buffer("marlin_scales_bwd", prepared.marlin_scales_bwd)
 
         # 注册 kernel workspace，但不把它写入 state_dict。
         self.register_buffer("workspace", prepared.workspace, persistent=False)
@@ -441,12 +461,17 @@ class GPTQMarlinFP8Linear(torch.nn.Module):
             * 512
         )
 
+        # 反向 dInput 的 reduction 维是 N，因此保留 row-major [num_groups, N]
+        # 布局，让反向 kernel 沿 N 维连续读取 scale。
+        marlin_scales_bwd = scales.contiguous()
+
         # ------------------------------- 打包验证所需的冻结权重状态 -------------------------------
 
         # 将所有前向/反向复用的中间结果打包成一个冻结权重结构体。
         prepared = _PreparedValidationWeight(
             marlin_qweight=marlin_qweight,
             marlin_scales=marlin_scales,
+            marlin_scales_bwd=marlin_scales_bwd,
             workspace=marlin_make_workspace_new(qweight.device),
             bias=marlin_permute_bias(bias.contiguous()) if bias is not None else None,
             g_idx=empty,
@@ -470,6 +495,7 @@ class GPTQMarlinFP8Linear(torch.nn.Module):
             x,
             self.marlin_qweight,
             self.marlin_scales,
+            self.marlin_scales_bwd,
             self.workspace,
             self.bias,
             self.g_idx,
