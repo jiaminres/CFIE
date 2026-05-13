@@ -690,7 +690,7 @@ class LayerTieredExpertCacheController:
                 and planned_cpu_static_bytes > DEFAULT_PINNED_CPU_STATIC_LIMIT_BYTES
         ):
             self._use_pinned_cpu_static = False
-            logger.info(
+            logger.debug(
                 "Disabling pinned CPU static expert mirror: layer=%s "
                 "cpu_static=%.2f GiB limit=%.2f GiB",
                 self.layer_key,
@@ -1926,9 +1926,9 @@ class LayerTieredExpertCacheController:
             self._install_mapping(expert_id, slot)
             # 增加累计加载计数。
             self._total_loads += 1
-            # 仅在前几次或每 100 次动态换入时打日志。
+            # 首 3 次 + 每 200 次动态换入时打日志, 避免预热阶段刷屏。
             if log_runtime_events and (
-                self._total_loads <= 8 or self._total_loads % 100 == 0
+                self._total_loads <= 3 or self._total_loads % 200 == 0
             ):
                 logger.info(
                     "Tiered MoE cache event: layer=%s load=%d batch=%d source=%s "
