@@ -408,41 +408,117 @@ namespace marlin {
     }
 
     // 执行底层 Marlin GEMM kernel，负责配置选择、act-order 预处理和分段 launch。
-    void marlin_mm(const void *A,
-                   const void *B,
-                   void *C,
-                   void *C_tmp,
-                   void *b_bias,
-                   void *a_s,
-                   void *b_s,
-                   void *g_s,
-                   void *zp,
-                   void *g_idx,
-                   void *perm,
-                   void *a_tmp,
-                   int prob_m,
-                   int prob_n,
-                   int prob_k,
-                   int lda,
-                   void *workspace,
-                   vllm::ScalarType const &a_type,
-                   vllm::ScalarType const &b_type,
-                   vllm::ScalarType const &c_type,
-                   vllm::ScalarType const &s_type,
-                   bool has_bias,
-                   bool has_act_order,
-                   bool is_k_full,
-                   bool has_zp,
-                   int num_groups,
-                   int group_size,
-                   int dev,
-                   cudaStream_t stream,
-                   int thread_k_init,
-                   int thread_n_init,
-                   int sms,
-                   bool use_atomic_add,
-                   bool use_fp32_reduce,
-                   bool is_zp_float) {
+    void marlin_mm(
+        // ------------------------------- 输入、输出和临时缓冲 -------------------------------
+        // A：activation 矩阵，按 [M, K] 解释；底层会根据 a_type 判断 8bit/16bit 加载步长。
+        const void *A,
+
+        // B：Marlin packed 后的量化权重，逻辑形状对应 [K, N] 的压缩表示。
+        const void *B,
+
+        // C：最终输出矩阵，按 [M, N] 解释，kernel 会把 GEMM 结果写回这里。
+        void *C,
+
+        // C_tmp：FP32/global reduce 路径使用的临时累加缓冲；普通路径传空占位。
+        void *C_tmp,
+
+        // b_bias：可选 bias，逻辑形状为 [N]；has_bias=false 时底层不会读取。
+        void *b_bias,
+
+        // a_s：A 为 8bit/fp8 activation 时使用的输入 scale，通常按 token/M 维存储。
+        void *a_s,
+
+        // b_s：B 权重量化 scale，通常按 [num_groups, N] 或 per-channel 布局解释。
+        void *b_s,
+
+        // g_s：NVFP4/MXFP4 等路径使用的 global scale；无该路径时传空占位。
+        void *g_s,
+
+        // zp：非对称量化 zero-point；has_zp=false 时底层不会读取。
+        void *zp,
+
+        // g_idx：act-order 路径下的 group 索引，逻辑形状为 [K]。
+        void *g_idx,
+
+        // perm：act-order 路径下的 K 维重排索引，逻辑形状为 [K]。
+        void *perm,
+
+        // a_tmp：act-order 需要重排 A 时使用的临时缓冲，逻辑形状为 [M, K]。
+        void *a_tmp,
+
+        // ------------------------------- 问题规模和内存步长 -------------------------------
+        // prob_m：GEMM 的 M 维，也就是 A/C 的行数。
+        int prob_m,
+
+        // prob_n：GEMM 的 N 维，也就是 B/C 的输出列数。
+        int prob_n,
+
+        // prob_k：GEMM 的 K 维，也就是 A 的列数和 B 的输入行数。
+        int prob_k,
+
+        // lda：A 的行跨度，按元素数传入；底层结合 a_type 换算为 int4 地址步长。
+        int lda,
+
+        // workspace：kernel 间同步和归约锁缓冲，至少需要覆盖 sms 个锁位。
+        void *workspace,
+
+        // ------------------------------- 数据类型描述 -------------------------------
+        // a_type：activation A 的内部标量类型，例如 FP16/BF16/INT8/FP8。
+        vllm::ScalarType const &a_type,
+
+        // b_type：量化权重 B 的内部标量类型，用于推导 num_bits 和 selector 分支。
+        vllm::ScalarType const &b_type,
+
+        // c_type：输出 C 的内部标量类型，用于选择累加和写回 kernel。
+        vllm::ScalarType const &c_type,
+
+        // s_type：scale 的内部标量类型，可能等于 c_type，也可能是 FP4 专用 scale 类型。
+        vllm::ScalarType const &s_type,
+
+        // ------------------------------- 量化和布局开关 -------------------------------
+        // has_bias：是否读取 b_bias 并在输出前加到 GEMM 结果上。
+        bool has_bias,
+
+        // has_act_order：是否启用 GPTQ act-order 路径，即先按 perm 重排 A 的 K 维。
+        bool has_act_order,
+
+        // is_k_full：当前 rank 是否持有完整 K；影响 act-order 下 group_size 的静态推导。
+        bool is_k_full,
+
+        // has_zp：是否存在 zero-point；为 false 时 zp 指针只是占位。
+        bool has_zp,
+
+        // num_groups：B scale/zero 的 group 数，通常来自 b_scales.shape[0]。
+        int num_groups,
+
+        // group_size：每个量化 group 覆盖的 K 元素数；-1 表示单组，0 表示 act-order 动态 group。
+        int group_size,
+
+        // ------------------------------- 执行配置 -------------------------------
+        // dev：当前 CUDA 设备编号，用于查询共享内存上限和计算能力。
+        int dev,
+
+        // stream：kernel launch 使用的 CUDA stream。
+        cudaStream_t stream,
+
+        // thread_k_init：用户指定的 K 维 thread tile；-1 表示自动选择。
+        int thread_k_init,
+
+        // thread_n_init：用户指定的 N 维 thread tile；-1 表示自动选择。
+        int thread_n_init,
+
+        // sms：当前设备 SM 数，用于确定 grid block 数、workspace 锁数量和 M 分段策略。
+        int sms,
+
+        // use_atomic_add：是否允许小输出规模下使用 atomicAdd reduce。
+        bool use_atomic_add,
+
+        // use_fp32_reduce：是否启用 FP32 临时缓冲做全局归约。
+        bool use_fp32_reduce,
+
+        // is_zp_float：zero-point 是否按浮点数解释；影响共享内存估算和 kernel selector。
+        bool is_zp_float
+    ) {
         // A 为 8bit dtype 时，kernel 内部按 1 字节 activation 加载。
         bool is_a_8bit = a_type.size_bits() == 8;
 
@@ -459,8 +535,10 @@ namespace marlin {
             if (is_k_full) {
                 // 完整 K 的 act-order 不能使用 per-channel 单组标记。
                 TORCH_CHECK(group_size != -1);
+
                 // kernel selector 使用 16 元素为单位的 group block。
                 group_blocks = group_size / 16;
+
                 // K 维必须能按 group block 整除，保证 kernel 内部 group 索引合法。
                 TORCH_CHECK(prob_k % group_blocks == 0, "prob_k = ", prob_k,
                             " is not divisible by group_blocks = ", group_blocks);
@@ -487,6 +565,7 @@ namespace marlin {
 
         // num_bits 表示 B 权重量化位宽，用于共享内存估算与 selector 匹配。
         int num_bits = b_type.size_bits();
+
         // A/B/C 都按 int4 进行 16B 向量化访问。
         const int4 *A_ptr = (const int4 *) A;
         const int4 *B_ptr = (const int4 *) B;
@@ -495,21 +574,28 @@ namespace marlin {
 
         // bias 按 int4 加载，内部再解释为对应 c_type。
         const int4 *bias_ptr = (const int4 *) b_bias;
+
         // activation scale 始终以 float 指针传给 kernel。
         const float *a_s_ptr = (const float *) a_s;
+
         // weight scale 按 int4 加载，实际解释由 s_type 决定。
         const int4 *b_s_ptr = (const int4 *) b_s;
+
         // global scale 用于 NVFP4/MXFP4 等额外全局缩放路径。
         const uint16_t *g_s_ptr = (const uint16_t *) g_s;
 
         // zero-point 按 int4 加载，实际布局由 has_zp/is_zp_float 决定。
         const int4 *zp_ptr = (const int4 *) zp;
+
         // g_idx 描述 act-order 路径下本地 K 位置对应的 group id。
         const int *g_idx_ptr = (const int *) g_idx;
+
         // perm 描述 A 的 K 维重排顺序。
         const int *perm_ptr = (const int *) perm;
+
         // a_tmp 是 act-order 重排后的 A 临时缓冲。
         int4 *a_tmp_ptr = (int4 *) a_tmp;
+
         // workspace 首段作为 kernel 间同步/归约锁使用。
         int *locks = (int *) workspace;
 
@@ -517,13 +603,16 @@ namespace marlin {
         if (has_act_order) {
             // 每个 SM 负责一段 M 行，尽量让重排 kernel 覆盖所有 SM。
             int block_rows = div_ceil(prob_m, sms);
+
             // 避免 clang-format 把 CUDA launch 的 >>> 拆成 > > >。
     // clang-format off
     permute_cols_kernel<<<sms, default_threads, 0, stream>>>(
         A_ptr, perm_ptr, a_tmp_ptr, prob_m, prob_k, lda, block_rows);
             // clang-format on
+
             // 后续 GEMM 读取重排后的 A。
             A_ptr = a_tmp_ptr;
+
             // 重排后的 A 是紧凑 [M, K]，行跨度变为 prob_k。
             lda = prob_k;
 
@@ -535,6 +624,7 @@ namespace marlin {
         int max_shared_mem = 0;
         cudaDeviceGetAttribute(&max_shared_mem,
                                cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+
         // 设备必须返回有效共享内存上限，否则无法验证 kernel 配置。
         TORCH_CHECK(max_shared_mem > 0);
 
@@ -545,11 +635,14 @@ namespace marlin {
         // 查询 CUDA 计算能力次版本。
         cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
                                dev);
+
         // Marlin kernel 最低要求 SM75。
         TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
                     "marlin kernel only support Turing or newer GPUs.");
+
         // 默认使用 4 stage pipeline。
         int stages = 4;
+
         // Turing SM75 共享内存和指令能力较弱，降低 pipeline stage。
         if (major_capability == 7 && minor_capability == 5) {
             // Turing 上使用 2 stage，避免共享内存和调度压力过大。
@@ -558,6 +651,7 @@ namespace marlin {
             TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
                         "Turing only support FP16 or INT8 activation.");
         }
+
         // W4A8-FP8 Marlin 只在 Ada SM89 和 Blackwell SM120 上启用。
         if (a_type == vllm::kFE4M3fn) {
             TORCH_CHECK(
@@ -569,48 +663,62 @@ namespace marlin {
 
         // max_par 控制 M 维拆分并行度，避免一次 launch 覆盖过多 M 分片。
         int max_par = 16;
+
         // 小 N 场景可放宽 M 维并行拆分，提高 SM 利用率。
         if (prob_n <= 4096) max_par = 16 * 8;
+
         // max_shared_mem_new 会随 blocks_per_sm 调整为每个 block 可用的共享内存。
         int max_shared_mem_new = max_shared_mem;
+
         // rest_m 记录尚未 launch 的 M 行数。
         int rest_m = prob_m;
+
         // 每个 kernel 分段最多覆盖 4 个 16 行 M block。
         int max_thread_m_blocks = 4;
+
         // 按 M 维分段 launch，直到所有 M 行处理完毕。
         while (rest_m) {
             // par_count 表示当前剩余 M 能切出多少个最大 M tile。
             int par_count = rest_m / (max_thread_m_blocks * 16);
+
             // 限制单次 launch 的 M tile 数，防止过大 grid 降低调度效率。
             if (par_count > max_par) par_count = max_par;
+
             // prob_m_split 是本轮 launch 实际处理的 M 行数。
             int prob_m_split =
                     par_count > 0 ? (par_count * (max_thread_m_blocks * 16)) : rest_m;
 
             // 用户指定 thread_k 时优先使用，否则保持 -1 进入自动配置。
             int thread_k = thread_k_init;
+
             // 用户指定 thread_n 时优先使用，否则保持 -1 进入自动配置。
             int thread_n = thread_n_init;
 
             // 当前 M 分段需要的 16 行 block 数，不超过 max_thread_m_blocks。
             int thread_m_blocks = min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
+
             // 小 M 且 16bit activation 可选择 8 行特化 kernel。
             int m_block_size_8 = prob_m_split <= 8 && a_type.size_bits() == 16;
 
             // ------------------------------- 选择线程 tile 配置 -------------------------------
             // exec_cfg 保存最终 blocks_per_sm 和线程 tile。
             exec_config_t exec_cfg;
+
             // thread_tfg 保存当前轮 launch 的 thread_k/thread_n/num_threads。
             thread_config_t thread_tfg;
+
             // 同时指定 thread_k/thread_n 时，跳过自动配置。
             if (thread_k != -1 && thread_n != -1) {
                 // 手动配置默认使用 default_threads。
                 thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
+
                 // 手动配置每个 SM 只放一个 block。
                 exec_cfg = exec_config_t{1, thread_tfg};
+
                 // N 维必须能被手动 thread_n 整除。
                 TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
                             " is not divisible by thread_n = ", thread_n);
+
                 // K 维必须能被手动 thread_k 整除。
                 TORCH_CHECK(prob_k % thread_k == 0, "prob_k = ", prob_k,
                             " is not divisible by thread_k = ", thread_k);
