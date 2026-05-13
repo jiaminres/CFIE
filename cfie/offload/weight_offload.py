@@ -1071,19 +1071,6 @@ class LayerTieredExpertCacheController:
         self._cpu_static_bundles[expert_id] = bundle
         self._cpu_buffer_bytes += bundle.nbytes
 
-        materialized = len(self._cpu_static_bundles)
-        if materialized <= 8 or materialized % 32 == 0:
-            logger.info(
-                "Materialized CPU static expert bundle: layer=%s expert=%d "
-                "mode=%s materialized=%d/%d cpu_bytes=%.2f MiB",
-                self.layer_key,
-                expert_id,
-                "eager" if eager else "lazy",
-                materialized,
-                len(self._cpu_static_experts),
-                self._cpu_buffer_bytes / (1 << 20),
-            )
-
         return bundle
 
     def _pack_cpu_static_bundles_layer_wide(
@@ -1181,21 +1168,36 @@ class LayerTieredExpertCacheController:
         if not pending:
             return
 
+        log_runtime = bool(getattr(self, "_log_runtime_events", False))
+        t_start = time.perf_counter() if log_runtime else 0.0
+        effective_batch: int = 0
+
         if self._mode != "gptq_marlin":
             for expert_id in pending:
                 self._materialize_cpu_static_bundle(expert_id, eager=True)
-            return
+        else:
+            batch_size = self._resolve_cpu_static_preprocess_batch_size(len(pending))
+            effective_batch = max(1, batch_size)
+            if batch_size == 1:
+                for expert_id in pending:
+                    self._materialize_cpu_static_bundle(expert_id, eager=True)
+            else:
+                for start in range(0, len(pending), batch_size):
+                    batch_expert_ids = pending[start:start + batch_size]
+                    self._materialize_quantized_cpu_static_batch_with_retry(
+                        batch_expert_ids
+                    )
 
-        batch_size = self._resolve_cpu_static_preprocess_batch_size(len(pending))
-        if batch_size == 1:
-            for expert_id in pending:
-                self._materialize_cpu_static_bundle(expert_id, eager=True)
-            return
-
-        for start in range(0, len(pending), batch_size):
-            batch_expert_ids = pending[start:start + batch_size]
-            self._materialize_quantized_cpu_static_batch_with_retry(
-                batch_expert_ids
+        if log_runtime:
+            elapsed = time.perf_counter() - t_start
+            logger.info(
+                "CPU static mirror: layer=%s experts=%d batch=%d "
+                "cpu_bytes=%.2f MiB elapsed=%.1fs",
+                self.layer_key,
+                len(pending),
+                effective_batch,
+                self._cpu_buffer_bytes / (1 << 20),
+                elapsed,
             )
 
     def _materialize_quantized_cpu_static_batch_with_retry(
@@ -3590,7 +3592,9 @@ def maybe_enable_tiered_moe_cache(model: nn.Module, cfie_config: Any) -> None:
     shared_prefill_burst_pool: SharedPrefillBurstPool | None = None
 
     # ------------------------------- 遍历模型模块并为目标 FusedMoE 层挂载控制器 -------------------------------
-    # 遍历模型中的全部子模块，逐个查找需要启用 tiered cache 的 FusedMoE 层。
+    # 阶段 1: 延迟 burst pool 创建, 先完成所有层的 CPU 静态镜像材料化。
+    # 这样 repack 过程中不会与 burst pool 的 ~1.2 GiB GPU 分配争抢显存。
+    controllers: list[LayerTieredExpertCacheController] = []
     for module in model.modules():
         # 仅处理 FusedMoE 类型的层。
         if not isinstance(module, FusedMoE):
@@ -3603,41 +3607,33 @@ def maybe_enable_tiered_moe_cache(model: nn.Module, cfie_config: Any) -> None:
         # 统计当前模型中被标记需要启用 tiered cache 的层数。
         marked_layers += 1
 
-        # 当前层默认不绑定任何 prefill burst pool。
-        layer_prefill_burst_pool: SharedPrefillBurstPool | None = None
-
-        # ------------------------------- 按需为当前层分配或复用共享 prefill burst pool -------------------------------
-        # 当计划中启用了 prefill burst pool 时，优先尝试为当前层复用全局共享池。
-        if prefill_burst_slots > 0:
-            # 当全局共享 burst pool 尚未创建时，基于当前层构造一份模板化共享池。
-            if shared_prefill_burst_pool is None:
-                shared_prefill_burst_pool = SharedPrefillBurstPool(
-                    template_layer=module,
-                    num_slots=prefill_burst_slots,
-                )
-
-            # 当当前层与共享 burst pool 的形状兼容时，直接复用同一个共享池。
-            if shared_prefill_burst_pool.supports_layer(module):
-                layer_prefill_burst_pool = shared_prefill_burst_pool
-            else:
-                # 当当前层与共享 burst pool 不兼容时，保留告警，并让该层仅走 resident prepare 路径。
-                logger.warning(
-                    "Skipping shared prefill burst pool on incompatible MoE layer: %s",
-                    module.layer_name,
-                )
-
-        # ------------------------------- 为当前 FusedMoE 层挂载 tiered cache controller -------------------------------
-        # 基于当前层、全局计划、专家存储和可选的 prefill burst pool 构造分层专家缓存控制器。
-        module._cfie_tiered_cache_controller = LayerTieredExpertCacheController(
+        # 阶段 1 不创建 burst pool (传 None), 让 repack 独占 GPU 临时空间, 避免 2× 分配。
+        controller = LayerTieredExpertCacheController(
             layer=module,
             plan=plan,
             expert_store=expert_store,
-            prefill_burst_pool=layer_prefill_burst_pool,
+            prefill_burst_pool=None,
             log_runtime_events=log_runtime_events,
         )
-
-        # 统计当前已成功挂载控制器的层数。
+        module._cfie_tiered_cache_controller = controller
+        controllers.append(controller)
         enabled_layers += 1
+
+    # 阶段 2: CPU 镜像全部完成后再分配 shared prefill burst pool, 并绑定到各层。
+    if prefill_burst_slots > 0 and controllers:
+        template = controllers[0]
+        shared_prefill_burst_pool = SharedPrefillBurstPool(
+            template_layer=template.layer,
+            num_slots=prefill_burst_slots,
+        )
+        for controller in controllers:
+            if shared_prefill_burst_pool.supports_layer(controller.layer):
+                controller.prefill_burst_pool = shared_prefill_burst_pool
+            else:
+                logger.warning(
+                    "Skipping shared prefill burst pool on incompatible MoE layer: %s",
+                    controller.layer.layer_name,
+                )
 
     # ------------------------------- 校验目标层数与实际挂载层数是否一致 -------------------------------
     # 当存在被标记的目标层，但实际成功挂载的层数与标记层数不一致时，直接失败并报错。

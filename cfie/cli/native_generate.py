@@ -58,6 +58,8 @@ def add_native_generate_parser(subparsers: Any) -> None:
     parser.add_argument("--enable-prefix-caching",
                         action=argparse.BooleanOptionalAction,
                         default=None)
+    # predictor checkpoint 路径（启用 predictor 加速 MoE 专家预取）
+    parser.add_argument("--predictor-checkpoint", default=None)
     # 指定 MoE CPU cache 预算。
     parser.add_argument("--moe-cpu-budget-gb", type=float, default=0.0)
     # 指定系统空闲内存保底。
@@ -265,6 +267,11 @@ def _build_engine_args(args: Namespace):
     )
     if args.mamba_cache_mode is not None:
         engine_kwargs["mamba_cache_mode"] = args.mamba_cache_mode
+    # 启用 predictor 加速：将 checkpoint 路径注入 hf_overrides
+    if getattr(args, "predictor_checkpoint", None):
+        engine_kwargs["hf_overrides"] = {
+            "predictor_checkpoint_path": args.predictor_checkpoint,
+        }
     return EngineArgs(**engine_kwargs)
 
 

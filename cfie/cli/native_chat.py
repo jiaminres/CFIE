@@ -127,6 +127,8 @@ def add_native_chat_parser(subparsers: Any) -> None:
     parser.add_argument("--skip-mm-profiling",
                         action=argparse.BooleanOptionalAction,
                         default=False)
+    # predictor checkpoint 路径（启用 predictor 加速 MoE 专家预取）
+    parser.add_argument("--predictor-checkpoint", default=None)
 
     # 采样参数；未显式传入时优先使用模型 generation_config.json。
     parser.add_argument("--temperature", type=float, default=None)

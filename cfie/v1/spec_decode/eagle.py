@@ -1286,6 +1286,7 @@ class SpecDecodeBaseProposer:
                 "GlmOcrForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_5MoePredictorForConditionalGeneration",
             ]:
                 self.model.config.image_token_index = target_model.config.image_token_id
             elif self.get_model_name(target_model) == "PixtralForConditionalGeneration":
@@ -1297,8 +1298,14 @@ class SpecDecodeBaseProposer:
                     target_model.config.media_placeholder_token_id
                 )
             else:
-                self.model.config.image_token_index = (
-                    target_model.config.image_token_index
+                # Qwen3.5 系列 config 使用 image_token_id 而非 image_token_index
+                _token_index_attr = (
+                    "image_token_index"
+                    if hasattr(target_model.config, "image_token_index")
+                    else "image_token_id"
+                )
+                self.model.config.image_token_index = getattr(
+                    target_model.config, _token_index_attr
                 )
             target_language_model = cast(
                 SupportsMultiModal, target_model
