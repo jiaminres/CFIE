@@ -92,10 +92,15 @@ warnings.filterwarnings(
 
 MODULE_ATTRS = {
     "PoolingParams": ".pooling_params:PoolingParams",
+    "PoolingRequestOutput": ".outputs:PoolingRequestOutput",
+    "PromptType": ".inputs:PromptType",
     "SamplingParams": ".sampling_params:SamplingParams",
+    "TokensPrompt": ".inputs.data:TokensPrompt",
 }
 
 if typing.TYPE_CHECKING:
+    from cfie.inputs import PromptType
+    from cfie.outputs import PoolingRequestOutput
     from cfie.pooling_params import PoolingParams
     from cfie.sampling_params import SamplingParams
 else:
@@ -114,5 +119,7 @@ __all__ = [
     "__version__",
     "__version_tuple__",
     "PoolingParams",
+    "PoolingRequestOutput",
+    "PromptType",
     "SamplingParams",
 ]
