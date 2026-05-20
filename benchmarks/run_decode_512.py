@@ -18,7 +18,12 @@ from cfie.cli.native_generate import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Measure 512-token decode latency")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--prompt", default=None)
+    parser.add_argument(
+        "--prompt-file",
+        default=None,
+        help="Read the prompt from a UTF-8 text file. Overrides --prompt.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
@@ -116,6 +121,10 @@ def _build_args_namespace(raw: argparse.Namespace) -> argparse.Namespace:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.prompt_file:
+        args.prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig")
+    if args.prompt is None:
+        raise SystemExit("Either --prompt or --prompt-file is required.")
     ns = _build_args_namespace(args)
 
     EngineArgs, SamplingParams, RequestOutputKind, LLMEngine = _resolve_runtime_symbols()
@@ -168,6 +177,7 @@ def main() -> None:
         first_step_tokens = 0
         generated_tokens = 0
         generated_text_parts: list[str] = []
+        step_records: list[dict[str, float | int]] = []
         while engine.has_unfinished_requests():
             is_first_step = step_count == 0
             step_t0 = time.perf_counter()
@@ -176,6 +186,7 @@ def main() -> None:
             if is_first_step:
                 first_step_seconds = step_dt
             step_count += 1
+            step_generated_tokens = 0
             for output in outputs:
                 if getattr(output, "request_id", None) != request_id:
                     continue
@@ -183,11 +194,16 @@ def main() -> None:
                     for completion in output.outputs:
                         token_count = len(completion.token_ids)
                         generated_tokens += token_count
+                        step_generated_tokens += token_count
                         if is_first_step:
                             first_step_tokens += token_count
                         text = getattr(completion, "text", "")
                         if text:
                             generated_text_parts.append(text)
+            if step_generated_tokens:
+                step_records.append(
+                    {"seconds": step_dt, "tokens": step_generated_tokens}
+                )
         total_seconds = time.perf_counter() - decode_t0
     finally:
         try:
@@ -200,6 +216,24 @@ def main() -> None:
     steady_tokens = max(generated_tokens - first_step_tokens, 0)
     steady_seconds = max(total_seconds - first_step_seconds, 0.0)
     steady_tps = steady_tokens / steady_seconds if steady_seconds > 0 else 0.0
+
+    def _tail_window(target_tokens: int) -> dict[str, float | int]:
+        tokens = 0
+        seconds = 0.0
+        for record in reversed(step_records):
+            tokens += int(record["tokens"])
+            seconds += float(record["seconds"])
+            if tokens >= target_tokens:
+                break
+        return {
+            "tokens": tokens,
+            "seconds": seconds,
+            "tokens_per_sec": tokens / seconds if seconds > 0.0 else 0.0,
+        }
+
+    tail_64 = _tail_window(64)
+    tail_128 = _tail_window(128)
+    tail_256 = _tail_window(256)
     scheduler_config = engine.cfie_config.scheduler_config
     result = {
         "decode_tokens": generated_tokens,
@@ -211,6 +245,15 @@ def main() -> None:
         "steady_tokens": steady_tokens,
         "steady_seconds": steady_seconds,
         "steady_tokens_per_sec": steady_tps,
+        "tail_64_tokens": tail_64["tokens"],
+        "tail_64_seconds": tail_64["seconds"],
+        "tail_64_tokens_per_sec": tail_64["tokens_per_sec"],
+        "tail_128_tokens": tail_128["tokens"],
+        "tail_128_seconds": tail_128["seconds"],
+        "tail_128_tokens_per_sec": tail_128["tokens_per_sec"],
+        "tail_256_tokens": tail_256["tokens"],
+        "tail_256_seconds": tail_256["seconds"],
+        "tail_256_tokens_per_sec": tail_256["tokens_per_sec"],
         "steps": step_count,
         "gpu_slots_per_layer": ns.gpu_slots_per_layer,
         "prefill_burst_slots": ns.prefill_burst_slots,
