@@ -654,11 +654,24 @@ def get__quant_fp8_method() -> QuantFP8:
 
 
 def get_marlin_input_dtype(prefix: str | None = None):
-    if envs.VLLM_MARLIN_INPUT_DTYPE is None:
+    try:
+        from cfie.config import get_current_cfie_config_or_none
+
+        cfie_config = get_current_cfie_config_or_none()
+    except Exception:
+        cfie_config = None
+
+    dtype_name = None
+    if cfie_config is not None:
+        dtype_name = cfie_config.compilation_config.marlin_input_dtype
+        if dtype_name == "auto":
+            dtype_name = None
+
+    if dtype_name is None:
         return
-    elif envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "int8":
+    elif dtype_name.lower() == "int8":
         return torch.int8
-    elif envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "fp8":
+    elif dtype_name.lower() == "fp8":
         if not current_platform.is_device_capability(
                 89
         ) and not current_platform.is_device_capability(120):
@@ -666,7 +679,7 @@ def get_marlin_input_dtype(prefix: str | None = None):
                 "Marlin W4A8-FP8 only support SM89 or SM120 device "
                 "(It is slower than Marlin W4A16 on other devices). "
                 "You can consider using W4A8-INT8 instead"
-                "(set VLLM_MARLIN_INPUT_DTYPE=int8)."
+                "(set --marlin-input-dtype int8)."
             )
 
         _ = get__quant_fp8_method()

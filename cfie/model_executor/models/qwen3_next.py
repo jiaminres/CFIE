@@ -403,8 +403,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # ------------------------------- 规范化输入形状并记录原始布局 -------------------------------
-        # 先保存调用方传入的原始形状，函数返回前会按这个形状还原输出。
-        orig_shape = hidden_states.shape
         # 当前 MoE 路径按 [num_tokens, hidden_dim] 组织输入，这里取出两个核心维度。
         num_tokens, hidden_dim = hidden_states.shape
         # 显式整理成二维张量，保证后续 gate 和 experts 使用统一输入格式。
@@ -454,8 +452,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 final_hidden_states
             )
 
-        # 按输入进入本函数前的形状还原输出，保持该层对外接口不变。
-        return final_hidden_states.view(orig_shape)
+        # 按输入进入本函数前的形状还原输出。这里不要保存/传递 torch.Size 对象，
+        # 否则 PIECE/AOT split 边界会把它当成非 tensor 输出。
+        return final_hidden_states.view(num_tokens, hidden_dim)
 
 
 class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):

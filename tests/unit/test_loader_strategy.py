@@ -1,18 +1,12 @@
-"""内置优先 + HF 兜底加载策略测试。"""
+"""Unit tests for native + HF loader strategy."""
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 from cfie.config.schema import LoadConfig, ModelConfig
 from cfie.loader.hf_loader import HFModelLoader
-from cfie.model_executor.models.config import MODELS_CONFIG_MAP
 from cfie.model_executor.models.registry import ModelRegistry
-from cfie.model_executor.models.qwen3_5_predictor import (
-    Qwen3_5MoePredictorForCausalLM,
-)
-from cfie.transformers_utils.config import get_config
 
 
 class _FakeLoadedModel:
@@ -31,63 +25,6 @@ class _FakeLoadedModel:
 
 def test_model_registry_resolves_builtin_gpt2() -> None:
     assert "GPT2LMHeadModel" in ModelRegistry.get_supported_archs()
-
-
-def test_model_registry_resolves_qwen35_predictor_causallm() -> None:
-    assert "Qwen3_5MoePredictorForCausalLM" in ModelRegistry.get_supported_archs()
-
-
-def test_qwen35_predictor_causallm_is_marked_hybrid() -> None:
-    assert getattr(Qwen3_5MoePredictorForCausalLM, "is_hybrid", False) is True
-
-
-def test_qwen35_predictor_causallm_has_model_config_updater() -> None:
-    assert "Qwen3_5MoePredictorForCausalLM" in MODELS_CONFIG_MAP
-
-
-def test_get_config_supports_qwen35_predictor_text_model_type(tmp_path) -> None:
-    model_dir = tmp_path / "qwen35_predictor_text"
-    model_dir.mkdir()
-    (model_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "architectures": ["Qwen3_5MoePredictorForCausalLM"],
-                "model_type": "qwen3_5_moe_predictor_text",
-                "vocab_size": 32,
-                "hidden_size": 16,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 1,
-                "moe_intermediate_size": 32,
-                "shared_expert_intermediate_size": 32,
-                "num_experts_per_tok": 2,
-                "num_experts": 8,
-                "layer_types": ["linear_attention", "full_attention"],
-                "predictor_bundle_path": "bundle/predictor_bundle.json",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    config = get_config(str(model_dir), trust_remote_code=False)
-
-    assert config.model_type == "qwen3_5_moe_predictor_text"
-    assert config.predictor_bundle_path == "bundle/predictor_bundle.json"
-
-
-def test_qwen35_predictor_causallm_mapper_strips_mm_prefixes() -> None:
-    mapped = Qwen3_5MoePredictorForCausalLM.hf_to_cfie_mapper.apply_list(
-        [
-            "model.visual.blocks.0.attn.qkv.weight",
-            "model.language_model.layers.4.mlp.experts.0.gate_proj.qweight",
-            "lm_head.weight",
-        ]
-    )
-
-    assert mapped == [
-        "model.layers.4.mlp.experts.0.gate_proj.qweight",
-        "lm_head.weight",
-    ]
 
 
 def test_loader_prefers_native_model(monkeypatch, tmp_path) -> None:

@@ -17,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cfie.offload.policy import LOG_RUNTIME_EVENTS_KEY
 from cfie_training.config import TrainingProjectConfig
 from cfie_training.predictor.architectures import (
     FutureExpertPredictor,
@@ -348,11 +347,7 @@ class EngineRouterTeacherModelBackend(PredictorTeacherModelBackend):
 
     # ------------------------------- 构造训练 teacher 专用 additional_config -------------------------------
     def _resolve_engine_additional_config(self) -> dict[str, Any]:
-        return {
-            LOG_RUNTIME_EVENTS_KEY: bool(
-                self._config.teacher_engine.log_runtime_moe_cache_events
-            ),
-        }
+        return {}
 
     # ------------------------------- 按真实有效长度提取 prompt 行 -------------------------------
     @staticmethod

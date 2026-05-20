@@ -6,6 +6,13 @@
 #include <torch/library.h>
 #include <torch/version.h>
 
+#include <algorithm>
+#include <condition_variable>
+#include <cstring>
+#include <mutex>
+#include <thread>
+#include <vector>
+
 #if defined(_MSC_VER)
 // PyTorch 的 schema 解析模板在 MSVC 下会从 `size_t`/`uint64_t` 推导出一批
 // 与本文件注册逻辑无关的窄化告警；这里仅对注册文件本身做局部静音，避免把
@@ -18,6 +25,253 @@
 // ------------------------------- 注册主命名空间下的自定义算子 -------------------------------
 // 下面这一整段是主算子表；
 // 推理热链、量化热链、MoE 热链以及若干运行时辅助算子都会先在这里声明 schema。
+namespace {
+
+class ExpertCopyThreadPool {
+ public:
+  ~ExpertCopyThreadPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+      generation_++;
+    }
+    work_cv_.notify_all();
+    for (auto& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+
+  void run(const uint8_t* src,
+           uint8_t* dst,
+           const int64_t* offsets,
+           int64_t num_experts,
+           int64_t per_expert_bytes,
+           int64_t num_workers) {
+    const int64_t total_bytes = num_experts * per_expert_bytes;
+    const int64_t workers = std::max<int64_t>(
+        1,
+        std::min<int64_t>(num_workers, std::max<int64_t>(1, total_bytes >> 20)));
+    ensure_workers(workers);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      src_ = src;
+      dst_ = dst;
+      offsets_ = offsets;
+      num_experts_ = num_experts;
+      per_expert_bytes_ = per_expert_bytes;
+      active_workers_ = workers;
+      pending_workers_ = workers;
+      generation_++;
+      active_ = true;
+    }
+    work_cv_.notify_all();
+    std::unique_lock<std::mutex> lock(mutex_);
+    done_cv_.wait(lock, [&] { return !active_; });
+  }
+
+ private:
+  void ensure_workers(int64_t workers) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    while (static_cast<int64_t>(workers_.size()) < workers) {
+      const int64_t index = static_cast<int64_t>(workers_.size());
+      workers_.emplace_back([this, index] { worker_loop(index); });
+    }
+  }
+
+  void worker_loop(int64_t worker_index) {
+    int64_t seen_generation = 0;
+    while (true) {
+      const uint8_t* src = nullptr;
+      uint8_t* dst = nullptr;
+      const int64_t* offsets = nullptr;
+      int64_t num_experts = 0;
+      int64_t per_expert_bytes = 0;
+      int64_t active_workers = 0;
+      int64_t generation = 0;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        work_cv_.wait(lock, [&] {
+          return stop_ || (active_ && generation_ != seen_generation &&
+                           worker_index < active_workers_);
+        });
+        if (stop_) {
+          return;
+        }
+        src = src_;
+        dst = dst_;
+        offsets = offsets_;
+        num_experts = num_experts_;
+        per_expert_bytes = per_expert_bytes_;
+        active_workers = active_workers_;
+        generation = generation_;
+        seen_generation = generation;
+      }
+
+      const int64_t total_bytes = num_experts * per_expert_bytes;
+      const int64_t chunk =
+          (total_bytes + active_workers - 1) / active_workers;
+      int64_t cursor = std::min<int64_t>(total_bytes, worker_index * chunk);
+      const int64_t end = std::min<int64_t>(total_bytes, cursor + chunk);
+      while (cursor < end) {
+        const int64_t expert_index = cursor / per_expert_bytes;
+        const int64_t expert_offset = cursor - expert_index * per_expert_bytes;
+        const int64_t bytes =
+            std::min<int64_t>(end - cursor, per_expert_bytes - expert_offset);
+        std::memcpy(dst + cursor,
+                    src + offsets[expert_index] + expert_offset,
+                    static_cast<size_t>(bytes));
+        cursor += bytes;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (generation == generation_ && --pending_workers_ == 0) {
+          active_ = false;
+          done_cv_.notify_one();
+        }
+      }
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable work_cv_;
+  std::condition_variable done_cv_;
+  std::vector<std::thread> workers_;
+  bool stop_ = false;
+  bool active_ = false;
+  int64_t generation_ = 0;
+  int64_t pending_workers_ = 0;
+  int64_t active_workers_ = 0;
+  const uint8_t* src_ = nullptr;
+  uint8_t* dst_ = nullptr;
+  const int64_t* offsets_ = nullptr;
+  int64_t num_experts_ = 0;
+  int64_t per_expert_bytes_ = 0;
+};
+
+ExpertCopyThreadPool& expert_copy_thread_pool() {
+  static ExpertCopyThreadPool pool;
+  return pool;
+}
+
+void copy_expert_slices_to_stage_cpu(
+    torch::Tensor source_storage,
+    torch::Tensor source_offsets,
+    torch::Tensor dest_storage,
+    int64_t per_expert_bytes,
+    int64_t num_workers) {
+  TORCH_CHECK(source_storage.device().is_cpu(),
+              "source_storage must be a CPU tensor");
+  TORCH_CHECK(source_offsets.device().is_cpu(),
+              "source_offsets must be a CPU tensor");
+  TORCH_CHECK(dest_storage.device().is_cpu(),
+              "dest_storage must be a CPU tensor");
+  TORCH_CHECK(source_storage.scalar_type() == torch::kUInt8,
+              "source_storage must be uint8");
+  TORCH_CHECK(dest_storage.scalar_type() == torch::kUInt8,
+              "dest_storage must be uint8");
+  TORCH_CHECK(source_offsets.scalar_type() == torch::kInt64,
+              "source_offsets must be int64");
+  TORCH_CHECK(source_storage.is_contiguous(),
+              "source_storage must be contiguous");
+  TORCH_CHECK(dest_storage.is_contiguous(),
+              "dest_storage must be contiguous");
+  TORCH_CHECK(source_offsets.is_contiguous(),
+              "source_offsets must be contiguous");
+  TORCH_CHECK(per_expert_bytes > 0,
+              "per_expert_bytes must be positive");
+
+  const int64_t num_experts = source_offsets.numel();
+  if (num_experts == 0) {
+    return;
+  }
+  TORCH_CHECK(dest_storage.numel() >= num_experts * per_expert_bytes,
+              "dest_storage is too small for requested expert slices");
+
+  const auto* src = source_storage.const_data_ptr<uint8_t>();
+  auto* dst = dest_storage.data_ptr<uint8_t>();
+  const auto* offsets = source_offsets.const_data_ptr<int64_t>();
+  const int64_t source_numel = source_storage.numel();
+
+  for (int64_t i = 0; i < num_experts; ++i) {
+    const int64_t source_offset = offsets[i];
+    TORCH_CHECK(source_offset >= 0,
+                "source offset must be non-negative");
+    TORCH_CHECK(source_offset + per_expert_bytes <= source_numel,
+                "source expert slice exceeds source_storage");
+  }
+
+  if (num_workers <= 1 || num_experts == 1) {
+    for (int64_t i = 0; i < num_experts; ++i) {
+      std::memcpy(dst + i * per_expert_bytes,
+                  src + offsets[i],
+                  static_cast<size_t>(per_expert_bytes));
+    }
+    return;
+  }
+  expert_copy_thread_pool().run(src, dst, offsets, num_experts,
+                                per_expert_bytes, num_workers);
+}
+
+void copy_expert_slices_to_stage_device(
+    torch::Tensor source_storage,
+    torch::Tensor source_offsets,
+    torch::Tensor dest_storage,
+    int64_t per_expert_bytes,
+    bool non_blocking) {
+  TORCH_CHECK(source_storage.device().is_cpu(),
+              "source_storage must be a CPU tensor");
+  TORCH_CHECK(source_offsets.device().is_cpu(),
+              "source_offsets must be a CPU tensor");
+  TORCH_CHECK(dest_storage.device().is_cuda(),
+              "dest_storage must be a CUDA tensor");
+  TORCH_CHECK(source_storage.scalar_type() == torch::kUInt8,
+              "source_storage must be uint8");
+  TORCH_CHECK(dest_storage.scalar_type() == torch::kUInt8,
+              "dest_storage must be uint8");
+  TORCH_CHECK(source_offsets.scalar_type() == torch::kInt64,
+              "source_offsets must be int64");
+  TORCH_CHECK(source_storage.is_contiguous(),
+              "source_storage must be contiguous");
+  TORCH_CHECK(dest_storage.is_contiguous(),
+              "dest_storage must be contiguous");
+  TORCH_CHECK(source_offsets.is_contiguous(),
+              "source_offsets must be contiguous");
+  TORCH_CHECK(per_expert_bytes > 0,
+              "per_expert_bytes must be positive");
+
+  const int64_t num_experts = source_offsets.numel();
+  if (num_experts == 0) {
+    return;
+  }
+  TORCH_CHECK(dest_storage.numel() >= num_experts * per_expert_bytes,
+              "dest_storage is too small for requested expert slices");
+
+  const auto* offsets = source_offsets.const_data_ptr<int64_t>();
+  const int64_t source_numel = source_storage.numel();
+  for (int64_t i = 0; i < num_experts; ++i) {
+    const int64_t source_offset = offsets[i];
+    TORCH_CHECK(source_offset >= 0,
+                "source offset must be non-negative");
+    TORCH_CHECK(source_offset + per_expert_bytes <= source_numel,
+                "source expert slice exceeds source_storage");
+  }
+
+  at::NoGradGuard no_grad;
+  for (int64_t i = 0; i < num_experts; ++i) {
+    const int64_t source_offset = offsets[i];
+    const int64_t dest_offset = i * per_expert_bytes;
+    dest_storage.slice(0, dest_offset, dest_offset + per_expert_bytes)
+        .copy_(source_storage.slice(0, source_offset,
+                                    source_offset + per_expert_bytes),
+               non_blocking);
+  }
+}
+
+}  // namespace
+
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // ------------------------------- 注册基础辅助算子与轻量工具入口 -------------------------------
   // 这几项算子会被更高层的 Python 逻辑直接探测或复用，
@@ -37,6 +291,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // 把该 schema 绑定到 CPU dispatch 的 UVA 原生实现。
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
+
+  ops.def(
+      "copy_expert_slices_to_stage_cpu("
+      "Tensor source_storage, Tensor source_offsets, Tensor! dest_storage, "
+      "int per_expert_bytes, int num_workers) -> ()");
+  ops.impl("copy_expert_slices_to_stage_cpu", torch::kCPU,
+           &copy_expert_slices_to_stage_cpu);
+
+  ops.def(
+      "copy_expert_slices_to_stage_device("
+      "Tensor source_storage, Tensor source_offsets, Tensor! dest_storage, "
+      "int per_expert_bytes, bool non_blocking) -> ()");
+  ops.impl("copy_expert_slices_to_stage_device", torch::kCPU,
+           &copy_expert_slices_to_stage_device);
+  ops.impl("copy_expert_slices_to_stage_device", torch::kCUDA,
+           &copy_expert_slices_to_stage_device);
 
   // ------------------------------- 注册 Attention 与稀疏索引相关算子 -------------------------------
   // 这一段负责把分页注意力、注意力结果合并以及稀疏注意力索引转换入口注册到 PyTorch；

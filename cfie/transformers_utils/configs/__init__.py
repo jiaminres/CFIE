@@ -66,12 +66,6 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "Qwen3_5TextConfig": "cfie.transformers_utils.configs.qwen3_5",
     "Qwen3_5MoeConfig": "cfie.transformers_utils.configs.qwen3_5_moe",
     "Qwen3_5MoeTextConfig": "cfie.transformers_utils.configs.qwen3_5_moe",
-    "Qwen3_5MoePredictorConfig":
-        "cfie.transformers_utils.configs.qwen3_5_moe_predictor",
-    "Qwen3_5MoePredictorTextConfig":
-        "cfie.transformers_utils.configs.qwen3_5_moe_predictor",
-    "Qwen3_5MoePredictorVisionConfig":
-        "cfie.transformers_utils.configs.qwen3_5_moe_predictor",
     "Tarsier2Config": "cfie.transformers_utils.configs.tarsier2",
     # Special case: DeepseekV3Config is from HuggingFace Transformers
     "DeepseekV3Config": "transformers",
@@ -127,9 +121,6 @@ __all__ = [
     "Qwen3_5TextConfig",
     "Qwen3_5MoeConfig",
     "Qwen3_5MoeTextConfig",
-    "Qwen3_5MoePredictorConfig",
-    "Qwen3_5MoePredictorTextConfig",
-    "Qwen3_5MoePredictorVisionConfig",
     "Tarsier2Config",
 ]
 

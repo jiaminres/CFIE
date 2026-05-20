@@ -192,7 +192,7 @@ from cfie.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from cfie.v1.worker.utils import is_residual_scattered_for_sp
-from cfie.v1.worker.workspace import lock_workspace
+from cfie.v1.worker.workspace import lock_workspace, reserve_workspace_bytes
 
 from .utils import (
     AttentionGroup,
@@ -1454,7 +1454,7 @@ class GPUModelRunner(
         return req_state
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
-        model = self._resolve_predictor_capture_model()
+        model = self.get_model()
         assert supports_mrope(model), "M-RoPE support is not implemented."
         assert req_state.prompt_token_ids is not None, (
             "M-RoPE requires prompt_token_ids to be available."
@@ -1469,7 +1469,7 @@ class GPUModelRunner(
         )
 
     def _init_xdrope_positions(self, req_state: CachedRequestState):
-        model = self._resolve_predictor_capture_model()
+        model = self.get_model()
         xdrope_model = cast(SupportsXDRoPE, model)
         assert req_state.prompt_token_ids is not None, (
             "XD-RoPE requires prompt_token_ids to be available."
@@ -3509,6 +3509,21 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _should_skip_compiled_for_decode_only_cudagraph(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        batch_desc: BatchDescriptor,
+    ) -> bool:
+        """Keep prefill out of decode-only PIECEWISE compile/capture paths."""
+        compilation_config = self.compilation_config
+        return (
+            cudagraph_mode == CUDAGraphMode.NONE
+            and not batch_desc.uniform
+            and bool(compilation_config.cudagraph_decode_capture_sizes)
+            and compilation_config.cudagraph_prefill_capture_sizes == []
+            and compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+        )
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -4006,7 +4021,10 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
+                skip_compiled=has_encoder_input
+                or self._should_skip_compiled_for_decode_only_cudagraph(
+                    cudagraph_mode, batch_desc
+                ),
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -5963,7 +5981,10 @@ class GPUModelRunner(
         真正的作用是给 `GPUWorker.determine_available_memory()` 一个更完整的
         `runtime_peak_memory` 估计值。
         """
-        if self._has_capture_unsafe_tiered_moe_cache():
+        if (
+            self._has_capture_unsafe_tiered_moe_cache()
+            and not self._allow_experimental_tiered_moe_capture()
+        ):
             logger.warning_once(
                 "Skipping CUDA graph memory profiling because CFIE tiered "
                 "MoE cache performs dynamic expert remapping and host-backed "
@@ -6100,6 +6121,9 @@ class GPUModelRunner(
         self._capture_unsafe_tiered_moe_cache = has_tiered_cache
         return has_tiered_cache
 
+    def _allow_experimental_tiered_moe_capture(self) -> bool:
+        return bool(self.compilation_config.allow_tiered_moe_compile)
+
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
         """
@@ -6109,12 +6133,17 @@ class GPUModelRunner(
         capture-unsafe 路径，应直接跳过，让主线保持 eager 可运行。
         """
         if self._has_capture_unsafe_tiered_moe_cache():
+            if not self._allow_experimental_tiered_moe_capture():
+                logger.warning_once(
+                    "Skipping CUDA graph capture because CFIE tiered MoE cache "
+                    "currently runs in eager mode while expert remapping and "
+                    "host-backed loads remain capture-unsafe."
+                )
+                return 0
             logger.warning_once(
-                "Skipping CUDA graph capture because CFIE tiered MoE cache "
-                "currently runs in eager mode while expert remapping and "
-                "host-backed loads remain capture-unsafe."
+                "Experimentally allowing CUDA graph capture with CFIE tiered "
+                "MoE cache because --allow-tiered-moe-compile is enabled."
             )
-            return 0
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
@@ -6160,6 +6189,8 @@ class GPUModelRunner(
 
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.
+        if self.speculative_config is not None:
+            reserve_workspace_bytes(16 * 1024 * 1024)
         lock_workspace()
 
         end_time = time.perf_counter()

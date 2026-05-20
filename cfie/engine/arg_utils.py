@@ -474,6 +474,10 @@ class EngineArgs:
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     # MoE 算子实现后端。
     moe_backend: MoEBackend = KernelConfig.moe_backend
+    # GPTQ Marlin dense/MoE kernel activation dtype.
+    marlin_input_dtype: Literal["auto", "int8", "fp8"] | None = None
+    # Allow tiered MoE compile / CUDA graph capture with explicit boundaries.
+    allow_tiered_moe_compile: bool | None = None
     # expert parallel 的 all-to-all 通信后端。
     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
     # 是否启用 elastic expert parallel。
@@ -518,6 +522,14 @@ class EngineArgs:
     offload_backend: str = OffloadConfig.offload_backend
     moe_cpu_budget_gb: float = OffloadConfig.moe_cpu_budget_gb
     moe_cpu_min_free_gb: float = OffloadConfig.moe_cpu_min_free_gb
+    gpu_slots_per_layer: int = OffloadConfig.gpu_slots_per_layer
+    prefill_burst_slots: int = OffloadConfig.prefill_burst_slots
+    cpu_static_preprocess_batch_size: int = (
+        OffloadConfig.cpu_static_preprocess_batch_size
+    )
+    cpu_static_pinned_gb: float = OffloadConfig.cpu_static_pinned_gb
+    cpu_static_pinned_layers: str = OffloadConfig.cpu_static_pinned_layers
+    prepare_cpu_copy_batch_size: int = OffloadConfig.prepare_cpu_copy_batch_size
     cpu_offload_gb: float = UVAOffloadConfig.cpu_offload_gb
     cpu_offload_params: set[str] = get_field(UVAOffloadConfig, "cpu_offload_params")
     offload_group_size: int = PrefetchOffloadConfig.offload_group_size
@@ -527,7 +539,6 @@ class EngineArgs:
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
 
-    # 调度、partial prefill、采样日志与请求并发控制配置。
     max_num_batched_tokens: int | None = None
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
@@ -1119,6 +1130,28 @@ class EngineArgs:
         offload_group.add_argument(
             "--moe-cpu-min-free-gb", **offload_kwargs["moe_cpu_min_free_gb"]
         )
+        offload_group.add_argument(
+            "--gpu-slots-per-layer", **offload_kwargs["gpu_slots_per_layer"]
+        )
+        offload_group.add_argument(
+            "--prefill-burst-slots", **offload_kwargs["prefill_burst_slots"]
+        )
+        offload_group.add_argument(
+            "--cpu-static-preprocess-batch-size",
+            **offload_kwargs["cpu_static_preprocess_batch_size"],
+        )
+        offload_group.add_argument(
+            "--cpu-static-pinned-gb",
+            **offload_kwargs["cpu_static_pinned_gb"],
+        )
+        offload_group.add_argument(
+            "--cpu-static-pinned-layers",
+            **offload_kwargs["cpu_static_pinned_layers"],
+        )
+        offload_group.add_argument(
+            "--prepare-cpu-copy-batch-size",
+            **offload_kwargs["prepare_cpu_copy_batch_size"],
+        )
         offload_group.add_argument("--cpu-offload-gb", **uva_kwargs["cpu_offload_gb"])
         offload_group.add_argument(
             "--cpu-offload-params", **uva_kwargs["cpu_offload_params"]
@@ -1340,6 +1373,14 @@ class EngineArgs:
         compilation_group.add_argument(
             "--max-cudagraph-capture-size",
             **compilation_kwargs["max_cudagraph_capture_size"],
+        )
+        compilation_group.add_argument(
+            "--allow-tiered-moe-compile",
+            **{**compilation_kwargs["allow_tiered_moe_compile"], "default": None},
+        )
+        compilation_group.add_argument(
+            "--marlin-input-dtype",
+            **{**compilation_kwargs["marlin_input_dtype"], "default": None},
         )
 
         # Kernel arguments
@@ -2081,6 +2122,12 @@ class EngineArgs:
 
         # 准备 compilation 配置副本，后续把 CLI 覆写项合并进去。
         compilation_config = copy.deepcopy(self.compilation_config)
+        if self.marlin_input_dtype is not None:
+            compilation_config.marlin_input_dtype = self.marlin_input_dtype
+        if self.allow_tiered_moe_compile is not None:
+            compilation_config.allow_tiered_moe_compile = (
+                self.allow_tiered_moe_compile
+            )
         # 如果 CLI 给了 cudagraph_capture_sizes，就覆盖副本中的对应字段。
         if self.cudagraph_capture_sizes is not None:
             # 不允许同时在 compilation_config 和 CLI 两边都指定 capture sizes。
@@ -2104,11 +2151,17 @@ class EngineArgs:
                 self.max_cudagraph_capture_size
             )
 
-        # 组装 offload 配置，把 CPU/UVA/prefetch 相关参数统一收口。
+        # 组装 offload 配置，把 CPU/UVA/stage 相关参数统一收口。
         offload_config = OffloadConfig(
             offload_backend=self.offload_backend,
             moe_cpu_budget_gb=self.moe_cpu_budget_gb,
             moe_cpu_min_free_gb=self.moe_cpu_min_free_gb,
+            gpu_slots_per_layer=self.gpu_slots_per_layer,
+            prefill_burst_slots=self.prefill_burst_slots,
+            cpu_static_preprocess_batch_size=self.cpu_static_preprocess_batch_size,
+            cpu_static_pinned_gb=self.cpu_static_pinned_gb,
+            cpu_static_pinned_layers=str(self.cpu_static_pinned_layers or ""),
+            prepare_cpu_copy_batch_size=self.prepare_cpu_copy_batch_size,
             uva=UVAOffloadConfig(
                 cpu_offload_gb=self.cpu_offload_gb,
                 cpu_offload_params=self.cpu_offload_params,

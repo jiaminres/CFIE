@@ -85,6 +85,7 @@ class PredictorRuntimeSchema:
     allow_candidate_mismatch: bool
     model_descriptor: dict[str, Any] = field(default_factory=dict)
     min_insertion_layer_index: int = 0
+    gpu_slots_per_layer: int = 0
 
     def validate(self) -> "PredictorRuntimeSchema":
         if self.schema_kind != _SCHEMA_KIND:
@@ -112,6 +113,7 @@ class PredictorRuntimeSchema:
             self.min_insertion_layer_index,
             allow_zero=True,
         )
+        _require_int("gpu_slots_per_layer", self.gpu_slots_per_layer, allow_zero=True)
         if not isinstance(self.model_descriptor, dict):
             raise ValueError("model_descriptor must be a dictionary")
         if self.candidate_experts_per_layer < self.executed_experts_per_layer:
@@ -140,6 +142,7 @@ class PredictorRuntimeSchema:
             "allow_candidate_mismatch": self.allow_candidate_mismatch,
             "model_descriptor": dict(self.model_descriptor),
             "min_insertion_layer_index": self.min_insertion_layer_index,
+            "gpu_slots_per_layer": self.gpu_slots_per_layer,
         }
 
     @classmethod
@@ -166,6 +169,9 @@ class PredictorRuntimeSchema:
             model_descriptor=dict(payload.get("model_descriptor", {})),
             min_insertion_layer_index=int(
                 payload.get("min_insertion_layer_index", 0)
+            ),
+            gpu_slots_per_layer=int(
+                payload.get("gpu_slots_per_layer", 0)
             ),
         )
         return schema.validate()
@@ -701,7 +707,7 @@ def load_predictor_model(
     bundle_path: str | Path,
     *,
     map_location: str | torch.device = "cpu",
-    device: str | torch.device = "cpu",
+    device: str | torch.device = "cuda:0",
     base_model_path: str | Path | None = None,
     num_layers: int | None = None,
 ) -> tuple[FutureExpertPredictor, LoadedPredictorBundle]:

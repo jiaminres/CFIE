@@ -21,6 +21,14 @@ pip-wheel-metadata/
 # ------------------------------- 本地临时目录与运行日志 -------------------------------
 .tmp/
 logs/
+.bench_logs/
+.claude/
+.cmake/
+.wsl-venv/
+ctest/
+vllm-flash-attn/
+csrc/quantization/machete/generated/
+CLAUDE.md
 %LOG%
 *.log
 

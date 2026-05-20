@@ -68,17 +68,37 @@ def make_copy_and_call(
         A wrapper function that copies inputs and calls the compiled function
     """
 
+    input_buffer_maps: list[dict[tuple[Any, ...], torch.Tensor]] = [
+        {} for _ in sym_tensor_indices
+    ]
+
+    def _buffer_key(tensor: torch.Tensor) -> tuple[Any, ...]:
+        return (
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+            tensor.device,
+            tensor.layout,
+        )
+
     def copy_and_call(*args: Any) -> Any:
         list_args = list(args)
         for i, index in enumerate(sym_tensor_indices):
             runtime_tensor = list_args[index]
-            runtime_shape = runtime_tensor.shape[0]
+            assert isinstance(runtime_tensor, torch.Tensor)
 
-            # lazy initialization of buffer on first call
-            if input_buffers[i] is None:
-                input_buffers[i] = runtime_tensor.clone()
+            key = _buffer_key(runtime_tensor)
+            static_tensor = input_buffer_maps[i].get(key)
+            if static_tensor is None:
+                static_tensor = torch.empty_strided(
+                    tuple(runtime_tensor.shape),
+                    tuple(runtime_tensor.stride()),
+                    dtype=runtime_tensor.dtype,
+                    device=runtime_tensor.device,
+                )
+                input_buffer_maps[i][key] = static_tensor
+                input_buffers[i] = static_tensor
 
-            static_tensor = input_buffers[i][:runtime_shape]  # type: ignore[index]
             static_tensor.copy_(runtime_tensor)
             list_args[index] = static_tensor
         return callable_fn(*list_args)

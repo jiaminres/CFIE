@@ -259,6 +259,13 @@ def lock_workspace() -> None:
     current_workspace_manager().lock()
 
 
+def reserve_workspace_bytes(num_bytes: int) -> None:
+    """Ensure the shared workspace can satisfy at least ``num_bytes`` bytes."""
+    if num_bytes <= 0:
+        return
+    current_workspace_manager().get_simultaneous(((num_bytes,), torch.uint8))
+
+
 def unlock_workspace() -> None:
     """Unlock the workspace to allow growth.
 

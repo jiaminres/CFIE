@@ -376,6 +376,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
             fake_mode_ctx: Any = patch(
                 "torch._inductor.standalone_compile.FakeTensorMode",
                 lambda *a, **kw: input_fake_mode,
+                create=True,
             )
         else:
             fake_mode_ctx = contextlib.nullcontext()

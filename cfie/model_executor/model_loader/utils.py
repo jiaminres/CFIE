@@ -224,25 +224,6 @@ _MODEL_ARCH_BY_HASH = dict[int, tuple[type[nn.Module], str]]()
 """Caches the outputs of `_get_model_architecture`."""
 
 
-def _has_predictor_runtime_override(model_config: ModelConfig) -> bool:
-    result = any(
-        getattr(config, "predictor_bundle_path", None)
-        or getattr(config, "predictor_checkpoint_path", None)
-        for config in (
-            getattr(model_config, "hf_config", None),
-            getattr(model_config, "hf_text_config", None),
-        )
-        if config is not None
-    )
-    import logging
-    _log = logging.getLogger(__name__)
-    _log.info("_has_predictor_runtime_override: %s (hf_config=%s hf_text=%s)",
-              result,
-              getattr(getattr(model_config, "hf_config", None), "predictor_checkpoint_path", "N/A"),
-              getattr(getattr(model_config, "hf_text_config", None), "predictor_checkpoint_path", "N/A"))
-    return result
-
-
 # 从 HF config / registry 中解析出真正的模型类与架构名。
 def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     from cfie.model_executor.models.adapters import as_embedding_model, as_seq_cls_model
@@ -256,16 +237,6 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
         architectures,
         model_config=model_config,
     )
-    import logging as _log2
-    _override = _has_predictor_runtime_override(model_config)
-    _log2.getLogger(__name__).info("predictor override check: override=%s arch=%s", _override, arch)
-    if _override and arch == "Qwen3_5MoeForConditionalGeneration":
-        _log2.getLogger(__name__).info("predictor override TRIGGERED, switching architecture...")
-        model_cls, arch = model_config.registry.resolve_model_cls(
-            ["Qwen3_5MoePredictorForConditionalGeneration"],
-            model_config=model_config,
-        )
-        _log2.getLogger(__name__).info("predictor override RESULT: arch=%s cls=%s", arch, model_cls)
     # 当前 122B-A10B checkpoint 的 architectures =
     # ["Qwen3_5MoeForConditionalGeneration"]，
     # 所以主模型这里会解析到 Qwen3_5MoeForConditionalGeneration；
@@ -311,10 +282,6 @@ def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], 
             model_config.trust_remote_code,
             model_config.model_impl,
             tuple(getattr(model_config.hf_config, "architectures", [])),
-            getattr(model_config.hf_config, "predictor_bundle_path", None),
-            getattr(model_config.hf_config, "predictor_checkpoint_path", None),
-            getattr(model_config.hf_text_config, "predictor_bundle_path", None),
-            getattr(model_config.hf_text_config, "predictor_checkpoint_path", None),
         )
     )
     # 如果缓存里已有结果，直接返回。

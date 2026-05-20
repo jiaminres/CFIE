@@ -6,7 +6,6 @@ import argparse
 import copy
 import contextlib
 import io
-import logging
 import os
 import re
 import sys
@@ -21,7 +20,6 @@ from cfie.cli.native_generate import (
     _iter_request_text,
     _resolve_runtime_symbols,
 )
-from cfie.logger import suppress_logging
 from cfie.utils.logging import get_logger
 
 # 初始化当前模块的 logger，供异常或调试日志使用。
@@ -108,6 +106,18 @@ def add_native_chat_parser(subparsers: Any) -> None:
     parser.add_argument("--max-num-seqs", type=int, default=1)
     # 单轮调度的 batched token 预算上限。
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--kv-cache-memory-bytes", type=int, default=None)
+    parser.add_argument("--enable-chunked-prefill",
+                        action=argparse.BooleanOptionalAction,
+                        default=True)
+    parser.add_argument("--gpu-slots-per-layer", type=int, default=0)
+    parser.add_argument("--prefill-burst-slots", type=int, default=0)
+    parser.add_argument("--prepare-cpu-copy-batch-size", type=int, default=8)
+    parser.add_argument("--cpu-static-preprocess-batch-size",
+                        type=int,
+                        default=0)
+    parser.add_argument("--cpu-static-pinned-gb", type=float, default=0.0)
+    parser.add_argument("--cpu-static-pinned-layers", default="")
 
     # speculative decoding 方式。
     parser.add_argument("--spec-method",
@@ -120,6 +130,12 @@ def add_native_chat_parser(subparsers: Any) -> None:
     # attention / moe 后端配置。
     parser.add_argument("--attention-backend", default=None)
     parser.add_argument("--moe-backend", default="auto")
+    parser.add_argument("--marlin-input-dtype",
+                        choices=("auto", "int8", "fp8"),
+                        default="auto")
+    parser.add_argument("--allow-tiered-moe-compile",
+                        action=argparse.BooleanOptionalAction,
+                        default=None)
     parser.add_argument("--mamba-cache-mode", default=None)
     parser.add_argument("--language-model-only",
                         action=argparse.BooleanOptionalAction,
@@ -127,9 +143,6 @@ def add_native_chat_parser(subparsers: Any) -> None:
     parser.add_argument("--skip-mm-profiling",
                         action=argparse.BooleanOptionalAction,
                         default=False)
-    # predictor checkpoint 路径（启用 predictor 加速 MoE 专家预取）
-    parser.add_argument("--predictor-checkpoint", default=None)
-
     # 采样参数；未显式传入时优先使用模型 generation_config.json。
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=None)
@@ -557,9 +570,8 @@ def _runtime_output_suppressed(show_runtime_output: bool) -> Iterator[None]:
     # 3) stdout/stderr 的底层输出
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        with suppress_logging(logging.CRITICAL):
-            with _suppress_stream_output():
-                yield
+        with _suppress_stream_output():
+            yield
 
 
 # 运行交互式 chat 主循环：构建引擎、渲染 prompt、提交请求并流式打印输出。

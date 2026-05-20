@@ -522,6 +522,11 @@ class Platform:
     @classmethod
     def is_pin_memory_available(cls) -> bool:
         # ------------------------------- 判断当前平台是否可用 pinned memory -------------------------------
+        if os.environ.get("CFIE_FORCE_PIN_MEMORY", "0") == "1":
+            logger.warning_once(
+                "Forcing pin_memory=True because CFIE_FORCE_PIN_MEMORY=1 is set."
+            )
+            return True
         # 当检测到当前运行环境位于 WSL 中时，记录告警并返回 False。
         if in_wsl():
             logger.warning(

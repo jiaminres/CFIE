@@ -353,12 +353,36 @@ class PiecewiseBackend:
         return None
 
     def __call__(self, *args: Any) -> Any:
+        if not self.sym_shape_indices:
+            range_entry = next(iter(self.range_entries.values()))
+            assert range_entry.compiled, (
+                "All ranges should be compiled or loaded up front in "
+                "PiecewiseBackend.__init__. "
+                f"range_entry={range_entry.compile_range}"
+            )
+            return range_entry.runnable(*args)
+
         runtime_shape = args[self.sym_shape_indices[0]]
         range_entry = self._find_range_for_shape(runtime_shape)
 
-        assert range_entry is not None, (
-            f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
-        )
+        if range_entry is None:
+            if self.graph is not None:
+                logger.warning_once(
+                    "PIECEWISE compile shape %s is outside considered ranges %s; "
+                    "falling back to eager FX subgraph for this call.",
+                    str(runtime_shape),
+                    str(self.compile_ranges),
+                )
+                graph_output = self.graph(*args)
+                if self.returns_tuple or not isinstance(graph_output, (tuple, list)):
+                    return graph_output
+                return graph_output[0]
+            raise AssertionError(
+                f"Shape: {runtime_shape} out of considered ranges: "
+                f"{self.compile_ranges}. Eager fallback is unavailable because "
+                "this PiecewiseBackend was loaded from compiled artifacts without "
+                "the original FX graph."
+            )
         assert range_entry.compiled, (
             "All ranges should be compiled or loaded up front in "
             "PiecewiseBackend.__init__. "

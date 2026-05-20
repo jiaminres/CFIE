@@ -507,6 +507,16 @@ class CompilationConfig:
     在更多模型经过验证之前，默认保持关闭。
     """
 
+    allow_tiered_moe_compile: bool = False
+    """Allow experimental piecewise compile / CUDA graph capture around the
+    CFIE tiered MoE cache. Prepare and MoE custom ops stay as graph boundaries
+    instead of disabling graph capture for the whole model."""
+
+    marlin_input_dtype: Literal["auto", "int8", "fp8"] = "auto"
+    """Optional Marlin activation dtype. ``auto`` keeps the model dtype,
+    ``int8`` uses W4A8-int8 activations, and ``fp8`` uses W4A8-fp8 activations
+    for GPTQ Marlin paths including MoE."""
+
     # Inductor 编译 size 相关配置
     compile_sizes: list[int | str] | None = None
     """指定要为 Inductor 编译哪些 size。
@@ -603,6 +613,12 @@ class CompilationConfig:
     - `None`（默认）：根据 cfie 配置自动推导 capture size
     - `list[int]`：显式指定要捕获哪些 size
     """
+    cudagraph_decode_capture_sizes: list[int] | None = None
+    """Uniform decode CUDA graph sizes. When set, decode dispatch uses this
+    list instead of sharing the mixed prefill/decode padding table."""
+    cudagraph_prefill_capture_sizes: list[int] | None = None
+    """Mixed prefill/decode CUDA graph sizes. When set, prefill and mixed
+    batches use this list while uniform decode can use a separate list."""
     cudagraph_copy_inputs: bool = False
     """是否为 cudagraph 复制输入张量。
 
@@ -1031,6 +1047,10 @@ class CompilationConfig:
 
         # make sure the sizes are in ascending order
         self.cudagraph_capture_sizes.sort()
+        if self.cudagraph_decode_capture_sizes is not None:
+            self.cudagraph_decode_capture_sizes.sort()
+        if self.cudagraph_prefill_capture_sizes is not None:
+            self.cudagraph_prefill_capture_sizes.sort()
         if self.cudagraph_capture_sizes:
             assert self.cudagraph_capture_sizes[-1] == self.max_cudagraph_capture_size
 

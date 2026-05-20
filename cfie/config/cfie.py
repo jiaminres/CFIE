@@ -1175,6 +1175,40 @@ class CfieConfig:
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+            # MoE tiered cache executes prepare/H2D/scatter from the host between
+            # layers. That runtime path is not safe for a full-model CUDA graph,
+            # but piecewise graphs can still cover capture-safe subgraphs.
+            if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+                from cfie.offload.policy import get_moe_tiered_cache_plan
+
+                moe_tiered_plan = get_moe_tiered_cache_plan(self)
+                if (
+                        moe_tiered_plan is not None
+                        and bool(moe_tiered_plan.get("enabled", False))
+                ):
+                    allow_experimental_compile = (
+                        self.compilation_config.allow_tiered_moe_compile
+                    )
+                    if allow_experimental_compile:
+                        logger.warning_once(
+                            "MoE tiered cache uses runtime prepare/H2D/scatter and "
+                            "does not support full CUDA graph capture. Overriding "
+                            "cudagraph_mode from %s to PIECEWISE.",
+                            self.compilation_config.cudagraph_mode.name,
+                        )
+                        self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                    else:
+                        logger.warning_once(
+                            "MoE tiered cache uses runtime prepare/H2D/scatter. "
+                            "Disabling torch.compile and CUDA graph by default for "
+                            "stability. Set --allow-tiered-moe-compile to "
+                            "experiment with PIECEWISE compile/capture."
+                        )
+                        self.compilation_config.mode = CompilationMode.NONE
+                        self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                        self.compilation_config.max_cudagraph_capture_size = 0
+                        self.compilation_config.cudagraph_capture_sizes = []
+
             # 在强制 eager 执行时禁用 cudagraph
             # enforce_eager 优先级最高，最终直接把 cudagraph 全部关闭。
             if self.model_config is not None and self.model_config.enforce_eager:
@@ -1269,6 +1303,28 @@ class CfieConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
+        # MoE tiered cache performs host-side prepare/H2D/scatter. Keep only
+        # that prepare boundary outside piecewise CUDA graph capture; the
+        # following MoE compute custom op can still be captured.
+        if self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs():
+            from cfie.offload.policy import get_moe_tiered_cache_plan
+
+            moe_tiered_plan = get_moe_tiered_cache_plan(self)
+            if (
+                    moe_tiered_plan is not None
+                    and bool(moe_tiered_plan.get("enabled", False))
+                    and self.compilation_config.mode != CompilationMode.NONE
+            ):
+                if self.compilation_config.splitting_ops is None:
+                    self.compilation_config.splitting_ops = []
+                tiered_moe_boundary_ops = [
+                    "cfie::moe_prepare_tiered",
+                    "cfie::moe_forward",
+                    "cfie::moe_forward_shared",
+                ]
+                for op_name in tiered_moe_boundary_ops:
+                    if op_name not in self.compilation_config.splitting_ops:
+                        self.compilation_config.splitting_ops.append(op_name)
 
         # 若启用了序列并行，还需要进一步处理 rms_norm 相关兼容项。
         if self.compilation_config.pass_config.enable_sp:
@@ -1640,22 +1696,61 @@ class CfieConfig:
                 "when using cuda graph."
             )
 
+            def _normalize_capture_sizes(
+                sizes: list[int] | None,
+                *,
+                name: str,
+                require_non_empty: bool,
+            ) -> list[int] | None:
+                if sizes is None:
+                    return None
+                if not sizes:
+                    return []
+                if require_non_empty:
+                    assert len(sizes) > 0, (
+                        f"{name} should contain at least one element "
+                        "when using cuda graph."
+                    )
+                return sorted({int(i) for i in sizes if int(i) <= max_num_tokens})
+
+            decode_capture_sizes = _normalize_capture_sizes(
+                self.compilation_config.cudagraph_decode_capture_sizes,
+                name="cudagraph_decode_capture_sizes",
+                require_non_empty=True,
+            )
+            prefill_capture_sizes = _normalize_capture_sizes(
+                self.compilation_config.cudagraph_prefill_capture_sizes,
+                name="cudagraph_prefill_capture_sizes",
+                require_non_empty=True,
+            )
+            capture_sizes_explicit = (
+                self.compilation_config.cudagraph_capture_sizes is not None
+                or decode_capture_sizes is not None
+                or prefill_capture_sizes is not None
+            )
+
             # ----------------- 生成最终的 cudagraph_capture_sizes 列表 -----------------
             # 确定 cudagraph_capture_sizes
-            if self.compilation_config.cudagraph_capture_sizes is not None:
-                # 用户手工指定列表时，要求列表非空。
-                assert len(self.compilation_config.cudagraph_capture_sizes) > 0, (
-                    "cudagraph_capture_sizes should contain at least one element "
-                    "when using cuda graph."
+            if capture_sizes_explicit:
+                base_capture_sizes = _normalize_capture_sizes(
+                    self.compilation_config.cudagraph_capture_sizes,
+                    name="cudagraph_capture_sizes",
+                    require_non_empty=(
+                        decode_capture_sizes is None and prefill_capture_sizes is None
+                    ),
                 )
-                # 对配置中给出的 size 去重
-                dedup_sizes = list(set(self.compilation_config.cudagraph_capture_sizes))
-                # 过滤掉超过 max_num_tokens 的非法 size。
-                cudagraph_capture_sizes = [
-                    i for i in dedup_sizes if i <= max_num_tokens
-                ]
-                # 排序，确保 size 按升序
-                cudagraph_capture_sizes.sort()
+                separate_decode_only = (
+                    decode_capture_sizes is not None
+                    and prefill_capture_sizes is None
+                    and base_capture_sizes is None
+                )
+                if decode_capture_sizes is None:
+                    decode_capture_sizes = base_capture_sizes
+                if prefill_capture_sizes is None:
+                    prefill_capture_sizes = [] if separate_decode_only else base_capture_sizes
+                cudagraph_capture_sizes = sorted(
+                    set(decode_capture_sizes or []) | set(prefill_capture_sizes or [])
+                )
             else:
                 # interactivity 模式优先生成更细粒度的小 batch 捕获列表。
                 if self.performance_mode == "interactivity":
@@ -1680,6 +1775,8 @@ class CfieConfig:
                     )
                 # 去重并排序
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
+                decode_capture_sizes = None
+                prefill_capture_sizes = None
 
             # 若开启了序列并行，则继续删掉无法被 TP 整除的 capture size。
             if (
@@ -1689,6 +1786,19 @@ class CfieConfig:
                 cudagraph_capture_sizes = self.update_sizes_for_sequence_parallelism(
                     cudagraph_capture_sizes
                 )
+                if decode_capture_sizes is not None:
+                    decode_capture_sizes = self.update_sizes_for_sequence_parallelism(
+                        decode_capture_sizes
+                    )
+                if prefill_capture_sizes is not None:
+                    prefill_capture_sizes = self.update_sizes_for_sequence_parallelism(
+                        prefill_capture_sizes
+                    )
+                if decode_capture_sizes is not None or prefill_capture_sizes is not None:
+                    cudagraph_capture_sizes = sorted(
+                        set(decode_capture_sizes or [])
+                        | set(prefill_capture_sizes or [])
+                    )
 
             # 当用户指定的 compilation_config.max_cudagraph_capture_size
             # 与实际可用值不一致时，会被截断到 valid_max_size。
@@ -1701,7 +1811,7 @@ class CfieConfig:
                     and self.compilation_config.max_cudagraph_capture_size != valid_max_size
             ):
                 # 仅当两个参数都由用户显式指定且互相不一致时抛错
-                if self.compilation_config.cudagraph_capture_sizes is not None:
+                if capture_sizes_explicit:
                     raise ValueError(
                         "customized max_cudagraph_capture_size"
                         f"(={self.compilation_config.max_cudagraph_capture_size}) "
@@ -1732,11 +1842,19 @@ class CfieConfig:
                 )
             # 始终写回最终 size 列表
             self.compilation_config.cudagraph_capture_sizes = cudagraph_capture_sizes
+            self.compilation_config.cudagraph_decode_capture_sizes = (
+                decode_capture_sizes
+            )
+            self.compilation_config.cudagraph_prefill_capture_sizes = (
+                prefill_capture_sizes
+            )
 
         else:
             # 当前不使用 cudagraph
             self.compilation_config.max_cudagraph_capture_size = 0
             self.compilation_config.cudagraph_capture_sizes = []
+            self.compilation_config.cudagraph_decode_capture_sizes = []
+            self.compilation_config.cudagraph_prefill_capture_sizes = []
 
         # 完成剩余流程
         self.compilation_config.post_init_cudagraph_sizes()

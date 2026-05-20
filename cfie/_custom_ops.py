@@ -29,6 +29,46 @@ else:
         from torch.library import impl_abstract as register_fake
 
 
+def has_copy_expert_slices_to_stage_cpu() -> bool:
+    return hasattr(torch.ops._C, "copy_expert_slices_to_stage_cpu")
+
+
+def has_copy_expert_slices_to_stage_device() -> bool:
+    return hasattr(torch.ops._C, "copy_expert_slices_to_stage_device")
+
+
+def copy_expert_slices_to_stage_cpu(
+        source_storage: torch.Tensor,
+        source_offsets: torch.Tensor,
+        dest_storage: torch.Tensor,
+        per_expert_bytes: int,
+        num_workers: int,
+) -> None:
+    torch.ops._C.copy_expert_slices_to_stage_cpu(
+        source_storage,
+        source_offsets,
+        dest_storage,
+        int(per_expert_bytes),
+        int(num_workers),
+    )
+
+
+def copy_expert_slices_to_stage_device(
+        source_storage: torch.Tensor,
+        source_offsets: torch.Tensor,
+        dest_storage: torch.Tensor,
+        per_expert_bytes: int,
+        non_blocking: bool,
+) -> None:
+    torch.ops._C.copy_expert_slices_to_stage_device(
+        source_storage,
+        source_offsets,
+        dest_storage,
+        int(per_expert_bytes),
+        bool(non_blocking),
+    )
+
+
 # page attention ops
 def paged_attention_v1(
         out: torch.Tensor,

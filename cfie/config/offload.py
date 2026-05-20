@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration for model weight offloading."""
 
@@ -9,7 +9,7 @@ from pydantic import Field, model_validator
 
 from cfie.config.utils import config
 
-# 当前支持的权重 offload 后端类型。
+# 褰撳墠鏀寔鐨勬潈閲?offload 鍚庣绫诲瀷銆?
 OffloadBackend = Literal["auto", "uva", "prefetch"]
 
 
@@ -21,7 +21,7 @@ class UVAOffloadConfig:
     fast CPU-GPU interconnect.
     """
 
-    # 每张 GPU 允许借用的 CPU offload 空间上限，单位 GiB。
+    # 姣忓紶 GPU 鍏佽鍊熺敤鐨?CPU offload 绌洪棿涓婇檺锛屽崟浣?GiB銆?
     cpu_offload_gb: float = Field(default=0, ge=0)
     """The space in GiB to offload to CPU, per GPU. Default is 0, which means
     no offloading. Intuitively, this argument can be seen as a virtual way to
@@ -33,7 +33,7 @@ class UVAOffloadConfig:
     This uses UVA (Unified Virtual Addressing) for zero-copy access.
     """
 
-    # 只对名称中匹配这些参数段的权重启用 UVA offload；为空则按预算非选择性 offload。
+    # 鍙鍚嶇О涓尮閰嶈繖浜涘弬鏁版鐨勬潈閲嶅惎鐢?UVA offload锛涗负绌哄垯鎸夐绠楅潪閫夋嫨鎬?offload銆?
     cpu_offload_params: set[str] = Field(default_factory=set)
     """The set of parameter name segments to target for CPU offloading.
     Unmatched parameters are not offloaded. If this set is empty, parameters
@@ -54,7 +54,7 @@ class PrefetchOffloadConfig:
     Groups layers and uses async H2D prefetch to hide transfer latency.
     """
 
-    # 每多少层划成一个 offload group。
+    # 姣忓灏戝眰鍒掓垚涓€涓?offload group銆?
     offload_group_size: int = Field(default=0, ge=0)
     """Group every N layers together. Offload last `offload_num_in_group`
     layers of each group. Default is 0 (disabled).
@@ -63,17 +63,17 @@ class PrefetchOffloadConfig:
     latency.
     """
 
-    # 每个 group 中有多少层真正走 offload。
+    # 姣忎釜 group 涓湁澶氬皯灞傜湡姝ｈ蛋 offload銆?
     offload_num_in_group: int = Field(default=1, ge=1)
     """Number of layers to offload per group.
     Must be <= offload_group_size. Default is 1."""
 
-    # 向前预取多少层。
+    # 鍚戝墠棰勫彇澶氬皯灞傘€?
     offload_prefetch_step: int = Field(default=1, ge=0)
     """Number of layers to prefetch ahead.
     Higher values hide more latency but use more GPU memory. Default is 1."""
 
-    # 仅对这些参数段匹配的权重启用 prefetch offload；为空则整层都 offload。
+    # 浠呭杩欎簺鍙傛暟娈靛尮閰嶇殑鏉冮噸鍚敤 prefetch offload锛涗负绌哄垯鏁村眰閮?offload銆?
     offload_params: set[str] = Field(default_factory=set)
     """The set of parameter name segments to target for prefetch offloading.
     Unmatched parameters are not offloaded. If this set is empty, ALL
@@ -87,7 +87,7 @@ class PrefetchOffloadConfig:
 class OffloadConfig:
     """Configuration for model weight offloading to reduce GPU memory usage."""
 
-    # 选择使用哪种权重 offload 后端。
+    # 閫夋嫨浣跨敤鍝鏉冮噸 offload 鍚庣銆?
     offload_backend: OffloadBackend = "auto"
     """The backend for weight offloading. Options:
     - "auto": Selects based on which sub-config has non-default values
@@ -96,7 +96,7 @@ class OffloadConfig:
     - "prefetch": Async prefetch with group-based layer offloading.
     """
 
-    # MoE tiered cache 自动规划时可使用的 CPU 总预算上限。
+    # MoE tiered cache 鑷姩瑙勫垝鏃跺彲浣跨敤鐨?CPU 鎬婚绠椾笂闄愩€?
     moe_cpu_budget_gb: float = Field(default=0, ge=0)
     """Hard cap for the auto-enabled MoE tiered cache CPU budget.
 
@@ -105,7 +105,7 @@ class OffloadConfig:
     generic UVA/prefetch offloader budgets.
     """
 
-    # MoE tiered cache planner 需要为主机预留的最小空闲内存。
+    # MoE tiered cache planner 闇€瑕佷负涓绘満棰勭暀鐨勬渶灏忕┖闂插唴瀛樸€?
     moe_cpu_min_free_gb: float = Field(default=0, ge=0)
     """Minimum host memory to keep free for the MoE tiered cache planner.
 
@@ -114,27 +114,50 @@ class OffloadConfig:
     cache, pinned buffers, and other runtime allocations.
     """
 
-    # UVA offload 子配置。
+    # UVA offload 瀛愰厤缃€?
     uva: UVAOffloadConfig = Field(default_factory=UVAOffloadConfig)
     """Parameters for UVA offloading backend."""
 
-    # prefetch offload 子配置。
+    # prefetch offload 瀛愰厤缃€?
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
+
+    # 姣忓眰 resident slots 涓婇檺銆?
+    gpu_slots_per_layer: int = Field(default=0, ge=0)
+    """Explicit cap for GPU resident expert slots per layer. 0 keeps planner
+    controlled sizing."""
+
+    prefill_burst_slots: int = Field(default=0, ge=0)
+    """Shared GPU temporary expert slots for prefill chunks. 0 lets the
+    planner decide when applicable."""
+
+    cpu_static_preprocess_batch_size: int = Field(default=0, ge=0)
+    """Number of experts to preprocess per initialization batch. A value of 0
+    auto-fits the largest safe batch from current CPU/GPU free memory."""
+
+    cpu_static_pinned_gb: float = Field(default=0.0, ge=0.0)
+    """Maximum GiB of runtime-ready CPU static experts to keep in pinned memory."""
+
+    cpu_static_pinned_layers: str = ""
+    """Comma-separated MoE layer indices or ranges to pin, e.g. '0-23,30'."""
+
+    prepare_cpu_copy_batch_size: int = Field(default=8, ge=0)
+    """Number of missing experts processed by one CPU copy worker during
+    prepare-time staging. A value of 0 keeps automatic sizing."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
-        # ----------------- 先校验 prefetch 自身的组大小约束 -----------------
+        # ----------------- 鍏堟牎楠?prefetch 鑷韩鐨勭粍澶у皬绾︽潫 -----------------
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
-            # 每个 group 内要 offload 的层数不能超过 group 总层数。
+            # 姣忎釜 group 鍐呰 offload 鐨勫眰鏁颁笉鑳借秴杩?group 鎬诲眰鏁般€?
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(
                     f"offload_num_in_group ({self.prefetch.offload_num_in_group})"
                     f" must be <= offload_group_size"
                     f" ({self.prefetch.offload_group_size})"
                 )
-            # 一旦启用 prefetch，就要求至少预取 1 层。
+            # 涓€鏃﹀惎鐢?prefetch锛屽氨瑕佹眰鑷冲皯棰勫彇 1 灞傘€?
             if self.prefetch.offload_prefetch_step < 1:
                 raise ValueError(
                     f"offload_prefetch_step"
@@ -143,25 +166,25 @@ class OffloadConfig:
                     f" (offload_group_size > 0)"
                 )
 
-        # ----------------- 再检查“后端选择”与“子配置是否激活”是否冲突 -----------------
+        # ----------------- 鍐嶆鏌モ€滃悗绔€夋嫨鈥濅笌鈥滃瓙閰嶇疆鏄惁婵€娲烩€濇槸鍚﹀啿绐?-----------------
         # Warn if both backends have non-default values
         uva_active = self.uva.cpu_offload_gb > 0
         prefetch_active = self.prefetch.offload_group_size > 0
-        # 显式指定走 UVA 时，prefetch 子配置即使被填了也不会生效。
+        # 鏄惧紡鎸囧畾璧?UVA 鏃讹紝prefetch 瀛愰厤缃嵆浣胯濉簡涔熶笉浼氱敓鏁堛€?
         if self.offload_backend == "uva" and prefetch_active:
             warnings.warn(
                 "Prefetch offload fields are set but offload_backend='uva'. "
                 "Prefetch settings will be ignored.",
                 stacklevel=2,
             )
-        # 显式指定走 prefetch 时，UVA 子配置会被忽略。
+        # 鏄惧紡鎸囧畾璧?prefetch 鏃讹紝UVA 瀛愰厤缃細琚拷鐣ャ€?
         elif self.offload_backend == "prefetch" and uva_active:
             warnings.warn(
                 "UVA offload fields are set but offload_backend='prefetch'. "
                 "UVA settings will be ignored.",
                 stacklevel=2,
             )
-        # auto 模式下若两边都被激活，会优先选择 prefetch，并给出提醒。
+        # auto 妯″紡涓嬭嫢涓よ竟閮借婵€娲伙紝浼氫紭鍏堥€夋嫨 prefetch锛屽苟缁欏嚭鎻愰啋銆?
         elif self.offload_backend == "auto" and uva_active and prefetch_active:
             warnings.warn(
                 "Both UVA and prefetch offload fields are set with "
@@ -169,7 +192,9 @@ class OffloadConfig:
                 "Set offload_backend explicitly to suppress this warning.",
                 stacklevel=2,
             )
-        # 返回校验完成后的配置对象。
+        if self.gpu_slots_per_layer and self.gpu_slots_per_layer < 8:
+            raise ValueError("gpu_slots_per_layer must be 0 or at least top-k=8")
+        # 杩斿洖鏍￠獙瀹屾垚鍚庣殑閰嶇疆瀵硅薄銆?
         return self
 
     def compute_hash(self) -> str:
@@ -184,7 +209,7 @@ class OffloadConfig:
         """
         from cfie.config.utils import get_hash_factors, hash_factors
 
-        # offload 配置会影响 forward patching 和 prefetch 索引计算，因此全部字段都参与哈希。
+        # offload 閰嶇疆浼氬奖鍝?forward patching 鍜?prefetch 绱㈠紩璁＄畻锛屽洜姝ゅ叏閮ㄥ瓧娈甸兘鍙備笌鍝堝笇銆?
         factors = get_hash_factors(self, ignored_factors=set())
         hash_str = hash_factors(factors)
         return hash_str

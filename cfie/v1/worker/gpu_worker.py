@@ -442,10 +442,9 @@ class Worker(WorkerBase):
         """
         # 若用户直接指定了 KV cache 大小，则跳过自动估算。
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
-            # 仍要做一次 profile_run 来完成编译和 warmup。
-            self.model_runner.profile_run()
+            if os.getenv("CFIE_PROFILE_WITH_MANUAL_KV", "") == "1":
+                # Optional warmup/profile for deployments that still want it.
+                self.model_runner.profile_run()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "

@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import time as _time
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from cfie.predictor.bundle import FutureExpertPredictor, PredictorRuntimeSchema
+
+logger = logging.getLogger(__name__)
+
+
+def _bench_timing_enabled() -> bool:
+    return os.getenv("CFIE_BENCH_TIMING", "") == "1"
 
 
 @dataclass(slots=True, frozen=True)
@@ -135,32 +144,73 @@ class PredictorCandidatePlanner:
         total_layers: int | None = None,
         future_layer_indices: tuple[int, ...] | None = None,
     ) -> PredictorCandidatePlan:
+        bench_timing = _bench_timing_enabled()
+        plan_t0 = _time.perf_counter() if bench_timing else 0.0
+        normalize_t0 = _time.perf_counter() if bench_timing else 0.0
         normalized_hidden = self._normalize_hidden_state(hidden_state)
+        normalize_seconds = (
+            _time.perf_counter() - normalize_t0 if bench_timing else 0.0
+        )
         resolved_future_layers = self._resolve_future_layer_indices(
             insertion_layer_index=insertion_layer_index,
             total_layers=total_layers,
             future_layer_indices=future_layer_indices,
         )
+        forward_t0 = _time.perf_counter() if bench_timing else 0.0
         with torch.no_grad():
             logits = self.model(normalized_hidden, int(insertion_layer_index))
+        forward_seconds = (_time.perf_counter() - forward_t0) if bench_timing else 0.0
+        topk_t0 = _time.perf_counter() if bench_timing else 0.0
         logits = logits.mean(dim=0).to(device="cpu", dtype=torch.float32)
+
+        executed_k = min(
+            int(self.schema.executed_experts_per_layer),
+            int(self.schema.num_experts),
+        )
+        candidate_k = min(
+            int(self.schema.candidate_experts_per_layer),
+            int(self.schema.num_experts),
+        )
+        if candidate_k < executed_k:
+            candidate_k = executed_k
 
         layer_plans: list[CandidateLayerPlan] = []
         for window_offset, future_layer_index in enumerate(resolved_future_layers):
-            scores, candidate_ids = torch.topk(
+            candidate_scores, candidate_ids = torch.topk(
                 logits[window_offset],
-                k=self.schema.candidate_experts_per_layer,
+                k=candidate_k,
                 dim=-1,
             )
+            executed_tuple = tuple(
+                int(expert_id)
+                for expert_id in candidate_ids[:executed_k].tolist()
+            )
             candidate_tuple = tuple(int(expert_id) for expert_id in candidate_ids.tolist())
-            executed_tuple = candidate_tuple[: self.schema.executed_experts_per_layer]
             layer_plans.append(
                 CandidateLayerPlan(
                     future_layer_index=int(future_layer_index),
                     predicted_executed_expert_ids=executed_tuple,
                     candidate_expert_ids=candidate_tuple,
-                    candidate_scores=tuple(float(score) for score in scores.tolist()),
+                    candidate_scores=tuple(float(score) for score in candidate_scores.tolist()),
                 )
+            )
+
+        if bench_timing:
+            logger.info(
+                "CFIE_PREDICTOR_PLAN window_layers=%d stride_layers=%d insertion=%d "
+                "executed_k=%d candidate_k=%d model_device=%s model_dtype=%s "
+                "normalize=%.3fms forward=%.3fms postprocess=%.3fms total=%.3fms",
+                self.schema.window_layers,
+                self.schema.stride_layers,
+                int(insertion_layer_index),
+                executed_k,
+                candidate_k,
+                self._model_device(),
+                self._model_dtype(),
+                normalize_seconds * 1000.0,
+                forward_seconds * 1000.0,
+                (_time.perf_counter() - topk_t0) * 1000.0,
+                (_time.perf_counter() - plan_t0) * 1000.0,
             )
 
         return PredictorCandidatePlan(

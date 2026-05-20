@@ -21,7 +21,6 @@ logger = init_logger(__name__)
 PLAN_KEY = "moe_tiered_cache"
 TARGET_OCCUPIED_GPU_BYTES_KEY = "moe_tiered_cache_target_occupied_gpu_bytes"
 MTP_RESERVE_MODE_KEY = "moe_tiered_cache_mtp_reserve_mode"
-LOG_RUNTIME_EVENTS_KEY = "moe_tiered_cache_log_runtime_events"
 GiB = 1 << 30
 # 当前主线已经去掉 NVMe 二级缓存与 staging 过渡区，默认不再为其预留空间。
 DEFAULT_STAGE_BYTES = 0
@@ -37,11 +36,10 @@ DEFAULT_CPU_CACHE_BUDGET_FRACTION = 0.50
 DEFAULT_CPU_CACHE_BOOST_FRACTION = 0.75
 DEFAULT_MTP_BASE_GPU_SLOTS = 8
 DEFAULT_PREFILL_BURST_MIN_TOKENS = 8
+GPU_SLOTS_BASE_ALIGN = 8  # gpu_slots_per_layer 必须对齐到此值
 DEFAULT_PREFILL_BURST_TOKENS_PER_GPU_SLOT = 4
 
 QWEN35_MOE_MODEL_TYPE = "qwen3_5_moe"
-QWEN35_MOE_PREDICTOR_MODEL_TYPE = "qwen3_5_moe_predictor"
-QWEN35_MOE_PREDICTOR_TEXT_MODEL_TYPE = "qwen3_5_moe_predictor_text"
 QWEN35_MTP_MODEL_TYPE = "qwen3_5_mtp"
 QWEN35_MOE_MTP_ARCH = "Qwen3_5MoeMTP"
 SUPPORTED_TIERED_CACHE_QUANTIZATIONS = frozenset(
@@ -103,10 +101,33 @@ class MoeTieredCachePlan:
     nvme_expert_bytes: int = 0
     initial_gpu_experts: tuple[int, ...] = ()
     initial_cpu_experts: tuple[int, ...] = ()
+    cpu_static_preprocess_batch_size: int = 0
+    cpu_static_pinned_gb: float = 0.0
+    cpu_static_pinned_layers: tuple[int, ...] = ()
+    prepare_cpu_copy_batch_size: int = 8
 
     def to_dict(self) -> dict[str, Any]:
-        # 统一把 dataclass 计划对象转成可注入 additional_config 的普通字典。
+        """统一把 dataclass 计划对象转成可注入 additional_config 的普通字典."""
         return asdict(self)
+
+
+
+def _parse_layer_index_ranges(raw: str, *, max_layers: int) -> tuple[int, ...]:
+    layer_ids: set[int] = set()
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            start = int(start_raw.strip())
+            end = int(end_raw.strip())
+            if end < start:
+                start, end = end, start
+            layer_ids.update(range(start, end + 1))
+        else:
+            layer_ids.add(int(part))
+    return tuple(sorted(layer for layer in layer_ids if 0 <= layer < max_layers))
 
 
 def get_moe_tiered_cache_plan(cfie_config: Any) -> dict[str, Any] | None:
@@ -198,6 +219,35 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
 
     # 真实 draft 计划会读取 target 已占据的 GPU 预算，再按剩余空间重新分配 resident slots。
     target_occupied_gpu_bytes = _get_target_occupied_gpu_bytes(cfie_config)
+    offload_config = getattr(cfie_config, "offload_config", None)
+    cpu_static_preprocess_batch_size = int(
+        getattr(
+            offload_config,
+            "cpu_static_preprocess_batch_size",
+            0,
+        )
+        or 0
+    )
+    cpu_static_pinned_gb = float(
+        getattr(offload_config, "cpu_static_pinned_gb", 0.0) or 0.0
+    )
+    cpu_static_pinned_layers_raw = str(
+        getattr(offload_config, "cpu_static_pinned_layers", "") or ""
+    )
+    prepare_cpu_copy_batch_size = int(
+        getattr(
+            offload_config,
+            "prepare_cpu_copy_batch_size",
+            0,
+        )
+        or 0
+    )
+    explicit_gpu_slots_per_layer = int(
+        getattr(offload_config, "gpu_slots_per_layer", 0) or 0
+    )
+    explicit_prefill_burst_slots = int(
+        getattr(offload_config, "prefill_burst_slots", 0) or 0
+    )
 
     # 读取模型本地目录路径；planner 只支持本地目录，不支持纯 repo id。
     model_path = _resolve_model_path_for_moe_plan(
@@ -247,7 +297,6 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     # 维度非法时无法继续规划。
     if num_experts <= 0 or top_k <= 0:
         return MoeTieredCachePlan(enabled=False, reason="invalid_moe_dimensions")
-
     # ------------------ 统计专家体积与 dense 体积，得到规划所需的核心规模参数 ------------------
     # 统计总权重大小、全部专家权重大小，以及“每层-每专家”的大小映射。
     (
@@ -400,22 +449,25 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         mtp_reserve_mode=mtp_reserve_mode,
         target_occupied_gpu_bytes=target_occupied_gpu_bytes,
     )
+    if explicit_gpu_slots_per_layer > 0:
+        fixed_gpu_slots_per_layer = explicit_gpu_slots_per_layer
 
     # 若当前模式要求固定 GPU slot 数，则不再额外规划 burst 池。
     if fixed_gpu_slots_per_layer is not None:
-        # 取“总专家数 / raw 能放下的数 / 固定目标值”三者最小值作为最终常驻 slot 数。
+        # 取”总专家数 / raw 能放下的数 / 固定目标值”三者最小值作为最终常驻 slot 数。
         gpu_slots_per_layer = min(
             num_experts,
             raw_gpu_slots_per_layer,
             fixed_gpu_slots_per_layer,
         )
         # 固定常驻模式下不启用 prefill burst。
-        prefill_burst_slots = 0
+        prefill_burst_slots = min(num_experts, max(0, explicit_prefill_burst_slots))
         # 对应的 burst 临时池显存也为 0。
-        prefill_burst_bytes = 0
+        prefill_burst_bytes = prefill_burst_slots * expert_bytes_per_expert
         # GPU 专家预算收缩为“常驻 slot 数 * 每 slot 跨层总字节”。
         gpu_expert_budget_bytes = (
                 gpu_slots_per_layer * expert_bytes_per_slot_all_layers
+                + prefill_burst_bytes
         )
     else:
         # 非固定模式下，先按“全量 prefill burst 池”预留预算，再用剩余预算计算常驻 resident slots。
@@ -427,6 +479,8 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             expert_bytes_per_slot_all_layers=expert_bytes_per_slot_all_layers,
             expert_bytes_per_expert=expert_bytes_per_expert,
         )
+        if explicit_prefill_burst_slots > 0:
+            prefill_burst_slots = min(num_experts, explicit_prefill_burst_slots)
 
         # burst 池显存预算等于 burst slot 数乘以单专家最大字节数。
         prefill_burst_bytes = prefill_burst_slots * expert_bytes_per_expert
@@ -436,12 +490,18 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
                 gpu_slots_per_layer * expert_bytes_per_slot_all_layers + prefill_burst_bytes
         )
 
+    if int(gpu_slots_per_layer) < int(top_k):
+        raise ValueError(
+            "Insufficient GPU slots for MoE execution: "
+            f"gpu_slots_per_layer={gpu_slots_per_layer} top_k={top_k}."
+        )
+
     # ------------------------------- 根据 batch token 上限决定是否关闭 prefill burst 池 -------------------------------
     # 读取当前配置下允许的最大 batched token 数。
     max_num_batched_tokens = _get_max_num_batched_tokens(cfie_config)
 
     # 当当前仍计划启用 prefill burst 池时，继续检查 token 上限是否足以支撑 burst。
-    if prefill_burst_slots > 0:
+    if prefill_burst_slots > 0 and explicit_prefill_burst_slots <= 0:
         # ------------------------------- 计算当前 resident-slot 方案对应的 burst 最小 token 门槛 -------------------------------
         # 取默认下限与“每层 GPU 常驻槽位数乘以每槽位 token 配额”两者中的较大值，作为 burst 的最小 token 门槛。
         burst_min_tokens = max(
@@ -504,6 +564,19 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     cpu_slots_per_layer = num_experts
     staging_bytes = 0
     nvme_expert_bytes = 0
+    if cpu_static_pinned_layers_raw:
+        cpu_static_pinned_layers = _parse_layer_index_ranges(
+            cpu_static_pinned_layers_raw,
+            max_layers=num_moe_layers,
+        )
+    elif cpu_static_pinned_gb > 0 and expert_bytes_per_layer > 0:
+        max_pinned_layers = min(
+            num_moe_layers,
+            int((cpu_static_pinned_gb * GiB) // expert_bytes_per_layer),
+        )
+        cpu_static_pinned_layers = tuple(range(max_pinned_layers))
+    else:
+        cpu_static_pinned_layers = ()
 
     # ------------------ 汇总最终 plan，并把自动规划结果打到启动日志 ------------------
     # 汇总前面所有中间结果，生成最终的 enabled plan 对象。
@@ -517,6 +590,10 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         staging_bytes=int(staging_bytes),
         nvme_expert_bytes=int(nvme_expert_bytes),
         initial_cpu_experts=tuple(range(int(cpu_slots_per_layer))),
+        cpu_static_preprocess_batch_size=cpu_static_preprocess_batch_size,
+        cpu_static_pinned_gb=cpu_static_pinned_gb,
+        cpu_static_pinned_layers=cpu_static_pinned_layers,
+        prepare_cpu_copy_batch_size=prepare_cpu_copy_batch_size,
         # 记录模型本地路径，后续运行时会据此重新打开 safetensors expert store。
         model_path=model_path,
         # 记录原始模型类型，便于日志与运行时区分不同规划模式。
@@ -552,7 +629,7 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         gpu_budget_bytes=gpu_budget_bytes,
         # 记录实际分配给专家相关内容的 GPU 预算。
         gpu_expert_budget_bytes=gpu_expert_budget_bytes,
-        # 记录每层最终 GPU 常驻 slot 数。
+        # 记录每层最终 GPU 常驻 slot 数, 上限 40。
         gpu_slots_per_layer=int(gpu_slots_per_layer),
         # 记录 prefill burst 临时池的 slot 数。
         prefill_burst_slots=int(prefill_burst_slots),
@@ -592,11 +669,7 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
 def _resolve_qwen35_moe_planning_mode(hf_config: Any) -> str | None:
     # 先读取原始 HF config 中声明的 model_type。
     model_type = str(getattr(hf_config, "model_type", ""))
-    if model_type in {
-        QWEN35_MOE_MODEL_TYPE,
-        QWEN35_MOE_PREDICTOR_MODEL_TYPE,
-        QWEN35_MOE_PREDICTOR_TEXT_MODEL_TYPE,
-    }:
+    if model_type == QWEN35_MOE_MODEL_TYPE:
         # 命中主干 target 变体时，返回 target 规划模式。
         return "target"
 

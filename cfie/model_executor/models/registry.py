@@ -192,10 +192,6 @@ _TEXT_GENERATION_MODELS = {
     "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ("qwen3_moe", "Qwen3MoeForCausalLM"),
-    "Qwen3_5MoePredictorForCausalLM": (
-        "qwen3_5_predictor",
-        "Qwen3_5MoePredictorForCausalLM",
-    ),
     "RWForCausalLM": ("falcon", "FalconForCausalLM"),
     "SarvamMoEForCausalLM": ("sarvam", "SarvamMoEForCausalLM"),
     "SarvamMLAForCausalLM": ("sarvam", "SarvamMLAForCausalLM"),
@@ -526,10 +522,6 @@ _MULTIMODAL_MODELS = {
     "Qwen3_5MoeForConditionalGeneration": (
         "qwen3_5",
         "Qwen3_5MoeForConditionalGeneration",
-    ),
-    "Qwen3_5MoePredictorForConditionalGeneration": (
-        "qwen3_5_predictor",
-        "Qwen3_5MoePredictorForConditionalGeneration",
     ),
     "SkyworkR1VChatModel": ("skyworkr1v", "SkyworkR1VChatModel"),
     "Step3VLForConditionalGeneration": ("step3_vl", "Step3VLForConditionalGeneration"),  # noqa: E501

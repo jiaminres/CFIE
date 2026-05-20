@@ -217,6 +217,18 @@ def pack_cpu_bundles_by_expert(
         expert_slice = storage[
             expert_index * per_expert_bytes: (expert_index + 1) * per_expert_bytes
         ]
+        source_storage = bundle.storage
+        source_offset = int(bundle.storage_offset_bytes)
+        if (
+            source_storage is not None
+            and source_storage.device.type == "cpu"
+            and source_storage.dtype == torch.uint8
+            and source_offset >= 0
+            and source_offset + per_expert_bytes <= int(source_storage.numel())
+        ):
+            expert_slice.copy_(
+                source_storage[source_offset:source_offset + per_expert_bytes]
+            )
         views: dict[str, torch.Tensor] = {}
         offset = 0
         for spec in per_expert_specs:
@@ -229,7 +241,14 @@ def pack_cpu_bundles_by_expert(
             view = expert_slice[offset: offset + num_bytes].view(source.dtype).view(
                 source.shape
             )
-            view.copy_(source)
+            if (
+                source_storage is None
+                or source_storage.device.type != "cpu"
+                or source_storage.dtype != torch.uint8
+                or source_offset < 0
+                or source_offset + per_expert_bytes > int(source_storage.numel())
+            ):
+                view.copy_(source)
             views[spec.name] = view
             offset += num_bytes
         packed_bundles.append(
