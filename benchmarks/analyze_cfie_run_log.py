@@ -28,7 +28,10 @@ MODEL_LOADING_RE = re.compile(
 GRAPH_RE = re.compile(
     r"Graph capturing finished in (?P<seconds>[0-9.]+) secs, took (?P<gib>[0-9.]+) GiB"
 )
-KV_RE = re.compile(r"Hybrid GPU KV cache aggregate block capacity: (?P<tokens>[0-9,]+) tokens")
+KV_RE = re.compile(
+    r"Hybrid GPU KV cache estimated single-request max context: "
+    r"(?P<tokens>>= [0-9,]+|[0-9,]+) tokens with (?P<gib>[0-9.]+) GiB"
+)
 PINNED_RE = re.compile(
     r"pinned_static=(?P<pinned>[0-9.]+) MiB pageable_static=(?P<pageable>[0-9.]+) MiB"
 )
@@ -130,7 +133,8 @@ def analyze(path: Path) -> str:
     model_loading_gib: float | None = None
     graph_seconds: float | None = None
     graph_gib: float | None = None
-    kv_tokens: int | None = None
+    kv_context: str | None = None
+    kv_gib: float | None = None
 
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         ts = _timestamp(line)
@@ -173,10 +177,11 @@ def analyze(path: Path) -> str:
                 model_loading_gib = float(match.group("gib"))
                 model_loading_seconds = float(match.group("seconds"))
 
-        if "Hybrid GPU KV cache aggregate block capacity" in line:
+        if "Hybrid GPU KV cache estimated single-request max context" in line:
             match = KV_RE.search(line)
             if match:
-                kv_tokens = int(match.group("tokens").replace(",", ""))
+                kv_context = match.group("tokens")
+                kv_gib = float(match.group("gib"))
 
         if "Graph capturing finished" in line:
             match = GRAPH_RE.search(line)
@@ -260,8 +265,11 @@ def analyze(path: Path) -> str:
         )
     if graph_seconds is not None:
         lines.append(f"- CUDA graph capture: {graph_seconds:.1f}s, {graph_gib:.2f} GiB")
-    if kv_tokens is not None:
-        lines.append(f"- Hybrid KV lower-bound block capacity: {kv_tokens} tokens")
+    if kv_context is not None:
+        lines.append(
+            f"- Hybrid KV estimated single-request context: {kv_context} tokens "
+            f"with {kv_gib:.2f} GiB KV tensors"
+        )
     lines.append(
         f"- Static expert mirror: pinned {pinned_gib:.2f} GiB across {len(pinned_layers)} layers; "
         f"pageable {pageable_gib:.2f} GiB across {len(pageable_layers)} layers"
