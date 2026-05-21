@@ -61,7 +61,6 @@ DEFAULT_CPU_STATIC_PREPROCESS_GPU_RESERVE_BYTES = 512 << 20
 MARLIN_READY_EXPERT_CACHE_VERSION = 1
 MARLIN_READY_FP8_WEIGHT_SCALE_FACTOR = 512
 MARLIN_READY_FP8_PREPROCESS_SCHEMA_VERSION = 2
-_CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE = False
 
 
 def _callable_accepts_keyword_argument(callback: Any, keyword: str) -> bool:
@@ -778,18 +777,11 @@ class SharedRuntimeExpertStagePool:
             except Exception as exc:
                 if not pin_memory:
                     raise
-                logger.warning(
-                    "Falling back to pageable runtime expert stage after pinned "
-                    "stage allocation failed: capacity=%d bytes=%.2f MiB error=%s",
-                    required_capacity,
-                    required_numel / (1 << 20),
-                    exc,
-                )
-                gc.collect()
-                _empty_torch_host_allocator_cache_best_effort()
-                torch.accelerator.empty_cache()
-                kwargs.pop("pin_memory", None)
-                self._cpu_storage = torch.empty(required_numel, **kwargs)
+                raise RuntimeError(
+                    "Failed to allocate pinned runtime expert stage: "
+                    f"capacity={required_capacity} "
+                    f"bytes={required_numel / (1 << 20):.2f} MiB"
+                ) from exc
             self._cpu_capacity = required_capacity
             self._cpu_signature = signature
             return self._cpu_storage
@@ -827,6 +819,37 @@ class SharedRuntimeExpertStagePool:
             self._gpu_signature = signature
             self._gpu_device = device
             return self._gpu_storage
+
+    def preallocate(
+            self,
+            *,
+            capacity: int,
+            per_expert_bytes: int,
+            pin_memory: bool,
+            cpu_signature: tuple[Any, ...],
+            device: torch.device,
+    ) -> dict[str, Any]:
+        cpu_storage = self.get_cpu_storage(
+            capacity=capacity,
+            per_expert_bytes=per_expert_bytes,
+            pin_memory=pin_memory,
+            signature=cpu_signature,
+        )
+        gpu_storage = self.get_gpu_storage(
+            capacity=capacity,
+            required_numel=capacity * per_expert_bytes,
+            per_expert_numel=per_expert_bytes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        return {
+            "capacity": int(capacity),
+            "per_expert_bytes": int(per_expert_bytes),
+            "cpu_bytes": int(cpu_storage.numel() * cpu_storage.element_size()),
+            "gpu_bytes": int(gpu_storage.numel() * gpu_storage.element_size()),
+            "cpu_pinned": bool(cpu_storage.is_pinned()),
+            "device": str(device),
+        }
 
     def map_cpu_stage_copies(
             self,
@@ -924,7 +947,6 @@ class LayerTieredExpertCacheController:
 
         # ------------------------------- 闁告帗绻傞～鎰板礌?CPU 濞撴皜鍛閻庢稒眉缁楀瞼绱撻幘鍐叉毐闁告牞娅ｆ慨鎼佸箑?-------------------------------
         # 妤犵偛鍟胯ぐ鎾绩椤栨稑鐦?pinned memory 闁哄啫澧庨弫銈嗙?stage buffer; CPU static mirror 婵ɑ鐡曠换?pageable闁?
-        self._use_pinned_cpu = is_pin_memory_available()
         self._use_pinned_cpu_static = bool(
             self.plan.get(
                 "use_pinned_cpu_static",
@@ -935,6 +957,7 @@ class LayerTieredExpertCacheController:
             int(layer)
             for layer in self.plan.get("cpu_static_pinned_layers", ())
         )
+        self._use_pinned_cpu = is_pin_memory_available()
         self._moe_layer_index = _extract_moe_layer_index(str(self.layer_key))
         # 濞ｅ洦绻傞悺銊ヮ啅閼碱剙鈷栭柛鏍ㄧ墪閸?CPU 閻㈩垱鎮傞埞妤呭礃閸涱厾鎽犲☉鎿冨幘濞堟垿妫冨▎鎰ㄥ亾?expert bundle闁?
         self._cpu_static_bundles: dict[int, ExpertBundle] = {}
@@ -1277,13 +1300,19 @@ class LayerTieredExpertCacheController:
                 load_stats.get("gpu_scatter_seconds", 0.0)
             )
             load_install_seconds = float(load_stats.get("install_seconds", 0.0))
+            load_cpu_stage_mode = str(load_stats.get("cpu_stage_mode", ""))
+            load_h2d_mode = str(load_stats.get("h2d_mode", ""))
             logger.info(
                 "CFIE_BENCH_TIMING prepare layer=%s step=%d plan=%.3fms "
                 "stage=%.3fms stage_materialize=%.3fms stage_write=%.3fms "
                 "stage_cpu_pack=%.3fms stage_h2d=%.3fms stage_gpu_scatter=%.3fms "
                 "stage_install=%.3fms total=%.3fms requested=%d staged=%d "
                 "final_requested=%d missing=%d load_missing=%d "
-                "cpu_copy_batch_size=%d",
+                "cpu_copy_batch_size=%d cpu_stage_mode=%s cpu_stage_native=%d "
+                "cpu_stage_pinned=%d cpu_source_pinned=%d cpu_source_pageable=%d "
+                "cpu_source_shared=%d cpu_source_contiguous=%d h2d_mode=%s "
+                "h2d_source_pinned=%d h2d_non_blocking=%d h2d_source_shared=%d "
+                "h2d_single_contiguous=%d h2d_bytes=%d",
                 self.layer_key,
                 self._step,
                 ((_time.perf_counter() - plan_t0) - load_seconds) * 1000.0,
@@ -1301,6 +1330,19 @@ class LayerTieredExpertCacheController:
                 len(missing),
                 len(load_missing),
                 cpu_copy_batch_size,
+                load_cpu_stage_mode,
+                int(load_stats.get("cpu_stage_native", 0) or 0),
+                int(load_stats.get("cpu_stage_pinned", 0) or 0),
+                int(load_stats.get("cpu_source_pinned", 0) or 0),
+                int(load_stats.get("cpu_source_pageable", 0) or 0),
+                int(load_stats.get("cpu_source_shared", 0) or 0),
+                int(load_stats.get("cpu_source_contiguous", 0) or 0),
+                load_h2d_mode,
+                int(load_stats.get("h2d_source_pinned", 0) or 0),
+                int(load_stats.get("h2d_non_blocking", 0) or 0),
+                int(load_stats.get("h2d_source_shared", 0) or 0),
+                int(load_stats.get("h2d_single_contiguous", 0) or 0),
+                int(load_stats.get("h2d_bytes", 0) or 0),
             )
 
     def _router_scores(self, router_probs: torch.Tensor | None) -> torch.Tensor | None:
@@ -1598,8 +1640,6 @@ class LayerTieredExpertCacheController:
         gc.collect()
 
     def _should_pin_cpu_static_layer(self) -> bool:
-        if _CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE:
-            return False
         use_pinned = bool(getattr(self, "_use_pinned_cpu_static", False))
         layer_index = getattr(self, "_moe_layer_index", None)
         pinned_layers = getattr(self, "_cpu_static_pinned_layers", frozenset())
@@ -1620,18 +1660,12 @@ class LayerTieredExpertCacheController:
             _empty_torch_host_allocator_cache_best_effort()
             self._pack_cpu_static_bundles_layer_wide(pin_memory=True)
         except Exception as exc:
-            global _CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE
-            _CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE = True
-            logger.warning(
-                "Falling back to pageable CPU static storage after pinned pack "
-                "failed; disabling further CPU static pinned attempts for this "
-                "process: layer=%s error=%s",
-                getattr(self, "layer_key", "<unknown>"),
-                exc,
-            )
             gc.collect()
             _empty_torch_host_allocator_cache_best_effort()
-            self._pack_cpu_static_bundles_layer_wide(pin_memory=False)
+            raise RuntimeError(
+                "Failed to allocate pinned CPU static storage for configured "
+                f"tiered MoE layer {getattr(self, 'layer_key', '<unknown>')}"
+            ) from exc
 
     def _build_cpu_static_layer_field_views(
             self,
@@ -2068,32 +2102,15 @@ class LayerTieredExpertCacheController:
         except Exception as exc:
             if not pin_cpu_static:
                 raise
-            global _CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE
-            _CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE = True
-            logger.warning(
-                "Falling back to pageable CPU static runtime bundle after direct "
-                "pinned allocation failed; disabling further CPU static pinned "
-                "attempts for this process: layer=%s experts=%d error=%s",
-                getattr(self, "layer_key", "<unknown>"),
-                len(expert_ids),
-                exc,
-            )
             gc.collect()
             _empty_torch_host_allocator_cache_best_effort()
             torch.accelerator.empty_cache()
-            if source_runtime_bundles is not None:
-                runtime_bundles = pack_cpu_bundles_by_expert(
-                    source_runtime_bundles,
-                    pin_memory=False,
-                    runtime_ready=True,
-                )
-            elif runtime_tensors is not None:
-                runtime_bundles = self._build_quantized_runtime_bundles(
-                    runtime_tensors,
-                    pin_memory=False,
-                )
-            else:
-                runtime_bundles = []
+            raise RuntimeError(
+                "Failed to allocate pinned CPU static runtime bundles for "
+                f"configured tiered MoE layer "
+                f"{getattr(self, 'layer_key', '<unknown>')} "
+                f"(experts={len(expert_ids)})"
+            ) from exc
         for expert_id, runtime_bundle in zip(expert_ids, runtime_bundles, strict=False):
             self._register_cpu_static_bundle(
                 expert_id,
@@ -2363,21 +2380,11 @@ class LayerTieredExpertCacheController:
                 )
             except Exception as exc:
                 if end - start <= 1:
-                    global _CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE
-                    _CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE = True
-                    logger.warning(
-                        "Falling back to pageable CPU static runtime bundle for "
-                        "single expert after pinned allocation failed; disabling "
-                        "further CPU static pinned attempts for this process: "
-                        "layer=%s expert_index=%d error=%s",
-                        getattr(self, "layer_key", "<unknown>"),
-                        start,
-                        exc,
-                    )
-                    return self._build_quantized_runtime_bundles(
-                        sliced,
-                        pin_memory=False,
-                    )
+                    raise RuntimeError(
+                        "Failed to allocate pinned CPU static runtime bundle for "
+                        f"layer={getattr(self, 'layer_key', '<unknown>')} "
+                        f"expert_index={start}"
+                    ) from exc
                 gc.collect()
                 _empty_torch_host_allocator_cache_best_effort()
                 torch.accelerator.empty_cache()
@@ -2413,18 +2420,11 @@ class LayerTieredExpertCacheController:
                 )
             except Exception as exc:
                 if end - start <= 1:
-                    global _CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE
-                    _CPU_STATIC_PINNING_DISABLED_AFTER_FAILURE = True
-                    logger.warning(
-                        "Falling back to pageable CPU static runtime bundle for "
-                        "single expert after pinned allocation failed; disabling "
-                        "further CPU static pinned attempts for this process: "
-                        "layer=%s expert_index=%d error=%s",
-                        getattr(self, "layer_key", "<unknown>"),
-                        start,
-                        exc,
-                    )
-                    return list(sliced)
+                    raise RuntimeError(
+                        "Failed to pin CPU static runtime bundle for "
+                        f"layer={getattr(self, 'layer_key', '<unknown>')} "
+                        f"expert_index={start}"
+                    ) from exc
                 gc.collect()
                 _empty_torch_host_allocator_cache_best_effort()
                 torch.accelerator.empty_cache()
@@ -2479,6 +2479,20 @@ class LayerTieredExpertCacheController:
 
     def _runtime_requires_pinned_cpu(self) -> bool:
         return bool(getattr(self, "_use_pinned_cpu", False))
+
+    def runtime_stage_allocation_spec(
+            self,
+            *,
+            pin_memory: bool,
+    ) -> tuple[int, tuple[Any, ...]]:
+        template_bundle = self._allocate_runtime_ready_stage_bundle(pin_memory=False)
+        return (
+            int(template_bundle.nbytes),
+            self._runtime_ready_stage_signature(
+                [template_bundle],
+                pin_memory=pin_memory,
+            ),
+        )
 
     def _allocate_runtime_ready_stage_bundle(
             self,
@@ -2603,6 +2617,14 @@ class LayerTieredExpertCacheController:
                 source_storage.device == resolved_device
                 and all(bundle.storage is source_storage for bundle in bundles)
         ):
+            self._last_runtime_h2d_info = {
+                "mode": "already_device",
+                "source_pinned": False,
+                "non_blocking": False,
+                "source_shared": True,
+                "single_contiguous": False,
+                "bytes": 0,
+            }
             return bundles
 
         required_numel = self._runtime_ready_stage_required_numel(
@@ -2615,6 +2637,9 @@ class LayerTieredExpertCacheController:
         non_blocking = bool(
             source_storage.device.type == "cpu" and source_storage.is_pinned()
         )
+        h2d_mode = "unknown"
+        source_shared = all(bundle.storage is source_storage for bundle in bundles)
+        source_is_single_contiguous_run = False
         target_storage = self._get_runtime_ready_gpu_stage_storage(
             required_numel=required_numel,
             per_expert_numel=self._runtime_ready_stage_per_expert_numel(bundles),
@@ -2622,7 +2647,7 @@ class LayerTieredExpertCacheController:
             device=resolved_device,
             stage_slot_capacity=stage_slot_capacity,
         )
-        if all(bundle.storage is source_storage for bundle in bundles):
+        if source_shared:
             used_native_h2d = False
             per_expert_bytes = int(bundles[0].nbytes)
             source_base_offset = int(bundles[0].storage_offset_bytes)
@@ -2633,6 +2658,7 @@ class LayerTieredExpertCacheController:
                 for index, bundle in enumerate(bundles)
             )
             if source_is_single_contiguous_run:
+                h2d_mode = "direct_contiguous"
                 source_end = source_base_offset + required_numel
                 target_storage[:required_numel].copy_(
                     source_storage[source_base_offset:source_end],
@@ -2661,8 +2687,10 @@ class LayerTieredExpertCacheController:
                     per_expert_bytes,
                     non_blocking,
                 )
+                h2d_mode = "native_gather_device"
                 used_native_h2d = True
             if not used_native_h2d:
+                h2d_mode = "loop_shared_storage"
                 dest_offset = 0
                 for bundle in bundles:
                     source_start = int(bundle.storage_offset_bytes)
@@ -2674,6 +2702,7 @@ class LayerTieredExpertCacheController:
                     )
                     dest_offset = dest_end
         else:
+            h2d_mode = "loop_multi_storage"
             dest_offset = 0
             for bundle in bundles:
                 bundle_storage = bundle.storage
@@ -2692,6 +2721,15 @@ class LayerTieredExpertCacheController:
                     ),
                 )
                 dest_offset = dest_end
+
+        self._last_runtime_h2d_info = {
+            "mode": h2d_mode,
+            "source_pinned": bool(non_blocking),
+            "non_blocking": bool(non_blocking),
+            "source_shared": bool(source_shared),
+            "single_contiguous": bool(source_is_single_contiguous_run),
+            "bytes": int(required_numel),
+        }
 
         moved_bundles: list[ExpertBundle] = []
         dest_offset = 0
@@ -2845,7 +2883,7 @@ class LayerTieredExpertCacheController:
             self,
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             target: Any,
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
         bundles_and_sources = self._order_runtime_ready_bundles_for_batch_write(
             bundles_and_sources
         )
@@ -2869,6 +2907,7 @@ class LayerTieredExpertCacheController:
             stage_slot_capacity=stage_slot_capacity,
         )
         cpu_pack_seconds = _time.perf_counter() - stage_t0
+        cpu_stage_info = getattr(self, "_last_runtime_cpu_stage_info", {})
         if not runtime_ready_stage_bundles:
             return {
                 "cpu_pack_seconds": cpu_pack_seconds,
@@ -2896,6 +2935,7 @@ class LayerTieredExpertCacheController:
             stage_slot_capacity=stage_slot_capacity,
         )
         h2d_seconds = _time.perf_counter() - h2d_t0
+        h2d_info = getattr(self, "_last_runtime_h2d_info", {})
         gpu_stage_bundles_and_sources = [
             (expert_id, slot, bundle, "gpu_stage")
             for (expert_id, slot, _bundle, _source), bundle in zip(
@@ -2932,6 +2972,25 @@ class LayerTieredExpertCacheController:
             "cpu_pack_seconds": cpu_pack_seconds,
             "h2d_seconds": h2d_seconds,
             "gpu_scatter_seconds": gpu_scatter_seconds,
+            "cpu_stage_mode": str(cpu_stage_info.get("mode", "")),
+            "cpu_stage_native": int(bool(cpu_stage_info.get("native_copy", False))),
+            "cpu_stage_pinned": int(bool(cpu_stage_info.get("stage_pinned", False))),
+            "cpu_source_pinned": int(cpu_stage_info.get("source_pinned", 0) or 0),
+            "cpu_source_pageable": int(
+                cpu_stage_info.get("source_pageable", 0) or 0
+            ),
+            "cpu_source_shared": int(bool(cpu_stage_info.get("source_shared", False))),
+            "cpu_source_contiguous": int(
+                cpu_stage_info.get("source_contiguous", 0) or 0
+            ),
+            "h2d_mode": str(h2d_info.get("mode", "")),
+            "h2d_source_pinned": int(bool(h2d_info.get("source_pinned", False))),
+            "h2d_non_blocking": int(bool(h2d_info.get("non_blocking", False))),
+            "h2d_source_shared": int(bool(h2d_info.get("source_shared", False))),
+            "h2d_single_contiguous": int(
+                bool(h2d_info.get("single_contiguous", False))
+            ),
+            "h2d_bytes": int(h2d_info.get("bytes", 0) or 0),
         }
 
     def _copy_runtime_ready_bundle_tensors(
@@ -3028,13 +3087,13 @@ class LayerTieredExpertCacheController:
     def _load_experts_into_slots(
             self,
             assignments: list[tuple[int, int]],
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
         # Chunk missing experts so each CPU worker handles a bounded batch.
         if not assignments:
             return {}
 
         batch_size = max(1, int(getattr(self, "_prepare_cpu_copy_batch_size", 1) or 1))
-        load_stats: dict[str, float] = {
+        load_stats: dict[str, Any] = {
             "materialize_seconds": 0.0,
             "write_seconds": 0.0,
             "cpu_pack_seconds": 0.0,
@@ -3070,6 +3129,31 @@ class LayerTieredExpertCacheController:
             load_stats["gpu_scatter_seconds"] += float(
                 batch_stats.get("gpu_scatter_seconds", 0.0)
             )
+            for key in (
+                "cpu_stage_native",
+                "cpu_stage_pinned",
+                "cpu_source_pinned",
+                "cpu_source_pageable",
+                "cpu_source_shared",
+                "cpu_source_contiguous",
+                "h2d_source_pinned",
+                "h2d_non_blocking",
+                "h2d_source_shared",
+                "h2d_single_contiguous",
+                "h2d_bytes",
+            ):
+                load_stats[key] = load_stats.get(key, 0) + int(
+                    batch_stats.get(key, 0) or 0
+                )
+            for key in ("cpu_stage_mode", "h2d_mode"):
+                value = str(batch_stats.get(key, "") or "")
+                if value:
+                    previous = str(load_stats.get(key, "") or "")
+                    load_stats[key] = (
+                        value
+                        if not previous or previous == value
+                        else f"{previous}+{value}"
+                    )
             for _expert_id, _slot, _bundle, source in bundles_and_sources:
                 if source == "nvme_stage":
                     self._nvme_loads += 1
@@ -3297,6 +3381,45 @@ class LayerTieredExpertCacheController:
                 for tensor in bundles[0].tensors.values()
             )
         )
+        source_pinned = sum(
+            1
+            for bundle in bundles
+            if bool(bundle.pinned)
+            or (
+                bundle.storage is not None
+                and bundle.storage.device.type == "cpu"
+                and bool(bundle.storage.is_pinned())
+            )
+        )
+        source_shared = (
+            bundles[0].storage is not None
+            and all(bundle.storage is bundles[0].storage for bundle in bundles)
+        )
+        source_contiguous = sum(
+            1
+            for bundle in bundles
+            if self._source_has_contiguous_expert_storage(
+                bundle,
+                first_packed_nbytes,
+            )
+        )
+
+        def _record_cpu_stage_info(
+                mode: str,
+                *,
+                stage_pinned: bool,
+                native_copy: bool = False,
+        ) -> None:
+            self._last_runtime_cpu_stage_info = {
+                "mode": mode,
+                "native_copy": bool(native_copy),
+                "stage_pinned": bool(stage_pinned),
+                "source_pinned": int(source_pinned),
+                "source_pageable": int(len(bundles) - source_pinned),
+                "source_shared": bool(source_shared),
+                "source_contiguous": int(source_contiguous),
+            }
+
         if len(bundles) == 1:
             storage = bundles[0].storage
             if (
@@ -3305,6 +3428,12 @@ class LayerTieredExpertCacheController:
                     and int(bundles[0].storage_offset_bytes) == 0
                     and int(storage.numel()) == first_packed_nbytes
             ):
+                _record_cpu_stage_info(
+                    "already_packed_single",
+                    stage_pinned=bool(
+                        storage.device.type == "cpu" and storage.is_pinned()
+                    ),
+                )
                 return bundles
         else:
             first = bundles[0]
@@ -3320,6 +3449,13 @@ class LayerTieredExpertCacheController:
                         and int(bundle.storage_offset_bytes) == index * expected_stride
                         for index, bundle in enumerate(bundles)
                 ):
+                    _record_cpu_stage_info(
+                        "already_packed_batch",
+                        stage_pinned=bool(
+                            first_storage.device.type == "cpu"
+                            and first_storage.is_pinned()
+                        ),
+                    )
                     return bundles
         if pin_memory and all(
             bundle.pinned
@@ -3329,6 +3465,10 @@ class LayerTieredExpertCacheController:
             )
             for bundle in bundles
         ):
+            _record_cpu_stage_info(
+                "direct_pinned_static",
+                stage_pinned=True,
+            )
             return bundles
 
         return self._pack_runtime_ready_bundles_into_reused_stage(
@@ -3544,16 +3684,19 @@ class LayerTieredExpertCacheController:
             per_expert_bytes,
             copy_batch_size,
         )
+        copy_mode = "native_cpu_copy"
         shared_pool = getattr(self, "_runtime_stage_pool", None)
         if used_native_copy:
             pass
         elif shared_pool is not None:
+            copy_mode = "shared_pool_copy"
             shared_pool.map_cpu_stage_copies(
                 _copy_one,
                 copy_items,
                 max_workers=copy_batch_size,
             )
         elif copy_batch_size > 1 and len(bundles) > 1:
+            copy_mode = "python_threadpool_copy"
             def _copy_one_in_inference_mode(item: tuple[int, ExpertBundle]) -> None:
                 with torch.inference_mode():
                     _copy_one(item)
@@ -3563,11 +3706,43 @@ class LayerTieredExpertCacheController:
             ) as executor:
                 list(executor.map(_copy_one_in_inference_mode, copy_items))
         else:
+            copy_mode = "serial_copy"
             for item in copy_items:
                 _copy_one(item)
 
         stage_bundles: list[ExpertBundle] = []
         resolved_pinned = bool(storage.is_pinned())
+        source_pinned = sum(
+            1
+            for bundle in bundles
+            if bool(bundle.pinned)
+            or (
+                bundle.storage is not None
+                and bundle.storage.device.type == "cpu"
+                and bool(bundle.storage.is_pinned())
+            )
+        )
+        self._last_runtime_cpu_stage_info = {
+            "mode": copy_mode,
+            "native_copy": bool(used_native_copy),
+            "stage_pinned": bool(resolved_pinned),
+            "source_pinned": int(source_pinned),
+            "source_pageable": int(len(bundles) - source_pinned),
+            "source_shared": bool(
+                bundles[0].storage is not None
+                and all(bundle.storage is bundles[0].storage for bundle in bundles)
+            ),
+            "source_contiguous": int(
+                sum(
+                    1
+                    for bundle in bundles
+                    if self._source_has_contiguous_expert_storage(
+                        bundle,
+                        per_expert_bytes,
+                    )
+                )
+            ),
+        }
         for expert_index in range(len(bundles)):
             expert_start = expert_index * per_expert_bytes
             expert_slice = storage[expert_start:expert_start + per_expert_bytes]
@@ -5441,6 +5616,69 @@ def maybe_enable_tiered_moe_cache(model: nn.Module, cfie_config: Any) -> None:
                     "Skipping shared prefill burst pool on incompatible MoE layer: %s",
                     controller.layer.layer_name,
                 )
+
+    if controllers:
+        runtime_stage_slots = max(
+            1,
+            prefill_burst_slots,
+            *(
+                max(
+                    int(getattr(controller, "_runtime_stage_slots", 0) or 0),
+                    int(getattr(controller, "_compute_slots", 0) or 0),
+                )
+                for controller in controllers
+            ),
+        )
+        pin_runtime_stage = any(
+            controller._runtime_requires_pinned_cpu()
+            for controller in controllers
+        )
+        template = controllers[0]
+        per_expert_bytes, cpu_signature = template.runtime_stage_allocation_spec(
+            pin_memory=pin_runtime_stage,
+        )
+        stage_device = torch.device(template.device)
+        mismatched_stage_layers: list[str] = []
+        for controller in controllers[1:]:
+            other_bytes, other_signature = controller.runtime_stage_allocation_spec(
+                pin_memory=pin_runtime_stage,
+            )
+            if other_bytes != per_expert_bytes or other_signature != cpu_signature:
+                mismatched_stage_layers.append(controller.layer_key)
+        if mismatched_stage_layers:
+            logger.warning(
+                "Shared runtime expert stage was preallocated from %s, but %d "
+                "layers have a different runtime bundle layout. The stage may "
+                "need to reallocate lazily for those layers; first mismatched=%s",
+                template.layer_key,
+                len(mismatched_stage_layers),
+                mismatched_stage_layers[0],
+            )
+        try:
+            stage_info = shared_runtime_stage_pool.preallocate(
+                capacity=runtime_stage_slots,
+                per_expert_bytes=per_expert_bytes,
+                pin_memory=pin_runtime_stage,
+                cpu_signature=cpu_signature,
+                device=stage_device,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to preallocate shared runtime expert CPU/GPU stage: "
+                f"slots={runtime_stage_slots} "
+                f"per_expert={per_expert_bytes / (1 << 20):.2f} MiB "
+                f"pin_memory={pin_runtime_stage} device={stage_device}"
+            ) from exc
+        logger.info(
+            "Preallocated shared runtime expert stage: slots=%d "
+            "per_expert=%.2f MiB cpu=%.2f MiB pinned=%s gpu=%.2f MiB device=%s",
+            int(stage_info["capacity"]),
+            float(stage_info["per_expert_bytes"]) / (1 << 20),
+            float(stage_info["cpu_bytes"]) / (1 << 20),
+            bool(stage_info["cpu_pinned"]),
+            float(stage_info["gpu_bytes"]) / (1 << 20),
+            stage_info["device"],
+        )
 
     # ------------------------------- 闁哄稄绻濋悰娆撴儎椤旂晫鍨奸悘鐐插€归弳鐔哥▔鎼达紕鏉介梻鍕噺鐎垫洘娼挊澶屾勾闁轰胶澧楀Σ鎼佸触閿旇法顏遍柤?-------------------------------
     if marked_layers and enabled_layers != marked_layers:

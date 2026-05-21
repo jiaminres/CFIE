@@ -1341,17 +1341,27 @@ def _report_kv_cache_config(
             pcp_size,
             dcp_size,
         )
-    num_tokens_str = f"{num_tokens:,}"
     if len(kv_cache_config.kv_cache_groups) > 1:
+        single_req_max_len = _estimate_single_request_max_model_len_for_config(
+            cfie_config, kv_cache_config
+        )
+        kv_tensor_bytes = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+        single_req_max_len_str = (
+            f">= {single_req_max_len:,}"
+            if single_req_max_len
+            >= _kv_capacity_estimate_search_cap(cfie_config.model_config.max_model_len)
+            else f"{single_req_max_len:,}"
+        )
         logger.info_once(
-            "Hybrid GPU KV cache aggregate block capacity: %s tokens "
-            "(computed as num_blocks / num_groups * min_block_size). "
-            "This is a lower-bound scheduling metric, not the single-request "
-            "maximum context length.",
-            num_tokens_str,
+            "Hybrid GPU KV cache estimated single-request max context: %s "
+            "tokens with %s GiB KV tensors (computed from each KV group spec, "
+            "so Mamba/linear/state groups do not scale like full attention).",
+            single_req_max_len_str,
+            format_gib(kv_tensor_bytes),
             scope="local",
         )
     else:
+        num_tokens_str = f"{num_tokens:,}"
         logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{cfie_config.model_config.max_model_len:,}"
     max_concurrency = get_max_concurrency_for_kv_cache_config(
@@ -1389,22 +1399,51 @@ def _max_memory_usage_bytes_from_groups(
             for spec in per_layer_specs.values()
         )
 
-    # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
+    # General case: group_size pools, each shared by one layer per group.
+    # The block pool is shared across KV groups, so a single request consumes
+    # the sum of the group-specific block requirements. This matters for
+    # hybrid models such as Qwen3.5 where Mamba/linear-state groups are nearly
+    # constant-size while full-attention groups scale with context length.
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
     page_size = get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]
     )
-    any_spec = kv_cache_groups[0].kv_cache_spec
-    blocks_needed = cdiv(any_spec.max_memory_usage_bytes(cfie_config), page_size)
+    blocks_needed = sum(
+        cdiv(group.kv_cache_spec.max_memory_usage_bytes(cfie_config), page_size)
+        for group in kv_cache_groups
+    )
 
     return group_size * page_size * blocks_needed
+
+
+def _kv_capacity_estimate_search_cap(configured_max_model_len: int) -> int:
+    # Keep the log useful for long-context models even when a benchmark run uses
+    # a smaller max_model_len. The result is still an estimate and is capped.
+    return max(int(configured_max_model_len), 262_144)
+
+
+def _estimate_single_request_max_model_len_for_config(
+    cfie_config: CfieConfig,
+    kv_cache_config: KVCacheConfig,
+) -> int:
+    if not kv_cache_config.kv_cache_groups:
+        return cfie_config.model_config.max_model_len
+    available_memory = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+    return _estimate_max_model_len_from_groups(
+        cfie_config,
+        kv_cache_config.kv_cache_groups,
+        available_memory,
+        search_upper=_kv_capacity_estimate_search_cap(
+            cfie_config.model_config.max_model_len
+        ),
+    )
 
 
 def _estimate_max_model_len_from_groups(
     cfie_config: CfieConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    search_upper: int | None = None,
 ) -> int:
     """
     Binary search for the maximum model length that fits in available memory.
@@ -1420,7 +1459,8 @@ def _estimate_max_model_len_from_groups(
         )
 
     try:
-        left, right = 1, original_max
+        left = 1
+        right = int(search_upper) if search_upper is not None else original_max
         if not fits(left):
             return 0
         result = 1

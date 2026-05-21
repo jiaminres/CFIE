@@ -248,7 +248,7 @@ def decorate_logs(process_name: str | None = None) -> None:
 
 def kill_process_tree(pid: int):
     """
-    Kills all descendant processes of the given pid by sending SIGKILL.
+    Kill all descendant processes of the given pid.
 
     Args:
         pid (int): Process ID of the parent process
@@ -258,17 +258,14 @@ def kill_process_tree(pid: int):
     except psutil.NoSuchProcess:
         return
 
-    # Get all children recursively
     children = parent.children(recursive=True)
 
-    # Send SIGKILL to all children first
     for child in children:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(child.pid, signal.SIGKILL)
+        with contextlib.suppress(psutil.NoSuchProcess):
+            child.kill()
 
-    # Finally kill the parent
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
+    with contextlib.suppress(psutil.NoSuchProcess):
+        parent.kill()
 
 
 # Resource utilities

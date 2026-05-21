@@ -15,6 +15,7 @@ from cfie.loader.weight_utils import prepare_weights
 from cfie.logger import init_logger
 from cfie.transformers_utils.config import get_safetensors_params_metadata
 from cfie.utils.mem_utils import split_gpu_memory_budget
+from cfie.utils.platform_utils import is_pin_memory_available
 
 logger = init_logger(__name__)
 
@@ -234,6 +235,15 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     cpu_static_pinned_layers_raw = str(
         getattr(offload_config, "cpu_static_pinned_layers", "") or ""
     )
+    if (cpu_static_pinned_gb > 0.0 or cpu_static_pinned_layers_raw) and (
+        not is_pin_memory_available()
+    ):
+        raise RuntimeError(
+            "MoE tiered cache was configured to use pinned CPU static experts "
+            f"(cpu_static_pinned_gb={cpu_static_pinned_gb}, "
+            f"cpu_static_pinned_layers={cpu_static_pinned_layers_raw!r}), but "
+            "the current platform reports pinned memory is unavailable."
+        )
     prepare_cpu_copy_batch_size = int(
         getattr(
             offload_config,

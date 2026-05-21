@@ -527,13 +527,24 @@ class Platform:
                 "Forcing pin_memory=True because CFIE_FORCE_PIN_MEMORY=1 is set."
             )
             return True
-        # 当检测到当前运行环境位于 WSL 中时，记录告警并返回 False。
         if in_wsl():
-            logger.warning(
-                "Using 'pin_memory=False' as WSL is detected. "
-                "This may slow down the performance."
-            )
-            return False
+            try:
+                probe = torch.empty(1, dtype=torch.uint8, pin_memory=True)
+                available = bool(probe.is_pinned())
+                del probe
+            except Exception as exc:
+                logger.warning_once(
+                    "Pinned memory probe failed under WSL; using "
+                    "pin_memory=False. error=%s",
+                    exc,
+                )
+                return False
+            if available:
+                logger.info_once(
+                    "Pinned memory is available under WSL; using "
+                    "pin_memory=True."
+                )
+            return available
 
         # 当不在 WSL 中时，默认认为 pinned memory 可用。
         return True
