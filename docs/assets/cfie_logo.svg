@@ -1,0 +1,51 @@
+<svg width="960" height="300" viewBox="0 0 960 300" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">CFIE logo</title>
+  <desc id="desc">CFIE logo showing intelligent devices with their own local brain.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="960" y2="300" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A"/>
+      <stop offset="1" stop-color="#1E3A8A"/>
+    </linearGradient>
+    <linearGradient id="chip" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#60A5FA"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect width="960" height="300" rx="28" fill="url(#bg)"/>
+  <g opacity="0.15" stroke="#BFDBFE" stroke-width="1.4">
+    <path d="M95 246C176 188 261 188 342 246"/>
+    <path d="M610 246C691 188 776 188 857 246"/>
+    <path d="M149 66H811"/>
+    <path d="M149 66L95 246M811 66L857 246"/>
+  </g>
+  <g transform="translate(86 76)">
+    <rect x="0" y="0" width="132" height="110" rx="18" fill="#F8FAFC" fill-opacity="0.95"/>
+    <rect x="18" y="18" width="96" height="62" rx="10" fill="#DBEAFE"/>
+    <rect x="53" y="86" width="26" height="8" rx="4" fill="#93C5FD"/>
+    <circle cx="66" cy="49" r="20" fill="url(#chip)" filter="url(#glow)"/>
+    <path d="M54 49H78M66 37V61M57 40L75 58M75 40L57 58" stroke="#EFF6FF" stroke-width="2.4" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(734 76)">
+    <rect x="0" y="0" width="132" height="110" rx="18" fill="#F8FAFC" fill-opacity="0.95"/>
+    <rect x="18" y="18" width="96" height="62" rx="10" fill="#DCFCE7"/>
+    <rect x="53" y="86" width="26" height="8" rx="4" fill="#86EFAC"/>
+    <circle cx="66" cy="49" r="20" fill="url(#chip)" filter="url(#glow)"/>
+    <path d="M54 49H78M66 37V61M57 40L75 58M75 40L57 58" stroke="#EFF6FF" stroke-width="2.4" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(386 48)">
+    <rect x="0" y="0" width="188" height="150" rx="28" fill="#EFF6FF"/>
+    <rect x="36" y="32" width="116" height="86" rx="24" fill="url(#chip)" filter="url(#glow)"/>
+    <path d="M58 75C58 55 75 45 94 50C112 45 130 55 130 75C130 96 113 105 94 100C75 105 58 96 58 75Z" fill="#0F172A" fill-opacity="0.82"/>
+    <path d="M73 73C85 65 102 84 115 73M73 87C85 79 102 98 115 87M94 53V100" stroke="#93C5FD" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="94" cy="75" r="68" stroke="#60A5FA" stroke-width="2" stroke-dasharray="6 8"/>
+  </g>
+  <text x="480" y="235" text-anchor="middle" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="52" font-weight="800" fill="#FFFFFF">CFIE</text>
+  <text x="480" y="266" text-anchor="middle" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="18" font-weight="600" fill="#BFDBFE">Capacity-First Inference Engine · Local Brain for Every Device</text>
+</svg>

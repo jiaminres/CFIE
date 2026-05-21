@@ -1,0 +1,91 @@
+<svg width="1120" height="520" viewBox="0 0 1120 520" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">CFIE inference flow</title>
+  <desc id="desc">CFIE data flow from model cache to CPU mirror, pinned runtime stage, GPU stages, MoE kernel, and OpenAI service.</desc>
+  <defs>
+    <linearGradient id="cardBlue" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#EFF6FF"/>
+      <stop offset="1" stop-color="#DBEAFE"/>
+    </linearGradient>
+    <linearGradient id="cardGreen" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#ECFDF5"/>
+      <stop offset="1" stop-color="#D1FAE5"/>
+    </linearGradient>
+    <linearGradient id="cardOrange" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#FFF7ED"/>
+      <stop offset="1" stop-color="#FFEDD5"/>
+    </linearGradient>
+    <linearGradient id="cardPurple" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#F5F3FF"/>
+      <stop offset="1" stop-color="#EDE9FE"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2 2L10 6L2 10Z" fill="#334155"/>
+    </marker>
+    <marker id="arrowPinned" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2 2L10 6L2 10Z" fill="#0EA5E9"/>
+    </marker>
+    <style>
+      .title { font: 700 20px "Segoe UI", Arial, sans-serif; fill: #0F172A; }
+      .small { font: 500 13px "Segoe UI", Arial, sans-serif; fill: #475569; }
+      .label { font: 700 15px "Segoe UI", Arial, sans-serif; fill: #111827; }
+      .muted { font: 500 12px "Segoe UI", Arial, sans-serif; fill: #64748B; }
+      .box { stroke-width: 2; rx: 16; }
+      .line { stroke: #334155; stroke-width: 2.2; marker-end: url(#arrow); }
+      .pinned { stroke: #0EA5E9; stroke-width: 2.2; stroke-dasharray: 7 7; marker-end: url(#arrowPinned); }
+    </style>
+  </defs>
+  <rect width="1120" height="520" rx="26" fill="#F8FAFC"/>
+  <text x="46" y="46" class="title">CFIE 推理数据流</text>
+  <text x="46" y="72" class="small">把模型权重、CPU 内存、pinned memory 与 GPU resident cache 组织成客户端本地推理能力。</text>
+
+  <rect x="46" y="112" width="190" height="96" class="box" fill="url(#cardBlue)" stroke="#3B82F6"/>
+  <text x="141" y="146" text-anchor="middle" class="label">NVMe 模型与缓存</text>
+  <text x="141" y="172" text-anchor="middle" class="muted">GPTQ Int4 · safetensors</text>
+  <text x="141" y="190" text-anchor="middle" class="muted">Marlin-ready cache</text>
+
+  <rect x="296" y="92" width="218" height="136" class="box" fill="url(#cardGreen)" stroke="#10B981"/>
+  <text x="405" y="128" text-anchor="middle" class="label">CPU Static Mirror</text>
+  <text x="405" y="154" text-anchor="middle" class="muted">expert-major runtime bundle</text>
+  <text x="405" y="176" text-anchor="middle" class="muted">pageable + pinned static mirror</text>
+  <text x="405" y="198" text-anchor="middle" class="muted">启动期完成格式准备</text>
+
+  <rect x="574" y="112" width="210" height="96" class="box" fill="url(#cardOrange)" stroke="#F97316"/>
+  <text x="679" y="146" text-anchor="middle" class="label">CPU Runtime Stage</text>
+  <text x="679" y="172" text-anchor="middle" class="muted">缺失 expert 前缀写入</text>
+  <text x="679" y="190" text-anchor="middle" class="muted">C++ 并行 copy</text>
+
+  <rect x="858" y="92" width="216" height="136" class="box" fill="url(#cardPurple)" stroke="#8B5CF6"/>
+  <text x="966" y="128" text-anchor="middle" class="label">GPU Runtime</text>
+  <text x="966" y="154" text-anchor="middle" class="muted">GPU stage · H2D</text>
+  <text x="966" y="176" text-anchor="middle" class="muted">resident slots / burst pool</text>
+  <text x="966" y="198" text-anchor="middle" class="muted">scatter 到执行槽位</text>
+
+  <rect x="210" y="316" width="222" height="104" class="box" fill="#FFFFFF" stroke="#38BDF8"/>
+  <text x="321" y="350" text-anchor="middle" class="label">Router Top-k</text>
+  <text x="321" y="376" text-anchor="middle" class="muted">每层选择激活 experts</text>
+  <text x="321" y="394" text-anchor="middle" class="muted">命中 resident 则直接执行</text>
+
+  <rect x="506" y="316" width="242" height="104" class="box" fill="#FFFFFF" stroke="#22C55E"/>
+  <text x="627" y="350" text-anchor="middle" class="label">Marlin MoE Kernel</text>
+  <text x="627" y="376" text-anchor="middle" class="muted">W4A8 / FP8 activation</text>
+  <text x="627" y="394" text-anchor="middle" class="muted">decode 与长 prefill 执行</text>
+
+  <rect x="822" y="316" width="214" height="104" class="box" fill="#FFFFFF" stroke="#6366F1"/>
+  <text x="929" y="350" text-anchor="middle" class="label">OpenAI API / GUI Agent</text>
+  <text x="929" y="376" text-anchor="middle" class="muted">Responses · Chat Completions</text>
+  <text x="929" y="394" text-anchor="middle" class="muted">本地应用自动化</text>
+
+  <path d="M236 160H296" class="line"/>
+  <path d="M514 160H574" class="line"/>
+  <path d="M784 160H858" class="line"/>
+  <path d="M405 92C405 54 966 54 966 92" class="pinned"/>
+  <rect x="574" y="40" width="222" height="30" rx="15" fill="#E0F2FE" stroke="#0EA5E9"/>
+  <text x="685" y="60" text-anchor="middle" class="muted">pinned static mirror 命中：直接 H2D</text>
+  <path d="M432 340H548C562 340 574 328 574 314V208" class="line"/>
+  <path d="M432 368H506" class="line"/>
+  <path d="M966 228V270C966 292 865 292 748 350" class="line"/>
+  <path d="M748 368H822" class="line"/>
+
+  <rect x="46" y="456" width="1028" height="34" rx="12" fill="#E2E8F0"/>
+  <text x="560" y="478" text-anchor="middle" class="small">核心原则：启动期完成格式准备；推理期只搬运当前缺失 expert；长 prefill 使用 burst pool 承接高 unique-expert 层。</text>
+</svg>
