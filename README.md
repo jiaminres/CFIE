@@ -49,6 +49,18 @@ CFIE 使用 MoE tiered cache，把模型权重、CPU 内存、pinned memory 和 
 D:\models\Qwen3.5-122B-A10B-GPTQ-Int4\snapshots\5b9f0050d3ec98b0c81a7716776533c5eacebb64
 ```
 
+## 实测速度
+
+以下数据来自当前 Windows + RTX 5090 32GB + Qwen3.5-122B-A10B-GPTQ-Int4 的本地 decode 测试，配置为 `gpu_slots_per_layer=16`、`prefill_burst_slots=256`、`prepare_cpu_copy_threads=32`、`cpu_static_pinned_gb=44`、`marlin_input_dtype=fp8`、`MTP=1`、关闭 CUDA graph。
+
+| 场景 | 结果 |
+| --- | ---: |
+| 512 token decode steady TPS | 约 `7.3-7.7 tok/s` |
+| 512 token decode tail 64 TPS | 最高约 `8.2 tok/s` |
+| 首 token 延迟 | 约 `1.8-2.0 s` |
+
+当前 Windows 环境下 pinned static mirror 主要覆盖前 37 层，后 11 层仍需要 pageable CPU memory 到 pinned runtime stage 的中转，prepare 端主要瓶颈在这部分 CPU pack。若部署在能够让 MoE static mirror 全量进入 pinned memory 的环境中，例如更充足内存和更高 pinned 上限的原生 Linux，按当前逐层 prepare 耗时估算，decode 速度有机会提升到约 `11 tok/s`。该数值是基于瓶颈拆分的工程估算，不是当前 Windows 配置的实测值。
+
 ## 安装
 
 以下命令以 Windows PowerShell 为例。
