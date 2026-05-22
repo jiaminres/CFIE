@@ -16,7 +16,7 @@ The GUI Agent workload is different from a first-chat-only benchmark. Each new c
 - Speculation: disabled for this sweep (`--spec-method none`).
 - `gpu_slots_per_layer=16`
 - `prefill_burst_slots=256`
-- `prepare_cpu_copy_batch_size=8`
+- `prepare_cpu_copy_threads=8`
 - `cpu_static_pinned_gb=44`
 - `marlin_input_dtype=fp8`
 - `turns=2`
@@ -101,7 +101,7 @@ Standard run shape:
 --max-num-batched-tokens 8192
 --gpu-slots-per-layer 16
 --prefill-burst-slots 256
---prepare-cpu-copy-batch-size 8
+--prepare-cpu-copy-threads 8
 --cpu-static-pinned-gb 44
 --marlin-input-dtype fp8
 --spec-method mtp
@@ -219,7 +219,7 @@ Command shape:
 --kv-cache-memory-bytes 4000000000
 --gpu-slots-per-layer 16
 --prefill-burst-slots 256
---prepare-cpu-copy-batch-size 8
+--prepare-cpu-copy-threads 8
 --cpu-static-pinned-gb 44
 --marlin-input-dtype fp8
 --spec-method mtp
@@ -256,7 +256,7 @@ Windows benchmark command shape for later non-graph tests:
   --kv-cache-memory-bytes 4000000000 `
   --gpu-slots-per-layer 16 `
   --prefill-burst-slots 256 `
-  --prepare-cpu-copy-batch-size 8 `
+  --prepare-cpu-copy-threads 8 `
   --cpu-static-pinned-gb 44 `
   --enable-prefix-caching `
   --language-model-only `
@@ -280,7 +280,7 @@ OpenAI API server command shape for text-only Responses smoke tests:
   --kv-cache-memory-bytes 4000000000 `
   --gpu-slots-per-layer 16 `
   --prefill-burst-slots 256 `
-  --prepare-cpu-copy-batch-size 8 `
+  --prepare-cpu-copy-threads 8 `
   --cpu-static-pinned-gb 40 `
   --enable-prefix-caching `
   --language-model-only `

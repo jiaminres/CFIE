@@ -37,6 +37,14 @@ def has_copy_expert_slices_to_stage_device() -> bool:
     return hasattr(torch.ops._C, "copy_expert_slices_to_stage_device")
 
 
+def has_moe_batch_load_unquantized_runtime_and_install() -> bool:
+    return hasattr(torch.ops._C, "moe_batch_load_unquantized_runtime_and_install")
+
+
+def has_moe_batch_load_gptq_runtime_and_install() -> bool:
+    return hasattr(torch.ops._C, "moe_batch_load_gptq_runtime_and_install")
+
+
 def copy_expert_slices_to_stage_cpu(
         source_storage: torch.Tensor,
         source_offsets: torch.Tensor,
@@ -66,6 +74,82 @@ def copy_expert_slices_to_stage_device(
         dest_storage,
         int(per_expert_bytes),
         bool(non_blocking),
+    )
+
+
+def moe_batch_load_unquantized_runtime_and_install(
+        slot_ids: torch.Tensor,
+        old_expert_ids: torch.Tensor,
+        new_expert_ids: torch.Tensor,
+        w13_src: torch.Tensor,
+        w2_src: torch.Tensor,
+        w13_dst: torch.Tensor,
+        w2_dst: torch.Tensor,
+        expert_map: torch.Tensor,
+) -> None:
+    torch.ops._C.moe_batch_load_unquantized_runtime_and_install(
+        slot_ids,
+        old_expert_ids,
+        new_expert_ids,
+        w13_src,
+        w2_src,
+        w13_dst,
+        w2_dst,
+        expert_map,
+    )
+
+
+def moe_batch_load_gptq_runtime_and_install(
+        slot_ids: torch.Tensor,
+        old_expert_ids: torch.Tensor,
+        new_expert_ids: torch.Tensor,
+        w13_qweight_src: torch.Tensor,
+        w2_qweight_src: torch.Tensor,
+        w13_scales_src: torch.Tensor,
+        w2_scales_src: torch.Tensor,
+        w13_qzeros_src: torch.Tensor,
+        w2_qzeros_src: torch.Tensor,
+        w13_qweight_dst: torch.Tensor,
+        w2_qweight_dst: torch.Tensor,
+        w13_scales_dst: torch.Tensor,
+        w2_scales_dst: torch.Tensor,
+        w13_qzeros_dst: torch.Tensor,
+        w2_qzeros_dst: torch.Tensor,
+        w13_g_idx_src: torch.Tensor | None,
+        w2_g_idx_src: torch.Tensor | None,
+        w13_g_idx_sort_indices_src: torch.Tensor | None,
+        w2_g_idx_sort_indices_src: torch.Tensor | None,
+        w13_g_idx_dst: torch.Tensor | None,
+        w2_g_idx_dst: torch.Tensor | None,
+        w13_g_idx_sort_indices_dst: torch.Tensor | None,
+        w2_g_idx_sort_indices_dst: torch.Tensor | None,
+        expert_map: torch.Tensor,
+) -> None:
+    torch.ops._C.moe_batch_load_gptq_runtime_and_install(
+        slot_ids,
+        old_expert_ids,
+        new_expert_ids,
+        w13_qweight_src,
+        w2_qweight_src,
+        w13_scales_src,
+        w2_scales_src,
+        w13_qzeros_src,
+        w2_qzeros_src,
+        w13_qweight_dst,
+        w2_qweight_dst,
+        w13_scales_dst,
+        w2_scales_dst,
+        w13_qzeros_dst,
+        w2_qzeros_dst,
+        w13_g_idx_src,
+        w2_g_idx_src,
+        w13_g_idx_sort_indices_src,
+        w2_g_idx_sort_indices_src,
+        w13_g_idx_dst,
+        w2_g_idx_dst,
+        w13_g_idx_sort_indices_dst,
+        w2_g_idx_sort_indices_dst,
+        expert_map,
     )
 
 

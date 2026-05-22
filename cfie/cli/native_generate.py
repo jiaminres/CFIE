@@ -55,7 +55,8 @@ def add_native_generate_parser(subparsers: Any) -> None:
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=None)
     parser.add_argument("--gpu-slots-per-layer", type=int, default=0)
     parser.add_argument("--prefill-burst-slots", type=int, default=0)
-    parser.add_argument("--prepare-cpu-copy-batch-size", type=int, default=8)
+    parser.add_argument("--prepare-cpu-copy-threads", type=int, default=32)
+    parser.add_argument("--prepare-cpu-copy-batch-size", type=int, default=0)
     parser.add_argument("--cpu-static-preprocess-batch-size",
                         type=int,
                         default=0)
@@ -219,9 +220,11 @@ def _build_engine_args(args: Namespace):
         offload_backend=args.offload_backend,
         gpu_slots_per_layer=getattr(args, "gpu_slots_per_layer", 0),
         prefill_burst_slots=getattr(args, "prefill_burst_slots", 0),
-        prepare_cpu_copy_batch_size=getattr(
-            args, "prepare_cpu_copy_batch_size", 8
+        prepare_cpu_copy_threads=(
+            getattr(args, "prepare_cpu_copy_batch_size", 0)
+            or getattr(args, "prepare_cpu_copy_threads", 32)
         ),
+        prepare_cpu_copy_batch_size=getattr(args, "prepare_cpu_copy_batch_size", 0),
         cpu_static_preprocess_batch_size=getattr(
             args, "cpu_static_preprocess_batch_size", 0
         ),

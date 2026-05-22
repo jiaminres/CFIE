@@ -529,6 +529,7 @@ class EngineArgs:
     )
     cpu_static_pinned_gb: float = OffloadConfig.cpu_static_pinned_gb
     cpu_static_pinned_layers: str = OffloadConfig.cpu_static_pinned_layers
+    prepare_cpu_copy_threads: int = OffloadConfig.prepare_cpu_copy_threads
     prepare_cpu_copy_batch_size: int = OffloadConfig.prepare_cpu_copy_batch_size
     cpu_offload_gb: float = UVAOffloadConfig.cpu_offload_gb
     cpu_offload_params: set[str] = get_field(UVAOffloadConfig, "cpu_offload_params")
@@ -1149,8 +1150,17 @@ class EngineArgs:
             **offload_kwargs["cpu_static_pinned_layers"],
         )
         offload_group.add_argument(
+            "--prepare-cpu-copy-threads",
+            **offload_kwargs["prepare_cpu_copy_threads"],
+        )
+        legacy_prepare_copy_kwargs = offload_kwargs["prepare_cpu_copy_batch_size"]
+        legacy_prepare_copy_kwargs["dest"] = "prepare_cpu_copy_batch_size"
+        legacy_prepare_copy_kwargs["help"] = (
+            "Deprecated alias for --prepare-cpu-copy-threads."
+        )
+        offload_group.add_argument(
             "--prepare-cpu-copy-batch-size",
-            **offload_kwargs["prepare_cpu_copy_batch_size"],
+            **legacy_prepare_copy_kwargs,
         )
         offload_group.add_argument("--cpu-offload-gb", **uva_kwargs["cpu_offload_gb"])
         offload_group.add_argument(
@@ -2161,6 +2171,11 @@ class EngineArgs:
             cpu_static_preprocess_batch_size=self.cpu_static_preprocess_batch_size,
             cpu_static_pinned_gb=self.cpu_static_pinned_gb,
             cpu_static_pinned_layers=str(self.cpu_static_pinned_layers or ""),
+            prepare_cpu_copy_threads=(
+                self.prepare_cpu_copy_batch_size
+                if self.prepare_cpu_copy_batch_size
+                else self.prepare_cpu_copy_threads
+            ),
             prepare_cpu_copy_batch_size=self.prepare_cpu_copy_batch_size,
             uva=UVAOffloadConfig(
                 cpu_offload_gb=self.cpu_offload_gb,

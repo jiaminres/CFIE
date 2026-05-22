@@ -105,7 +105,8 @@ class MoeTieredCachePlan:
     cpu_static_preprocess_batch_size: int = 0
     cpu_static_pinned_gb: float = 0.0
     cpu_static_pinned_layers: tuple[int, ...] = ()
-    prepare_cpu_copy_batch_size: int = 8
+    prepare_cpu_copy_threads: int = 32
+    prepare_cpu_copy_batch_size: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """统一把 dataclass 计划对象转成可注入 additional_config 的普通字典."""
@@ -244,13 +245,10 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             f"cpu_static_pinned_layers={cpu_static_pinned_layers_raw!r}), but "
             "the current platform reports pinned memory is unavailable."
         )
-    prepare_cpu_copy_batch_size = int(
-        getattr(
-            offload_config,
-            "prepare_cpu_copy_batch_size",
-            0,
-        )
-        or 0
+    prepare_cpu_copy_threads = int(
+        getattr(offload_config, "prepare_cpu_copy_batch_size", 0)
+        or getattr(offload_config, "prepare_cpu_copy_threads", 0)
+        or 8
     )
     explicit_gpu_slots_per_layer = int(
         getattr(offload_config, "gpu_slots_per_layer", 0) or 0
@@ -603,7 +601,10 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         cpu_static_preprocess_batch_size=cpu_static_preprocess_batch_size,
         cpu_static_pinned_gb=cpu_static_pinned_gb,
         cpu_static_pinned_layers=cpu_static_pinned_layers,
-        prepare_cpu_copy_batch_size=prepare_cpu_copy_batch_size,
+        prepare_cpu_copy_threads=prepare_cpu_copy_threads,
+        prepare_cpu_copy_batch_size=int(
+            getattr(offload_config, "prepare_cpu_copy_batch_size", 0) or 0
+        ),
         # 记录模型本地路径，后续运行时会据此重新打开 safetensors expert store。
         model_path=model_path,
         # 记录原始模型类型，便于日志与运行时区分不同规划模式。

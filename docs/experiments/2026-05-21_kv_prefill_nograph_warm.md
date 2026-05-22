@@ -6,7 +6,7 @@
 - Standard decode/prefill config under test:
   - `gpu_slots_per_layer=16`
   - `prefill_burst_slots=256`
-  - `prepare_cpu_copy_batch_size=8`
+  - `prepare_cpu_copy_threads=8`
   - `cpu_static_pinned_gb=44`
   - `marlin_input_dtype=fp8`
   - `spec_method=mtp`
@@ -88,7 +88,7 @@ CFIE_MONITOR_INTERVAL=1 ./benchmarks/run_logged_wsl_command.sh \
   --kv-cache-memory-bytes 1073741824 \
   --gpu-slots-per-layer 16 \
   --prefill-burst-slots 256 \
-  --prepare-cpu-copy-batch-size 8 \
+  --prepare-cpu-copy-threads 8 \
   --cpu-static-pinned-gb 44 \
   --language-model-only \
   --skip-mm-profiling \

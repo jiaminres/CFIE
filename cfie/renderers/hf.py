@@ -25,6 +25,9 @@ from cfie.entrypoints.chat_utils import (
     parse_chat_messages,
     parse_chat_messages_async,
 )
+from cfie.entrypoints.openai.reasoning_template import (
+    QWEN_REASONING_PREAMBLE_KWARG,
+)
 from cfie.logger import init_logger
 from cfie.tokenizers import cached_get_tokenizer
 from cfie.tokenizers.hf import CachedHfTokenizer, HfTokenizer
@@ -441,6 +444,32 @@ def resolve_chat_template_kwargs(
     return {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
 
 
+def _apply_cfie_reasoning_preamble(
+    prompt: str | list[int],
+    preamble: str | None,
+) -> str | list[int]:
+    if not preamble or not isinstance(prompt, str):
+        return prompt
+
+    preamble = preamble.strip()
+    if not preamble:
+        return prompt
+
+    # Qwen3/Qwen3.5 generation prompts end inside the think block:
+    # <|im_start|>assistant\n<think>\n
+    # If thinking is disabled, the prompt already contains </think> and should
+    # not be modified.
+    disabled_suffix = "<think>\n\n</think>\n\n"
+    if prompt.endswith(disabled_suffix):
+        return prompt
+
+    thinking_suffix = "<think>\n"
+    if prompt.endswith(thinking_suffix):
+        return f"{prompt}{preamble}\n"
+
+    return prompt
+
+
 @overload
 def safe_apply_chat_template(
     model_config: "ModelConfig",
@@ -473,6 +502,7 @@ def safe_apply_chat_template(
     tokenize: bool = True,
     **kwargs,
 ) -> str | list[int]:
+    reasoning_preamble = kwargs.pop(QWEN_REASONING_PREAMBLE_KWARG, None)
     chat_template = resolve_chat_template(
         tokenizer,
         chat_template=chat_template,
@@ -493,13 +523,14 @@ def safe_apply_chat_template(
     )
 
     try:
-        return tokenizer.apply_chat_template(
+        rendered = tokenizer.apply_chat_template(
             conversation=conversation,  # type: ignore[arg-type]
             tools=tools,  # type: ignore[arg-type]
             chat_template=chat_template,
             tokenize=tokenize,
             **resolved_kwargs,
         )
+        return _apply_cfie_reasoning_preamble(rendered, reasoning_preamble)
     # External library exceptions can sometimes occur despite the framework's
     # internal exception management capabilities.
     except Exception as e:

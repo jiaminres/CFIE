@@ -61,6 +61,7 @@ DEFAULT_CPU_STATIC_PREPROCESS_GPU_RESERVE_BYTES = 512 << 20
 MARLIN_READY_EXPERT_CACHE_VERSION = 1
 MARLIN_READY_FP8_WEIGHT_SCALE_FACTOR = 512
 MARLIN_READY_FP8_PREPROCESS_SCHEMA_VERSION = 2
+SMALL_TOPK_UNIQUE_CPU_THRESHOLD = 256
 
 
 def _callable_accepts_keyword_argument(callback: Any, keyword: str) -> bool:
@@ -928,6 +929,7 @@ class LayerTieredExpertCacheController:
         # 闁告帗绻傞～鎰板礌?resident GPU slot 闁告帗婢橀崣蹇曚沪閳?expert 闁汇劌瀚浠嬪触閹寸偞衼閻忓繐瀚妴鍐Υ?
         self._slot_to_global = [-1] * self.num_slots
         self._expert_to_slot = [-1] * int(layer.global_num_experts)
+        self._victim_cursor = 0
 
         # ------------------------------- 闁告帗绻傞～鎰板礌閺嶎剛绠ラ悶娑樻湰濠€锛勭磼閻旀椿鍚€闁圭娲﹂悥?-------------------------------
         # 閻犱焦婢樼紞宥夊箳瑜嶉崺妤呭闯閵娧呮焾閻犱讲鍓濇晶鐣屾偘瀹€鍐畺闁汇劌瀚粭鎾垛偓纭呮硾婵偞娼懞銉仹闁轰浇鍩囬埀?
@@ -986,6 +988,13 @@ class LayerTieredExpertCacheController:
         self._cpu_runtime_batch_buffers: dict[str, torch.Tensor] = {}
         self._cpu_static_bundle_lock = threading.Lock()
         self._cpu_runtime_batch_buffers_lock = threading.Lock()
+        self._runtime_target_field_cache: dict[
+            int, tuple[list[tuple[str, torch.Tensor]], torch.device]
+        ] = {}
+        self._runtime_slot_ids_cpu: torch.Tensor | None = None
+        self._runtime_slot_ids_gpu: torch.Tensor | None = None
+        self._runtime_slot_ids_gpu_device: torch.device | None = None
+        self._runtime_slot_ids_lock = threading.Lock()
         self._cpu_runtime_expert_stage_storage: torch.Tensor | None = None
         self._cpu_runtime_expert_stage_capacity = 0
         self._cpu_runtime_expert_stage_signature: tuple[Any, ...] | None = None
@@ -999,16 +1008,21 @@ class LayerTieredExpertCacheController:
         # Stage storage is reusable capacity only. Each H2D copy uses the
         # prefix matching the actual number of missing experts in prepare().
         self._runtime_stage_slots = max(1, int(self._compute_slots or 1))
-        self._prepare_cpu_copy_batch_size = max(
+        self._prepare_cpu_copy_threads = max(
             1,
             int(
                 self.plan.get(
                     "prepare_cpu_copy_batch_size",
+                    0,
+                )
+                or self.plan.get(
+                    "prepare_cpu_copy_threads",
                     DEFAULT_CPU_STATIC_PREPROCESS_BATCH_SIZE_CAP,
                 )
                 or 1
             ),
         )
+        self._prepare_cpu_copy_batch_size = self._prepare_cpu_copy_threads
 
         # ------------------------------- 閻犱緤绱曢悾?prefill burst 闁汇劌瀚〒鍓佷焊?token 閻熸瑱绠戣ぐ鍌炴⒓閸績鍋?-------------------------------
         # 濞村吋锚閸樻稓鎷犵拠鎻掔悼閻犱讲鈧啿鐏婂☉鎿冨幗濡顕ｈ箛娑樺赋缂傚喚鍠氬▓?burst 闁哄牃鍋撻悘?token 闂傚啫鐗嗛埀顒傤儠閳?
@@ -1202,22 +1216,6 @@ class LayerTieredExpertCacheController:
                 seen.add(parsed)
         return requested
 
-    def _build_load_plan(
-            self,
-            requested: list[int],
-    ) -> list[tuple[int, int]]:
-        protected = set(requested)
-        load_plan: list[tuple[int, int]] = []
-        for expert_id in requested:
-            if self._is_resident(expert_id):
-                continue
-            slot = self._choose_victim_slot(protected)
-            load_plan.append((expert_id, slot))
-            protected.add(expert_id)
-        return load_plan
-
-
-
     def prepare(
             self,
             topk_ids: torch.Tensor,
@@ -1226,7 +1224,12 @@ class LayerTieredExpertCacheController:
     ) -> None:
         bench_timing = _bench_timing_enabled()
         prepare_t0 = _time.perf_counter() if bench_timing else 0.0
+        request_t0 = _time.perf_counter() if bench_timing else 0.0
         requested = self._normalize_requested_experts(topk_ids)
+        request_seconds = (
+            _time.perf_counter() - request_t0
+            if bench_timing else 0.0
+        )
         if not requested:
             return
         execution_slots = self.num_slots
@@ -1238,26 +1241,48 @@ class LayerTieredExpertCacheController:
 
         self._step += 1
         plan_t0 = _time.perf_counter() if bench_timing else 0.0
-        router_scores = self._router_scores(router_probs)
-
-        missing = [expert_id for expert_id in requested if not self._is_resident(expert_id)]
-        missing_by_score = sorted(
-            missing,
-            key=lambda expert_id: self._expert_router_score(router_scores, expert_id),
-            reverse=True,
+        resident_t0 = _time.perf_counter() if bench_timing else 0.0
+        expert_to_slot = self._ensure_cpu_expert_to_slot()
+        resident_requested_slots: list[int] = []
+        load_missing: list[int] = []
+        for expert_id in requested:
+            slot = (
+                int(expert_to_slot[expert_id])
+                if 0 <= expert_id < len(expert_to_slot)
+                else -1
+            )
+            if slot >= 0:
+                resident_requested_slots.append(slot)
+            else:
+                load_missing.append(expert_id)
+        resident_check_seconds = (
+            _time.perf_counter() - resident_t0
+            if bench_timing else 0.0
         )
-        protected = {expert_id for expert_id in requested if self._is_resident(expert_id)}
-        load_missing = missing_by_score
-        protected.update(load_missing)
 
         load_plan: list[tuple[int, int]] = []
+        victim_select_seconds = 0.0
+        load_plan_zip_seconds = 0.0
         if load_missing:
-            victim_slots = self._choose_victim_slots_by_router_score(
+            victim_t0 = _time.perf_counter() if bench_timing else 0.0
+            victim_slots = self._choose_victim_slots_round_robin(
                 count=len(load_missing),
-                protected=protected,
-                router_scores=router_scores,
+                protected_slots=resident_requested_slots,
             )
+            victim_select_seconds = (
+                _time.perf_counter() - victim_t0
+                if bench_timing else 0.0
+            )
+            load_plan_zip_t0 = _time.perf_counter() if bench_timing else 0.0
             load_plan = list(zip(load_missing, victim_slots, strict=True))
+            load_plan_zip_seconds = (
+                _time.perf_counter() - load_plan_zip_t0
+                if bench_timing else 0.0
+            )
+        plan_seconds = (
+            _time.perf_counter() - plan_t0
+            if bench_timing else 0.0
+        )
         if load_plan:
             load_t0 = _time.perf_counter() if bench_timing else 0.0
             load_stats = self._load_experts_into_slots(load_plan) or {}
@@ -1266,26 +1291,37 @@ class LayerTieredExpertCacheController:
             load_stats = {}
             load_seconds = 0.0
 
-        final_requested = self._normalize_requested_experts(topk_ids)
-        if self._step % 50 == 0 or bench_timing:
+        final_requested_count = len(requested)
+        cpu_copy_threads = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "_prepare_cpu_copy_threads",
+                    getattr(self, "_prepare_cpu_copy_batch_size", 1),
+                )
+                or 1
+            ),
+        )
+        if (
+            self._step % 50 == 0
+            and not bench_timing
+            and logger.isEnabledFor(10)
+        ):
             resident_hit = (len(requested) - len(load_plan)) / max(len(requested), 1) * 100
-            cpu_copy_batch_size = max(
-                1,
-                int(getattr(self, "_prepare_cpu_copy_batch_size", 1) or 1),
-            )
-            logger.info(
+            logger.debug(
                 "CFIE_PREPARE_STATS layer=%s step=%d requested=%d final_requested=%d "
                 "staged=%d stage_resident_hit=%.0f%% missing=%d load_missing=%d "
-                "cpu_copy_batch_size=%d cpu_hits=%d evictions=%d",
+                "cpu_copy_threads=%d cpu_hits=%d evictions=%d",
                 self.layer_key,
                 self._step,
                 len(requested),
-                len(final_requested),
+                final_requested_count,
                 len(load_plan),
                 resident_hit,
-                len(missing),
                 len(load_missing),
-                cpu_copy_batch_size,
+                len(load_missing),
+                cpu_copy_threads,
                 self._cpu_hits,
                 self._evictions,
             )
@@ -1304,18 +1340,25 @@ class LayerTieredExpertCacheController:
             load_h2d_mode = str(load_stats.get("h2d_mode", ""))
             logger.info(
                 "CFIE_BENCH_TIMING prepare layer=%s step=%d plan=%.3fms "
+                "request_unique=%.3fms plan_resident=%.3fms "
+                "plan_victim=%.3fms plan_zip=%.3fms "
                 "stage=%.3fms stage_materialize=%.3fms stage_write=%.3fms "
                 "stage_cpu_pack=%.3fms stage_h2d=%.3fms stage_gpu_scatter=%.3fms "
                 "stage_install=%.3fms total=%.3fms requested=%d staged=%d "
                 "final_requested=%d missing=%d load_missing=%d "
-                "cpu_copy_batch_size=%d cpu_stage_mode=%s cpu_stage_native=%d "
+                "cpu_copy_threads=%d cpu_stage_mode=%s cpu_stage_native=%d "
                 "cpu_stage_pinned=%d cpu_source_pinned=%d cpu_source_pageable=%d "
                 "cpu_source_shared=%d cpu_source_contiguous=%d h2d_mode=%s "
                 "h2d_source_pinned=%d h2d_non_blocking=%d h2d_source_shared=%d "
-                "h2d_single_contiguous=%d h2d_bytes=%d",
+                "h2d_single_contiguous=%d h2d_bytes=%d native_scatter_install=%d "
+                "installed_mappings=%d",
                 self.layer_key,
                 self._step,
-                ((_time.perf_counter() - plan_t0) - load_seconds) * 1000.0,
+                plan_seconds * 1000.0,
+                request_seconds * 1000.0,
+                resident_check_seconds * 1000.0,
+                victim_select_seconds * 1000.0,
+                load_plan_zip_seconds * 1000.0,
                 load_seconds * 1000.0,
                 load_materialize_seconds * 1000.0,
                 load_write_seconds * 1000.0,
@@ -1326,10 +1369,10 @@ class LayerTieredExpertCacheController:
                 (_time.perf_counter() - prepare_t0) * 1000.0,
                 len(requested),
                 len(load_plan),
-                len(final_requested),
-                len(missing),
+                final_requested_count,
                 len(load_missing),
-                cpu_copy_batch_size,
+                len(load_missing),
+                cpu_copy_threads,
                 load_cpu_stage_mode,
                 int(load_stats.get("cpu_stage_native", 0) or 0),
                 int(load_stats.get("cpu_stage_pinned", 0) or 0),
@@ -1343,26 +1386,9 @@ class LayerTieredExpertCacheController:
                 int(load_stats.get("h2d_source_shared", 0) or 0),
                 int(load_stats.get("h2d_single_contiguous", 0) or 0),
                 int(load_stats.get("h2d_bytes", 0) or 0),
+                int(load_stats.get("native_scatter_install", 0) or 0),
+                int(load_stats.get("installed_mappings", 0) or 0),
             )
-
-    def _router_scores(self, router_probs: torch.Tensor | None) -> torch.Tensor | None:
-        if router_probs is None:
-            return None
-        scores = router_probs.detach()
-        if scores.ndim == 2:
-            scores = scores.max(dim=0).values
-        elif scores.ndim != 1:
-            raise ValueError("router_probs must have shape [tokens, experts] or [experts]")
-        return scores.to(device="cpu", dtype=torch.float32)
-
-    @staticmethod
-    def _expert_router_score(
-            router_scores: torch.Tensor | None,
-            expert_id: int,
-    ) -> float:
-        if router_scores is None or expert_id < 0 or expert_id >= router_scores.numel():
-            return 0.0
-        return float(router_scores[expert_id].item())
 
     def _ensure_cpu_expert_to_slot(self) -> list[int]:
         expert_to_slot = getattr(self, "_expert_to_slot", None)
@@ -1383,48 +1409,67 @@ class LayerTieredExpertCacheController:
         self._expert_to_slot = expert_to_slot
         return expert_to_slot
 
-    def _choose_victim_slots_by_router_score(
+    def _choose_victim_slots_round_robin(
             self,
             *,
             count: int,
-            protected: set[int],
-            router_scores: torch.Tensor | None,
+            protected_slots: list[int] | tuple[int, ...],
     ) -> list[int]:
         if count <= 0:
             return []
-        slots = list(range(min(self.num_slots, len(self._slot_to_global))))
-        free_slots = [slot for slot in slots if self._slot_to_global[slot] < 0]
-        selected = free_slots[:count]
-        if len(selected) >= count:
-            return selected
+        num_slots = min(self.num_slots, len(self._slot_to_global))
+        if num_slots <= 0:
+            raise RuntimeError(f"{self.layer_key}: no resident slots are available")
 
-        candidates = [
-            slot
-            for slot in slots
-            if slot not in selected
-            and self._slot_to_global[slot] >= 0
-            and self._slot_to_global[slot] not in protected
-        ]
-        candidates.sort(
-            key=lambda slot: (
-                self._expert_router_score(router_scores, self._slot_to_global[slot]),
-                slot,
-            )
-        )
-        selected.extend(candidates[: count - len(selected)])
+        protected = [False] * num_slots
+        for slot in protected_slots:
+            parsed = int(slot)
+            if 0 <= parsed < num_slots:
+                protected[parsed] = True
+
+        selected: list[int] = []
+        cursor = int(getattr(self, "_victim_cursor", 0) or 0) % num_slots
+        scanned = 0
+        while len(selected) < count and scanned < num_slots:
+            slot = cursor
+            cursor = (cursor + 1) % num_slots
+            scanned += 1
+            if protected[slot]:
+                continue
+            selected.append(slot)
+            protected[slot] = True
+
         if len(selected) < count:
             raise RuntimeError(
                 f"{self.layer_key}: no evictable slot available for requested experts"
             )
+        self._victim_cursor = cursor
         return selected
 
     def _unique_experts(self, topk_ids: torch.Tensor) -> list[int]:
         # 缂佸矂缂氱欢顓㈠礂閵壯勭函闁规亽鍎寸换鎴﹀炊閻愮鏁勯柛鎺擃殙閵嗗啴濡?
         if topk_ids.numel() == 0:
             return []
+        flat_ids = topk_ids.detach().reshape(-1)
+        if flat_ids.numel() <= SMALL_TOPK_UNIQUE_CPU_THRESHOLD:
+            cpu_ids = flat_ids.to(device="cpu", dtype=torch.int64)
+            requested: list[int] = []
+            seen: set[int] = set()
+            for expert_id in cpu_ids.tolist():
+                parsed = int(expert_id)
+                if parsed < 0 or parsed in seen:
+                    continue
+                seen.add(parsed)
+                requested.append(parsed)
+            requested.sort()
+            return requested
         # 闁稿繐鐗嗘禒?unique闁挎稑鑻崯鈧柛?CPU 閺夌儐鍓氶崹?Python int 闁告帗顨夐妴鍐晬鐏炵偓鐓欏〒姘仢閹绱掗鐔蜂粯闁告帟鍩栫粊锔芥媴鐠恒劍鏆忛柕?
-        unique_ids = torch.unique(topk_ids.detach()).to(device="cpu")
-        return [int(expert_id) for expert_id in unique_ids.tolist()]
+        unique_ids = torch.unique(flat_ids).to(device="cpu")
+        return [
+            int(expert_id)
+            for expert_id in unique_ids.tolist()
+            if int(expert_id) >= 0
+        ]
 
     def _is_resident(self, expert_id: int) -> bool:
         # Keep prepare metadata on CPU. Reading layer._expert_map[expert].item()
@@ -1433,32 +1478,6 @@ class LayerTieredExpertCacheController:
         if expert_id < 0 or expert_id >= len(expert_to_slot):
             return False
         return int(expert_to_slot[expert_id]) >= 0
-
-    def _choose_victim_slot(self, protected: set[int]) -> int:
-        # 濞寸姴鎳忛悘鍥ㄧ▔?stage_0 (0..7), kernel 闁告瑯浜ｉ崗妯兼媼閸ф锛栭弶?8 濞?slot
-        slots = range(min(self.num_slots, len(self._slot_to_global)))
-        # 濞村吋锚閸樻盯骞嶉崜褉鏁勯梻?slot
-        for slot in slots:
-            if slot >= len(self._slot_to_global):
-                break
-            if self._slot_to_global[slot] < 0:
-                return slot
-
-        # 闁告熬绠戦崹顖涚?stage_0 闁哄牜浜滆ぐ鍫熺┍濠靛洤袘闁?resident experts 濞戞搩鍘界€殿偅銇欓柆宥佸亾閹邦剦鍤犻悹?
-        candidates = [
-            slot
-            for slot in slots
-            if slot < len(self._slot_to_global)
-            and self._slot_to_global[slot] >= 0
-            and self._slot_to_global[slot] not in protected
-        ]
-        # 闁圭鍋撻柡?slot 闂侇喖鈧噥娼堕柡鍫墲閻ゅ棛鎷犻柨瀣勾濞ｅ洦绻冩慨銏ゅ籍鐠佸湱绀夐悹鍥х摠濡叉垶寰勯弽褏婀?chunking 闂侇偅妲掔欢顐⑩柦閳╁啫惟闁逛絻顫夐濂稿礆閸パ冪厒濞达絽绉查埀?
-        if not candidates:
-            raise RuntimeError(
-                f"{self.layer_key}: no evictable slot available for requested experts"
-            )
-
-        return candidates[0]
 
     def _materialize_cpu_static_bundle(
             self,
@@ -2883,10 +2902,9 @@ class LayerTieredExpertCacheController:
             self,
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             target: Any,
+            *,
+            install_mappings: bool = False,
     ) -> dict[str, Any]:
-        bundles_and_sources = self._order_runtime_ready_bundles_for_batch_write(
-            bundles_and_sources
-        )
         if not bundles_and_sources:
             return {
                 "cpu_pack_seconds": 0.0,
@@ -2915,18 +2933,10 @@ class LayerTieredExpertCacheController:
                 "gpu_scatter_seconds": 0.0,
             }
 
-        field_names = list(runtime_ready_stage_bundles[0].tensors.keys())
-        target_device = None
-        for field_name in field_names:
-            target_attr = field_name.removeprefix("runtime.")
-            target_tensor = getattr(target, target_attr, None)
-            if target_tensor is not None:
-                target_device = target_tensor.device
-                break
-        if target_device is None:
-            raise RuntimeError(
-                f"{self.layer_key}: runtime-ready target has no writable tensors"
-            )
+        target_fields, target_device = self._runtime_target_fields(
+            target,
+            runtime_ready_stage_bundles[0],
+        )
 
         h2d_t0 = _time.perf_counter()
         gpu_stage_bundles = self._move_runtime_ready_bundles_to_device(
@@ -2936,37 +2946,33 @@ class LayerTieredExpertCacheController:
         )
         h2d_seconds = _time.perf_counter() - h2d_t0
         h2d_info = getattr(self, "_last_runtime_h2d_info", {})
-        gpu_stage_bundles_and_sources = [
-            (expert_id, slot, bundle, "gpu_stage")
-            for (expert_id, slot, _bundle, _source), bundle in zip(
-                bundles_and_sources,
-                gpu_stage_bundles,
-                strict=True,
-            )
-        ]
-        slot_ids = torch.tensor(
+        slot_ids = self._runtime_slot_ids_for_target(
             [slot for _expert_id, slot, _bundle, _source in bundles_and_sources],
-            dtype=torch.int64,
-            device=target_device,
+            target_device,
         )
 
         scatter_t0 = _time.perf_counter()
+        native_installed = False
         with torch.no_grad():
-            for field_name in field_names:
-                target_attr = field_name.removeprefix("runtime.")
-                target_tensor = getattr(target, target_attr, None)
-                if target_tensor is None:
-                    continue
-                source_view = self._view_packed_runtime_ready_cpu_field(
-                    gpu_stage_bundles_and_sources,
-                    field_name,
+            if install_mappings:
+                native_installed = self._try_native_runtime_scatter_and_install(
+                    bundles_and_sources,
+                    gpu_stage_bundles,
+                    target,
+                    slot_ids,
                 )
-                if source_view is None:
-                    raise RuntimeError(
-                        f"{self.layer_key}: failed to build GPU runtime-ready "
-                        f"stage view for {field_name}"
+            if not native_installed:
+                for field_name, target_tensor in target_fields:
+                    source_view = self._runtime_ready_stage_field_view(
+                        gpu_stage_bundles,
+                        field_name,
                     )
-                target_tensor.index_copy_(0, slot_ids, source_view)
+                    if source_view is None:
+                        raise RuntimeError(
+                            f"{self.layer_key}: failed to build GPU runtime-ready "
+                            f"stage view for {field_name}"
+                        )
+                    target_tensor.index_copy_(0, slot_ids, source_view)
         gpu_scatter_seconds = _time.perf_counter() - scatter_t0
         return {
             "cpu_pack_seconds": cpu_pack_seconds,
@@ -2991,7 +2997,288 @@ class LayerTieredExpertCacheController:
                 bool(h2d_info.get("single_contiguous", False))
             ),
             "h2d_bytes": int(h2d_info.get("bytes", 0) or 0),
+            "native_scatter_install": int(native_installed),
+            "installed_mappings": int(native_installed),
         }
+
+    def _runtime_target_fields(
+            self,
+        target: Any,
+        template_bundle: ExpertBundle,
+    ) -> tuple[list[tuple[str, torch.Tensor]], torch.device]:
+        if not hasattr(self, "_runtime_target_field_cache"):
+            self._runtime_target_field_cache = {}
+        cache_key = id(target)
+        cached = self._runtime_target_field_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        fields: list[tuple[str, torch.Tensor]] = []
+        target_device: torch.device | None = None
+        for field_name in template_bundle.tensors.keys():
+            target_attr = field_name.removeprefix("runtime.")
+            target_tensor = getattr(target, target_attr, None)
+            if target_tensor is None:
+                continue
+            if target_device is None:
+                target_device = target_tensor.device
+            fields.append((field_name, target_tensor))
+        if target_device is None or not fields:
+            raise RuntimeError(
+                f"{self.layer_key}: runtime-ready target has no writable tensors"
+            )
+        resolved = (fields, target_device)
+        self._runtime_target_field_cache[cache_key] = resolved
+        return resolved
+
+    def _runtime_slot_ids_for_target(
+            self,
+            slots: list[int],
+            device: torch.device,
+    ) -> torch.Tensor:
+        count = len(slots)
+        if count <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=device)
+        if device.type != "cuda":
+            return torch.tensor(slots, dtype=torch.int64, device=device)
+
+        if not hasattr(self, "_runtime_slot_ids_lock"):
+            self._runtime_slot_ids_lock = threading.Lock()
+            self._runtime_slot_ids_cpu = None
+            self._runtime_slot_ids_gpu = None
+            self._runtime_slot_ids_gpu_device = None
+        with self._runtime_slot_ids_lock:
+            capacity = max(
+                count,
+                int(getattr(self, "_runtime_stage_slots", 0) or 0),
+                int(getattr(self, "_compute_slots", 0) or 0),
+            )
+            cpu_buffer = self._runtime_slot_ids_cpu
+            gpu_buffer = self._runtime_slot_ids_gpu
+            if cpu_buffer is None or int(cpu_buffer.numel()) < capacity:
+                cpu_buffer = torch.empty(
+                    (capacity,),
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=is_pin_memory_available(),
+                )
+                self._runtime_slot_ids_cpu = cpu_buffer
+            if (
+                gpu_buffer is None
+                or int(gpu_buffer.numel()) < capacity
+                or self._runtime_slot_ids_gpu_device != device
+            ):
+                gpu_buffer = torch.empty(
+                    (capacity,),
+                    dtype=torch.int64,
+                    device=device,
+                )
+                self._runtime_slot_ids_gpu = gpu_buffer
+                self._runtime_slot_ids_gpu_device = device
+
+            for index, slot in enumerate(slots):
+                cpu_buffer[index] = int(slot)
+            gpu_buffer[:count].copy_(
+                cpu_buffer[:count],
+                non_blocking=bool(cpu_buffer.is_pinned()),
+            )
+            return gpu_buffer[:count]
+
+    def _runtime_ready_stage_field_view(
+            self,
+            bundles: list[ExpertBundle],
+            field_name: str,
+    ) -> torch.Tensor | None:
+        if not bundles:
+            return None
+        first_bundle = bundles[0]
+        storage = first_bundle.storage
+        if storage is None:
+            return None
+        first_tensor = first_bundle.tensors[field_name]
+        itemsize = int(first_tensor.element_size())
+        per_expert_bytes = int(first_bundle.nbytes)
+        field_offset_bytes = (
+            first_tensor.data_ptr()
+            - (storage.data_ptr() + int(first_bundle.storage_offset_bytes))
+        )
+        if (
+            field_offset_bytes < 0
+            or field_offset_bytes % itemsize != 0
+            or per_expert_bytes % itemsize != 0
+        ):
+            return None
+        start_byte = int(first_bundle.storage_offset_bytes) + field_offset_bytes
+        if start_byte < 0 or start_byte >= int(storage.numel()):
+            return None
+        typed_storage = storage[start_byte:].view(first_tensor.dtype)
+        batch_stride = per_expert_bytes // itemsize
+        return typed_storage.as_strided(
+            (len(bundles), *tuple(first_tensor.shape)),
+            (batch_stride, *tuple(first_tensor.stride())),
+        )
+
+    def _runtime_int64_ids_for_target(
+            self,
+            values: list[int],
+            device: torch.device,
+            *,
+            name: str,
+    ) -> torch.Tensor:
+        count = len(values)
+        if count <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=device)
+        if device.type != "cuda":
+            return torch.tensor(values, dtype=torch.int64, device=device)
+
+        cpu_attr = f"_runtime_{name}_ids_cpu"
+        gpu_attr = f"_runtime_{name}_ids_gpu"
+        gpu_device_attr = f"_runtime_{name}_ids_gpu_device"
+        lock_attr = f"_runtime_{name}_ids_lock"
+        lock = getattr(self, lock_attr, None)
+        if lock is None:
+            lock = threading.Lock()
+            setattr(self, lock_attr, lock)
+            setattr(self, cpu_attr, None)
+            setattr(self, gpu_attr, None)
+            setattr(self, gpu_device_attr, None)
+
+        with lock:
+            capacity = max(
+                count,
+                int(getattr(self, "_runtime_stage_slots", 0) or 0),
+                int(getattr(self, "_compute_slots", 0) or 0),
+            )
+            cpu_buffer = getattr(self, cpu_attr)
+            gpu_buffer = getattr(self, gpu_attr)
+            gpu_buffer_device = getattr(self, gpu_device_attr)
+            if cpu_buffer is None or int(cpu_buffer.numel()) < capacity:
+                cpu_buffer = torch.empty(
+                    (capacity,),
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=is_pin_memory_available(),
+                )
+                setattr(self, cpu_attr, cpu_buffer)
+            if (
+                gpu_buffer is None
+                or int(gpu_buffer.numel()) < capacity
+                or gpu_buffer_device != device
+            ):
+                gpu_buffer = torch.empty(
+                    (capacity,),
+                    dtype=torch.int64,
+                    device=device,
+                )
+                setattr(self, gpu_attr, gpu_buffer)
+                setattr(self, gpu_device_attr, device)
+
+            for index, value in enumerate(values):
+                cpu_buffer[index] = int(value)
+            gpu_buffer[:count].copy_(
+                cpu_buffer[:count],
+                non_blocking=bool(cpu_buffer.is_pinned()),
+            )
+            return gpu_buffer[:count]
+
+    def _try_native_runtime_scatter_and_install(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+            gpu_stage_bundles: list[ExpertBundle],
+            target: Any,
+            slot_ids: torch.Tensor,
+    ) -> bool:
+        if self._is_prefill_burst_target(target):
+            return False
+        expert_map = getattr(target, "_expert_map", None)
+        if not torch.is_tensor(expert_map):
+            return False
+        if not gpu_stage_bundles or len(gpu_stage_bundles) != len(bundles_and_sources):
+            return False
+
+        device = expert_map.device
+        old_expert_ids = [
+            int(self._slot_to_global[int(slot)])
+            for _expert_id, slot, _bundle, _source in bundles_and_sources
+        ]
+        new_expert_ids = [
+            int(expert_id)
+            for expert_id, _slot, _bundle, _source in bundles_and_sources
+        ]
+        old_ids = self._runtime_int64_ids_for_target(
+            old_expert_ids,
+            device,
+            name="old_expert",
+        )
+        new_ids = self._runtime_int64_ids_for_target(
+            new_expert_ids,
+            device,
+            name="new_expert",
+        )
+
+        def _view(field_name: str) -> torch.Tensor:
+            source_view = self._runtime_ready_stage_field_view(
+                gpu_stage_bundles,
+                field_name,
+            )
+            if source_view is None:
+                raise RuntimeError(
+                    f"{self.layer_key}: failed to build GPU runtime-ready "
+                    f"stage view for {field_name}"
+                )
+            return source_view
+
+        if self._mode == "unquantized":
+            if not ops.has_moe_batch_load_unquantized_runtime_and_install():
+                return False
+            ops.moe_batch_load_unquantized_runtime_and_install(
+                slot_ids,
+                old_ids,
+                new_ids,
+                _view("runtime.w13_weight"),
+                _view("runtime.w2_weight"),
+                target.w13_weight,
+                target.w2_weight,
+                expert_map,
+            )
+            return True
+
+        if self._mode != "gptq_marlin":
+            return False
+        if not ops.has_moe_batch_load_gptq_runtime_and_install():
+            return False
+
+        has_g_idx = (
+            "runtime.w13_g_idx" in gpu_stage_bundles[0].tensors
+            and hasattr(target, "w13_g_idx")
+        )
+        ops.moe_batch_load_gptq_runtime_and_install(
+            slot_ids,
+            old_ids,
+            new_ids,
+            _view("runtime.w13_qweight"),
+            _view("runtime.w2_qweight"),
+            _view("runtime.w13_scales"),
+            _view("runtime.w2_scales"),
+            _view("runtime.w13_qzeros"),
+            _view("runtime.w2_qzeros"),
+            target.w13_qweight,
+            target.w2_qweight,
+            target.w13_scales,
+            target.w2_scales,
+            target.w13_qzeros,
+            target.w2_qzeros,
+            _view("runtime.w13_g_idx") if has_g_idx else None,
+            _view("runtime.w2_g_idx") if has_g_idx else None,
+            _view("runtime.w13_g_idx_sort_indices") if has_g_idx else None,
+            _view("runtime.w2_g_idx_sort_indices") if has_g_idx else None,
+            target.w13_g_idx if has_g_idx else None,
+            target.w2_g_idx if has_g_idx else None,
+            target.w13_g_idx_sort_indices if has_g_idx else None,
+            target.w2_g_idx_sort_indices if has_g_idx else None,
+            expert_map,
+        )
+        return True
 
     def _copy_runtime_ready_bundle_tensors(
             self,
@@ -3003,7 +3290,7 @@ class LayerTieredExpertCacheController:
 
     # 闁冲厜鍋撻柍鍏夊亾 鐎瑰憡褰冮崹褰掓⒔閵堝洦鐣?batch H2D 闁哄倽顫夌涵?闁冲厜鍋撻柍鍏夊亾
     # _get_runtime_ready_batch_buffer, _try_write_runtime_ready_bundles_batch,
-    # _order_runtime_ready_bundles_for_batch_write, _view_packed_runtime_ready_cpu_field,
+    # _view_packed_runtime_ready_cpu_field,
     # _stack_runtime_ready_cpu_field, _maybe_stack_runtime_ready_cpu_field,
     # _write_unquantized_runtime_ready_bundles_batch, _write_gptq_runtime_ready_bundles_batch
     # Shared expert-major staging view reused across fields before the GPU copy.
@@ -3088,11 +3375,9 @@ class LayerTieredExpertCacheController:
             self,
             assignments: list[tuple[int, int]],
     ) -> dict[str, Any]:
-        # Chunk missing experts so each CPU worker handles a bounded batch.
         if not assignments:
             return {}
 
-        batch_size = max(1, int(getattr(self, "_prepare_cpu_copy_batch_size", 1) or 1))
         load_stats: dict[str, Any] = {
             "materialize_seconds": 0.0,
             "write_seconds": 0.0,
@@ -3102,92 +3387,73 @@ class LayerTieredExpertCacheController:
             "install_seconds": 0.0,
         }
         materialize_t0 = _time.perf_counter()
-        if batch_size > 1 and len(assignments) > batch_size:
-            chunks = [
-                assignments[start:start + batch_size]
-                for start in range(0, len(assignments), batch_size)
-            ]
-            with ThreadPoolExecutor(max_workers=min(len(chunks), batch_size)) as executor:
-                batches = list(executor.map(self._materialize_batch_sources, chunks))
-        else:
-            batches = [self._materialize_batch_sources(assignments)]
+        bundles_and_sources = self._resolve_batch_sources_for_plan(assignments)
         load_stats["materialize_seconds"] = _time.perf_counter() - materialize_t0
 
-        for bundles_and_sources in batches:
-            if not bundles_and_sources:
-                continue
-            write_t0 = _time.perf_counter()
-            batch_stats = self._write_expert_bundles(
-                bundles_and_sources,
-                self.layer,
-            ) or {}
-            load_stats["write_seconds"] += _time.perf_counter() - write_t0
-            load_stats["cpu_pack_seconds"] += float(
-                batch_stats.get("cpu_pack_seconds", 0.0)
-            )
-            load_stats["h2d_seconds"] += float(batch_stats.get("h2d_seconds", 0.0))
-            load_stats["gpu_scatter_seconds"] += float(
-                batch_stats.get("gpu_scatter_seconds", 0.0)
-            )
-            for key in (
-                "cpu_stage_native",
-                "cpu_stage_pinned",
-                "cpu_source_pinned",
-                "cpu_source_pageable",
-                "cpu_source_shared",
-                "cpu_source_contiguous",
-                "h2d_source_pinned",
-                "h2d_non_blocking",
-                "h2d_source_shared",
-                "h2d_single_contiguous",
-                "h2d_bytes",
-            ):
-                load_stats[key] = load_stats.get(key, 0) + int(
-                    batch_stats.get(key, 0) or 0
-                )
-            for key in ("cpu_stage_mode", "h2d_mode"):
-                value = str(batch_stats.get(key, "") or "")
-                if value:
-                    previous = str(load_stats.get(key, "") or "")
-                    load_stats[key] = (
-                        value
-                        if not previous or previous == value
-                        else f"{previous}+{value}"
-                    )
-            for _expert_id, _slot, _bundle, source in bundles_and_sources:
-                if source == "nvme_stage":
-                    self._nvme_loads += 1
-                else:
-                    self._cpu_hits += 1
-            install_t0 = _time.perf_counter()
-            for expert_id, slot, _bundle, source in bundles_and_sources:
-                self._install_mapping(expert_id, slot)
-                self._total_loads += 1
-                if self._total_loads <= 3 or self._total_loads % 200 == 0:
-                    logger.debug(
-                        "Tiered MoE cache event: layer=%s load=%d batch=%d source=%s "
-                        "expert=%d slot=%d cpu_hits=%d nvme_loads=%d evictions=%d",
-                        self.layer_key,
-                        self._total_loads,
-                        len(bundles_and_sources),
-                        source,
-                        expert_id,
-                        slot,
-                        self._cpu_hits,
-                        self._nvme_loads,
-                        self._evictions,
-                    )
-            load_stats["install_seconds"] += _time.perf_counter() - install_t0
+        if not bundles_and_sources:
+            return load_stats
+
+        write_t0 = _time.perf_counter()
+        batch_stats = self._write_expert_bundles(
+            bundles_and_sources,
+            self.layer,
+            install_mappings=True,
+        ) or {}
+        load_stats["write_seconds"] += _time.perf_counter() - write_t0
+        load_stats["cpu_pack_seconds"] += float(
+            batch_stats.get("cpu_pack_seconds", 0.0)
+        )
+        load_stats["h2d_seconds"] += float(batch_stats.get("h2d_seconds", 0.0))
+        load_stats["gpu_scatter_seconds"] += float(
+            batch_stats.get("gpu_scatter_seconds", 0.0)
+        )
+        for key in (
+            "cpu_stage_native",
+            "cpu_stage_pinned",
+            "cpu_source_pinned",
+            "cpu_source_pageable",
+            "cpu_source_shared",
+            "cpu_source_contiguous",
+            "h2d_source_pinned",
+            "h2d_non_blocking",
+            "h2d_source_shared",
+            "h2d_single_contiguous",
+            "h2d_bytes",
+            "native_scatter_install",
+            "installed_mappings",
+        ):
+            load_stats[key] = int(batch_stats.get(key, 0) or 0)
+        for key in ("cpu_stage_mode", "h2d_mode"):
+            value = str(batch_stats.get(key, "") or "")
+            if value:
+                load_stats[key] = value
+        for _expert_id, _slot, _bundle, source in bundles_and_sources:
+            if source == "nvme_stage":
+                self._nvme_loads += 1
+            else:
+                self._cpu_hits += 1
+
+        install_t0 = _time.perf_counter()
+        if int(batch_stats.get("installed_mappings", 0) or 0):
+            self._install_cpu_mappings_after_native(bundles_and_sources)
+        else:
+            self._install_mappings(bundles_and_sources)
+        load_stats["install_seconds"] += _time.perf_counter() - install_t0
 
         return load_stats
 
-    def _materialize_batch_sources(
+    def _resolve_batch_sources_for_plan(
             self,
             assignments: list[tuple[int, int]],
     ) -> list[tuple[int, int, ExpertBundle, str]]:
         bundles_and_sources: list[tuple[int, int, ExpertBundle, str]] = []
+        cpu_static_bundles = getattr(self, "_cpu_static_bundles", {})
         for expert_id, slot in assignments:
-            bundle, source = self._get_source_bundle(expert_id)
+            bundle = cpu_static_bundles.get(expert_id)
+            if bundle is None:
+                bundle, source = self._get_source_bundle(expert_id)
+            else:
+                source = "cpu_static"
             bundles_and_sources.append((expert_id, slot, bundle, source))
         return bundles_and_sources
 
@@ -3221,10 +3487,13 @@ class LayerTieredExpertCacheController:
             self,
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             target: Any,
+            *,
+            install_mappings: bool = False,
     ) -> dict[str, float]:
         batch_stats = self._try_write_runtime_ready_bundles_batch(
             bundles_and_sources,
             target,
+            install_mappings=install_mappings,
         )
         if batch_stats is not None:
             return batch_stats
@@ -3240,6 +3509,8 @@ class LayerTieredExpertCacheController:
             self,
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             target: Any,
+            *,
+            install_mappings: bool = False,
     ) -> dict[str, float] | None:
         if not bundles_and_sources:
             return None
@@ -3252,31 +3523,20 @@ class LayerTieredExpertCacheController:
             return self._write_unquantized_runtime_ready_bundles_batch(
                 bundles_and_sources,
                 target,
+                install_mappings=install_mappings,
             )
 
         if self._mode == "gptq_marlin":
             return self._write_gptq_runtime_ready_bundles_batch(
                 bundles_and_sources,
                 target,
+                install_mappings=install_mappings,
             )
 
         return self._write_runtime_ready_bundles_via_gpu_stage(
             bundles_and_sources,
             target,
-        )
-
-    @staticmethod
-    def _order_runtime_ready_bundles_for_batch_write(
-            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
-    ) -> list[tuple[int, int, ExpertBundle, str]]:
-        return sorted(
-            bundles_and_sources,
-            key=lambda item: (
-                1 if item[2].storage is None else 0,
-                -1 if item[2].storage is None else id(item[2].storage),
-                int(getattr(item[2], "storage_offset_bytes", 0)),
-                item[1],
-            ),
+            install_mappings=install_mappings,
         )
 
     def _view_packed_runtime_ready_cpu_field(
@@ -3673,16 +3933,23 @@ class LayerTieredExpertCacheController:
                 view.copy_(source)
                 offset += num_bytes
 
-        copy_batch_size = max(
+        copy_threads = max(
             1,
-            int(getattr(self, "_prepare_cpu_copy_batch_size", 1) or 1),
+            int(
+                getattr(
+                    self,
+                    "_prepare_cpu_copy_threads",
+                    getattr(self, "_prepare_cpu_copy_batch_size", 1),
+                )
+                or 1
+            ),
         )
         copy_items = list(enumerate(bundles))
         used_native_copy = self._copy_contiguous_expert_storage_to_stage_native(
             bundles,
             storage,
             per_expert_bytes,
-            copy_batch_size,
+            copy_threads,
         )
         copy_mode = "native_cpu_copy"
         shared_pool = getattr(self, "_runtime_stage_pool", None)
@@ -3693,16 +3960,16 @@ class LayerTieredExpertCacheController:
             shared_pool.map_cpu_stage_copies(
                 _copy_one,
                 copy_items,
-                max_workers=copy_batch_size,
+                max_workers=copy_threads,
             )
-        elif copy_batch_size > 1 and len(bundles) > 1:
+        elif copy_threads > 1 and len(bundles) > 1:
             copy_mode = "python_threadpool_copy"
             def _copy_one_in_inference_mode(item: tuple[int, ExpertBundle]) -> None:
                 with torch.inference_mode():
                     _copy_one(item)
 
             with ThreadPoolExecutor(
-                max_workers=min(copy_batch_size, len(bundles))
+                max_workers=min(copy_threads, len(bundles))
             ) as executor:
                 list(executor.map(_copy_one_in_inference_mode, copy_items))
         else:
@@ -3965,20 +4232,26 @@ class LayerTieredExpertCacheController:
             self,
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             target: Any,
+            *,
+            install_mappings: bool = False,
     ) -> dict[str, float]:
         return self._write_runtime_ready_bundles_via_gpu_stage(
             bundles_and_sources,
             target,
+            install_mappings=install_mappings,
         )
 
     def _write_gptq_runtime_ready_bundles_batch(
             self,
             bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
             target: Any,
+            *,
+            install_mappings: bool = False,
     ) -> dict[str, float]:
         return self._write_runtime_ready_bundles_via_gpu_stage(
             bundles_and_sources,
             target,
+            install_mappings=install_mappings,
         )
 
     def _copy_resident_expert_to_target(
@@ -5501,6 +5774,63 @@ class LayerTieredExpertCacheController:
                 expert_to_slot[expert_id] = slot
         # 闁哄洤鐡ㄩ弻濠囧矗瀹ュ懏鍊荤紒渚垮灩缁扁晝鎮伴…鎺旂閻炴稏鍔庨妵姘交濞嗗酣鍤?slot 闁绘粍婢樺﹢顏嗘啑閸涱垱绲婚柡?expert闁?
         self._slot_to_global[slot] = expert_id
+
+    def _install_mappings(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+    ) -> None:
+        for expert_id, slot, _bundle, source in bundles_and_sources:
+            self._install_mapping(expert_id, slot)
+            self._total_loads += 1
+            if self._total_loads <= 3 or self._total_loads % 200 == 0:
+                logger.debug(
+                    "Tiered MoE cache event: layer=%s load=%d batch=%d source=%s "
+                    "expert=%d slot=%d cpu_hits=%d nvme_loads=%d evictions=%d",
+                    self.layer_key,
+                    self._total_loads,
+                    len(bundles_and_sources),
+                    source,
+                    expert_id,
+                    slot,
+                    self._cpu_hits,
+                    self._nvme_loads,
+                    self._evictions,
+                )
+
+    def _install_cpu_mappings_after_native(
+            self,
+            bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
+    ) -> None:
+        expert_to_slot = self._ensure_cpu_expert_to_slot()
+        for expert_id, slot, _bundle, source in bundles_and_sources:
+            expert_id = int(expert_id)
+            slot = int(slot)
+            previous_global = int(self._slot_to_global[slot])
+            if previous_global >= 0:
+                if previous_global < len(expert_to_slot):
+                    expert_to_slot[previous_global] = -1
+                self._evictions += 1
+            if expert_id >= len(expert_to_slot):
+                expert_to_slot.extend([-1] * (expert_id + 1 - len(expert_to_slot)))
+            if expert_id >= 0:
+                expert_to_slot[expert_id] = slot
+            self._slot_to_global[slot] = expert_id
+
+            self._total_loads += 1
+            if self._total_loads <= 3 or self._total_loads % 200 == 0:
+                logger.debug(
+                    "Tiered MoE cache event: layer=%s load=%d batch=%d source=%s "
+                    "expert=%d slot=%d cpu_hits=%d nvme_loads=%d evictions=%d",
+                    self.layer_key,
+                    self._total_loads,
+                    len(bundles_and_sources),
+                    source,
+                    expert_id,
+                    slot,
+                    self._cpu_hits,
+                    self._nvme_loads,
+                    self._evictions,
+                )
 
     @staticmethod
     def _raw_quantized_nbytes(raw: _RawExpertWeights) -> int:

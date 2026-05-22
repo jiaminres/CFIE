@@ -879,6 +879,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &moe_batch_load_unquantized_runtime_precompiled);
 
   ops.def(
+      "moe_batch_load_unquantized_runtime_and_install("
+      "    Tensor slot_ids, Tensor old_expert_ids, Tensor new_expert_ids,"
+      "    Tensor w13_src, Tensor w2_src, Tensor! w13_dst, Tensor! w2_dst,"
+      "    Tensor! expert_map) -> ()");
+  ops.impl("moe_batch_load_unquantized_runtime_and_install", torch::kCUDA,
+           &moe_batch_load_unquantized_runtime_and_install);
+
+  ops.def(
       "moe_batch_load_gptq_runtime_precompiled("
       "    Tensor slot_ids, Tensor w13_qweight_src, Tensor w2_qweight_src,"
       "    Tensor w13_scales_src, Tensor w2_scales_src,"
@@ -894,6 +902,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor!? w2_g_idx_sort_indices_dst) -> ()");
   ops.impl("moe_batch_load_gptq_runtime_precompiled", torch::kCUDA,
            &moe_batch_load_gptq_runtime_precompiled);
+
+  ops.def(
+      "moe_batch_load_gptq_runtime_and_install("
+      "    Tensor slot_ids, Tensor old_expert_ids, Tensor new_expert_ids,"
+      "    Tensor w13_qweight_src, Tensor w2_qweight_src,"
+      "    Tensor w13_scales_src, Tensor w2_scales_src,"
+      "    Tensor w13_qzeros_src, Tensor w2_qzeros_src,"
+      "    Tensor! w13_qweight_dst, Tensor! w2_qweight_dst,"
+      "    Tensor! w13_scales_dst, Tensor! w2_scales_dst,"
+      "    Tensor! w13_qzeros_dst, Tensor! w2_qzeros_dst,"
+      "    Tensor? w13_g_idx_src, Tensor? w2_g_idx_src,"
+      "    Tensor? w13_g_idx_sort_indices_src,"
+      "    Tensor? w2_g_idx_sort_indices_src,"
+      "    Tensor!? w13_g_idx_dst, Tensor!? w2_g_idx_dst,"
+      "    Tensor!? w13_g_idx_sort_indices_dst,"
+      "    Tensor!? w2_g_idx_sort_indices_dst,"
+      "    Tensor! expert_map) -> ()");
+  ops.impl("moe_batch_load_gptq_runtime_and_install", torch::kCUDA,
+           &moe_batch_load_gptq_runtime_and_install);
 
   ops.def(
       "moe_batched_mm_precompiled("

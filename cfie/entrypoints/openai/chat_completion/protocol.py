@@ -32,6 +32,9 @@ from cfie.entrypoints.openai.engine.protocol import (
     ToolCall,
     UsageInfo,
 )
+from cfie.entrypoints.openai.reasoning_template import (
+    build_reasoning_chat_template_kwargs,
+)
 from cfie.exceptions import VLLMValidationError
 from cfie.logger import init_logger
 from cfie.logprobs import Logprob
@@ -361,18 +364,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_template: str | None,
         default_template_content_format: ChatTemplateContentFormatOption,
     ) -> ChatParams:
+        chat_template_kwargs = merge_kwargs(
+            self.chat_template_kwargs,
+            dict(
+                add_generation_prompt=self.add_generation_prompt,
+                continue_final_message=self.continue_final_message,
+                documents=self.documents,
+            ),
+        )
+        chat_template_kwargs = merge_kwargs(
+            chat_template_kwargs,
+            build_reasoning_chat_template_kwargs(self.reasoning_effort),
+        )
+
         return ChatParams(
             chat_template=self.chat_template or default_template,
             chat_template_content_format=default_template_content_format,
-            chat_template_kwargs=merge_kwargs(
-                self.chat_template_kwargs,
-                dict(
-                    add_generation_prompt=self.add_generation_prompt,
-                    continue_final_message=self.continue_final_message,
-                    documents=self.documents,
-                    reasoning_effort=self.reasoning_effort,
-                ),
-            ),
+            chat_template_kwargs=chat_template_kwargs,
             media_io_kwargs=self.media_io_kwargs,
         )
 

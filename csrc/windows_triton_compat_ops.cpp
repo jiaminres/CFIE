@@ -522,6 +522,29 @@ namespace {
         batch_copy_into_slots(slot_ids, src.value(), dst_tensor, field_name);
     }
 
+    void install_expert_map_for_slots(const torch::Tensor &slot_ids,
+                                      const torch::Tensor &old_expert_ids,
+                                      const torch::Tensor &new_expert_ids,
+                                      torch::Tensor &expert_map) {
+        TORCH_CHECK(expert_map.dim() == 1,
+                    "expert_map must be a 1D tensor");
+        TORCH_CHECK(slot_ids.numel() == old_expert_ids.numel() &&
+                    slot_ids.numel() == new_expert_ids.numel(),
+                    "slot_ids, old_expert_ids, and new_expert_ids must have "
+                    "the same number of elements");
+
+        auto slots_device = move_slot_ids_to_target_device(slot_ids, expert_map);
+        auto old_device = move_slot_ids_to_target_device(old_expert_ids, expert_map);
+        auto new_device = move_slot_ids_to_target_device(new_expert_ids, expert_map);
+
+        auto valid_old = old_device.ge(0);
+        auto old_valid = old_device.masked_select(valid_old);
+        expert_map.index_fill_(0, old_valid, c10::Scalar(-1));
+
+        auto slot_values = slots_device.to(expert_map.scalar_type()).contiguous();
+        expert_map.index_copy_(0, new_device, slot_values);
+    }
+
     torch::Tensor load_initial_history(const torch::Tensor &state,
                                        int64_t history_len,
                                        bool load_initial_state,
@@ -3936,6 +3959,22 @@ void moe_batch_load_unquantized_runtime_precompiled(
     batch_copy_into_slots(slot_ids, w2_src, w2_dst, "w2_weight");
 }
 
+void moe_batch_load_unquantized_runtime_and_install(
+        const torch::Tensor &slot_ids, const torch::Tensor &old_expert_ids,
+        const torch::Tensor &new_expert_ids, const torch::Tensor &w13_src,
+        const torch::Tensor &w2_src, torch::Tensor &w13_dst,
+        torch::Tensor &w2_dst, torch::Tensor &expert_map) {
+    if (moe_batch_load_unquantized_runtime_and_install_fused_cuda(
+            slot_ids, old_expert_ids, new_expert_ids, w13_src, w2_src, w13_dst,
+            w2_dst, expert_map)) {
+        return;
+    }
+    moe_batch_load_unquantized_runtime_precompiled(
+            slot_ids, w13_src, w2_src, w13_dst, w2_dst);
+    install_expert_map_for_slots(
+            slot_ids, old_expert_ids, new_expert_ids, expert_map);
+}
+
 // 把 GPTQ 量化 expert 的各路权重与元数据批量搬进运行时槽位。
 // 可选的 g_idx 及其排序索引也会在这里同步更新，避免 Python 层拆成多次调用。
 void moe_batch_load_gptq_runtime_precompiled(
@@ -3978,6 +4017,47 @@ void moe_batch_load_gptq_runtime_precompiled(
     batch_copy_into_slots_optional(slot_ids, w2_g_idx_sort_indices_src,
                                    w2_g_idx_sort_indices_dst,
                                    "w2_g_idx_sort_indices");
+}
+
+void moe_batch_load_gptq_runtime_and_install(
+        const torch::Tensor &slot_ids, const torch::Tensor &old_expert_ids,
+        const torch::Tensor &new_expert_ids, const torch::Tensor &w13_qweight_src,
+        const torch::Tensor &w2_qweight_src, const torch::Tensor &w13_scales_src,
+        const torch::Tensor &w2_scales_src, const torch::Tensor &w13_qzeros_src,
+        const torch::Tensor &w2_qzeros_src, torch::Tensor &w13_qweight_dst,
+        torch::Tensor &w2_qweight_dst, torch::Tensor &w13_scales_dst,
+        torch::Tensor &w2_scales_dst, torch::Tensor &w13_qzeros_dst,
+        torch::Tensor &w2_qzeros_dst,
+        const std::optional<torch::Tensor> &w13_g_idx_src,
+        const std::optional<torch::Tensor> &w2_g_idx_src,
+        const std::optional<torch::Tensor> &w13_g_idx_sort_indices_src,
+        const std::optional<torch::Tensor> &w2_g_idx_sort_indices_src,
+        const std::optional<torch::Tensor> &w13_g_idx_dst,
+        const std::optional<torch::Tensor> &w2_g_idx_dst,
+        const std::optional<torch::Tensor> &w13_g_idx_sort_indices_dst,
+        const std::optional<torch::Tensor> &w2_g_idx_sort_indices_dst,
+        torch::Tensor &expert_map) {
+    if (moe_batch_load_gptq_runtime_and_install_fused_cuda(
+            slot_ids, old_expert_ids, new_expert_ids, w13_qweight_src,
+            w2_qweight_src, w13_scales_src, w2_scales_src, w13_qzeros_src,
+            w2_qzeros_src, w13_qweight_dst, w2_qweight_dst, w13_scales_dst,
+            w2_scales_dst, w13_qzeros_dst, w2_qzeros_dst, w13_g_idx_src,
+            w2_g_idx_src, w13_g_idx_sort_indices_src,
+            w2_g_idx_sort_indices_src, w13_g_idx_dst, w2_g_idx_dst,
+            w13_g_idx_sort_indices_dst, w2_g_idx_sort_indices_dst,
+            expert_map)) {
+        return;
+    }
+    moe_batch_load_gptq_runtime_precompiled(
+            slot_ids, w13_qweight_src, w2_qweight_src, w13_scales_src,
+            w2_scales_src, w13_qzeros_src, w2_qzeros_src, w13_qweight_dst,
+            w2_qweight_dst, w13_scales_dst, w2_scales_dst, w13_qzeros_dst,
+            w2_qzeros_dst, w13_g_idx_src, w2_g_idx_src,
+            w13_g_idx_sort_indices_src, w2_g_idx_sort_indices_src,
+            w13_g_idx_dst, w2_g_idx_dst, w13_g_idx_sort_indices_dst,
+            w2_g_idx_sort_indices_dst);
+    install_expert_map_for_slots(
+            slot_ids, old_expert_ids, new_expert_ids, expert_map);
 }
 
 // 逐 expert 执行 batched matmul，必要时先把 fp8 / 量化输入反量化成 float32。

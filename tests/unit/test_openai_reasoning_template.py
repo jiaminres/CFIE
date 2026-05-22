@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from cfie.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from cfie.entrypoints.openai.reasoning_template import (
+    QWEN_REASONING_PREAMBLE_KWARG,
+)
+from cfie.entrypoints.openai.responses.protocol import ResponsesRequest
+from cfie.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
+from cfie.renderers.hf import _apply_cfie_reasoning_preamble
+
+
+def test_responses_reasoning_none_disables_qwen_thinking() -> None:
+    request = ResponsesRequest(input="hello", reasoning={"effort": "none"})
+
+    params = request.build_chat_params(None, "auto")
+
+    assert params.chat_template_kwargs["reasoning_effort"] == "none"
+    assert params.chat_template_kwargs["enable_thinking"] is False
+    assert QWEN_REASONING_PREAMBLE_KWARG not in params.chat_template_kwargs
+
+
+def test_responses_reasoning_efforts_build_distinct_qwen_preambles() -> None:
+    prompts = {}
+    for effort in ("minimal", "low", "medium", "high", "xhigh"):
+        request = ResponsesRequest(input="hello", reasoning={"effort": effort})
+        params = request.build_chat_params(None, "auto")
+
+        assert params.chat_template_kwargs["reasoning_effort"] == effort
+        assert params.chat_template_kwargs["enable_thinking"] is True
+        prompts[effort] = params.chat_template_kwargs[QWEN_REASONING_PREAMBLE_KWARG]
+
+    assert len(set(prompts.values())) == len(prompts)
+    assert "minimal" in prompts["minimal"]
+    assert "xhigh" in prompts["xhigh"]
+
+
+def test_responses_reasoning_effort_overrides_default_thinking_disabled() -> None:
+    request = ResponsesRequest(
+        input="hello",
+        chat_template_kwargs={"enable_thinking": False},
+        reasoning={"effort": "low"},
+    )
+
+    params = request.build_chat_params(None, "auto")
+
+    assert params.chat_template_kwargs["enable_thinking"] is True
+    assert params.chat_template_kwargs["reasoning_effort"] == "low"
+
+
+def test_chat_completion_reasoning_effort_uses_same_template_mapping() -> None:
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning_effort="low",
+    )
+
+    params = request.build_chat_params(None, "auto")
+
+    assert params.chat_template_kwargs["reasoning_effort"] == "low"
+    assert params.chat_template_kwargs["enable_thinking"] is True
+    assert "Think fast" in params.chat_template_kwargs[QWEN_REASONING_PREAMBLE_KWARG]
+
+
+def test_qwen_preamble_is_inserted_inside_generation_think_block() -> None:
+    prompt = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+
+    rendered = _apply_cfie_reasoning_preamble(prompt, "Current think mode: low.")
+
+    assert rendered.endswith("<think>\nCurrent think mode: low.\n")
+
+
+def test_qwen_preamble_does_not_modify_disabled_thinking_prompt() -> None:
+    prompt = (
+        "<|im_start|>user\nhello<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+
+    rendered = _apply_cfie_reasoning_preamble(prompt, "Current think mode: low.")
+
+    assert rendered == prompt
+
+
+class _FakeTokenizer:
+    def get_vocab(self):
+        return {"<think>": 1, "</think>": 2}
+
+
+def test_qwen_parser_treats_response_effort_none_as_content_without_end_tag() -> None:
+    parser = Qwen3ReasoningParser(_FakeTokenizer())
+    request = ResponsesRequest(input="hello", reasoning={"effort": "none"})
+
+    reasoning, content = parser.extract_reasoning("final answer", request)
+
+    assert reasoning is None
+    assert content == "final answer"
+
+
+def test_qwen_parser_honors_response_template_kwargs_when_no_effort() -> None:
+    parser = Qwen3ReasoningParser(_FakeTokenizer())
+    request = ResponsesRequest(
+        input="hello",
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    reasoning, content = parser.extract_reasoning("final answer", request)
+
+    assert reasoning is None
+    assert content == "final answer"
+
+
+def test_qwen_parser_effort_overrides_template_kwargs_for_enabled_thinking() -> None:
+    parser = Qwen3ReasoningParser(_FakeTokenizer())
+    request = ResponsesRequest(
+        input="hello",
+        chat_template_kwargs={"enable_thinking": False},
+        reasoning={"effort": "low"},
+    )
+
+    reasoning, content = parser.extract_reasoning("unfinished reasoning", request)
+
+    assert reasoning == "unfinished reasoning"
+    assert content is None

@@ -74,7 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=None)
     parser.add_argument("--gpu-slots-per-layer", type=int, default=24)
     parser.add_argument("--prefill-burst-slots", type=int, default=256)
-    parser.add_argument("--prepare-cpu-copy-batch-size", type=int, default=8)
+    parser.add_argument("--prepare-cpu-copy-threads", type=int, default=32)
+    parser.add_argument("--prepare-cpu-copy-batch-size", type=int, default=0)
     parser.add_argument("--cpu-static-pinned-gb", type=float, default=0.0)
     parser.add_argument("--cpu-static-pinned-layers", default="")
     parser.add_argument("--enable-prefix-caching", action=argparse.BooleanOptionalAction, default=True)
@@ -336,6 +337,9 @@ def main() -> None:
         engine_args.compilation_config.cudagraph_copy_inputs = (
             args.cudagraph_copy_inputs
         )
+    engine_args.prepare_cpu_copy_threads = (
+        args.prepare_cpu_copy_batch_size or args.prepare_cpu_copy_threads
+    )
     engine_args.prepare_cpu_copy_batch_size = args.prepare_cpu_copy_batch_size
     engine_args.cpu_static_pinned_gb = args.cpu_static_pinned_gb
     engine_args.cpu_static_pinned_layers = args.cpu_static_pinned_layers

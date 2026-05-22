@@ -66,6 +66,9 @@ from cfie.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
 )
 from cfie.entrypoints.openai.engine.protocol import OpenAIBaseModel
+from cfie.entrypoints.openai.reasoning_template import (
+    build_reasoning_chat_template_kwargs,
+)
 from cfie.exceptions import VLLMValidationError
 from cfie.logger import init_logger
 from cfie.renderers import ChatParams, TokenizeParams, merge_kwargs
@@ -208,6 +211,14 @@ class ResponsesRequest(OpenAIBaseModel):
         default=None,
         description=("Additional kwargs to pass to the HF processor."),
     )
+    chat_template_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Additional keyword args to pass to the chat template renderer. "
+            "Request reasoning.effort is translated into these kwargs for "
+            "templates such as Qwen3/Qwen3.5."
+        ),
+    )
     priority: int = Field(
         default=0,
         description=(
@@ -271,18 +282,23 @@ class ResponsesRequest(OpenAIBaseModel):
         continue_final = should_continue_final_message(self.input)
 
         reasoning = self.reasoning
+        reasoning_effort = None if reasoning is None else reasoning.effort
+        chat_template_kwargs = merge_kwargs(
+            self.chat_template_kwargs,
+            dict(
+                add_generation_prompt=not continue_final,
+                continue_final_message=continue_final,
+            ),
+        )
+        chat_template_kwargs = merge_kwargs(
+            chat_template_kwargs,
+            build_reasoning_chat_template_kwargs(reasoning_effort),
+        )
 
         return ChatParams(
             chat_template=default_template,
             chat_template_content_format=default_template_content_format,
-            chat_template_kwargs=merge_kwargs(  # To remove unset values
-                {},
-                dict(
-                    add_generation_prompt=not continue_final,
-                    continue_final_message=continue_final,
-                    reasoning_effort=None if reasoning is None else reasoning.effort,
-                ),
-            ),
+            chat_template_kwargs=chat_template_kwargs,
             media_io_kwargs=self.media_io_kwargs,
         )
 

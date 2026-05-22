@@ -112,7 +112,8 @@ def add_native_chat_parser(subparsers: Any) -> None:
                         default=True)
     parser.add_argument("--gpu-slots-per-layer", type=int, default=0)
     parser.add_argument("--prefill-burst-slots", type=int, default=0)
-    parser.add_argument("--prepare-cpu-copy-batch-size", type=int, default=8)
+    parser.add_argument("--prepare-cpu-copy-threads", type=int, default=32)
+    parser.add_argument("--prepare-cpu-copy-batch-size", type=int, default=0)
     parser.add_argument("--cpu-static-preprocess-batch-size",
                         type=int,
                         default=0)

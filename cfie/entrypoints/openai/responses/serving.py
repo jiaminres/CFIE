@@ -169,6 +169,7 @@ class OpenAIServingResponses(OpenAIServing):
         request_logger: RequestLogger | None,
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
+        default_chat_template_kwargs: dict[str, object] | None = None,
         return_tokens_as_token_ids: bool = False,
         reasoning_parser: str = "",
         enable_auto_tools: bool = False,
@@ -187,6 +188,7 @@ class OpenAIServingResponses(OpenAIServing):
 
         self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
+        self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.enable_log_outputs = enable_log_outputs
 
         # Set up the unified parser - either a unified parser or fall back to
@@ -579,6 +581,10 @@ class OpenAIServingResponses(OpenAIServing):
         prev_response: ResponsesResponse | None,
     ):
         tool_dicts = construct_tool_dicts(request.tools, request.tool_choice)
+        request.chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+            request.chat_template_kwargs,
+            self.default_chat_template_kwargs,
+        )
         # Construct the input messages.
         messages = construct_input_messages(
             request_instructions=request.instructions,
@@ -592,7 +598,7 @@ class OpenAIServingResponses(OpenAIServing):
             messages,
             default_template=self.chat_template,
             default_template_content_format=self.chat_template_content_format,
-            default_template_kwargs=None,
+            default_template_kwargs=self.default_chat_template_kwargs,
             tool_dicts=tool_dicts,
             tool_parser=self.parser.tool_parser_cls if self.parser else None,
         )
@@ -1308,14 +1314,17 @@ class OpenAIServingResponses(OpenAIServing):
                             request=request,  # type: ignore[arg-type]
                         )
                 elif reasoning_parser:
-                    delta_message = reasoning_parser.extract_reasoning_streaming(
-                        previous_text=previous_text,
-                        current_text=current_text,
-                        delta_text=delta_text,
-                        previous_token_ids=previous_token_ids,
-                        current_token_ids=current_token_ids,
-                        delta_token_ids=delta_token_ids,
-                    )
+                    if prompt_is_reasoning_end:
+                        delta_message = DeltaMessage(content=delta_text)
+                    else:
+                        delta_message = reasoning_parser.extract_reasoning_streaming(
+                            previous_text=previous_text,
+                            current_text=current_text,
+                            delta_text=delta_text,
+                            previous_token_ids=previous_token_ids,
+                            current_token_ids=current_token_ids,
+                            delta_token_ids=delta_token_ids,
+                        )
                 elif tool_parser:
                     delta_message = tool_parser.extract_tool_calls_streaming(
                         previous_text=previous_text,

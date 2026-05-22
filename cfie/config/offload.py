@@ -141,9 +141,12 @@ class OffloadConfig:
     cpu_static_pinned_layers: str = ""
     """Comma-separated MoE layer indices or ranges to pin, e.g. '0-23,30'."""
 
-    prepare_cpu_copy_batch_size: int = Field(default=8, ge=0)
-    """Number of missing experts processed by one CPU copy worker during
-    prepare-time staging. A value of 0 keeps automatic sizing."""
+    prepare_cpu_copy_threads: int = Field(default=32, ge=0)
+    """Number of native CPU copy worker threads used when preparing pageable
+    experts into the pinned runtime stage. A value of 0 keeps automatic sizing."""
+
+    prepare_cpu_copy_batch_size: int = Field(default=0, ge=0)
+    """Deprecated alias for prepare_cpu_copy_threads."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":

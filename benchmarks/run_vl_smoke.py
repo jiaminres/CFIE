@@ -23,7 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     parser.add_argument("--gpu-slots-per-layer", type=int, default=16)
     parser.add_argument("--prefill-burst-slots", type=int, default=0)
-    parser.add_argument("--prepare-cpu-copy-batch-size", type=int, default=8)
+    parser.add_argument("--prepare-cpu-copy-threads", type=int, default=32)
+    parser.add_argument("--prepare-cpu-copy-batch-size", type=int, default=0)
     parser.add_argument("--cpu-static-pinned-gb", type=float, default=0.0)
     parser.add_argument("--enable-prefix-caching", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--enable-chunked-prefill", action=argparse.BooleanOptionalAction, default=True)
@@ -85,6 +86,9 @@ def main() -> None:
     engine_args.kv_cache_memory_bytes = args.kv_cache_memory_bytes
     engine_args.gpu_slots_per_layer = args.gpu_slots_per_layer
     engine_args.prefill_burst_slots = args.prefill_burst_slots
+    engine_args.prepare_cpu_copy_threads = (
+        args.prepare_cpu_copy_batch_size or args.prepare_cpu_copy_threads
+    )
     engine_args.prepare_cpu_copy_batch_size = args.prepare_cpu_copy_batch_size
     engine_args.cpu_static_pinned_gb = args.cpu_static_pinned_gb
 

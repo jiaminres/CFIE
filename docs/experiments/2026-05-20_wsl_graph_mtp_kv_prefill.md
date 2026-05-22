@@ -24,7 +24,7 @@ Common graph/MTP options for this run series:
 ```bash
 --gpu-slots-per-layer 16
 --prefill-burst-slots 256
---prepare-cpu-copy-batch-size 8
+--prepare-cpu-copy-threads 8
 --cpu-static-pinned-gb 44
 --marlin-input-dtype fp8
 --piecewise-cudagraph

@@ -1981,8 +1981,11 @@ def test_load_experts_into_slots_uses_single_batch_write_entrypoint() -> None:
     def _write_expert_bundles(
         bundles_and_sources: list[tuple[int, int, ExpertBundle, str]],
         target: object,
+        *,
+        install_mappings: bool = False,
     ) -> None:
         del target
+        del install_mappings
         batch_calls.append(tuple((expert_id, slot) for expert_id, slot, *_ in bundles_and_sources))
 
     controller._get_source_bundle = _get_source_bundle
@@ -2074,11 +2077,11 @@ def test_write_expert_bundles_uses_gpu_stage_for_unquantized_runtime_ready_bundl
         target.w2_weight[3],
         torch.tensor([[7.0], [8.0]], dtype=torch.float16),
     )
-    assert set(stats) == {
+    assert {
         "cpu_pack_seconds",
         "h2d_seconds",
         "gpu_scatter_seconds",
-    }
+    }.issubset(stats)
 
 
 def test_write_expert_bundles_uses_gpu_stage_for_gptq_runtime_ready_bundles(
@@ -2192,11 +2195,11 @@ def test_write_expert_bundles_uses_gpu_stage_for_gptq_runtime_ready_bundles(
         target.w2_g_idx_sort_indices[2],
         torch.tensor([[35, 36]], dtype=torch.int32),
     )
-    assert set(stats) == {
+    assert {
         "cpu_pack_seconds",
         "h2d_seconds",
         "gpu_scatter_seconds",
-    }
+    }.issubset(stats)
 
 
 def test_write_expert_bundles_uses_gpu_stage_for_prefill_target() -> None:
@@ -2260,11 +2263,11 @@ def test_write_expert_bundles_uses_gpu_stage_for_prefill_target() -> None:
         torch.tensor([[21, 22]], dtype=torch.int32),
     )
     assert controller._cpu_runtime_expert_stage_capacity == target.num_slots
-    assert set(stats) == {
+    assert {
         "cpu_pack_seconds",
         "h2d_seconds",
         "gpu_scatter_seconds",
-    }
+    }.issubset(stats)
 
 
 def test_get_source_bundle_requires_pre_materialized_cpu_static_expert() -> None:
@@ -2881,7 +2884,7 @@ def test_prepare_rejects_more_requested_experts_than_resident_slots() -> None:
         controller.prepare(torch.tensor([[0, 1, 2]], dtype=torch.long))
 
 
-def test_prepare_loads_missing_expert_into_lowest_router_score_slot() -> None:
+def test_prepare_loads_missing_expert_into_round_robin_victim_slot() -> None:
     controller = LayerTieredExpertCacheController.__new__(
         LayerTieredExpertCacheController
     )
@@ -2889,6 +2892,7 @@ def test_prepare_loads_missing_expert_into_lowest_router_score_slot() -> None:
     controller.num_slots = 8
     controller._step = 0
     controller._slot_to_global = list(range(8))
+    controller._victim_cursor = 4
     controller._cpu_hits = 0
     controller._evictions = 0
     expert_map = torch.full((9,), -1, dtype=torch.int32)
@@ -2908,24 +2912,21 @@ def test_prepare_loads_missing_expert_into_lowest_router_score_slot() -> None:
 
     controller._load_experts_into_slots = _load_experts_into_slots
 
-    router_probs = torch.ones((1, 9), dtype=torch.float32)
-    router_probs[0, 3] = 0.01
-    router_probs[0, 8] = 0.99
     topk_ids = torch.tensor([[8]], dtype=torch.long)
 
-    controller.prepare(topk_ids, router_probs=router_probs)
+    controller.prepare(topk_ids)
 
-    assert load_calls == [(8, 3)]
-    assert int(expert_map[8].item()) == 3
+    assert load_calls == [(8, 4)]
+    assert int(expert_map[8].item()) == 4
 
 
-def test_load_experts_into_slots_chunks_assignments_by_cpu_copy_batch_size() -> None:
+def test_load_experts_into_slots_writes_all_missing_experts_in_one_batch() -> None:
     controller = LayerTieredExpertCacheController.__new__(
         LayerTieredExpertCacheController
     )
     controller.layer_key = "model.layers.0.mlp.experts"
     controller.num_slots = 8
-    controller._prepare_cpu_copy_batch_size = 2
+    controller._prepare_cpu_copy_threads = 2
     controller._total_loads = 0
     controller._cpu_hits = 0
     controller._nvme_loads = 0
@@ -2936,7 +2937,7 @@ def test_load_experts_into_slots_chunks_assignments_by_cpu_copy_batch_size() -> 
 
     batch_sizes: list[int] = []
 
-    def _materialize_batch_sources(
+    def _resolve_batch_sources_for_plan(
         assignments: list[tuple[int, int]],
     ) -> list[tuple[int, int, ExpertBundle, str]]:
         batch_sizes.append(len(assignments))
@@ -2955,8 +2956,10 @@ def test_load_experts_into_slots_chunks_assignments_by_cpu_copy_batch_size() -> 
             for expert_id, slot in assignments
         ]
 
-    controller._materialize_batch_sources = _materialize_batch_sources
-    controller._write_expert_bundles = lambda _bundles, _target: None
+    controller._resolve_batch_sources_for_plan = _resolve_batch_sources_for_plan
+    controller._write_expert_bundles = (
+        lambda _bundles, _target, *, install_mappings=False: None
+    )
     def _install_mapping(expert_id: int, slot: int) -> None:
         controller._slot_to_global[slot] = expert_id
         expert_map[expert_id] = slot
@@ -2965,7 +2968,7 @@ def test_load_experts_into_slots_chunks_assignments_by_cpu_copy_batch_size() -> 
 
     controller._load_experts_into_slots([(0, 0), (1, 1), (2, 2), (3, 3)])
 
-    assert batch_sizes == [2, 2]
+    assert batch_sizes == [4]
 
 
 def test_prepare_allows_full_resident_slot_window() -> None:
@@ -3717,7 +3720,7 @@ def test_runtime_ready_stage_reuses_expert_major_prefix_storage() -> None:
     controller.layer_key = "test.layer"
     controller._runtime_stage_slots = 8
     controller._compute_slots = 8
-    controller._prepare_cpu_copy_batch_size = 4
+    controller._prepare_cpu_copy_threads = 4
     controller._cpu_buffer_bytes = 0
     controller._cpu_runtime_expert_stage_storage = None
     controller._cpu_runtime_expert_stage_capacity = 0
@@ -3765,7 +3768,7 @@ def test_runtime_ready_stage_h2d_prefix_size_ignores_unused_capacity() -> None:
     controller.layer_key = "test.layer"
     controller._runtime_stage_slots = 8
     controller._compute_slots = 8
-    controller._prepare_cpu_copy_batch_size = 1
+    controller._prepare_cpu_copy_threads = 1
     controller._cpu_buffer_bytes = 0
     controller._cpu_runtime_expert_stage_storage = None
     controller._cpu_runtime_expert_stage_capacity = 0
@@ -3783,6 +3786,174 @@ def test_runtime_ready_stage_h2d_prefix_size_ignores_unused_capacity() -> None:
     ) == 2 * per_expert_bytes
 
 
+def test_native_unquantized_scatter_and_install_updates_maps(monkeypatch) -> None:
+    controller = LayerTieredExpertCacheController.__new__(
+        LayerTieredExpertCacheController
+    )
+    controller.layer_key = "test.layer"
+    controller._mode = "unquantized"
+    controller._runtime_stage_slots = 2
+    controller._compute_slots = 2
+    controller._slot_to_global = [7, -1]
+    controller._expert_to_slot = [-1] * 8
+    controller._expert_to_slot[7] = 0
+    controller._total_loads = 0
+    controller._evictions = 0
+    controller._cpu_hits = 0
+    controller._nvme_loads = 0
+
+    storage = torch.empty(16, dtype=torch.uint8)
+    bundles: list[ExpertBundle] = []
+    for index in range(2):
+        offset = index * 8
+        w13 = storage[offset:offset + 4].view(torch.float32)
+        w2 = storage[offset + 4:offset + 8].view(torch.float32)
+        w13.fill_(10 + index)
+        w2.fill_(20 + index)
+        bundles.append(
+            ExpertBundle(
+                tensors={
+                    "runtime.w13_weight": w13,
+                    "runtime.w2_weight": w2,
+                },
+                nbytes=8,
+                pinned=False,
+                runtime_ready=True,
+                storage=storage,
+                storage_offset_bytes=offset,
+            )
+        )
+
+    target = SimpleNamespace(
+        w13_weight=torch.zeros((8, 1), dtype=torch.float32),
+        w2_weight=torch.zeros((8, 1), dtype=torch.float32),
+        _expert_map=torch.full((8,), -1, dtype=torch.int32),
+    )
+    target._expert_map[7] = 0
+
+    def fake_native(
+        slot_ids: torch.Tensor,
+        old_expert_ids: torch.Tensor,
+        new_expert_ids: torch.Tensor,
+        w13_src: torch.Tensor,
+        w2_src: torch.Tensor,
+        w13_dst: torch.Tensor,
+        w2_dst: torch.Tensor,
+        expert_map: torch.Tensor,
+    ) -> None:
+        w13_dst.index_copy_(0, slot_ids, w13_src)
+        w2_dst.index_copy_(0, slot_ids, w2_src)
+        valid_old = old_expert_ids[old_expert_ids >= 0]
+        expert_map.index_fill_(0, valid_old, -1)
+        expert_map.index_copy_(0, new_expert_ids, slot_ids.to(expert_map.dtype))
+
+    monkeypatch.setattr(
+        weight_offload.ops,
+        "has_moe_batch_load_unquantized_runtime_and_install",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        weight_offload.ops,
+        "moe_batch_load_unquantized_runtime_and_install",
+        fake_native,
+    )
+
+    bundles_and_sources = [
+        (3, 0, bundles[0], "cpu_static"),
+        (5, 1, bundles[1], "cpu_static"),
+    ]
+    slot_ids = torch.tensor([0, 1], dtype=torch.int64)
+
+    assert controller._try_native_runtime_scatter_and_install(
+        bundles_and_sources,
+        bundles,
+        target,
+        slot_ids,
+    )
+    controller._install_cpu_mappings_after_native(bundles_and_sources)
+
+    assert torch.equal(target.w13_weight[:2, 0], torch.tensor([10.0, 11.0]))
+    assert torch.equal(target.w2_weight[:2, 0], torch.tensor([20.0, 21.0]))
+    assert int(target._expert_map[7].item()) == -1
+    assert int(target._expert_map[3].item()) == 0
+    assert int(target._expert_map[5].item()) == 1
+    assert controller._slot_to_global == [3, 5]
+    assert controller._expert_to_slot[7] == -1
+    assert controller._expert_to_slot[3] == 0
+    assert controller._expert_to_slot[5] == 1
+
+
+def test_native_gptq_scatter_and_install_cuda_smoke() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not weight_offload.ops.has_moe_batch_load_gptq_runtime_and_install():
+        pytest.skip("native GPTQ scatter+install op is not available")
+
+    slot_ids = torch.tensor([2, 0], device="cuda", dtype=torch.int64)
+    old_expert_ids = torch.tensor([5, -1], device="cuda", dtype=torch.int64)
+    new_expert_ids = torch.tensor([7, 3], device="cuda", dtype=torch.int64)
+    expert_map = torch.full((10,), -1, device="cuda", dtype=torch.int32)
+    expert_map[5] = 2
+
+    w13_qweight_src = torch.arange(
+        2 * 2 * 4,
+        device="cuda",
+        dtype=torch.int32,
+    ).reshape(2, 2, 4)
+    w2_qweight_src = w13_qweight_src + 100
+    w13_scales_src = torch.arange(
+        2 * 2 * 4,
+        device="cuda",
+        dtype=torch.float16,
+    ).reshape(2, 2, 4)
+    w2_scales_src = w13_scales_src + 100
+    w13_qzeros_src = w13_qweight_src + 200
+    w2_qzeros_src = w13_qweight_src + 300
+
+    w13_qweight_dst = torch.zeros((4, 2, 4), device="cuda", dtype=torch.int32)
+    w2_qweight_dst = torch.zeros_like(w13_qweight_dst)
+    w13_scales_dst = torch.zeros((4, 2, 4), device="cuda", dtype=torch.float16)
+    w2_scales_dst = torch.zeros_like(w13_scales_dst)
+    w13_qzeros_dst = torch.zeros_like(w13_qweight_dst)
+    w2_qzeros_dst = torch.zeros_like(w13_qweight_dst)
+
+    weight_offload.ops.moe_batch_load_gptq_runtime_and_install(
+        slot_ids,
+        old_expert_ids,
+        new_expert_ids,
+        w13_qweight_src,
+        w2_qweight_src,
+        w13_scales_src,
+        w2_scales_src,
+        w13_qzeros_src,
+        w2_qzeros_src,
+        w13_qweight_dst,
+        w2_qweight_dst,
+        w13_scales_dst,
+        w2_scales_dst,
+        w13_qzeros_dst,
+        w2_qzeros_dst,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        expert_map,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(w13_qweight_dst[2], w13_qweight_src[0])
+    assert torch.equal(w13_qweight_dst[0], w13_qweight_src[1])
+    assert torch.equal(w2_qweight_dst[2], w2_qweight_src[0])
+    assert torch.equal(w13_scales_dst[0], w13_scales_src[1])
+    assert int(expert_map[5].item()) == -1
+    assert int(expert_map[7].item()) == 2
+    assert int(expert_map[3].item()) == 0
+
+
 def test_runtime_ready_stage_pool_is_shared_across_controllers() -> None:
     _storage, bundles, _per_expert_bytes = _make_layer_wide_runtime_bundle_storage()
     shared_pool = SharedRuntimeExpertStagePool()
@@ -3794,7 +3965,7 @@ def test_runtime_ready_stage_pool_is_shared_across_controllers() -> None:
         controller.layer_key = "test.layer"
         controller._runtime_stage_slots = 8
         controller._compute_slots = 8
-        controller._prepare_cpu_copy_batch_size = 1
+        controller._prepare_cpu_copy_threads = 1
         controller._cpu_buffer_bytes = 0
         controller._cpu_runtime_expert_stage_storage = None
         controller._cpu_runtime_expert_stage_capacity = 0

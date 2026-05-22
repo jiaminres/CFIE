@@ -51,6 +51,21 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         """The token that ends reasoning content."""
         return "</think>"
 
+    @staticmethod
+    def _request_disables_thinking(
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> bool:
+        reasoning = getattr(request, "reasoning", None)
+        effort = getattr(reasoning, "effort", None)
+        if effort is None:
+            effort = getattr(request, "reasoning_effort", None)
+        effort = str(effort).strip().lower() if effort is not None else ""
+        if effort:
+            return effort == "none"
+
+        chat_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+        return chat_kwargs.get("enable_thinking") is False
+
     def extract_reasoning(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> tuple[str | None, str | None]:
@@ -78,8 +93,12 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             model_output_parts[2] if model_output_parts[1] else model_output_parts[0]
         )
 
+        thinking_enabled = (
+            self.thinking_enabled and not self._request_disables_thinking(request)
+        )
+
         if self.end_token not in model_output:
-            if not self.thinking_enabled:
+            if not thinking_enabled:
                 # Thinking explicitly disabled — treat everything as content.
                 return None, model_output
             # Thinking enabled but no </think>: output was truncated.

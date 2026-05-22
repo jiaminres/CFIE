@@ -20,7 +20,7 @@ def test_engine_arg_utils_accepts_current_tiered_cache_args() -> None:
             "32",
             "--prefill-burst-slots",
             "256",
-            "--prepare-cpu-copy-batch-size",
+            "--prepare-cpu-copy-threads",
             "8",
         ]
     )
@@ -29,7 +29,8 @@ def test_engine_arg_utils_accepts_current_tiered_cache_args() -> None:
 
     assert engine_args.gpu_slots_per_layer == 32
     assert engine_args.prefill_burst_slots == 256
-    assert engine_args.prepare_cpu_copy_batch_size == 8
+    assert engine_args.prepare_cpu_copy_threads == 8
+    assert engine_args.prepare_cpu_copy_batch_size == 0
 
 
 @pytest.mark.parametrize(

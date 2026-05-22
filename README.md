@@ -103,7 +103,7 @@ $env:MAX_JOBS = "8"
 --kv-cache-memory-bytes 4000000000
 --gpu-slots-per-layer 16
 --prefill-burst-slots 256
---prepare-cpu-copy-batch-size 8
+--prepare-cpu-copy-threads 32
 --cpu-static-pinned-gb 40
 --enable-prefix-caching
 --marlin-input-dtype fp8
@@ -122,7 +122,7 @@ $env:MAX_JOBS = "8"
 | `--kv-cache-memory-bytes` | `4000000000` | 手动预留约 3.73 GiB KV，适配 128K 上下文。 |
 | `--gpu-slots-per-layer` | `16` | 每层 GPU resident expert slots。 |
 | `--prefill-burst-slots` | `256` | 长 prefill 的临时 expert 执行池。 |
-| `--prepare-cpu-copy-batch-size` | `8` | CPU static mirror 到 runtime stage 的并行 copy 粒度。 |
+| `--prepare-cpu-copy-threads` | `32` | CPU static mirror 到 runtime stage 的并行 copy 线程数。 |
 | `--cpu-static-pinned-gb` | `40` | OpenAI / VL 服务推荐值，给 runtime stage 留 pinned headroom。 |
 | `--enable-prefix-caching` | 开启 | GUI Agent 场景必须显式开启。 |
 | `--marlin-input-dtype` | `fp8` | 当前推荐 W4A8 路径。 |
@@ -144,7 +144,7 @@ $env:MAX_JOBS = "8"
   --kv-cache-memory-bytes 4000000000 `
   --gpu-slots-per-layer 16 `
   --prefill-burst-slots 256 `
-  --prepare-cpu-copy-batch-size 8 `
+  --prepare-cpu-copy-threads 32 `
   --cpu-static-pinned-gb 40 `
   --enable-prefix-caching `
   --language-model-only `
@@ -169,7 +169,7 @@ $env:MAX_JOBS = "8"
   --kv-cache-memory-bytes 4000000000 `
   --gpu-slots-per-layer 16 `
   --prefill-burst-slots 256 `
-  --prepare-cpu-copy-batch-size 8 `
+  --prepare-cpu-copy-threads 32 `
   --cpu-static-pinned-gb 40 `
   --enable-prefix-caching `
   --marlin-input-dtype fp8 `

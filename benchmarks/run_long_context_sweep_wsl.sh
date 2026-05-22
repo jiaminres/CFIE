@@ -17,7 +17,7 @@ WARM_PROMPT_MODE="${WARM_PROMPT_MODE:-rotated}"
 GPU_UTIL="${GPU_UTIL:-0.88}"
 GPU_SLOTS_PER_LAYER="${GPU_SLOTS_PER_LAYER:-16}"
 PREFILL_BURST_SLOTS="${PREFILL_BURST_SLOTS:-256}"
-CPU_COPY_BATCH="${CPU_COPY_BATCH:-8}"
+CPU_COPY_BATCH="${CPU_COPY_BATCH:-32}"
 CPU_STATIC_PINNED_GB="${CPU_STATIC_PINNED_GB:-44}"
 MARLIN_INPUT_DTYPE="${MARLIN_INPUT_DTYPE:-fp8}"
 SPEC_METHOD="${SPEC_METHOD:-none}"
@@ -63,7 +63,7 @@ run_case() {
     --kv-cache-memory-bytes "$kv_bytes"
     --gpu-slots-per-layer "$GPU_SLOTS_PER_LAYER"
     --prefill-burst-slots "$PREFILL_BURST_SLOTS"
-    --prepare-cpu-copy-batch-size "$CPU_COPY_BATCH"
+    --prepare-cpu-copy-threads "$CPU_COPY_BATCH"
     --cpu-static-pinned-gb "$CPU_STATIC_PINNED_GB"
     --language-model-only
     --skip-mm-profiling

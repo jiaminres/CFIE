@@ -433,6 +433,18 @@ void moe_batch_load_unquantized_runtime_precompiled(
     const torch::Tensor& w2_src, torch::Tensor& w13_dst,
     torch::Tensor& w2_dst);
 
+void moe_batch_load_unquantized_runtime_and_install(
+    const torch::Tensor& slot_ids, const torch::Tensor& old_expert_ids,
+    const torch::Tensor& new_expert_ids, const torch::Tensor& w13_src,
+    const torch::Tensor& w2_src, torch::Tensor& w13_dst,
+    torch::Tensor& w2_dst, torch::Tensor& expert_map);
+
+bool moe_batch_load_unquantized_runtime_and_install_fused_cuda(
+    const torch::Tensor& slot_ids, const torch::Tensor& old_expert_ids,
+    const torch::Tensor& new_expert_ids, const torch::Tensor& w13_src,
+    const torch::Tensor& w2_src, torch::Tensor& w13_dst,
+    torch::Tensor& w2_dst, torch::Tensor& expert_map);
+
 void moe_batch_load_gptq_runtime_precompiled(
     const torch::Tensor& slot_ids, const torch::Tensor& w13_qweight_src,
     const torch::Tensor& w2_qweight_src, const torch::Tensor& w13_scales_src,
@@ -449,6 +461,44 @@ void moe_batch_load_gptq_runtime_precompiled(
     const std::optional<torch::Tensor>& w2_g_idx_dst,
     const std::optional<torch::Tensor>& w13_g_idx_sort_indices_dst,
     const std::optional<torch::Tensor>& w2_g_idx_sort_indices_dst);
+
+void moe_batch_load_gptq_runtime_and_install(
+    const torch::Tensor& slot_ids, const torch::Tensor& old_expert_ids,
+    const torch::Tensor& new_expert_ids, const torch::Tensor& w13_qweight_src,
+    const torch::Tensor& w2_qweight_src, const torch::Tensor& w13_scales_src,
+    const torch::Tensor& w2_scales_src, const torch::Tensor& w13_qzeros_src,
+    const torch::Tensor& w2_qzeros_src, torch::Tensor& w13_qweight_dst,
+    torch::Tensor& w2_qweight_dst, torch::Tensor& w13_scales_dst,
+    torch::Tensor& w2_scales_dst, torch::Tensor& w13_qzeros_dst,
+    torch::Tensor& w2_qzeros_dst,
+    const std::optional<torch::Tensor>& w13_g_idx_src,
+    const std::optional<torch::Tensor>& w2_g_idx_src,
+    const std::optional<torch::Tensor>& w13_g_idx_sort_indices_src,
+    const std::optional<torch::Tensor>& w2_g_idx_sort_indices_src,
+    const std::optional<torch::Tensor>& w13_g_idx_dst,
+    const std::optional<torch::Tensor>& w2_g_idx_dst,
+    const std::optional<torch::Tensor>& w13_g_idx_sort_indices_dst,
+    const std::optional<torch::Tensor>& w2_g_idx_sort_indices_dst,
+    torch::Tensor& expert_map);
+
+bool moe_batch_load_gptq_runtime_and_install_fused_cuda(
+    const torch::Tensor& slot_ids, const torch::Tensor& old_expert_ids,
+    const torch::Tensor& new_expert_ids, const torch::Tensor& w13_qweight_src,
+    const torch::Tensor& w2_qweight_src, const torch::Tensor& w13_scales_src,
+    const torch::Tensor& w2_scales_src, const torch::Tensor& w13_qzeros_src,
+    const torch::Tensor& w2_qzeros_src, torch::Tensor& w13_qweight_dst,
+    torch::Tensor& w2_qweight_dst, torch::Tensor& w13_scales_dst,
+    torch::Tensor& w2_scales_dst, torch::Tensor& w13_qzeros_dst,
+    torch::Tensor& w2_qzeros_dst,
+    const std::optional<torch::Tensor>& w13_g_idx_src,
+    const std::optional<torch::Tensor>& w2_g_idx_src,
+    const std::optional<torch::Tensor>& w13_g_idx_sort_indices_src,
+    const std::optional<torch::Tensor>& w2_g_idx_sort_indices_src,
+    const std::optional<torch::Tensor>& w13_g_idx_dst,
+    const std::optional<torch::Tensor>& w2_g_idx_dst,
+    const std::optional<torch::Tensor>& w13_g_idx_sort_indices_dst,
+    const std::optional<torch::Tensor>& w2_g_idx_sort_indices_dst,
+    torch::Tensor& expert_map);
 
 void moe_batched_mm_precompiled(
     const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& C,
