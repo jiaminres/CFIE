@@ -138,22 +138,33 @@ class GuiAgentDesktopClient(tk.Tk):
         self.search_entry.insert(0, "搜索 APP")
         self.search_entry.bind("<FocusIn>", self._clear_search_placeholder)
 
-        self.app_listbox = tk.Listbox(
+        self.app_canvas = tk.Canvas(
             sidebar,
-            width=30,
-            activestyle="none",
             bg=self.colors["sidebar"],
-            fg=self.colors["ink"],
-            selectbackground=self.colors["sidebar_hover"],
-            selectforeground=self.colors["ink"],
-            relief="flat",
             highlightthickness=0,
             borderwidth=0,
-            font=("Microsoft YaHei UI", 10),
+            width=260,
         )
-        self.app_listbox.grid(row=4, column=0, sticky="nsew")
-        self.app_listbox.bind("<<ListboxSelect>>", self._on_app_select)
-        self.app_listbox.bind("<Button-3>", self._show_app_menu)
+        self.app_canvas.grid(row=4, column=0, sticky="nsew")
+        self.app_list_frame = tk.Frame(self.app_canvas, bg=self.colors["sidebar"])
+        self.app_canvas_window = self.app_canvas.create_window(
+            (0, 0),
+            window=self.app_list_frame,
+            anchor="nw",
+        )
+        self.app_list_frame.bind(
+            "<Configure>",
+            lambda _event: self.app_canvas.configure(
+                scrollregion=self.app_canvas.bbox("all")
+            ),
+        )
+        self.app_canvas.bind(
+            "<Configure>",
+            lambda event: self.app_canvas.itemconfigure(
+                self.app_canvas_window,
+                width=event.width,
+            ),
+        )
 
         bottom = ttk.Frame(sidebar, style="Sidebar.TFrame")
         bottom.grid(row=5, column=0, sticky="ew", pady=(12, 0))
@@ -286,18 +297,46 @@ class GuiAgentDesktopClient(tk.Tk):
             wraplength=330,
         ).grid(row=1, column=0, sticky="w", pady=(4, 12))
 
-        self.inspector_tree = ttk.Treeview(
-            self.inspector,
-            columns=("kind", "summary"),
-            show="headings",
-            selectmode="browse",
+        inspector_list_holder = ttk.Frame(self.inspector, style="Surface.TFrame")
+        inspector_list_holder.grid(row=2, column=0, sticky="nsew")
+        inspector_list_holder.columnconfigure(0, weight=1)
+        inspector_list_holder.rowconfigure(0, weight=1)
+        self.inspector_canvas = tk.Canvas(
+            inspector_list_holder,
+            bg=self.colors["surface"],
+            highlightthickness=0,
+            borderwidth=0,
         )
-        self.inspector_tree.heading("kind", text="类型")
-        self.inspector_tree.heading("summary", text="摘要")
-        self.inspector_tree.column("kind", width=80, anchor="center")
-        self.inspector_tree.column("summary", width=250, stretch=True)
-        self.inspector_tree.grid(row=2, column=0, sticky="nsew")
-        self.inspector_tree.bind("<<TreeviewSelect>>", self._on_inspector_select)
+        self.inspector_canvas.grid(row=0, column=0, sticky="nsew")
+        inspector_scroll = ttk.Scrollbar(
+            inspector_list_holder,
+            orient="vertical",
+            command=self.inspector_canvas.yview,
+        )
+        inspector_scroll.grid(row=0, column=1, sticky="ns")
+        self.inspector_canvas.configure(yscrollcommand=inspector_scroll.set)
+        self.inspector_list_frame = tk.Frame(
+            self.inspector_canvas,
+            bg=self.colors["surface"],
+        )
+        self.inspector_canvas_window = self.inspector_canvas.create_window(
+            (0, 0),
+            window=self.inspector_list_frame,
+            anchor="nw",
+        )
+        self.inspector_list_frame.bind(
+            "<Configure>",
+            lambda _event: self.inspector_canvas.configure(
+                scrollregion=self.inspector_canvas.bbox("all")
+            ),
+        )
+        self.inspector_canvas.bind(
+            "<Configure>",
+            lambda event: self.inspector_canvas.itemconfigure(
+                self.inspector_canvas_window,
+                width=event.width,
+            ),
+        )
 
         self.inspector_detail = tk.Text(
             self.inspector,
@@ -322,21 +361,16 @@ class GuiAgentDesktopClient(tk.Tk):
 
     def refresh_apps(self) -> None:
         current = self.selected_app_id.get()
-        self.app_listbox.delete(0, tk.END)
+        for child in self.app_list_frame.winfo_children():
+            child.destroy()
         app_ids = list(self.state.target_apps)
         for app_id in app_ids:
             config = self.state.target_apps[app_id]
             waiting = self._waiting_count_for_job(config.job_id)
-            badge = f"  ·  待处理 {waiting}" if waiting else ""
-            self.app_listbox.insert(tk.END, f"{config.app_name}{badge}")
+            self._add_app_card(app_id=app_id, config=config, waiting=waiting)
         if current not in self.state.target_apps and app_ids:
             current = app_ids[0]
             self.selected_app_id.set(current)
-        if current in self.state.target_apps:
-            index = app_ids.index(current)
-            self.app_listbox.selection_clear(0, tk.END)
-            self.app_listbox.selection_set(index)
-            self.app_listbox.activate(index)
 
     def refresh_header(self) -> None:
         config = self._selected_config()
@@ -408,38 +442,39 @@ class GuiAgentDesktopClient(tk.Tk):
         self.direct_command_combo.configure(state="readonly")
 
     def refresh_inspector(self) -> None:
-        self._clear_tree(self.inspector_tree)
+        for child in self.inspector_list_frame.winfo_children():
+            child.destroy()
         config = self._selected_config()
         if config is not None:
-            self.inspector_tree.insert(
-                "",
-                tk.END,
-                iid="task_definition",
-                values=("任务", config.task_description[:80] or "未填写"),
+            self._add_inspector_card(
+                item_id="task_definition",
+                kind="任务",
+                title="任务定义",
+                summary=config.task_description[:80] or "未填写",
             )
             for asset in config.reference_assets:
-                self.inspector_tree.insert(
-                    "",
-                    tk.END,
-                    iid=f"asset:{asset.asset_id}",
-                    values=(asset.kind, f"{asset.citation} {asset.title}"),
+                self._add_inspector_card(
+                    item_id=f"asset:{asset.asset_id}",
+                    kind=asset.kind,
+                    title=asset.title or Path(asset.path).name,
+                    summary=asset.citation,
                 )
         for index, item in enumerate(
             self.state.human_loop.list_requests(include_completed=True)
         ):
             request = item["request"]
-            self.inspector_tree.insert(
-                "",
-                tk.END,
-                iid=f"human:{index}",
-                values=(self._status_label(item["status"]), request.get("question") or ""),
+            self._add_inspector_card(
+                item_id=f"human:{index}",
+                kind=self._status_label(item["status"]),
+                title="人工介入",
+                summary=request.get("question") or "",
             )
         for index, event in enumerate(self.state.trace_store.events[-30:]):
-            self.inspector_tree.insert(
-                "",
-                tk.END,
-                iid=f"trace:{index}",
-                values=(self._trace_kind_label(event.kind), short_payload(event.payload)),
+            self._add_inspector_card(
+                item_id=f"trace:{index}",
+                kind=self._trace_kind_label(event.kind),
+                title=self._trace_kind_label(event.kind),
+                summary=short_payload(event.payload),
             )
         self._set_text(self.inspector_detail, "选择左侧记录查看详情。")
 
@@ -510,6 +545,100 @@ class GuiAgentDesktopClient(tk.Tk):
             "system": "#f3f6ff",
         }.get(role, "#f6f7fb")
 
+    def _add_app_card(
+        self,
+        *,
+        app_id: str,
+        config: TargetAppConfig,
+        waiting: int,
+    ) -> None:
+        selected = app_id == self.selected_app_id.get()
+        bg = "#ece7e2" if selected else self.colors["sidebar"]
+        card = tk.Frame(
+            self.app_list_frame,
+            bg=bg,
+            padx=10,
+            pady=8,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        card.pack(fill="x", pady=2)
+        title = tk.Label(
+            card,
+            text=config.app_name,
+            bg=bg,
+            fg=self.colors["ink"],
+            anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold" if selected else "normal"),
+        )
+        title.grid(row=0, column=0, sticky="ew")
+        subtitle_text = "待处理 " + str(waiting) if waiting else "就绪"
+        subtitle = tk.Label(
+            card,
+            text=subtitle_text,
+            bg=bg,
+            fg=self.colors["accent"] if waiting else self.colors["muted"],
+            anchor="w",
+            font=("Microsoft YaHei UI", 8),
+        )
+        subtitle.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        card.columnconfigure(0, weight=1)
+        for widget in (card, title, subtitle):
+            widget.bind("<Button-1>", lambda _event, value=app_id: self._select_app(value))
+            widget.bind("<Button-3>", lambda event, value=app_id: self._show_app_menu(event, value))
+
+    def _add_inspector_card(
+        self,
+        *,
+        item_id: str,
+        kind: str,
+        title: str,
+        summary: str,
+    ) -> None:
+        card = tk.Frame(
+            self.inspector_list_frame,
+            bg=self.colors["surface_soft"],
+            padx=10,
+            pady=8,
+            highlightthickness=1,
+            highlightbackground="#edf1f7",
+        )
+        card.pack(fill="x", pady=(0, 8))
+        top = tk.Frame(card, bg=self.colors["surface_soft"])
+        top.pack(fill="x")
+        tk.Label(
+            top,
+            text=kind,
+            bg=self.colors["brand_soft"],
+            fg=self.colors["brand"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+            padx=6,
+            pady=2,
+        ).pack(side="left")
+        tk.Label(
+            top,
+            text=title,
+            bg=self.colors["surface_soft"],
+            fg=self.colors["ink"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padx=8,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        tk.Label(
+            card,
+            text=summary,
+            bg=self.colors["surface_soft"],
+            fg=self.colors["muted"],
+            font=("Microsoft YaHei UI", 9),
+            wraplength=290,
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", pady=(6, 0))
+        for widget in (card, top):
+            widget.bind("<Button-1>", lambda _event, value=item_id: self._select_inspector_item(value))
+        for child in card.winfo_children():
+            child.bind("<Button-1>", lambda _event, value=item_id: self._select_inspector_item(value))
+
     def _on_messages_configure(self, _event: tk.Event[Any]) -> None:
         self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all"))
 
@@ -519,24 +648,18 @@ class GuiAgentDesktopClient(tk.Tk):
     def _scroll_messages_to_bottom(self) -> None:
         self.chat_canvas.yview_moveto(1.0)
 
-    def _on_app_select(self, _event: tk.Event[Any]) -> None:
-        selection = self.app_listbox.curselection()
-        if not selection:
-            return
-        app_id = list(self.state.target_apps)[selection[0]]
+    def _select_app(self, app_id: str) -> None:
         self.selected_app_id.set(app_id)
+        self.refresh_apps()
         self.refresh_header()
         self.refresh_messages()
         self.refresh_inspector()
+        self.refresh_composer()
 
-    def _show_app_menu(self, event: tk.Event[Any]) -> None:
-        index = self.app_listbox.nearest(event.y)
-        app_ids = list(self.state.target_apps)
-        if index < 0 or index >= len(app_ids):
-            return
-        self.app_listbox.selection_clear(0, tk.END)
-        self.app_listbox.selection_set(index)
-        self.selected_app_id.set(app_ids[index])
+    def _show_app_menu(self, event: tk.Event[Any], app_id: str | None = None) -> None:
+        if app_id is not None:
+            self.selected_app_id.set(app_id)
+            self.refresh_apps()
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="编辑任务定义", command=self._edit_selected_app)
         menu.add_command(label="复制 APP ID", command=self._copy_selected_app_id)
@@ -667,7 +790,9 @@ class GuiAgentDesktopClient(tk.Tk):
         self.refresh_composer()
 
     def _on_inspector_select(self, _event: tk.Event[Any]) -> None:
-        selected = self._selected_tree_iid(self.inspector_tree)
+        return
+
+    def _select_inspector_item(self, selected: str) -> None:
         if not selected:
             return
         config = self._selected_config()

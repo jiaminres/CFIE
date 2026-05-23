@@ -2865,6 +2865,24 @@ Product rules captured:
 - Advanced controls such as macros belong in settings unless they are needed in
   the immediate workflow.
 
+## Implementation Round 21
+
+Date: 2026-05-24
+
+Codex-style polish pass:
+
+- Removed the remaining native list/table feel from the main workbench.
+- Replaced the left APP `Listbox` with card-like conversation rows.
+- Replaced the right inspector `Treeview` with card-like event records.
+- Kept native table widgets only inside configuration dialogs where dense
+  editing is acceptable.
+- The main surface now follows the intended layout:
+  - left APP/workspace list;
+  - center chat-like interaction history and composer;
+  - right collapsible inspector.
+- A pending human request now changes the bottom composer into a handling input
+  for that APP. Otherwise the composer records/sends normal manager input.
+
 ## Future Implementation Checklist
 
 Task orchestration:
