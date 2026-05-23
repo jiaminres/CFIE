@@ -2747,6 +2747,64 @@ Verification:
 passed
 ```
 
+## Implementation Round 18
+
+Date: 2026-05-24
+
+Desktop client direction:
+
+- The main GUI Agent client should be a Windows desktop client, not the browser
+  debug console.
+- The browser console remains useful only as a low-level human-loop API smoke
+  test.
+- The desktop client is designed for Chinese users and centers on:
+  - one Target APP mapped to one JOB;
+  - APP task description text;
+  - reference images/videos cited from text, for example `[image:map_main]`;
+  - continuous key-control macros with model-facing descriptions;
+  - model execution trace, including prompt visual context, reasoning text,
+    output text, and tool results;
+  - JOB/Subtask queue visibility;
+  - blocked Subtask human intervention.
+
+Added desktop client module:
+
+```powershell
+..\.venv\Scripts\python.exe -m cfie_gui_agent.desktop_client
+```
+
+Human intervention form:
+
+- A structured human reply contains:
+  - handling type;
+  - direct command;
+  - manager input text;
+  - extra constraints.
+- Direct command is a separate field, so the model/harness does not need to
+  infer path changes only from free text.
+
+Initial direct commands:
+
+```text
+none
+continue
+do_not_reply
+change_path
+pause_job
+cancel_subtask
+mark_complete
+```
+
+Example:
+
+```text
+direct_command=do_not_reply
+manager_input=不要回复这个卖家，切换到下一个可处理会话。
+```
+
+This supports the user case where the manager wants to change the operation
+path rather than merely provide missing text.
+
 ## Future Implementation Checklist
 
 Task orchestration:

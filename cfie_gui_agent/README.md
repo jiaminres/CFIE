@@ -90,12 +90,30 @@ navigation request.
 
 ## Human Input Console
 
+The recommended local client is the Windows desktop client:
+
+```powershell
+..\.venv\Scripts\python.exe -m cfie_gui_agent.desktop_client
+```
+
+It provides:
+
+- APP + JOB configuration;
+- task descriptions with image/video citations such as `[image:map_main]`;
+- reference image/video registration;
+- model execution trace inspection;
+- JOB and Subtask queue inspection;
+- structured human input for blocked Subtasks;
+- direct command choices such as "do not reply", "change path", and
+  "pause current JOB";
+- continuous key-control macro registration with model-facing descriptions.
+
 When a Subtask is blocked and requires a manager decision, all human channels
 share the same `HumanLoopManager` request state. The local client console can
 claim and answer a request; once claimed or resolved, another channel cannot
 answer the same request.
 
-Run the local console:
+The browser console remains a low-level debugging fallback:
 
 ```powershell
 ..\.venv\Scripts\python.exe -m cfie_gui_agent.console --host 127.0.0.1 --port 8765
