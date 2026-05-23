@@ -33,6 +33,8 @@ def test_desktop_state_registers_macro_for_context_payload():
             name="quick_reply",
             description="Select all text and type a shortcut marker.",
             sequence="CTRL+A, B",
+            scope="app",
+            app_id="app_shop",
         )
     )
 
@@ -40,6 +42,8 @@ def test_desktop_state_registers_macro_for_context_payload():
 
     assert payload["macros"][0]["name"] == "quick_reply"
     assert payload["macros"][0]["metadata"]["sequence"] == "CTRL+A, B"
+    assert payload["macros"][0]["metadata"]["scope"] == "app"
+    assert payload["macros"][0]["metadata"]["app_id"] == "app_shop"
 
 
 def test_structured_human_reply_preserves_direct_command():

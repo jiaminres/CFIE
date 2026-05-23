@@ -2677,6 +2677,11 @@ If the local client claims a request, an external channel reply for the same
 request is ignored. If another source has claimed it, the local client cannot
 submit until the request is released.
 
+Product-facing rule added later: this synchronization state must not be exposed
+as manager-facing "claim/release" controls in the main client. The UI should
+show business states such as pending, processing, and resolved; channel locking
+remains an internal consistency mechanism.
+
 Added shared-state APIs:
 
 - `HumanLoopManager.list_requests()`;
@@ -2707,10 +2712,9 @@ POST /api/human/requests/{request_id}/reply
 Browser console:
 
 - request list;
-- request status and claimant;
+- request status;
 - manager text input;
-- claim / release / submit buttons;
-- raw shared state panel.
+- submit button.
 
 Embedding rule:
 
@@ -2824,6 +2828,37 @@ Cleaned up:
 - removed browser console request-creation endpoint;
 - removed browser console request-creation button;
 - updated tests to create requests by direct state injection.
+
+## Implementation Round 20
+
+Date: 2026-05-24
+
+Desktop client redesign:
+
+- Reworked the desktop client from a tabbed engineering console into a single
+  production workbench.
+- Left side now behaves like an APP/workspace list, similar to a chat session
+  selector.
+- APP configuration moved into a modal editor from the selected APP area.
+- Global and per-APP action macros moved into the settings dialog.
+- The main area shows the selected APP summary, task description, referenced
+  image/video assets, execution trace, and current JOB queues together.
+- The right side is only for business-facing human intervention.
+- Removed manager-facing claim/release controls; synchronization remains an
+  internal channel consistency mechanism.
+- Execution trace detail is rendered as readable key/value text instead of raw
+  JSON.
+- The color direction was adjusted toward a brighter blue/mint workbench rather
+  than a gray engineering panel.
+
+Product rules captured:
+
+- The user should not need to understand `HumanLoopManager`, claim ownership, or
+  channel locking.
+- The user should see "what app am I configuring", "what is the agent doing",
+  "what is blocked", and "what input should I provide".
+- Advanced controls such as macros belong in settings unless they are needed in
+  the immediate workflow.
 
 ## Future Implementation Checklist
 

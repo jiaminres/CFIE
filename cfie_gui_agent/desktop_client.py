@@ -85,12 +85,16 @@ class MacroConfig:
     name: str
     description: str
     sequence: str
+    scope: str = "global"
+    app_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
             "sequence": self.sequence,
+            "scope": self.scope,
+            "app_id": self.app_id,
         }
 
 
@@ -141,7 +145,11 @@ class DesktopClientState:
             name=macro_config.name.strip(),
             description=macro_config.description.strip(),
             steps=steps,
-            metadata={"sequence": macro_config.sequence},
+            metadata={
+                "sequence": macro_config.sequence,
+                "scope": macro_config.scope,
+                "app_id": macro_config.app_id,
+            },
         )
         self.action_macros.register(macro)
         return macro

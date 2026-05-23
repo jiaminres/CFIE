@@ -88,7 +88,7 @@ target coordinates plus obstacle polygons. The harness owns the route planning,
 real-time tracking, retry, and stop condition; model output is only the semantic
 navigation request.
 
-## Human Input Console
+## Desktop Client
 
 The recommended local client is the Windows desktop client:
 
@@ -109,9 +109,9 @@ It provides:
 - continuous key-control macro registration with model-facing descriptions.
 
 When a Subtask is blocked and requires a manager decision, all human channels
-share the same `HumanLoopManager` request state. The local client console can
-claim and answer a request; once claimed or resolved, another channel cannot
-answer the same request.
+share the same `HumanLoopManager` request state. The desktop client shows the
+current business question and lets the manager submit structured input or a
+direct command. Channel synchronization is handled internally.
 
 The browser console remains a low-level debugging fallback:
 
@@ -128,8 +128,6 @@ http://127.0.0.1:8765/
 Current console features:
 
 - list active and completed human requests;
-- claim a pending request from the local client;
-- release a claim;
 - submit a manager reply;
 - inspect the shared urgent queue payload.
 

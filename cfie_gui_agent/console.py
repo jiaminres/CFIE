@@ -344,12 +344,11 @@ _HTML = r"""<!doctype html>
   <main>
     <section class="list" id="requests"></section>
     <aside class="panel">
-      <p class="side-title">共享状态</p>
+      <p class="side-title">处理说明</p>
       <div class="meta">
-        客户端和后续微信等 channel 使用同一个 HumanLoopManager。
-        请求被某一端认领后，其他端不能提交回复。
+        这里是低层备用入口。正常使用请打开 Windows 桌面客户端。
+        请求状态会在各渠道间自动同步，用户只需要提交业务回复。
       </div>
-      <pre id="raw"></pre>
     </aside>
   </main>
   <script>
@@ -365,7 +364,6 @@ _HTML = r"""<!doctype html>
 
     async function refresh() {
       const payload = await api("/api/human/requests?include_completed=1");
-      document.getElementById("raw").textContent = JSON.stringify(payload, null, 2);
       const root = document.getElementById("requests");
       root.innerHTML = "";
       const active = payload.requests.filter(item => item.status !== "resolved");
@@ -393,30 +391,16 @@ _HTML = r"""<!doctype html>
               urgency=${escapeHtml(request.urgency || "normal")}
             </div>
           </div>
-          <span class="badge">${escapeHtml(item.status)}${claimedBy ? " · " + escapeHtml(claimedBy) : ""}</span>
+          <span class="badge">${escapeHtml(statusLabel(item.status))}</span>
         </div>
         ${request.risk_reason ? `<div class="meta">风险：${escapeHtml(request.risk_reason)}</div>` : ""}
         ${request.proposed_action ? `<div class="meta">建议动作：${escapeHtml(request.proposed_action)}</div>` : ""}
         <textarea placeholder="输入给 Agent 的人工指令或回复" ${locked ? "disabled" : ""}></textarea>
         <div class="actions">
-          <button onclick="claim('${request.request_id}')" ${item.status === "claimed" ? "disabled" : ""}>认领</button>
-          <button onclick="releaseReq('${request.request_id}')" ${!isClaimedByClient ? "disabled" : ""}>释放</button>
           <button class="primary" onclick="reply('${request.request_id}', this)" ${locked ? "disabled" : ""}>提交回复</button>
         </div>
       `;
       return div;
-    }
-
-    async function claim(id) {
-      try { await api(`/api/human/requests/${id}/claim`, { method: "POST", body: "{}" }); }
-      catch (err) { alert(err.message); }
-      await refresh();
-    }
-
-    async function releaseReq(id) {
-      try { await api(`/api/human/requests/${id}/release`, { method: "POST", body: "{}" }); }
-      catch (err) { alert(err.message); }
-      await refresh();
     }
 
     async function reply(id, button) {
@@ -437,6 +421,15 @@ _HTML = r"""<!doctype html>
       return String(value).replace(/[&<>"']/g, ch => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
       }[ch]));
+    }
+
+    function statusLabel(status) {
+      return {
+        pending: "待处理",
+        claimed: "处理中",
+        resolved: "已处理",
+        cancelled: "已取消",
+      }[status] || status;
     }
 
     refresh();
