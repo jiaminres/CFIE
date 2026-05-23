@@ -86,12 +86,20 @@ def create_default_backend() -> ComputerBackend:
 
 
 class ComputerExecutor:
-    def __init__(self, backend: ComputerBackend | None = None) -> None:
+    def __init__(
+        self,
+        backend: ComputerBackend | None = None,
+        *,
+        action_delay_seconds: float = 0.05,
+    ) -> None:
         self.backend = backend if backend is not None else create_default_backend()
+        self.action_delay_seconds = max(0.0, action_delay_seconds)
 
     def execute_all(self, actions: tuple[ComputerAction, ...]) -> None:
         for action in actions:
             self.execute(action)
+            if self.action_delay_seconds:
+                time.sleep(self.action_delay_seconds)
 
     def execute(self, action: ComputerAction) -> None:
         if action.type == "click":
@@ -148,7 +156,7 @@ class ComputerExecutor:
             return
 
         if action.type == "wait":
-            self.backend.wait(2.0)
+            self.backend.wait(action.duration if action.duration is not None else 1.0)
             return
 
         if action.type == "screenshot":

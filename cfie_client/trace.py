@@ -163,4 +163,10 @@ def _suffix_for_mime_type(mime_type: str) -> str:
         return ".jpg"
     if mime_type == "image/webp":
         return ".webp"
+    if mime_type == "video/mp4":
+        return ".mp4"
+    if mime_type == "video/webm":
+        return ".webm"
+    if mime_type == "video/jpeg":
+        return ".videojpeg"
     return ".bin"

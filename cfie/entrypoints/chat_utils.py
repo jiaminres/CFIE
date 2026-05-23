@@ -159,6 +159,31 @@ class ChatCompletionContentPartVideoParam(TypedDict, total=False):
     """The type of the content part."""
 
 
+class ResponsesInputVideoParam(TypedDict, total=False):
+    video_url: str | VideoURL | None
+    """
+    The URL of the video to be sent to the model.
+
+    It can be a fully qualified URL, a local file URL accepted by the configured
+    media connector, or a base64 encoded video in a data URL.
+    """
+
+    file_id: str | None
+    """
+    Accepted at validation time for protocol compatibility. CFIE currently
+    resolves video inputs from `video_url`.
+    """
+
+    type: Required[Literal["input_video"]]
+    """The type of the Responses content part."""
+
+    uuid: str | None
+    """
+    User-provided UUID of a media. User must guarantee that it is properly
+    generated and unique for different medias.
+    """
+
+
 class PILImage(BaseModel):
     """
     A PIL.Image.Image object.
@@ -1250,7 +1275,24 @@ _AudioParser = TypeAdapter(ChatCompletionContentPartAudioParam).validate_python
 _VideoParser = TypeAdapter(ChatCompletionContentPartVideoParam).validate_python
 
 _ResponsesInputImageParser = TypeAdapter(ResponseInputImageParam).validate_python
+_ResponsesInputVideoParser = TypeAdapter(ResponsesInputVideoParam).validate_python
 _ContentPart: TypeAlias = str | dict[str, str] | InputAudio | PILImage
+
+
+def _parse_responses_input_video_url(
+    part: ChatCompletionContentPartParam,
+) -> str | None:
+    parsed = _ResponsesInputVideoParser(part)
+    video_url = parsed.get("video_url", None)
+    if isinstance(video_url, dict):
+        video_url = video_url.get("url", None)
+    if video_url is None and parsed.get("file_id"):
+        raise ValueError(
+            "Responses input_video.file_id is not supported yet; pass "
+            "input_video.video_url as a URL, local file URL, or data URL."
+        )
+    return video_url
+
 
 # Define a mapping from part types to their corresponding parsing functions.
 MM_PARSER_MAP: dict[
@@ -1262,6 +1304,7 @@ MM_PARSER_MAP: dict[
     "input_text": lambda part: _TextParser(part).get("text", None),
     "output_text": lambda part: _TextParser(part).get("text", None),
     "input_image": lambda part: _ResponsesInputImageParser(part).get("image_url", None),
+    "input_video": _parse_responses_input_video_url,
     "image_url": lambda part: _ImageParser(part).get("image_url", {}).get("url", None),
     "image_embeds": lambda part: _ImageEmbedsParser(part).get("image_embeds", None),
     "audio_embeds": lambda part: _AudioEmbedsParser(part).get("audio_embeds", None),
@@ -1482,7 +1525,7 @@ def _parse_chat_message_content_part(
         dict_content = cast(InputAudio, content)
         mm_parser.parse_input_audio(dict_content, uuid)
         modality = "audio"
-    elif part_type == "video_url":
+    elif part_type in ("video_url", "input_video"):
         str_content = cast(str, content)
         mm_parser.parse_video(str_content, uuid)
         modality = "video"

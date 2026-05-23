@@ -47,10 +47,23 @@ def _require_int(value: Any, field_name: str) -> int:
         raise ProtocolError(f"{field_name} must be an integer") from exc
 
 
+def _require_float(value: Any, field_name: str) -> float:
+    if value is None:
+        raise ProtocolError(f"{field_name} is required")
+    if isinstance(value, bool):
+        raise ProtocolError(f"{field_name} must be a number")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(f"{field_name} must be a number") from exc
+
+
 def _normalize_keys(value: Any) -> tuple[str, ...]:
     if value is None:
         return ()
     if isinstance(value, str):
+        if "+" in value:
+            return tuple(part for part in value.split("+") if part)
         return (value,)
     try:
         return tuple(str(item) for item in value)
@@ -92,6 +105,7 @@ class ComputerAction:
     path: tuple[tuple[int, int], ...] = ()
     scroll_x: int = 0
     scroll_y: int = 0
+    duration: float | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -108,6 +122,11 @@ class ComputerAction:
         path = ()
         scroll_x = _read_field(value, "scroll_x", _read_field(value, "scrollX", 0))
         scroll_y = _read_field(value, "scroll_y", _read_field(value, "scrollY", 0))
+        duration = _read_field(
+            value,
+            "seconds",
+            _read_field(value, "duration", _read_field(value, "timeout", None)),
+        )
 
         if action_type in {"click", "double_click", "move", "scroll"}:
             x = _require_int(x, "x")
@@ -138,6 +157,13 @@ class ComputerAction:
                 raise ProtocolError("type action requires text")
             text = str(text)
 
+        if action_type == "wait" and duration is not None:
+            duration = _require_float(duration, "seconds")
+            if duration < 0:
+                raise ProtocolError("seconds must be non-negative")
+        else:
+            duration = None
+
         return cls(
             type=action_type,
             x=x,
@@ -148,6 +174,7 @@ class ComputerAction:
             path=path,
             scroll_x=_require_int(scroll_x, "scrollX"),
             scroll_y=_require_int(scroll_y, "scrollY"),
+            duration=duration,
             raw=dict(value) if isinstance(value, dict) else {},
         )
 
@@ -168,6 +195,8 @@ class ComputerAction:
         if self.type == "scroll":
             payload["scroll_x"] = self.scroll_x
             payload["scroll_y"] = self.scroll_y
+        if self.type == "wait" and self.duration is not None:
+            payload["seconds"] = self.duration
         return payload
 
     @property
@@ -201,6 +230,8 @@ class ComputerCall:
         if actions_raw is None:
             action_raw = _read_field(value, "action")
             actions_raw = [] if action_raw is None else [action_raw]
+        elif isinstance(actions_raw, dict):
+            actions_raw = [actions_raw]
 
         actions = tuple(ComputerAction.from_openai(action) for action in actions_raw)
         pending = tuple(

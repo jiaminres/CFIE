@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
@@ -37,25 +38,87 @@ for _index in range(1, 13):
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 
 
-class KEYBDINPUT(ctypes.Structure):
+class MOUSEINPUT(ctypes.Structure):
     _fields_ = [
-        ("wVk", ctypes.c_ushort),
-        ("wScan", ctypes.c_ushort),
-        ("dwFlags", ctypes.c_ulong),
-        ("time", ctypes.c_ulong),
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
         ("dwExtraInfo", ULONG_PTR),
     ]
 
 
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
 class INPUTUNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT)]
+    _fields_ = [
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
 
 
 class INPUT(ctypes.Structure):
+    _anonymous_ = ("union",)
     _fields_ = [
-        ("type", ctypes.c_ulong),
+        ("type", wintypes.DWORD),
         ("union", INPUTUNION),
     ]
+
+
+_USER32 = None
+
+
+def _user32():
+    global _USER32
+    if _USER32 is None:
+        _USER32 = ctypes.WinDLL("user32", use_last_error=True)
+        _USER32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+        _USER32.SendInput.restype = wintypes.UINT
+        _USER32.VkKeyScanW.argtypes = (wintypes.WCHAR,)
+        _USER32.VkKeyScanW.restype = ctypes.c_short
+        _USER32.keybd_event.argtypes = (
+            wintypes.BYTE,
+            wintypes.BYTE,
+            wintypes.DWORD,
+            ULONG_PTR,
+        )
+        _USER32.keybd_event.restype = None
+    return _USER32
+
+
+def _send_keyboard_inputs(inputs: tuple[KEYBDINPUT, ...]) -> None:
+    array_type = INPUT * len(inputs)
+    array = array_type(
+        *[
+            INPUT(
+                type=INPUT_KEYBOARD,
+                union=INPUTUNION(ki=input_),
+            )
+            for input_ in inputs
+        ]
+    )
+    sent = _user32().SendInput(len(array), array, ctypes.sizeof(INPUT))
+    if sent != len(array):
+        error = ctypes.get_last_error()
+        raise OSError(error, f"SendInput sent {sent}/{len(array)} keyboard events")
 
 
 def _vk_for_key(key: str) -> int:
@@ -63,18 +126,18 @@ def _vk_for_key(key: str) -> int:
     if normalized in _KEYS:
         return _KEYS[normalized]
     if len(key) == 1:
-        vk = ctypes.windll.user32.VkKeyScanW(ord(key)) & 0xFF
+        vk = _user32().VkKeyScanW(key) & 0xFF
         if vk:
             return int(vk)
     raise ValueError(f"Unsupported key: {key}")
 
 
 def key_down(key: str) -> None:
-    ctypes.windll.user32.keybd_event(_vk_for_key(key), 0, 0, 0)
+    _user32().keybd_event(_vk_for_key(key), 0, 0, 0)
 
 
 def key_up(key: str) -> None:
-    ctypes.windll.user32.keybd_event(_vk_for_key(key), 0, KEYEVENTF_KEYUP, 0)
+    _user32().keybd_event(_vk_for_key(key), 0, KEYEVENTF_KEYUP, 0)
 
 
 def press_keys(keys: tuple[str, ...]) -> None:
@@ -97,24 +160,9 @@ def press_keys(keys: tuple[str, ...]) -> None:
 def type_text(text: str) -> None:
     for char in text:
         code = ord(char)
-        inputs = (INPUT * 2)(
-            INPUT(
-                type=INPUT_KEYBOARD,
-                union=INPUTUNION(
-                    ki=KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0),
-                ),
-            ),
-            INPUT(
-                type=INPUT_KEYBOARD,
-                union=INPUTUNION(
-                    ki=KEYBDINPUT(
-                        0,
-                        code,
-                        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                        0,
-                        0,
-                    ),
-                ),
+        _send_keyboard_inputs(
+            (
+                KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0),
+                KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0),
             ),
         )
-        ctypes.windll.user32.SendInput(2, ctypes.byref(inputs), ctypes.sizeof(INPUT))

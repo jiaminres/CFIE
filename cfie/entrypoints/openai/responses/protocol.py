@@ -17,6 +17,9 @@ from openai.types.responses import (
     ResponseContentPartDoneEvent,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
+    ResponseInputFileParam,
+    ResponseInputImageParam,
+    ResponseInputTextParam,
     ResponseMcpCallArgumentsDeltaEvent,
     ResponseMcpCallArgumentsDoneEvent,
     ResponseMcpCallCompletedEvent,
@@ -41,6 +44,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.tool import Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
+from typing_extensions import Required, TypedDict
 
 # Backward compatibility for OpenAI client versions
 try:  # For older openai versions (< 1.100.0)
@@ -137,7 +141,50 @@ class ResponseRawMessageAndToken(OpenAIBaseModel):
 ResponseInputOutputMessage: TypeAlias = (
     list[ChatCompletionMessageParam] | list[ResponseRawMessageAndToken]
 )
-ResponseInputOutputItem: TypeAlias = ResponseInputItemParam | ResponseOutputItem
+
+
+class ResponsesInputVideoParam(TypedDict, total=False):
+    video_url: str | dict[str, str] | None
+    """URL, local file URL, or base64 data URL for a video input."""
+
+    file_id: str | None
+    """Reserved for protocol compatibility; CFIE resolves videos by URL."""
+
+    type: Required[Literal["input_video"]]
+    """The type of the Responses content part."""
+
+    uuid: str | None
+    """Optional caller-provided media UUID."""
+
+
+ResponsesInputContentParam: TypeAlias = (
+    ResponseInputTextParam
+    | ResponseInputImageParam
+    | ResponseInputFileParam
+    | ResponsesInputVideoParam
+)
+
+
+class CFIEResponseInputMessageParam(TypedDict, total=False):
+    content: Required[str | list[ResponsesInputContentParam]]
+    """Text and multimodal content passed to the model."""
+
+    role: Required[Literal["user", "assistant", "system", "developer"]]
+    """The role of the message input."""
+
+    phase: Literal["commentary", "final_answer"] | None
+    """Optional Responses assistant phase."""
+
+    status: Literal["in_progress", "completed", "incomplete"]
+    """Optional status for previous message items."""
+
+    type: Literal["message"]
+    """The type of the message input."""
+
+
+ResponseInputOutputItem: TypeAlias = (
+    ResponseInputItemParam | CFIEResponseInputMessageParam | ResponseOutputItem
+)
 
 
 class ResponsesRequest(OpenAIBaseModel):

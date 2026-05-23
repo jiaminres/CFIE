@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import ctypes
+import sys
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Protocol
@@ -37,5 +39,11 @@ class PillowScreenCapture:
         )
 
     def size(self) -> tuple[int, int]:
+        if sys.platform == "win32":
+            user32 = ctypes.windll.user32
+            return (
+                int(user32.GetSystemMetrics(0)),
+                int(user32.GetSystemMetrics(1)),
+            )
         image = ImageGrab.grab()
         return image.size
