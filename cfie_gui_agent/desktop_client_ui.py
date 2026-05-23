@@ -21,27 +21,27 @@ class GuiAgentDesktopClient(tk.Tk):
         super().__init__()
         self.state = state
         self.title("CFIE GUI Agent")
-        self.geometry("1320x840")
-        self.minsize(1180, 760)
+        self.geometry("1440x860")
+        self.minsize(1180, 720)
 
         self.colors = {
-            "bg": "#f4f7fb",
+            "bg": "#fbfaf8",
+            "sidebar": "#f4f0ec",
+            "sidebar_hover": "#ece7e2",
             "surface": "#ffffff",
-            "surface_soft": "#f8fbff",
-            "ink": "#142033",
-            "muted": "#64748b",
-            "line": "#d9e3f1",
-            "brand": "#2f6df6",
-            "brand_dark": "#1e4fd1",
-            "mint": "#1fbf9a",
-            "amber": "#f59e0b",
-            "purple": "#7c3aed",
-            "sidebar": "#102033",
-            "sidebar_soft": "#172a44",
+            "surface_soft": "#f7f8fb",
+            "ink": "#24272f",
+            "muted": "#7d8592",
+            "line": "#e5e7eb",
+            "brand": "#2563eb",
+            "brand_soft": "#eaf1ff",
+            "accent": "#ff7a45",
+            "success": "#12a87d",
         }
 
         self.selected_app_id = tk.StringVar(value=self._first_app_id())
         self.selected_request_id = tk.StringVar(value="")
+        self.inspector_visible = tk.BooleanVar(value=True)
         self.direct_command_label = tk.StringVar(
             value=DIRECT_COMMAND_LABELS[DIRECT_COMMAND_NONE]
         )
@@ -59,10 +59,10 @@ class GuiAgentDesktopClient(tk.Tk):
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TFrame", background=self.colors["bg"])
-        style.configure("Card.TFrame", background=self.colors["surface"])
-        style.configure("Soft.TFrame", background=self.colors["surface_soft"])
+        style.configure("Root.TFrame", background=self.colors["bg"])
         style.configure("Sidebar.TFrame", background=self.colors["sidebar"])
+        style.configure("Surface.TFrame", background=self.colors["surface"])
+        style.configure("Soft.TFrame", background=self.colors["surface_soft"])
         style.configure(
             "Title.TLabel",
             background=self.colors["surface"],
@@ -73,13 +73,7 @@ class GuiAgentDesktopClient(tk.Tk):
             "Section.TLabel",
             background=self.colors["surface"],
             foreground=self.colors["ink"],
-            font=("Microsoft YaHei UI", 11, "bold"),
-        )
-        style.configure(
-            "Body.TLabel",
-            background=self.colors["surface"],
-            foreground=self.colors["ink"],
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 10, "bold"),
         )
         style.configure(
             "Hint.TLabel",
@@ -90,298 +84,224 @@ class GuiAgentDesktopClient(tk.Tk):
         style.configure(
             "SidebarTitle.TLabel",
             background=self.colors["sidebar"],
-            foreground="#ffffff",
-            font=("Microsoft YaHei UI", 15, "bold"),
+            foreground=self.colors["ink"],
+            font=("Microsoft YaHei UI", 13, "bold"),
         )
         style.configure(
             "SidebarHint.TLabel",
             background=self.colors["sidebar"],
-            foreground="#a9b8ce",
+            foreground=self.colors["muted"],
             font=("Microsoft YaHei UI", 9),
         )
-        style.configure(
-            "Metric.TLabel",
-            background=self.colors["surface_soft"],
-            foreground=self.colors["ink"],
-            font=("Microsoft YaHei UI", 12, "bold"),
-        )
-        style.configure("TButton", font=("Microsoft YaHei UI", 9), padding=(12, 7))
         style.configure(
             "Primary.TButton",
             font=("Microsoft YaHei UI", 9, "bold"),
             foreground="#ffffff",
             background=self.colors["brand"],
             bordercolor=self.colors["brand"],
+            padding=(12, 7),
         )
-        style.map(
-            "Primary.TButton",
-            background=[("active", self.colors["brand_dark"])],
-        )
-        style.configure(
-            "Ghost.TButton",
-            font=("Microsoft YaHei UI", 9),
-            foreground=self.colors["ink"],
-            background="#eef4ff",
-            bordercolor="#c8d8ff",
-        )
+        style.map("Primary.TButton", background=[("active", "#1d4ed8")])
+        style.configure("TButton", font=("Microsoft YaHei UI", 9), padding=(10, 6))
         style.configure("Treeview", rowheight=28, font=("Microsoft YaHei UI", 9))
-        style.configure(
-            "Treeview.Heading",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            background="#eef2f7",
-        )
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
 
     def _build_layout(self) -> None:
         self.columnconfigure(1, weight=1)
-        self.columnconfigure(2, minsize=360)
         self.rowconfigure(0, weight=1)
-
         self._build_sidebar()
-        self._build_workspace()
-        self._build_human_panel()
+        self._build_chat_area()
+        self._build_inspector()
 
     def _build_sidebar(self) -> None:
-        sidebar = ttk.Frame(self, style="Sidebar.TFrame", padding=(16, 18))
+        sidebar = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 14))
         sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.rowconfigure(3, weight=1)
+        sidebar.rowconfigure(4, weight=1)
 
-        ttk.Label(sidebar, text="CFIE Agent", style="SidebarTitle.TLabel").grid(
+        top = ttk.Frame(sidebar, style="Sidebar.TFrame")
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=1)
+        ttk.Label(top, text="CFIE", style="SidebarTitle.TLabel").grid(
             row=0, column=0, sticky="w"
         )
+        ttk.Button(top, text="+", width=3, command=self._add_app_dialog).grid(
+            row=0, column=1, sticky="e"
+        )
+
         ttk.Label(
             sidebar,
-            text="本地自动化工作台",
+            text="应用会话",
             style="SidebarHint.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 18))
-
-        action_bar = ttk.Frame(sidebar, style="Sidebar.TFrame")
-        action_bar.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        action_bar.columnconfigure(0, weight=1)
-        action_bar.columnconfigure(1, weight=1)
-        ttk.Button(
-            action_bar,
-            text="新建 APP",
-            style="Primary.TButton",
-            command=self._add_app_dialog,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        ttk.Button(
-            action_bar,
-            text="设置",
-            command=self._open_settings,
-        ).grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        ).grid(row=1, column=0, sticky="w", pady=(18, 6))
+        self.search_entry = ttk.Entry(sidebar)
+        self.search_entry.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.search_entry.insert(0, "搜索 APP")
+        self.search_entry.bind("<FocusIn>", self._clear_search_placeholder)
 
         self.app_listbox = tk.Listbox(
             sidebar,
             width=30,
             activestyle="none",
-            bg=self.colors["sidebar_soft"],
-            fg="#eff6ff",
-            selectbackground=self.colors["brand"],
-            selectforeground="#ffffff",
+            bg=self.colors["sidebar"],
+            fg=self.colors["ink"],
+            selectbackground=self.colors["sidebar_hover"],
+            selectforeground=self.colors["ink"],
             relief="flat",
-            highlightthickness=1,
-            highlightbackground="#27415f",
+            highlightthickness=0,
             borderwidth=0,
             font=("Microsoft YaHei UI", 10),
         )
-        self.app_listbox.grid(row=3, column=0, sticky="nsew")
+        self.app_listbox.grid(row=4, column=0, sticky="nsew")
         self.app_listbox.bind("<<ListboxSelect>>", self._on_app_select)
+        self.app_listbox.bind("<Button-3>", self._show_app_menu)
 
-        self.status_text = tk.StringVar(value="生产模式：等待接入任务")
+        bottom = ttk.Frame(sidebar, style="Sidebar.TFrame")
+        bottom.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        bottom.columnconfigure(0, weight=1)
+        ttk.Button(bottom, text="设置", command=self._open_settings).grid(
+            row=0, column=0, sticky="ew"
+        )
+        self.status_text = tk.StringVar(value="生产模式")
         ttk.Label(
-            sidebar,
+            bottom,
             textvariable=self.status_text,
             style="SidebarHint.TLabel",
-            wraplength=220,
-        ).grid(row=4, column=0, sticky="ew", pady=(16, 0))
+            wraplength=230,
+        ).grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
-    def _build_workspace(self) -> None:
-        main = ttk.Frame(self, padding=(14, 14))
-        main.grid(row=0, column=1, sticky="nsew")
-        main.columnconfigure(0, weight=1)
-        main.rowconfigure(2, weight=1)
+    def _build_chat_area(self) -> None:
+        self.chat_frame = ttk.Frame(self, style="Surface.TFrame")
+        self.chat_frame.grid(row=0, column=1, sticky="nsew")
+        self.chat_frame.columnconfigure(0, weight=1)
+        self.chat_frame.rowconfigure(1, weight=1)
 
-        self.app_header = ttk.Frame(main, style="Card.TFrame", padding=16)
-        self.app_header.grid(row=0, column=0, sticky="ew")
-        self.app_header.columnconfigure(0, weight=1)
-        self.app_title = ttk.Label(
-            self.app_header,
-            text="未选择 APP",
-            style="Title.TLabel",
-        )
+        header = ttk.Frame(self.chat_frame, style="Surface.TFrame", padding=(18, 12))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        self.app_title = ttk.Label(header, text="未选择 APP", style="Title.TLabel")
         self.app_title.grid(row=0, column=0, sticky="w")
         self.app_subtitle = ttk.Label(
-            self.app_header,
-            text="从左侧新建或选择一个应用",
+            header,
+            text="左侧新建或选择应用",
             style="Hint.TLabel",
         )
-        self.app_subtitle.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.app_subtitle.grid(row=1, column=0, sticky="w", pady=(3, 0))
         ttk.Button(
-            self.app_header,
-            text="编辑任务配置",
-            style="Ghost.TButton",
+            header,
+            text="任务定义",
             command=self._edit_selected_app,
-        ).grid(row=0, column=1, rowspan=2, sticky="e")
+        ).grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
+        ttk.Button(
+            header,
+            text="检查器",
+            command=self._toggle_inspector,
+        ).grid(row=0, column=2, rowspan=2, sticky="e", padx=(8, 0))
 
-        metrics = ttk.Frame(main, style="Card.TFrame", padding=14)
-        metrics.grid(row=1, column=0, sticky="ew", pady=(12, 12))
-        for index in range(4):
-            metrics.columnconfigure(index, weight=1)
-        self.metric_jobs = self._metric(metrics, 0, "JOB", "0")
-        self.metric_waiting = self._metric(metrics, 1, "待人工", "0")
-        self.metric_running = self._metric(metrics, 2, "运行中", "0")
-        self.metric_macros = self._metric(metrics, 3, "可用宏", "0")
+        canvas_holder = ttk.Frame(self.chat_frame, style="Surface.TFrame")
+        canvas_holder.grid(row=1, column=0, sticky="nsew")
+        canvas_holder.columnconfigure(0, weight=1)
+        canvas_holder.rowconfigure(0, weight=1)
 
-        body = ttk.Frame(main)
-        body.grid(row=2, column=0, sticky="nsew")
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=2)
-        body.rowconfigure(0, weight=1)
-
-        overview = ttk.Frame(body, style="Card.TFrame", padding=16)
-        overview.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        overview.columnconfigure(0, weight=1)
-        overview.rowconfigure(2, weight=1)
-        ttk.Label(overview, text="任务说明", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w"
+        self.chat_canvas = tk.Canvas(
+            canvas_holder,
+            bg=self.colors["surface"],
+            highlightthickness=0,
         )
+        self.chat_canvas.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(
+            canvas_holder,
+            orient="vertical",
+            command=self.chat_canvas.yview,
+        )
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.chat_canvas.configure(yscrollcommand=scroll.set)
+        self.messages_frame = ttk.Frame(self.chat_canvas, style="Surface.TFrame")
+        self.messages_window = self.chat_canvas.create_window(
+            (0, 0),
+            window=self.messages_frame,
+            anchor="nw",
+        )
+        self.messages_frame.bind("<Configure>", self._on_messages_configure)
+        self.chat_canvas.bind("<Configure>", self._on_canvas_configure)
+
+        composer = ttk.Frame(self.chat_frame, style="Surface.TFrame", padding=(18, 12))
+        composer.grid(row=2, column=0, sticky="ew")
+        composer.columnconfigure(0, weight=1)
+        composer.columnconfigure(1, weight=0)
+        self.composer_mode_text = tk.StringVar(value="向当前 APP 发送输入")
+        self.send_button_text = tk.StringVar(value="发送给 Agent")
+        toolbar = ttk.Frame(composer, style="Surface.TFrame")
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        toolbar.columnconfigure(0, weight=1)
         ttk.Label(
-            overview,
-            text="文字描述、规则约束和图片/视频引用会共同组成模型上下文。",
+            toolbar,
+            textvariable=self.composer_mode_text,
             style="Hint.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 8))
-        self.description_view = tk.Text(
-            overview,
-            wrap="word",
-            bg=self.colors["surface_soft"],
-            fg=self.colors["ink"],
-            relief="flat",
-            padx=12,
-            pady=10,
-            font=("Microsoft YaHei UI", 10),
+        ).grid(row=0, column=0, sticky="w")
+        self.direct_command_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.direct_command_label,
+            values=tuple(DIRECT_COMMAND_LABELS.values()),
+            state="readonly",
+            width=18,
         )
-        self.description_view.grid(row=2, column=0, sticky="nsew")
-        self.description_view.configure(state="disabled")
-
-        refs = ttk.Frame(overview, style="Card.TFrame")
-        refs.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        refs.columnconfigure(0, weight=1)
-        ttk.Label(refs, text="素材引用", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        self.reference_list = tk.Listbox(
-            refs,
+        self.direct_command_combo.grid(row=0, column=1, sticky="e")
+        self.composer_text = tk.Text(
+            composer,
             height=4,
-            bg="#ffffff",
-            fg=self.colors["ink"],
+            wrap="word",
             relief="solid",
             borderwidth=1,
-            highlightthickness=0,
-            font=("Microsoft YaHei UI", 9),
+            bg="#ffffff",
+            fg=self.colors["ink"],
+            font=("Microsoft YaHei UI", 10),
         )
-        self.reference_list.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.composer_text.grid(row=1, column=0, sticky="ew")
+        ttk.Button(
+            composer,
+            textvariable=self.send_button_text,
+            style="Primary.TButton",
+            command=self._submit_user_message,
+        ).grid(row=1, column=1, sticky="se", padx=(10, 0))
 
-        trace = ttk.Frame(body, style="Card.TFrame", padding=16)
-        trace.grid(row=0, column=1, sticky="nsew")
-        trace.columnconfigure(0, weight=1)
-        trace.rowconfigure(2, weight=1)
-        ttk.Label(trace, text="执行轨迹", style="Section.TLabel").grid(
+    def _build_inspector(self) -> None:
+        self.inspector = ttk.Frame(self, style="Surface.TFrame", padding=(14, 14))
+        self.inspector.grid(row=0, column=2, sticky="nsew")
+        self.inspector.columnconfigure(0, weight=1)
+        self.inspector.rowconfigure(2, weight=1)
+
+        header = ttk.Frame(self.inspector, style="Surface.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="检查器", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
+        ttk.Button(header, text="收起", command=self._toggle_inspector).grid(
+            row=0, column=1, sticky="e"
+        )
         ttk.Label(
-            trace,
-            text="展示模型输入、思考摘要、工具调用和执行结果。",
+            self.inspector,
+            text="模型与 harness 的交互历史、素材和人工请求。",
             style="Hint.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 8))
-        self.trace_tree = ttk.Treeview(
-            trace,
+            wraplength=330,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 12))
+
+        self.inspector_tree = ttk.Treeview(
+            self.inspector,
             columns=("kind", "summary"),
             show="headings",
             selectmode="browse",
         )
-        self.trace_tree.heading("kind", text="类型")
-        self.trace_tree.heading("summary", text="摘要")
-        self.trace_tree.column("kind", width=84, anchor="center")
-        self.trace_tree.column("summary", width=280, stretch=True)
-        self.trace_tree.grid(row=2, column=0, sticky="nsew")
-        self.trace_tree.bind("<<TreeviewSelect>>", self._on_trace_select)
-        self.trace_detail = tk.Text(
-            trace,
-            height=8,
-            wrap="word",
-            bg="#f8fafc",
-            fg=self.colors["ink"],
-            relief="flat",
-            padx=10,
-            pady=8,
-            font=("Microsoft YaHei UI", 9),
-        )
-        self.trace_detail.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        self.trace_detail.configure(state="disabled")
+        self.inspector_tree.heading("kind", text="类型")
+        self.inspector_tree.heading("summary", text="摘要")
+        self.inspector_tree.column("kind", width=80, anchor="center")
+        self.inspector_tree.column("summary", width=250, stretch=True)
+        self.inspector_tree.grid(row=2, column=0, sticky="nsew")
+        self.inspector_tree.bind("<<TreeviewSelect>>", self._on_inspector_select)
 
-        queues = ttk.Frame(main, style="Card.TFrame", padding=16)
-        queues.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        queues.columnconfigure(0, weight=1)
-        ttk.Label(queues, text="当前 JOB 队列", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        self.queue_tree = ttk.Treeview(
-            queues,
-            columns=("queue", "subtask", "goal"),
-            show="headings",
-            height=5,
-        )
-        self.queue_tree.heading("queue", text="队列")
-        self.queue_tree.heading("subtask", text="子任务")
-        self.queue_tree.heading("goal", text="目标")
-        self.queue_tree.column("queue", width=110, anchor="center")
-        self.queue_tree.column("subtask", width=150)
-        self.queue_tree.column("goal", width=520, stretch=True)
-        self.queue_tree.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-
-    def _build_human_panel(self) -> None:
-        panel = ttk.Frame(self, padding=(0, 14, 14, 14))
-        panel.grid(row=0, column=2, sticky="nsew")
-        panel.columnconfigure(0, weight=1)
-        panel.rowconfigure(2, weight=1)
-
-        card = ttk.Frame(panel, style="Card.TFrame", padding=16)
-        card.grid(row=0, column=0, rowspan=3, sticky="nsew")
-        card.columnconfigure(0, weight=1)
-        card.rowconfigure(2, weight=1)
-
-        ttk.Label(card, text="需要你处理", style="Title.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Label(
-            card,
-            text="远程渠道和本地客户端会自动同步状态。你只需要处理业务问题。",
-            style="Hint.TLabel",
-            wraplength=320,
-        ).grid(row=1, column=0, sticky="w", pady=(4, 12))
-
-        self.human_tree = ttk.Treeview(
-            card,
-            columns=("status", "job", "question"),
-            show="headings",
-            selectmode="browse",
-            height=7,
-        )
-        self.human_tree.heading("status", text="状态")
-        self.human_tree.heading("job", text="JOB")
-        self.human_tree.heading("question", text="问题")
-        self.human_tree.column("status", width=70, anchor="center")
-        self.human_tree.column("job", width=90, anchor="center")
-        self.human_tree.column("question", width=210, stretch=True)
-        self.human_tree.grid(row=2, column=0, sticky="nsew")
-        self.human_tree.bind("<<TreeviewSelect>>", self._on_human_select)
-
-        ttk.Label(card, text="当前请求", style="Section.TLabel").grid(
-            row=3, column=0, sticky="w", pady=(14, 4)
-        )
-        self.request_detail = tk.Text(
-            card,
-            height=8,
+        self.inspector_detail = tk.Text(
+            self.inspector,
+            height=12,
             wrap="word",
             bg=self.colors["surface_soft"],
             fg=self.colors["ink"],
@@ -390,90 +310,15 @@ class GuiAgentDesktopClient(tk.Tk):
             pady=8,
             font=("Microsoft YaHei UI", 9),
         )
-        self.request_detail.grid(row=4, column=0, sticky="ew")
-        self.request_detail.configure(state="disabled")
-
-        form = ttk.Frame(card, style="Card.TFrame")
-        form.grid(row=5, column=0, sticky="ew", pady=(12, 0))
-        form.columnconfigure(1, weight=1)
-        ttk.Label(form, text="处理类型", style="Hint.TLabel").grid(
-            row=0, column=0, sticky="w", pady=4
-        )
-        self.decision_combo = ttk.Combobox(
-            form,
-            textvariable=self.decision_type,
-            values=("人工回复", "风险确认", "更改路径", "暂停/取消", "补充约束"),
-            state="readonly",
-        )
-        self.decision_combo.grid(row=0, column=1, sticky="ew", pady=4)
-
-        ttk.Label(form, text="直接命令", style="Hint.TLabel").grid(
-            row=1, column=0, sticky="w", pady=4
-        )
-        self.direct_command_combo = ttk.Combobox(
-            form,
-            textvariable=self.direct_command_label,
-            values=tuple(DIRECT_COMMAND_LABELS.values()),
-            state="readonly",
-        )
-        self.direct_command_combo.grid(row=1, column=1, sticky="ew", pady=4)
-
-        ttk.Label(card, text="你的输入", style="Hint.TLabel").grid(
-            row=6, column=0, sticky="w", pady=(12, 4)
-        )
-        self.manager_input = tk.Text(
-            card,
-            height=7,
-            wrap="word",
-            bg="#ffffff",
-            relief="solid",
-            borderwidth=1,
-            font=("Microsoft YaHei UI", 10),
-        )
-        self.manager_input.grid(row=7, column=0, sticky="ew")
-
-        ttk.Label(card, text="新增约束 / 注意事项", style="Hint.TLabel").grid(
-            row=8, column=0, sticky="w", pady=(12, 4)
-        )
-        self.constraints_input = tk.Text(
-            card,
-            height=5,
-            wrap="word",
-            bg="#ffffff",
-            relief="solid",
-            borderwidth=1,
-            font=("Microsoft YaHei UI", 10),
-        )
-        self.constraints_input.grid(row=9, column=0, sticky="ew")
-        ttk.Button(
-            card,
-            text="提交给 Agent",
-            style="Primary.TButton",
-            command=self._submit_human_reply,
-        ).grid(row=10, column=0, sticky="ew", pady=(14, 0))
-
-    def _metric(self, parent: ttk.Frame, column: int, title: str, value: str) -> tk.StringVar:
-        holder = ttk.Frame(parent, style="Soft.TFrame", padding=(12, 10))
-        holder.grid(row=0, column=column, sticky="ew", padx=5)
-        ttk.Label(
-            holder,
-            text=title,
-            background=self.colors["surface_soft"],
-            foreground=self.colors["muted"],
-            font=("Microsoft YaHei UI", 9),
-        ).grid(row=0, column=0, sticky="w")
-        var = tk.StringVar(value=value)
-        ttk.Label(holder, textvariable=var, style="Metric.TLabel").grid(
-            row=1, column=0, sticky="w", pady=(4, 0)
-        )
-        return var
+        self.inspector_detail.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self.inspector_detail.configure(state="disabled")
 
     def refresh_all(self) -> None:
         self.refresh_apps()
-        self.refresh_current_app()
-        self.refresh_human()
-        self.refresh_trace()
-        self.refresh_queues()
+        self.refresh_header()
+        self.refresh_messages()
+        self.refresh_inspector()
+        self.refresh_composer()
 
     def refresh_apps(self) -> None:
         current = self.selected_app_id.get()
@@ -481,10 +326,9 @@ class GuiAgentDesktopClient(tk.Tk):
         app_ids = list(self.state.target_apps)
         for app_id in app_ids:
             config = self.state.target_apps[app_id]
-            job = self.state.job_board.jobs.get(config.job_id)
-            waiting = job.queues.counts()["waiting_human"] if job else 0
-            suffix = f"  ·  待处理 {waiting}" if waiting else ""
-            self.app_listbox.insert(tk.END, f"{config.app_name}{suffix}")
+            waiting = self._waiting_count_for_job(config.job_id)
+            badge = f"  ·  待处理 {waiting}" if waiting else ""
+            self.app_listbox.insert(tk.END, f"{config.app_name}{badge}")
         if current not in self.state.target_apps and app_ids:
             current = app_ids[0]
             self.selected_app_id.set(current)
@@ -494,106 +338,186 @@ class GuiAgentDesktopClient(tk.Tk):
             self.app_listbox.selection_set(index)
             self.app_listbox.activate(index)
 
-    def refresh_current_app(self) -> None:
+    def refresh_header(self) -> None:
         config = self._selected_config()
         if config is None:
-            self.app_title.configure(text="未配置 APP")
-            self.app_subtitle.configure(text="从左侧新建 APP，填入任务描述和素材引用")
-            self._set_text(self.description_view, "当前没有 APP 配置。")
-            self.reference_list.delete(0, tk.END)
-            self.metric_jobs.set(str(len(self.state.job_board.jobs)))
-            self.metric_waiting.set(str(self._total_waiting_requests()))
-            self.metric_running.set("0")
-            self.metric_macros.set(str(len(self.state.action_macros.macros)))
+            self.app_title.configure(text="未选择 APP")
+            self.app_subtitle.configure(text="左侧新建或选择应用")
             return
+        refs = len(config.reference_assets)
+        macros = len(self._macros_for_app(config.app_id))
         self.app_title.configure(text=config.app_name)
-        self.app_subtitle.configure(text=f"JOB: {config.job_id}")
-        description = config.task_description.strip() or "尚未填写任务描述。"
-        self._set_text(self.description_view, description)
-        self.reference_list.delete(0, tk.END)
-        for asset in config.reference_assets:
-            self.reference_list.insert(
-                tk.END,
-                f"{asset.citation}  {asset.title or Path(asset.path).name}",
-            )
-        job = self.state.job_board.jobs.get(config.job_id)
-        counts = job.queues.counts() if job else {}
-        self.metric_jobs.set(str(len(self.state.job_board.jobs)))
-        self.metric_waiting.set(str(self._total_waiting_requests()))
-        self.metric_running.set(str(counts.get("running", 0)))
-        self.metric_macros.set(str(len(self._macros_for_app(config.app_id))))
+        self.app_subtitle.configure(
+            text=f"任务定义 · {refs} 个素材引用 · {macros} 个可用宏"
+        )
 
-    def refresh_human(self) -> None:
-        selected = self.selected_request_id.get()
-        self._clear_tree(self.human_tree)
+    def refresh_messages(self) -> None:
+        for child in self.messages_frame.winfo_children():
+            child.destroy()
+        config = self._selected_config()
+        if config is None:
+            self._add_empty_message()
+            return
+        self._add_message(
+            role="system",
+            title="任务定义",
+            text=config.task_description.strip() or "尚未填写任务定义。",
+            align="left",
+        )
+        if config.reference_assets:
+            text = "\n".join(
+                f"{asset.citation}  {asset.title or Path(asset.path).name}"
+                for asset in config.reference_assets
+            )
+            self._add_message(
+                role="asset",
+                title="素材引用",
+                text=text,
+                align="left",
+            )
         for item in self.state.human_loop.list_requests(include_completed=True):
-            if item["status"] == "resolved":
-                continue
             request = item["request"]
             metadata = request.get("metadata") or {}
-            request_id = request["request_id"]
-            self.human_tree.insert(
-                "",
-                tk.END,
-                iid=request_id,
-                values=(
-                    self._status_label(item["status"]),
-                    metadata.get("job_id") or "",
-                    request.get("question") or "",
-                ),
+            if metadata.get("job_id") != config.job_id:
+                continue
+            title = "人工介入" if item["status"] != "resolved" else "人工回复"
+            text = self._human_request_text(item)
+            self._add_message(role="human", title=title, text=text, align="right")
+        for event in self.state.trace_store.events[-12:]:
+            self._add_message(
+                role="trace",
+                title=self._trace_kind_label(event.kind),
+                text=short_payload(event.payload),
+                align="left",
             )
-        if selected and self.human_tree.exists(selected):
-            self.human_tree.selection_set(selected)
-            self.human_tree.focus(selected)
-        self._show_selected_request()
-        self.metric_waiting.set(str(self._total_waiting_requests()))
+        self.after_idle(self._scroll_messages_to_bottom)
 
-    def refresh_trace(self) -> None:
-        selected = self._selected_tree_iid(self.trace_tree)
-        self._clear_tree(self.trace_tree)
-        for index, event in enumerate(self.state.trace_store.events):
-            payload = event.payload
-            summary = (
-                payload.get("summary")
-                or payload.get("result")
-                or payload.get("status")
-                or event.kind
-            )
-            self.trace_tree.insert(
-                "",
-                tk.END,
-                iid=str(index),
-                values=(self._trace_kind_label(event.kind), str(summary)[:120]),
-            )
-        if selected and self.trace_tree.exists(selected):
-            self.trace_tree.selection_set(selected)
-            self.trace_tree.focus(selected)
-        self._show_selected_trace()
+    def refresh_composer(self) -> None:
+        pending = self._current_pending_request()
+        if pending is None:
+            self.composer_mode_text.set("向当前 APP 发送输入")
+            self.send_button_text.set("发送给 Agent")
+            self.direct_command_combo.configure(state="disabled")
+            self.direct_command_label.set(DIRECT_COMMAND_LABELS[DIRECT_COMMAND_NONE])
+            return
+        request = pending["request"]
+        self.composer_mode_text.set(
+            f"正在处理：{str(request.get('question') or '')[:36]}"
+        )
+        self.send_button_text.set("提交处理")
+        self.direct_command_combo.configure(state="readonly")
 
-    def refresh_queues(self) -> None:
-        self._clear_tree(self.queue_tree)
+    def refresh_inspector(self) -> None:
+        self._clear_tree(self.inspector_tree)
         config = self._selected_config()
-        if config is None:
-            return
-        job = self.state.job_board.jobs.get(config.job_id)
-        if job is None:
-            return
-        queues = job.queues.to_dict()
-        for queue_name, queue_value in queues.items():
-            if queue_name == "running" and queue_value:
-                self._insert_queue_row("运行中", queue_value)
-            elif isinstance(queue_value, list):
-                for subtask in queue_value:
-                    self._insert_queue_row(self._queue_label(queue_name), subtask)
-            elif isinstance(queue_value, dict):
-                for subtask in queue_value.values():
-                    self._insert_queue_row(self._queue_label(queue_name), subtask)
+        if config is not None:
+            self.inspector_tree.insert(
+                "",
+                tk.END,
+                iid="task_definition",
+                values=("任务", config.task_description[:80] or "未填写"),
+            )
+            for asset in config.reference_assets:
+                self.inspector_tree.insert(
+                    "",
+                    tk.END,
+                    iid=f"asset:{asset.asset_id}",
+                    values=(asset.kind, f"{asset.citation} {asset.title}"),
+                )
+        for index, item in enumerate(
+            self.state.human_loop.list_requests(include_completed=True)
+        ):
+            request = item["request"]
+            self.inspector_tree.insert(
+                "",
+                tk.END,
+                iid=f"human:{index}",
+                values=(self._status_label(item["status"]), request.get("question") or ""),
+            )
+        for index, event in enumerate(self.state.trace_store.events[-30:]):
+            self.inspector_tree.insert(
+                "",
+                tk.END,
+                iid=f"trace:{index}",
+                values=(self._trace_kind_label(event.kind), short_payload(event.payload)),
+            )
+        self._set_text(self.inspector_detail, "选择左侧记录查看详情。")
 
     def _periodic_refresh(self) -> None:
         self.refresh_apps()
-        self.refresh_human()
-        self.refresh_queues()
+        self.refresh_header()
+        self.refresh_messages()
+        self.refresh_inspector()
+        self.refresh_composer()
         self.after(2000, self._periodic_refresh)
+
+    def _add_empty_message(self) -> None:
+        holder = ttk.Frame(self.messages_frame, style="Surface.TFrame", padding=(0, 120))
+        holder.grid(row=0, column=0, sticky="nsew")
+        holder.columnconfigure(0, weight=1)
+        ttk.Label(
+            holder,
+            text="从左侧新建 APP，开始配置自动化任务。",
+            background=self.colors["surface"],
+            foreground=self.colors["muted"],
+            font=("Microsoft YaHei UI", 13, "bold"),
+        ).grid(row=0, column=0)
+
+    def _add_message(self, *, role: str, title: str, text: str, align: str) -> None:
+        row = len(self.messages_frame.winfo_children())
+        outer = ttk.Frame(self.messages_frame, style="Surface.TFrame", padding=(18, 8))
+        outer.grid(row=row, column=0, sticky="ew")
+        outer.columnconfigure(0, weight=1)
+        bubble = tk.Frame(
+            outer,
+            bg=self._role_color(role),
+            padx=14,
+            pady=10,
+            highlightthickness=1,
+            highlightbackground="#e8edf5",
+        )
+        bubble.grid(
+            row=0,
+            column=0,
+            sticky="e" if align == "right" else "w",
+            padx=(80, 0) if align == "right" else (0, 80),
+        )
+        tk.Label(
+            bubble,
+            text=title,
+            bg=self._role_color(role),
+            fg=self.colors["muted"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+            anchor="w",
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            bubble,
+            text=text or "",
+            bg=self._role_color(role),
+            fg=self.colors["ink"],
+            font=("Microsoft YaHei UI", 10),
+            anchor="w",
+            justify="left",
+            wraplength=660,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+    def _role_color(self, role: str) -> str:
+        return {
+            "human": "#fff4e8",
+            "asset": "#eef8f4",
+            "trace": "#f6f7fb",
+            "system": "#f3f6ff",
+        }.get(role, "#f6f7fb")
+
+    def _on_messages_configure(self, _event: tk.Event[Any]) -> None:
+        self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event: tk.Event[Any]) -> None:
+        self.chat_canvas.itemconfigure(self.messages_window, width=event.width)
+
+    def _scroll_messages_to_bottom(self) -> None:
+        self.chat_canvas.yview_moveto(1.0)
 
     def _on_app_select(self, _event: tk.Event[Any]) -> None:
         selection = self.app_listbox.curselection()
@@ -601,17 +525,28 @@ class GuiAgentDesktopClient(tk.Tk):
             return
         app_id = list(self.state.target_apps)[selection[0]]
         self.selected_app_id.set(app_id)
-        self.refresh_current_app()
-        self.refresh_queues()
+        self.refresh_header()
+        self.refresh_messages()
+        self.refresh_inspector()
 
-    def _on_human_select(self, _event: tk.Event[Any]) -> None:
-        selected = self._selected_tree_iid(self.human_tree)
-        if selected:
-            self.selected_request_id.set(selected)
-        self._show_selected_request()
+    def _show_app_menu(self, event: tk.Event[Any]) -> None:
+        index = self.app_listbox.nearest(event.y)
+        app_ids = list(self.state.target_apps)
+        if index < 0 or index >= len(app_ids):
+            return
+        self.app_listbox.selection_clear(0, tk.END)
+        self.app_listbox.selection_set(index)
+        self.selected_app_id.set(app_ids[index])
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="编辑任务定义", command=self._edit_selected_app)
+        menu.add_command(label="复制 APP ID", command=self._copy_selected_app_id)
+        menu.add_separator()
+        menu.add_command(label="打开设置", command=self._open_settings)
+        menu.tk_popup(event.x_root, event.y_root)
 
-    def _on_trace_select(self, _event: tk.Event[Any]) -> None:
-        self._show_selected_trace()
+    def _clear_search_placeholder(self, _event: tk.Event[Any]) -> None:
+        if self.search_entry.get() == "搜索 APP":
+            self.search_entry.delete(0, tk.END)
 
     def _add_app_dialog(self) -> None:
         dialog = AppConfigDialog(self, title="新建 APP")
@@ -621,7 +556,7 @@ class GuiAgentDesktopClient(tk.Tk):
         app_name = result["app_name"].strip()
         job_id = result["job_id"].strip()
         if not app_name or not job_id:
-            messagebox.showwarning("输入不完整", "APP 名称和 JOB ID 都不能为空。")
+            messagebox.showwarning("输入不完整", "APP 名称和内部 ID 都不能为空。")
             return
         app_id = unique_app_id(app_name, self.state.target_apps)
         config = TargetAppConfig(
@@ -629,6 +564,7 @@ class GuiAgentDesktopClient(tk.Tk):
             app_name=app_name,
             job_id=job_id,
             task_description=result["task_description"].strip(),
+            reference_assets=tuple(result["assets"]),
         )
         self.state.add_target_app(config)
         if job_id not in self.state.job_board.jobs:
@@ -636,15 +572,15 @@ class GuiAgentDesktopClient(tk.Tk):
                 JobState(job_id=job_id, target_app=app_name, goal=app_name)
             )
         self.selected_app_id.set(app_id)
-        self.status_text.set(f"已添加 APP：{app_name}")
+        self.status_text.set(f"已添加：{app_name}")
         self.refresh_all()
 
     def _edit_selected_app(self) -> None:
         config = self._selected_config()
         if config is None:
-            messagebox.showinfo("没有 APP", "请先从左侧新建或选择一个 APP。")
+            messagebox.showinfo("没有 APP", "请先新建或选择一个 APP。")
             return
-        dialog = AppConfigDialog(self, title="编辑任务配置", config=config)
+        dialog = AppConfigDialog(self, title="任务定义", config=config)
         result = dialog.result
         if result is None:
             return
@@ -665,86 +601,110 @@ class GuiAgentDesktopClient(tk.Tk):
                     goal=updated.app_name,
                 )
             )
-        self.status_text.set(f"已更新 APP：{updated.app_name}")
+        self.status_text.set("任务定义已更新")
         self.refresh_all()
+
+    def _copy_selected_app_id(self) -> None:
+        config = self._selected_config()
+        if config is None:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(config.app_id)
+        self.status_text.set("已复制 APP ID")
 
     def _open_settings(self) -> None:
         SettingsDialog(self, self.state, self.selected_app_id.get())
         self.refresh_all()
 
-    def _submit_human_reply(self) -> None:
-        request_id = self._selected_tree_iid(self.human_tree) or self.selected_request_id.get()
-        if not request_id:
-            messagebox.showwarning("未选择请求", "请先选择一个需要处理的请求。")
-            return
-        manager_input = self.manager_input.get("1.0", tk.END).strip()
-        constraints = self.constraints_input.get("1.0", tk.END).strip()
-        direct_command = self._selected_direct_command()
-        if not manager_input and direct_command == DIRECT_COMMAND_NONE:
-            messagebox.showwarning("缺少输入", "请填写人工输入，或选择一个直接命令。")
-            return
-        try:
-            self.state.human_loop.claim_request(request_id, source="client")
-            self.state.submit_structured_human_reply(
-                request_id=request_id,
-                manager_input=manager_input,
-                decision_type=self.decision_type.get(),
-                direct_command=direct_command,
-                constraints=constraints,
-            )
-        except Exception as exc:
-            messagebox.showerror("提交失败", f"{exc}\n\n该请求可能已经被其他渠道处理。")
-            self.refresh_human()
-            return
-        self.manager_input.delete("1.0", tk.END)
-        self.constraints_input.delete("1.0", tk.END)
-        self.status_text.set("人工处理已提交")
-        self.refresh_all()
+    def _toggle_inspector(self) -> None:
+        if self.inspector_visible.get():
+            self.inspector.grid_remove()
+            self.inspector_visible.set(False)
+        else:
+            self.inspector.grid(row=0, column=2, sticky="nsew")
+            self.inspector_visible.set(True)
 
-    def _show_selected_request(self) -> None:
-        selected = self._selected_tree_iid(self.human_tree)
-        text = "当前没有选中的人工请求。"
-        if selected:
-            for item in self.state.human_loop.list_requests(include_completed=True):
-                request = item["request"]
-                if request["request_id"] == selected:
-                    metadata = request.get("metadata") or {}
-                    lines = [
-                        f"问题：{request.get('question') or ''}",
-                        f"状态：{self._status_label(item['status'])}",
-                        f"JOB：{metadata.get('job_id') or ''}",
-                        f"子任务：{request.get('task_id') or ''}",
-                    ]
-                    if request.get("risk_reason"):
-                        lines.append(f"风险：{request['risk_reason']}")
-                    if request.get("proposed_action"):
-                        lines.append(f"建议：{request['proposed_action']}")
-                    if request.get("allowed_reply_format"):
-                        lines.append(f"格式：{request['allowed_reply_format']}")
-                    text = "\n".join(lines)
-                    break
-        self._set_text(self.request_detail, text)
-
-    def _show_selected_trace(self) -> None:
-        selected = self._selected_tree_iid(self.trace_tree)
-        text = "暂无执行轨迹。"
-        if selected is not None and selected.isdigit():
-            index = int(selected)
-            if 0 <= index < len(self.state.trace_store.events):
-                event = self.state.trace_store.events[index]
-                text = format_payload(event.payload)
-        self._set_text(self.trace_detail, text)
-
-    def _insert_queue_row(self, queue_name: str, subtask: dict[str, Any]) -> None:
-        self.queue_tree.insert(
-            "",
-            tk.END,
-            values=(
-                queue_name,
-                subtask.get("subtask_id", ""),
-                subtask.get("goal", ""),
-            ),
+    def _submit_user_message(self) -> None:
+        text = self.composer_text.get("1.0", tk.END).strip()
+        pending = self._current_pending_request()
+        if pending is not None:
+            direct_command = self._selected_direct_command()
+            if not text and direct_command == DIRECT_COMMAND_NONE:
+                messagebox.showwarning("缺少输入", "请填写处理意见，或选择一个直接命令。")
+                return
+            request_id = pending["request"]["request_id"]
+            try:
+                self.state.human_loop.claim_request(request_id, source="client")
+                self.state.submit_structured_human_reply(
+                    request_id=request_id,
+                    manager_input=text,
+                    decision_type=self.decision_type.get(),
+                    direct_command=direct_command,
+                )
+            except Exception as exc:
+                messagebox.showerror("提交失败", f"{exc}\n\n该请求可能已被其他渠道处理。")
+                self.refresh_all()
+                return
+            self.composer_text.delete("1.0", tk.END)
+            self.direct_command_label.set(DIRECT_COMMAND_LABELS[DIRECT_COMMAND_NONE])
+            self.status_text.set("人工处理已提交")
+            self.refresh_all()
+            return
+        if not text:
+            return
+        self.state.trace_store.record(
+            "manager_note",
+            {
+                "app_id": self.selected_app_id.get(),
+                "text": text,
+                "source": "desktop_client",
+            },
         )
+        self.composer_text.delete("1.0", tk.END)
+        self.status_text.set("已记录管理者输入")
+        self.refresh_messages()
+        self.refresh_inspector()
+        self.refresh_composer()
+
+    def _on_inspector_select(self, _event: tk.Event[Any]) -> None:
+        selected = self._selected_tree_iid(self.inspector_tree)
+        if not selected:
+            return
+        config = self._selected_config()
+        if selected == "task_definition" and config is not None:
+            self._set_text(self.inspector_detail, config.task_description)
+            return
+        if selected.startswith("asset:") and config is not None:
+            asset_id = selected.split(":", 1)[1]
+            for asset in config.reference_assets:
+                if asset.asset_id == asset_id:
+                    self._set_text(self.inspector_detail, format_asset(asset))
+                    return
+        if selected.startswith("human:"):
+            index = int(selected.split(":", 1)[1])
+            items = list(self.state.human_loop.list_requests(include_completed=True))
+            if 0 <= index < len(items):
+                self._set_text(self.inspector_detail, self._human_request_text(items[index]))
+            return
+        if selected.startswith("trace:"):
+            index = int(selected.split(":", 1)[1])
+            events = self.state.trace_store.events[-30:]
+            if 0 <= index < len(events):
+                self._set_text(self.inspector_detail, format_payload(events[index].payload))
+
+    def _current_pending_request(self) -> dict[str, Any] | None:
+        config = self._selected_config()
+        if config is None:
+            return None
+        for item in self.state.human_loop.list_requests():
+            request = item["request"]
+            metadata = request.get("metadata") or {}
+            if metadata.get("job_id") != config.job_id:
+                continue
+            if item["status"] == "resolved":
+                continue
+            return item
+        return None
 
     def _selected_direct_command(self) -> str:
         label = self.direct_command_label.get()
@@ -762,12 +722,13 @@ class GuiAgentDesktopClient(tk.Tk):
         except StopIteration:
             return ""
 
-    def _total_waiting_requests(self) -> int:
-        return sum(
-            1
-            for item in self.state.human_loop.list_requests()
-            if item["status"] != "resolved"
-        )
+    def _waiting_count_for_job(self, job_id: str) -> int:
+        count = 0
+        for item in self.state.human_loop.list_requests():
+            metadata = item["request"].get("metadata") or {}
+            if metadata.get("job_id") == job_id and item["status"] != "resolved":
+                count += 1
+        return count
 
     def _macros_for_app(self, app_id: str) -> list[Any]:
         return [
@@ -776,6 +737,23 @@ class GuiAgentDesktopClient(tk.Tk):
             if macro.metadata.get("scope") == "global"
             or macro.metadata.get("app_id") == app_id
         ]
+
+    def _human_request_text(self, item: dict[str, Any]) -> str:
+        request = item["request"]
+        metadata = request.get("metadata") or {}
+        lines = [
+            f"状态：{self._status_label(item['status'])}",
+            f"问题：{request.get('question') or ''}",
+        ]
+        if metadata.get("job_id"):
+            lines.append(f"来源：{metadata['job_id']}")
+        if request.get("risk_reason"):
+            lines.append(f"风险：{request['risk_reason']}")
+        if request.get("proposed_action"):
+            lines.append(f"建议：{request['proposed_action']}")
+        if item.get("reply"):
+            lines.append(f"回复：{item['reply'].get('text') or ''}")
+        return "\n".join(lines)
 
     @staticmethod
     def _status_label(status: str) -> str:
@@ -787,22 +765,10 @@ class GuiAgentDesktopClient(tk.Tk):
         }.get(status, status)
 
     @staticmethod
-    def _queue_label(queue_name: str) -> str:
-        return {
-            "urgent": "紧急",
-            "runnable": "可执行",
-            "waiting_human": "等人工",
-            "blocked": "阻塞",
-            "completed": "完成",
-            "failed": "失败",
-            "cancelled": "取消",
-            "superseded": "替换",
-        }.get(queue_name, queue_name)
-
-    @staticmethod
     def _trace_kind_label(kind: str) -> str:
         return {
             "step": "步骤",
+            "manager_note": "输入",
             "policy_update": "规则",
             "result": "结果",
         }.get(kind, kind)
@@ -843,7 +809,7 @@ class AppConfigDialog(tk.Toplevel):
         self.result: dict[str, Any] | None = None
         self.assets: list[ReferenceAsset] = list(config.reference_assets if config else ())
 
-        frame = ttk.Frame(self, style="Card.TFrame", padding=16)
+        frame = ttk.Frame(self, style="Surface.TFrame", padding=16)
         frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -858,18 +824,18 @@ class AppConfigDialog(tk.Toplevel):
         )
         self.app_name = ttk.Entry(frame)
         self.app_name.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(14, 4))
-        ttk.Label(frame, text="JOB ID", style="Hint.TLabel").grid(
+        ttk.Label(frame, text="内部 ID", style="Hint.TLabel").grid(
             row=2, column=0, sticky="w", pady=4
         )
         self.job_id = ttk.Entry(frame)
         self.job_id.grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
 
-        ttk.Label(frame, text="任务描述", style="Section.TLabel").grid(
+        ttk.Label(frame, text="任务定义", style="Section.TLabel").grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(14, 4)
         )
         ttk.Label(
             frame,
-            text="可在文字中引用下方素材，例如 [image:image_abcd1234]。",
+            text="描述场景、规则、目标和约束。素材引用可直接插入到文字中。",
             style="Hint.TLabel",
         ).grid(row=4, column=0, columnspan=3, sticky="w")
         self.task_text = tk.Text(
@@ -910,7 +876,7 @@ class AppConfigDialog(tk.Toplevel):
             row=8, column=2, sticky="ew", padx=(6, 0)
         )
 
-        buttons = ttk.Frame(frame, style="Card.TFrame")
+        buttons = ttk.Frame(frame, style="Surface.TFrame")
         buttons.grid(row=9, column=0, columnspan=3, sticky="e", pady=(16, 0))
         ttk.Button(buttons, text="取消", command=self.destroy).grid(row=0, column=0, padx=5)
         ttk.Button(
@@ -993,7 +959,7 @@ class SettingsDialog(tk.Toplevel):
         self.state = state
         self.current_app_id = current_app_id
 
-        frame = ttk.Frame(self, style="Card.TFrame", padding=16)
+        frame = ttk.Frame(self, style="Surface.TFrame", padding=16)
         frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -1010,7 +976,7 @@ class SettingsDialog(tk.Toplevel):
             style="Hint.TLabel",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 12))
 
-        left = ttk.Frame(frame, style="Card.TFrame")
+        left = ttk.Frame(frame, style="Surface.TFrame")
         left.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(1, weight=1)
@@ -1030,7 +996,7 @@ class SettingsDialog(tk.Toplevel):
         self.macro_tree.column("description", width=260, stretch=True)
         self.macro_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
 
-        right = ttk.Frame(frame, style="Card.TFrame")
+        right = ttk.Frame(frame, style="Surface.TFrame")
         right.grid(row=2, column=1, sticky="nsew")
         right.columnconfigure(1, weight=1)
         ttk.Label(right, text="新增动作宏", style="Section.TLabel").grid(
@@ -1139,6 +1105,28 @@ def format_payload(payload: dict[str, Any], *, indent: int = 0) -> str:
         else:
             lines.append(f"{pad}{label}: {value}")
     return "\n".join(line for line in lines if line)
+
+
+def short_payload(payload: dict[str, Any]) -> str:
+    for key in ("summary", "text", "result", "status"):
+        value = payload.get(key)
+        if value:
+            return str(value)[:160]
+    if "action" in payload:
+        return str(payload["action"])[:160]
+    return format_payload(payload).splitlines()[0] if payload else ""
+
+
+def format_asset(asset: ReferenceAsset) -> str:
+    return "\n".join(
+        [
+            f"引用：{asset.citation}",
+            f"类型：{asset.kind}",
+            f"标题：{asset.title}",
+            f"路径：{asset.path}",
+            f"说明：{asset.description}",
+        ]
+    )
 
 
 def unique_app_id(app_name: str, existing: dict[str, TargetAppConfig]) -> str:

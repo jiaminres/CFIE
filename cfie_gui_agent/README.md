@@ -98,15 +98,15 @@ The recommended local client is the Windows desktop client:
 
 It provides:
 
-- APP + JOB configuration;
+- APP session configuration;
 - task descriptions with image/video citations such as `[image:map_main]`;
 - reference image/video registration;
-- model execution trace inspection;
-- JOB and Subtask queue inspection;
-- structured human input for blocked Subtasks;
+- chat-style model and harness interaction history;
+- a collapsible inspector for text, image, and video context;
+- structured human input for blocked work;
 - direct command choices such as "do not reply", "change path", and
-  "pause current JOB";
-- continuous key-control macro registration with model-facing descriptions.
+  "pause current task";
+- global and per-APP action macro registration in settings.
 
 When a Subtask is blocked and requires a manager decision, all human channels
 share the same `HumanLoopManager` request state. The desktop client shows the

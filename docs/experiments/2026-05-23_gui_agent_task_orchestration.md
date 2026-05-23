@@ -2835,28 +2835,33 @@ Date: 2026-05-24
 
 Desktop client redesign:
 
-- Reworked the desktop client from a tabbed engineering console into a single
-  production workbench.
-- Left side now behaves like an APP/workspace list, similar to a chat session
-  selector.
-- APP configuration moved into a modal editor from the selected APP area.
+- Reworked the desktop client from a tabbed engineering console into a
+  Codex-style workbench.
+- Left side now treats each APP as a conversation/workspace entry.
+- Right-clicking an APP opens task-definition actions such as editing the task
+  prompt and copying the APP id.
+- APP task definition moved into a modal editor; it contains text plus
+  image/video references that can be inserted into the text.
 - Global and per-APP action macros moved into the settings dialog.
-- The main area shows the selected APP summary, task description, referenced
-  image/video assets, execution trace, and current JOB queues together.
-- The right side is only for business-facing human intervention.
+- The main area is now chat-like interaction history rather than an engineering
+  table.
+- A collapsible inspector on the right shows model/harness history, text,
+  images, videos, and human intervention records.
+- User-facing JOB/Subtask queue tables were removed from the main client.
+- Human intervention is handled through the unified bottom input: if the current
+  APP has a pending human request, the input submits the manager response;
+  otherwise it records/sends normal manager input.
 - Removed manager-facing claim/release controls; synchronization remains an
   internal channel consistency mechanism.
-- Execution trace detail is rendered as readable key/value text instead of raw
-  JSON.
-- The color direction was adjusted toward a brighter blue/mint workbench rather
-  than a gray engineering panel.
+- Execution trace detail is rendered as readable text instead of raw JSON.
+- The color direction now follows a softer, younger desktop/chat product style.
 
 Product rules captured:
 
 - The user should not need to understand `HumanLoopManager`, claim ownership, or
   channel locking.
-- The user should see "what app am I configuring", "what is the agent doing",
-  "what is blocked", and "what input should I provide".
+- The user should see "which APP/workspace is active", "what did I ask the
+  agent to do", "what happened", and "what input should I provide next".
 - Advanced controls such as macros belong in settings unless they are needed in
   the immediate workflow.
 
