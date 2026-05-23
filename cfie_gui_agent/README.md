@@ -88,6 +88,45 @@ target coordinates plus obstacle polygons. The harness owns the route planning,
 real-time tracking, retry, and stop condition; model output is only the semantic
 navigation request.
 
+## Human Input Console
+
+When a Subtask is blocked and requires a manager decision, all human channels
+share the same `HumanLoopManager` request state. The local client console can
+claim and answer a request; once claimed or resolved, another channel cannot
+answer the same request.
+
+Run the local console:
+
+```powershell
+..\.venv\Scripts\python.exe -m cfie_gui_agent.console --host 127.0.0.1 --port 8765
+```
+
+Open:
+
+```text
+http://127.0.0.1:8765/
+```
+
+Current console features:
+
+- list active and completed human requests;
+- claim a pending request from the local client;
+- release a claim;
+- submit a manager reply;
+- create a demo request for manual testing;
+- inspect the shared urgent queue payload.
+
+Embedding with a running Agent should pass the runner's manager into the
+console:
+
+```python
+from cfie_gui_agent import GuiAgentRunner
+from cfie_gui_agent.console import start_console_in_thread
+
+runner = GuiAgentRunner(max_steps=6)
+console = start_console_in_thread(human_loop=runner.human_loop, port=8765)
+```
+
 `TaskStack` still exists as a compatibility/helper structure for local
 interrupt/resume semantics, but the main scheduling model is Job/Subtask.
 

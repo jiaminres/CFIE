@@ -12,9 +12,14 @@ from cfie_gui_agent.context import (
     VisionContextPolicy,
 )
 from cfie_gui_agent.human_loop import (
+    HUMAN_REQUEST_CANCELLED,
+    HUMAN_REQUEST_CLAIMED,
+    HUMAN_REQUEST_PENDING,
+    HUMAN_REQUEST_RESOLVED,
     HumanLoopManager,
     HumanReply,
     HumanRequest,
+    HumanRequestState,
     InMemoryHumanChannel,
 )
 from cfie_gui_agent.jobs import (
@@ -102,6 +107,11 @@ __all__ = [
     "HumanLoopManager",
     "HumanReply",
     "HumanRequest",
+    "HumanRequestState",
+    "HUMAN_REQUEST_CANCELLED",
+    "HUMAN_REQUEST_CLAIMED",
+    "HUMAN_REQUEST_PENDING",
+    "HUMAN_REQUEST_RESOLVED",
     "InMemoryHumanChannel",
     "JobBoard",
     "JobBoardError",

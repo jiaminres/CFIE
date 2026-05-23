@@ -12,6 +12,8 @@ from cfie_gui_agent import (
     HumanLoopManager,
     HumanReply,
     InMemoryHumanChannel,
+    HUMAN_REQUEST_CLAIMED,
+    HUMAN_REQUEST_RESOLVED,
     AgentScheduler,
     JobBoard,
     JobState,
@@ -583,6 +585,31 @@ def test_human_loop_reply_becomes_urgent_task():
     assert tasks[0]["priority"] == "urgent"
     assert tasks[0]["reply"]["text"] == "Reply: hello"
     assert manager.pop_urgent_task() == tasks[0]
+
+
+def test_human_loop_client_claim_blocks_channel_reply():
+    channel = InMemoryHumanChannel()
+    manager = HumanLoopManager(channel=channel)
+    request = manager.request_help(question="Need human decision.")
+
+    claimed = manager.claim_request(request.request_id, source="client")
+
+    assert claimed.status == HUMAN_REQUEST_CLAIMED
+    assert claimed.claimed_by == "client"
+
+    channel.push_reply(HumanReply(request_id=request.request_id, text="channel reply"))
+    assert manager.poll() == ()
+    assert request.request_id in manager.pending
+
+    task = manager.submit_reply(
+        request_id=request.request_id,
+        text="client reply",
+        source="client",
+    )
+
+    assert task["reply"]["text"] == "client reply"
+    assert manager.completed[request.request_id].status == HUMAN_REQUEST_RESOLVED
+    assert request.request_id not in manager.pending
 
 
 def test_job_board_manager_reply_promotes_waiting_subtask():

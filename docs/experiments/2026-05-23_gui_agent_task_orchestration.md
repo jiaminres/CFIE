@@ -2652,6 +2652,101 @@ Verification:
 passed
 ```
 
+## Implementation Round 17
+
+Date: 2026-05-24
+
+Local human input console:
+
+- WeChat and other remote channels are deferred.
+- The local client now has a usable browser console for human intervention.
+- All channels share the same `HumanLoopManager` state model.
+- A request can be:
+  - pending;
+  - claimed;
+  - resolved;
+  - cancelled.
+
+Concurrency rule:
+
+```text
+one human request can be answered exactly once
+```
+
+If the local client claims a request, an external channel reply for the same
+request is ignored. If another source has claimed it, the local client cannot
+submit until the request is released.
+
+Added shared-state APIs:
+
+- `HumanLoopManager.list_requests()`;
+- `HumanLoopManager.claim_request()`;
+- `HumanLoopManager.release_request()`;
+- `HumanLoopManager.submit_reply()`;
+- `HumanRequestState`.
+
+Added local console:
+
+- module: `cfie_gui_agent.console`;
+- embedded entrypoint: `start_console_in_thread(human_loop=runner.human_loop)`;
+- command:
+
+```powershell
+..\.venv\Scripts\python.exe -m cfie_gui_agent.console --host 127.0.0.1 --port 8765
+```
+
+HTTP API:
+
+```text
+GET  /api/human/requests?include_completed=1
+POST /api/human/demo
+POST /api/human/requests/{request_id}/claim
+POST /api/human/requests/{request_id}/release
+POST /api/human/requests/{request_id}/reply
+```
+
+Browser console:
+
+- request list;
+- request status and claimant;
+- manager text input;
+- claim / release / submit buttons;
+- demo request button;
+- raw shared state panel.
+
+Embedding rule:
+
+```python
+from cfie_gui_agent import GuiAgentRunner
+from cfie_gui_agent.console import start_console_in_thread
+
+runner = GuiAgentRunner(max_steps=6)
+console = start_console_in_thread(human_loop=runner.human_loop, port=8765)
+```
+
+This keeps model-created `request_human_help` items and local-client replies on
+the same `HumanLoopManager` instance. External channels such as WeChat should
+later attach to the same manager, not create a second request store.
+
+Added project script:
+
+```text
+cfie-gui-agent-console = cfie_gui_agent.console:main
+```
+
+Verification:
+
+```text
+..\.venv\Scripts\python.exe -m pytest tests\unit\test_gui_agent_architecture.py tests\unit\test_gui_agent_console.py tests\unit\test_cfie_client_gui_agent.py -q
+41 passed
+
+..\.venv\Scripts\python.exe -m pytest tests\unit\test_responses_video_input.py tests\unit\test_gui_agent_architecture.py tests\unit\test_gui_agent_console.py tests\unit\test_cfie_client_gui_agent.py -q
+45 passed, 2 warnings
+
+..\.venv\Scripts\python.exe -m py_compile cfie_gui_agent\human_loop.py cfie_gui_agent\console.py cfie_gui_agent\__init__.py
+passed
+```
+
 ## Future Implementation Checklist
 
 Task orchestration:

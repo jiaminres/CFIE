@@ -46,6 +46,7 @@ dependencies = [
 [project.scripts]
 cfie = "cfie.cli.main:main"
 cfie-train = "cfie_training.cli.main:main"
+cfie-gui-agent-console = "cfie_gui_agent.console:main"
 
 [tool.setuptools.packages.find]
 include = ["cfie*", "cfie_training*", "vllm*"]
