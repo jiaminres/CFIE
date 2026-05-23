@@ -109,13 +109,6 @@ class GuiAgentDesktopClient(tk.Tk):
             text="配置 APP 任务、宏、执行轨迹和人工介入",
             style="SubHeader.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Button(
-            header,
-            text="创建人工阻塞示例",
-            style="Accent.TButton",
-            command=self._create_demo_human_request,
-        ).grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
-
         sidebar = ttk.Frame(self, style="Sidebar.TFrame", padding=(14, 16))
         sidebar.grid(row=1, column=0, sticky="nsew")
         sidebar.rowconfigure(2, weight=1)
@@ -208,7 +201,7 @@ class GuiAgentDesktopClient(tk.Tk):
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(16, 4))
         ttk.Label(
             form,
-            text="图片/视频用右侧引用插入，例如 [image:map_main]。",
+            text="图片/视频用右侧引用插入，引用会随任务描述一起进入上下文。",
             style="Hint.TLabel",
         ).grid(row=4, column=0, columnspan=2, sticky="w")
         self.task_text = tk.Text(
@@ -309,7 +302,7 @@ class GuiAgentDesktopClient(tk.Tk):
 
         request_buttons = ttk.Frame(left, style="Surface.TFrame")
         request_buttons.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        for idx in range(4):
+        for idx in range(3):
             request_buttons.columnconfigure(idx, weight=1)
         ttk.Button(request_buttons, text="认领", command=self._claim_request).grid(
             row=0, column=0, sticky="ew", padx=(0, 4)
@@ -317,13 +310,8 @@ class GuiAgentDesktopClient(tk.Tk):
         ttk.Button(request_buttons, text="释放", command=self._release_request).grid(
             row=0, column=1, sticky="ew", padx=4
         )
-        ttk.Button(
-            request_buttons,
-            text="创建示例",
-            command=self._create_demo_human_request,
-        ).grid(row=0, column=2, sticky="ew", padx=4)
         ttk.Button(request_buttons, text="刷新", command=self.refresh_human).grid(
-            row=0, column=3, sticky="ew", padx=(4, 0)
+            row=0, column=2, sticky="ew", padx=(4, 0)
         )
 
         right = ttk.Frame(tab, style="Surface.TFrame", padding=14)
@@ -543,7 +531,6 @@ class GuiAgentDesktopClient(tk.Tk):
         self.macro_name.grid(row=2, column=1, sticky="ew", pady=4)
         ttk.Label(right, text="按键序列", style="Hint.TLabel").grid(row=3, column=0, sticky="w")
         self.macro_sequence = ttk.Entry(right)
-        self.macro_sequence.insert(0, "CTRL+A, B")
         self.macro_sequence.grid(row=3, column=1, sticky="ew", pady=4)
         ttk.Label(right, text="操作含义", style="Hint.TLabel").grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(10, 0)
@@ -753,9 +740,9 @@ class GuiAgentDesktopClient(tk.Tk):
             self,
             title="新增 Target APP",
             fields=(
-                ("APP 名称", "Chrome"),
+                ("APP 名称", ""),
                 ("JOB ID", f"job_{len(self.state.target_apps) + 1}"),
-                ("任务描述", "描述这个 APP 的业务场景、规则和约束。"),
+                ("任务描述", ""),
             ),
         )
         values = dialog.result
@@ -826,13 +813,6 @@ class GuiAgentDesktopClient(tk.Tk):
             if asset.asset_id == selected:
                 return asset.citation
         return None
-
-    def _create_demo_human_request(self) -> None:
-        request_id = self.state.create_demo_human_request()
-        self.selected_request_id.set(request_id)
-        self.refresh_human()
-        self.notebook.select(1)
-        self.status_text.set("已创建人工介入示例请求")
 
     def _claim_request(self) -> None:
         request_id = self._require_selected_request_id()

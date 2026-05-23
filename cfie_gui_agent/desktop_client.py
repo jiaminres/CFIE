@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import argparse
-import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from cfie_gui_agent.human_loop import HumanLoopManager, InMemoryHumanChannel
-from cfie_gui_agent.jobs import JobBoard, JobState, SubtaskState
+from cfie_gui_agent.jobs import JobBoard
 from cfie_gui_agent.macros import ActionMacro, ActionMacroRegistry, ActionMacroStep
 from cfie_gui_agent.trace import AgentTraceStore
 
@@ -106,47 +104,6 @@ class DesktopClientState:
     action_macros: ActionMacroRegistry = field(default_factory=ActionMacroRegistry)
     target_apps: dict[str, TargetAppConfig] = field(default_factory=dict)
 
-    @classmethod
-    def demo(cls) -> "DesktopClientState":
-        state = cls()
-        config = TargetAppConfig(
-            app_id="app_dnf",
-            app_name="DNF",
-            job_id="job_dnf",
-            task_description=(
-                "目标：在 DNF 场景中观察角色状态、地图信息和任务目标，"
-                "必要时使用宏完成低延迟连续操作。\n\n"
-                "规则：遇到无法判断的弹窗、交易、账号风险提示时，"
-                "必须请求人工确认。地图和界面示例可用 [image:map_main] "
-                "这样的引用写入说明。"
-            ),
-        )
-        state.add_target_app(config)
-        state.job_board.add_job(
-            JobState(
-                job_id="job_dnf",
-                target_app="DNF",
-                goal="DNF 自动化操作与状态监控",
-                priority=10,
-            )
-        )
-        state.job_board.add_subtask(
-            SubtaskState(
-                subtask_id="subtask_observe",
-                job_id="job_dnf",
-                goal="观察当前界面并判断下一步动作",
-                priority=10,
-            )
-        )
-        state.register_macro(
-            MacroConfig(
-                name="combo_asd",
-                description="示例连续技：快速按下 A、S、D。",
-                sequence="A, S, D",
-            )
-        )
-        return state
-
     def add_target_app(self, config: TargetAppConfig) -> None:
         if not config.app_id:
             raise ValueError("app_id is required")
@@ -188,18 +145,6 @@ class DesktopClientState:
         )
         self.action_macros.register(macro)
         return macro
-
-    def create_demo_human_request(self) -> str:
-        request = self.human_loop.request_help(
-            question="当前子任务需要人工确认：是否继续执行？",
-            task_id="subtask_observe",
-            risk_reason="模型判断下一步可能影响任务状态。",
-            proposed_action="等待管理者给出明确回复。",
-            allowed_reply_format="请填写：你的输入、约束、是否继续。",
-            urgency="normal",
-            metadata={"job_id": "job_dnf", "source": "desktop_client_demo"},
-        )
-        return request.request_id
 
     def submit_structured_human_reply(
         self,
@@ -277,22 +222,16 @@ def parse_macro_sequence(sequence: str) -> tuple[tuple[str, ...], ...]:
 def run_desktop_client(
     *,
     state: DesktopClientState | None = None,
-    demo: bool = True,
 ) -> None:
     from cfie_gui_agent.desktop_client_ui import GuiAgentDesktopClient
 
-    app_state = state if state is not None else (
-        DesktopClientState.demo() if demo else DesktopClientState()
-    )
+    app_state = state if state is not None else DesktopClientState()
     app = GuiAgentDesktopClient(app_state)
     app.mainloop()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run CFIE GUI Agent desktop client.")
-    parser.add_argument("--empty", action="store_true", help="start without demo data")
-    args = parser.parse_args()
-    run_desktop_client(demo=not args.empty)
+    run_desktop_client()
 
 
 if __name__ == "__main__":

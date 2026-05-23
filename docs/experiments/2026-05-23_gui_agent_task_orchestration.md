@@ -2699,7 +2699,6 @@ HTTP API:
 
 ```text
 GET  /api/human/requests?include_completed=1
-POST /api/human/demo
 POST /api/human/requests/{request_id}/claim
 POST /api/human/requests/{request_id}/release
 POST /api/human/requests/{request_id}/reply
@@ -2711,7 +2710,6 @@ Browser console:
 - request status and claimant;
 - manager text input;
 - claim / release / submit buttons;
-- demo request button;
 - raw shared state panel.
 
 Embedding rule:
@@ -2804,6 +2802,28 @@ manager_input=不要回复这个卖家，切换到下一个可处理会话。
 
 This supports the user case where the manager wants to change the operation
 path rather than merely provide missing text.
+
+## Implementation Round 19
+
+Date: 2026-05-24
+
+Production-mode client rule:
+
+- Client code must not add throwaway controls, temporary prompts, or seeded
+  startup state.
+- The desktop client starts from an empty production state.
+- Human intervention requests are created by model/harness runtime paths, not
+  by a visible request-creation shortcut.
+- Tests may inject state directly, but runtime UI should not expose test data
+  creation controls.
+
+Cleaned up:
+
+- removed desktop "create human block example" controls;
+- removed desktop startup seed data;
+- removed browser console request-creation endpoint;
+- removed browser console request-creation button;
+- updated tests to create requests by direct state injection.
 
 ## Future Implementation Checklist
 

@@ -17,6 +17,15 @@ def test_parse_macro_sequence_groups_combo_keys():
     )
 
 
+def test_desktop_state_starts_without_seed_data():
+    state = DesktopClientState()
+
+    assert state.target_apps == {}
+    assert state.job_board.jobs == {}
+    assert state.human_loop.list_requests(include_completed=True) == ()
+    assert state.action_macros.macros == {}
+
+
 def test_desktop_state_registers_macro_for_context_payload():
     state = DesktopClientState()
     state.register_macro(

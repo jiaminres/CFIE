@@ -131,7 +131,6 @@ Current console features:
 - claim a pending request from the local client;
 - release a claim;
 - submit a manager reply;
-- create a demo request for manual testing;
 - inspect the shared urgent queue payload.
 
 Embedding with a running Agent should pass the runner's manager into the
@@ -156,7 +155,7 @@ from cfie_gui_agent import GuiAgentRunner, GuiAgentTaskSpec
 task = GuiAgentTaskSpec(
     task_id="open-settings",
     instruction="Open the settings page and report the page title.",
-    target_app="demo_app",
+    target_app="settings_app",
 )
 
 runner = GuiAgentRunner(max_steps=6)

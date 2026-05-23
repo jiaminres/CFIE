@@ -68,28 +68,6 @@ def create_handler(state: ConsoleState) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             try:
-                if parsed.path == "/api/human/demo":
-                    body = self._read_json(default={})
-                    with state.lock:
-                        request = state.human_loop.request_help(
-                            question=str(
-                                body.get("question")
-                                or "Please provide the next human instruction."
-                            ),
-                            task_id=body.get("task_id"),
-                            evidence_refs=tuple(body.get("evidence_refs", ()) or ()),
-                            risk_reason=body.get("risk_reason"),
-                            proposed_action=body.get("proposed_action"),
-                            allowed_reply_format=body.get("allowed_reply_format"),
-                            urgency=str(body.get("urgency", "normal")),
-                            metadata={
-                                "job_id": body.get("job_id"),
-                                "source": "console_demo",
-                            },
-                        )
-                    self._send_json({"request": request.to_task_payload()})
-                    return
-
                 if parsed.path.endswith("/claim"):
                     request_id = _request_id_from_path(parsed.path)
                     with state.lock:
@@ -360,7 +338,6 @@ _HTML = r"""<!doctype html>
   <header>
     <h1>CFIE GUI Agent 人工介入</h1>
     <div class="toolbar">
-      <button onclick="createDemo()">创建示例请求</button>
       <button class="primary" onclick="refresh()">刷新</button>
     </div>
   </header>
@@ -453,21 +430,6 @@ _HTML = r"""<!doctype html>
       } catch (err) {
         alert(err.message);
       }
-      await refresh();
-    }
-
-    async function createDemo() {
-      await api("/api/human/demo", {
-        method: "POST",
-        body: JSON.stringify({
-          question: "当前子任务需要人工确认：是否继续执行？",
-          task_id: "demo_subtask",
-          job_id: "job:demo",
-          urgency: "high",
-          risk_reason: "模型判断下一步可能影响任务状态。",
-          proposed_action: "等待管理者给出明确回复。",
-        }),
-      });
       await refresh();
     }
 

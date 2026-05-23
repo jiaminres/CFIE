@@ -37,12 +37,12 @@ def test_chat_parser_maps_input_video_to_video_url_content():
     part_type, content = _parse_chat_message_content_mm_part(
         {
             "type": "input_video",
-            "video_url": {"url": "file:///tmp/demo.mp4"},
+            "video_url": {"url": "file:///tmp/production_video.mp4"},
         }
     )
 
     assert part_type == "input_video"
-    assert content == "file:///tmp/demo.mp4"
+    assert content == "file:///tmp/production_video.mp4"
 
 
 def test_video_jpeg_data_url_round_trip_loads_frames():

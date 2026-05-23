@@ -11,37 +11,29 @@ from cfie_gui_agent.human_loop import HumanLoopManager, InMemoryHumanChannel
 
 def test_console_human_input_api_claims_and_replies():
     state = ConsoleState()
+    request = state.human_loop.request_help(
+        question="Need command.",
+        task_id="subtask_1",
+        urgency="high",
+        metadata={"job_id": "job:test"},
+    )
     server, _ = build_console_server(host="127.0.0.1", port=0, state=state)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
     try:
-        created = _request_json(
-            host,
-            port,
-            "POST",
-            "/api/human/demo",
-            {
-                "question": "Need command.",
-                "task_id": "subtask_1",
-                "job_id": "job:test",
-                "urgency": "high",
-            },
-        )
-        request_id = created["request"]["request_id"]
-
         claimed = _request_json(
             host,
             port,
             "POST",
-            f"/api/human/requests/{request_id}/claim",
+            f"/api/human/requests/{request.request_id}/claim",
             {},
         )
         replied = _request_json(
             host,
             port,
             "POST",
-            f"/api/human/requests/{request_id}/reply",
+            f"/api/human/requests/{request.request_id}/reply",
             {"text": "continue"},
         )
         listing = _request_json(
