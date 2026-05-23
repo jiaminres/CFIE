@@ -1,0 +1,701 @@
+from __future__ import annotations
+
+import pytest
+
+from cfie_gui_agent import (
+    AgentTraceStore,
+    ContextManager,
+    find_agent_tool_calls,
+    HumanLoopManager,
+    HumanReply,
+    InMemoryHumanChannel,
+    AgentScheduler,
+    JobBoard,
+    JobState,
+    LongHistorySummary,
+    ModelToolRegistry,
+    MonitorController,
+    MonitorEvent,
+    PolicyStore,
+    RuntimeContextBuilder,
+    SubtaskState,
+    QueuedTask,
+    StepRecord,
+    StepVerifier,
+    TASK_STATUS_ACTIVE,
+    TASK_STATUS_COMPLETED,
+    TASK_STATUS_PAUSED,
+    TASK_STATUS_SUPERSEDED,
+    TASK_TYPE_INTERRUPT,
+    TaskStack,
+    TaskState,
+    ToolRegistryError,
+    VERIFICATION_NO_SCREEN_CHANGE,
+    VERIFICATION_REPEATED_ACTION,
+    VisionContextPolicy,
+    WorkspaceProfile,
+    assign_subtask_completion_credit,
+)
+from cfie_gui_agent.context import CompactionPlanError
+
+
+def test_task_stack_interrupt_resume_and_override():
+    stack = TaskStack.with_root(TaskState(task_id="task_a", goal="clear dungeon"))
+
+    transition = stack.push_interrupt(
+        TaskState(task_id="task_b", goal="revive"),
+        reason="death_dialog",
+    )
+
+    assert transition.from_task_id == "task_a"
+    assert transition.to_task_id == "task_b"
+    assert stack.tasks[0].status == TASK_STATUS_PAUSED
+    assert stack.active_task_id == "task_b"
+    assert stack.active_task.type == TASK_TYPE_INTERRUPT
+
+    resume = stack.pop_resume(reason="revived")
+
+    assert resume.from_task_id == "task_b"
+    assert resume.to_task_id == "task_a"
+    assert stack.tasks[1].status == TASK_STATUS_COMPLETED
+    assert stack.active_task_id == "task_a"
+    assert stack.tasks[0].status == TASK_STATUS_ACTIVE
+
+    override = stack.override(
+        TaskState(task_id="task_c", goal="higher priority quest"),
+        reason="better_reward",
+    )
+
+    assert override.from_task_id == "task_a"
+    assert override.to_task_id == "task_c"
+    assert stack.tasks[0].status == TASK_STATUS_SUPERSEDED
+    assert stack.active_task_id == "task_c"
+
+
+def test_context_manager_uses_43_frame_default_policy():
+    policy = VisionContextPolicy()
+    assert policy.configured_frame_budget == 43
+
+    steps = [
+        StepRecord(
+            step_id=index,
+            after_ref=f"after_{index}.png",
+            video_refs=tuple(f"{index}_{frame}.png" for frame in range(8)),
+            tags=("key_evidence",) if index in {1, 2, 3, 4, 5, 6} else (),
+        )
+        for index in range(1, 36)
+    ]
+    manager = ContextManager(policy=policy)
+    selection = manager.select_prompt_context(
+        steps,
+        current_frame_ref="current.png",
+    )
+
+    assert [step.step_id for step in selection.recent_video_steps] == [34, 35]
+    assert len(selection.mid_history_after_frames) == 25
+    assert len(selection.key_evidence_frames) == 5
+    assert selection.selected_frame_count == 43
+
+    payload = selection.to_context_payload()
+    assert payload["current_frame"] == "current.png"
+    assert payload["vision_context_policy"]["max_visual_frames"] == 43
+
+
+def test_context_manager_downgrades_visual_budget_by_usage_ratio():
+    steps = [
+        StepRecord(
+            step_id=index,
+            after_ref=f"after_{index}.png",
+            video_refs=tuple(f"{index}_{frame}.png" for frame in range(8)),
+            tags=("key_evidence",) if index in {1, 2, 3, 4, 5} else (),
+        )
+        for index in range(1, 36)
+    ]
+    manager = ContextManager()
+
+    warning = manager.select_prompt_context(
+        steps,
+        current_frame_ref="current.png",
+        usage_ratio=0.75,
+    )
+    compact = manager.select_prompt_context(
+        steps,
+        current_frame_ref="current.png",
+        usage_ratio=0.90,
+    )
+    emergency = manager.select_prompt_context(
+        steps,
+        current_frame_ref="current.png",
+        usage_ratio=0.97,
+    )
+
+    assert warning.policy.mid_history_after_frames == 15
+    assert compact.policy.frames_per_recent_step == 4
+    assert compact.policy.key_evidence_frames == 3
+    assert emergency.policy.recent_video_steps == 1
+    assert emergency.policy.mid_history_after_frames == 0
+    assert emergency.selected_frame_count < compact.selected_frame_count
+
+
+def test_context_manager_validates_compaction_plan():
+    manager = ContextManager()
+    manager.validate_compaction_plan(
+        {
+            "merge_steps": [
+                {
+                    "steps": [1, 2, 3],
+                    "summary": "Repeated waits without progress.",
+                }
+            ],
+            "keep_visual_steps": [{"step": 4, "reason": "target page"}],
+        },
+        available_step_ids={1, 2, 3, 4},
+    )
+
+    with pytest.raises(CompactionPlanError):
+        manager.validate_compaction_plan(
+            {"drop_visual_steps": [{"steps": [5]}]},
+            available_step_ids={1, 2, 3, 4},
+        )
+
+    with pytest.raises(CompactionPlanError):
+        manager.validate_compaction_plan(
+            {"merge_steps": [{"steps": [4], "summary": "active"}]},
+            available_step_ids={1, 2, 3, 4},
+            current_step_id=4,
+        )
+
+
+def test_context_manager_applies_compaction_plan():
+    manager = ContextManager()
+    steps = [
+        StepRecord(
+            step_id=index,
+            after_ref=f"after_{index}.png",
+            video_refs=(f"{index}_0.png", f"{index}_1.png"),
+        )
+        for index in range(1, 6)
+    ]
+
+    result = manager.apply_compaction_plan(
+        steps,
+        long_history_summary=LongHistorySummary(),
+        plan={
+            "merge_steps": [
+                {
+                    "steps": [1, 2],
+                    "summary": "Tried a stale path and it did not progress.",
+                    "tags": ["failed_path", "do_not_repeat"],
+                    "keep_evidence": ["after_2.png"],
+                    "drop_video": True,
+                    "downgrade_to_text": True,
+                }
+            ],
+            "drop_visual_steps": [{"step": 3}],
+            "do_not_repeat": ["Do not repeat the stale path."],
+            "known_targets": {
+                "chat_input": {
+                    "description": "bottom input",
+                    "evidence": "after_4.png",
+                }
+            },
+        },
+        current_step_id=5,
+    )
+
+    assert [step.step_id for step in result.steps] == [3, 4, 5]
+    assert result.steps[0].video_refs == ()
+    assert result.merged_step_ids == (1, 2)
+    assert "Tried a stale path and it did not progress." in (
+        result.long_history_summary.failed_attempts
+    )
+    assert "after_2.png" in result.long_history_summary.evidence_refs
+    assert "Do not repeat the stale path." in result.long_history_summary.do_not_repeat
+    assert result.long_history_summary.known_targets["chat_input"]["evidence"] == (
+        "after_4.png"
+    )
+
+
+def test_step_verifier_detects_no_screen_change_and_repeated_action():
+    verifier = StepVerifier(max_repeated_actions=3)
+    action = {"type": "computer_call", "actions": [{"type": "click", "x": 1, "y": 2}]}
+
+    no_change = verifier.verify(
+        StepRecord(
+            step_id=1,
+            action=action,
+            before_ref="same.png",
+            after_ref="same.png",
+        )
+    )
+    second = verifier.verify(
+        StepRecord(
+            step_id=2,
+            action=action,
+            before_ref="before.png",
+            after_ref="after.png",
+        )
+    )
+    third = verifier.verify(
+        StepRecord(
+            step_id=3,
+            action=action,
+            before_ref="before2.png",
+            after_ref="after2.png",
+        )
+    )
+
+    assert no_change.status == VERIFICATION_NO_SCREEN_CHANGE
+    assert second.repeated_action_count == 2
+    assert third.status == VERIFICATION_REPEATED_ACTION
+
+
+def test_per_job_context_store_keeps_job_histories_separate():
+    from cfie_gui_agent import PerJobContextStore
+
+    store = PerJobContextStore()
+    chrome_step = StepRecord(step_id=1, task_id="job_chrome", after_ref="chrome.png")
+    wechat_step = StepRecord(step_id=1, task_id="job_wechat", after_ref="wechat.png")
+
+    store.append_step("job_chrome", chrome_step)
+    store.append_step("job_wechat", wechat_step)
+
+    assert store.get_steps("job_chrome") == [chrome_step]
+    assert store.get_steps("job_wechat") == [wechat_step]
+
+
+def test_per_job_context_store_compacts_one_job_without_touching_another():
+    from cfie_gui_agent import PerJobContextStore
+
+    manager = ContextManager()
+    store = PerJobContextStore()
+    for index in range(1, 5):
+        store.append_step(
+            "job_chrome",
+            StepRecord(step_id=index, task_id="job_chrome", after_ref=f"c{index}.png"),
+        )
+        store.append_step(
+            "job_wechat",
+            StepRecord(step_id=index, task_id="job_wechat", after_ref=f"w{index}.png"),
+        )
+
+    result = store.compact_job(
+        "job_chrome",
+        manager=manager,
+        current_step_id=4,
+        plan={
+            "merge_steps": [
+                {
+                    "steps": [1, 2],
+                    "summary": "Chrome setup completed.",
+                    "tags": ["completed"],
+                    "keep_evidence": ["c2.png"],
+                }
+            ]
+        },
+    )
+    payload = store.to_job_context_payload("job_chrome", manager=manager)
+
+    assert result.merged_step_ids == (1, 2)
+    assert [step.step_id for step in store.get_steps("job_chrome")] == [3, 4]
+    assert [step.step_id for step in store.get_steps("job_wechat")] == [1, 2, 3, 4]
+    assert store.get_raw_steps("job_chrome")[0].after_ref == "c1.png"
+    assert "Chrome setup completed." in store.get_summary("job_chrome").completed
+    assert payload["active_step_count"] == 2
+    assert payload["raw_step_count"] == 4
+
+
+def test_runtime_context_builder_exposes_active_job_subtask_and_policy():
+    from cfie_gui_agent import PerJobContextStore
+
+    board = JobBoard()
+    board.add_job(JobState(job_id="job_chrome", target_app="Chrome", goal="browse"))
+    board.add_subtask(
+        SubtaskState(
+            subtask_id="open_page",
+            job_id="job_chrome",
+            goal="open target page",
+            status="running",
+        )
+    )
+    store = PerJobContextStore()
+    store.append_step(
+        "job_chrome",
+        StepRecord(step_id=1, task_id="job_chrome", after_ref="after.png"),
+    )
+    policy = PolicyStore()
+    policy.apply_update(
+        summary="Do not close the browser.",
+        constraints={"current_job": ["Do not close the browser."]},
+    )
+
+    context = RuntimeContextBuilder(
+        context_manager=ContextManager(),
+        tool_registry=ModelToolRegistry(),
+        policy_store=policy,
+    ).build(
+        job_board=board,
+        context_store=store,
+        active_job_id="job_chrome",
+    ).to_dict()
+
+    assert context["active_job"]["target_app"] == "Chrome"
+    assert context["active_subtask"]["subtask_id"] == "open_page"
+    assert context["policy"]["rules"][0]["text"] == "Do not close the browser."
+    assert context["prompt_context"]["current_frame"] == "after.png"
+
+
+def test_workspace_profile_serializes_business_context():
+    profile = WorkspaceProfile(
+        profile_id="ecommerce_ops",
+        name="E-commerce operations",
+        description="Handle buyer messages and order exceptions.",
+        target_apps=("QianNiu", "WeChat"),
+        business_rules=("Ask manager before refunds.",),
+        reference_image_refs=("artifact://home.png",),
+        reference_video_refs=("artifact://flow.mp4",),
+        sop_refs=("artifact://sop.md",),
+    )
+
+    payload = profile.to_dict()
+
+    assert payload["target_apps"] == ["QianNiu", "WeChat"]
+    assert payload["business_rules"] == ["Ask manager before refunds."]
+    assert payload["sop_refs"] == ["artifact://sop.md"]
+
+
+def test_model_tool_registry_blocks_internal_tools():
+    registry = ModelToolRegistry()
+
+    registry.validate_model_tool("computer_use")
+    registry.validate_model_tool("request_human_help")
+
+    with pytest.raises(ToolRegistryError):
+        registry.validate_model_tool("extract_video_frames")
+
+    with pytest.raises(ToolRegistryError):
+        registry.validate_model_tool("check_human_reply")
+
+    with pytest.raises(ToolRegistryError):
+        registry.validate_model_tool("unknown_tool")
+
+
+def test_model_tool_registry_validates_tool_arguments():
+    registry = ModelToolRegistry()
+
+    registry.validate_model_tool_call(
+        "request_human_help",
+        {
+            "question": "Need approval before refund.",
+            "urgency": "high",
+            "evidence_refs": ["artifact://frame.png"],
+        },
+    )
+    registry.validate_model_tool_call(
+        "ask_replan",
+        {
+            "suggested_transition": "switch_job",
+            "reason": "manager reply arrived",
+            "target_job_id": "job_wechat",
+        },
+    )
+
+    with pytest.raises(ToolRegistryError):
+        registry.validate_model_tool_call(
+            "request_human_help",
+            {"urgency": "high"},
+        )
+
+    with pytest.raises(ToolRegistryError):
+        registry.validate_model_tool_call(
+            "request_human_help",
+            {"question": "Need approval.", "urgency": "soon"},
+        )
+
+    with pytest.raises(ToolRegistryError):
+        registry.validate_model_tool_call(
+            "ask_replan",
+            {
+                "suggested_transition": "teleport",
+                "reason": "bad plan",
+            },
+        )
+
+
+def test_model_tool_registry_exports_non_empty_openai_schemas():
+    tools = ModelToolRegistry().to_openai_tools()
+    by_name = {tool["function"]["name"]: tool for tool in tools}
+
+    request_schema = by_name["request_human_help"]["function"]["parameters"]
+    assert request_schema["required"] == ["question"]
+    assert "urgency" in request_schema["properties"]
+    assert "computer_use" in by_name
+
+
+def test_policy_store_converts_constraints_to_context_rules():
+    store = PolicyStore()
+
+    update = store.apply_update(
+        summary="Avoid repeating failed refund path.",
+        constraints={
+            "current_job": [
+                {
+                    "text": "Do not click refund before manager approval.",
+                    "severity": "high",
+                    "evidence_refs": ["artifact://frame.png"],
+                }
+            ]
+        },
+        reason="user correction",
+        source="user",
+    )
+    payload = store.to_context_payload()
+
+    assert update.summary == "Avoid repeating failed refund path."
+    assert update.rules[0].scope == "current_job"
+    assert update.rules[0].severity == "high"
+    assert payload["rules"][0]["text"] == "Do not click refund before manager approval."
+
+
+def test_agent_trace_store_records_jsonl_events(tmp_path):
+    trace_path = tmp_path / "agent_trace.jsonl"
+    store = AgentTraceStore(path=trace_path)
+
+    event = store.record_step(
+        StepRecord(
+            step_id=1,
+            action={"type": "agent_tool", "name": "finish_subtask"},
+            result="accepted",
+        )
+    )
+
+    assert event.kind == "step"
+    assert store.to_dict()["event_count"] == 1
+    assert trace_path.read_text(encoding="utf-8").strip()
+
+
+def test_find_agent_tool_calls_parses_json_arguments_and_skips_computer_use():
+    calls = find_agent_tool_calls(
+        {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "request_human_help",
+                    "call_id": "call_1",
+                    "arguments": '{"question": "Need approval."}',
+                },
+                {
+                    "type": "function_call",
+                    "name": "computer_use",
+                    "call_id": "call_2",
+                    "arguments": {"actions": []},
+                },
+            ]
+        }
+    )
+
+    assert len(calls) == 1
+    assert calls[0].name == "request_human_help"
+    assert calls[0].arguments == {"question": "Need approval."}
+
+
+def test_human_loop_reply_becomes_urgent_task():
+    channel = InMemoryHumanChannel()
+    manager = HumanLoopManager(channel=channel)
+
+    request = manager.request_help(
+        question="Seller asks for a human reply.",
+        task_id="task_a",
+        evidence_refs=("screen_1.png",),
+        urgency="high",
+    )
+
+    assert channel.sent_requests == [request]
+    assert request.request_id in manager.pending
+
+    channel.push_reply(HumanReply(request_id=request.request_id, text="Reply: hello"))
+    tasks = manager.poll()
+
+    assert request.request_id not in manager.pending
+    assert len(tasks) == 1
+    assert tasks[0]["type"] == "manager_reply"
+    assert tasks[0]["priority"] == "urgent"
+    assert tasks[0]["reply"]["text"] == "Reply: hello"
+    assert manager.pop_urgent_task() == tasks[0]
+
+
+def test_job_board_manager_reply_promotes_waiting_subtask():
+    board = JobBoard()
+    board.add_job(JobState(job_id="job_wechat", target_app="WeChat", goal="chat"))
+    board.add_subtask(
+        SubtaskState(
+            subtask_id="reply_buyer",
+            job_id="job_wechat",
+            goal="wait for manager wording",
+            status="waiting_human",
+            human_request_id="human_1",
+        )
+    )
+
+    promoted = board.enqueue_manager_reply(
+        {
+            "request": {
+                "request_id": "human_1",
+                "metadata": {"job_id": "job_wechat"},
+            },
+            "reply": {"request_id": "human_1", "text": "Reply: approved"},
+        }
+    )
+    selection = board.select_next(safe_to_interrupt=True)
+
+    assert promoted.subtask_id == "reply_buyer"
+    assert promoted.metadata["manager_reply"]["text"] == "Reply: approved"
+    assert selection.subtask.subtask_id == "reply_buyer"
+    assert board.jobs["job_wechat"].queues.counts()["waiting_human"] == 0
+
+
+def test_monitor_controller_ingests_event_into_target_job():
+    board = JobBoard()
+    board.add_job(JobState(job_id="job_qianniu", target_app="QianNiu", goal="chat"))
+    controller = MonitorController()
+
+    result = controller.ingest_event(
+        board,
+        MonitorEvent(
+            event_id="evt_1",
+            target_job_id="job_qianniu",
+            subtask_goal="Reply to new buyer message.",
+            priority=80,
+            evidence_refs=("artifact://notification.png",),
+        ),
+    )
+    selection = board.select_next(safe_to_interrupt=True)
+
+    assert result.accepted is True
+    assert selection.subtask.subtask_id == "monitor:evt_1"
+    assert selection.subtask.evidence_refs == ("artifact://notification.png",)
+
+
+def test_monitor_controller_rejects_unknown_target_job():
+    result = MonitorController().ingest_event(
+        JobBoard(),
+        MonitorEvent(
+            event_id="evt_bad",
+            target_job_id="job_missing",
+            subtask_goal="Reply to message.",
+        ),
+    )
+
+    assert result.accepted is False
+    assert "unknown target job" in result.reason
+
+
+def test_scheduler_waiting_human_does_not_block_active_work():
+    scheduler = AgentScheduler()
+    waiting = QueuedTask(task_id="seller_question", kind="waiting_human")
+    other = QueuedTask(task_id="inspect_orders", kind="automation")
+
+    scheduler.park_waiting_human(waiting, request_id="human_1")
+    scheduler.enqueue_active(other)
+
+    decision = scheduler.next_task(safe_to_interrupt=False)
+
+    assert decision.task == other
+    assert decision.queue == "active"
+    assert "human_1" in scheduler.snapshot()["waiting_human"]
+
+
+def test_scheduler_manager_reply_waits_for_safe_interruption_point():
+    scheduler = AgentScheduler()
+    scheduler.enqueue_manager_reply(
+        {
+            "request": {"request_id": "human_1"},
+            "reply": {"text": "Reply to seller: hello"},
+        }
+    )
+
+    unsafe = scheduler.next_task(safe_to_interrupt=False)
+
+    assert unsafe.task is None
+    assert unsafe.queue == "urgent"
+
+    safe = scheduler.next_task(safe_to_interrupt=True)
+
+    assert safe.task is not None
+    assert safe.task.kind == "manager_reply"
+    assert safe.queue == "urgent"
+
+
+def test_job_board_selects_urgent_work_across_jobs_at_safe_point():
+    board = JobBoard()
+    board.add_job(JobState(job_id="job_chrome", target_app="Chrome", goal="web"))
+    board.add_job(JobState(job_id="job_wechat", target_app="WeChat", goal="chat"))
+    board.add_subtask(
+        SubtaskState(
+            subtask_id="reply_manager",
+            job_id="job_wechat",
+            goal="reply manager",
+            priority=100,
+        )
+    )
+    board.add_subtask(
+        SubtaskState(
+            subtask_id="continue_web",
+            job_id="job_chrome",
+            goal="continue web",
+            priority=10,
+        )
+    )
+
+    selection = board.select_next(safe_to_interrupt=True)
+
+    assert selection.job.job_id == "job_wechat"
+    assert selection.subtask.subtask_id == "reply_manager"
+    assert board.active_job_id == "job_wechat"
+    assert board.switch_history[-1].from_job_id == "job_chrome"
+    assert board.switch_history[-1].to_job_id == "job_wechat"
+
+
+def test_job_board_keeps_running_subtask_when_not_safe_to_interrupt():
+    board = JobBoard()
+    board.add_job(JobState(job_id="job_chrome", target_app="Chrome", goal="web"))
+    board.add_job(JobState(job_id="job_wechat", target_app="WeChat", goal="chat"))
+    board.add_subtask(
+        SubtaskState(
+            subtask_id="typing_reply",
+            job_id="job_chrome",
+            goal="type reply",
+            status="running",
+        )
+    )
+    board.add_subtask(
+        SubtaskState(
+            subtask_id="manager_reply",
+            job_id="job_wechat",
+            goal="manager reply",
+            priority=100,
+        )
+    )
+
+    selection = board.select_next(safe_to_interrupt=False)
+
+    assert selection.job.job_id == "job_chrome"
+    assert selection.subtask.subtask_id == "typing_reply"
+    assert board.active_job_id == "job_chrome"
+
+
+def test_subtask_completion_reward_discounting():
+    assignment = assign_subtask_completion_credit(
+        subtask_id="send_message",
+        step_ids=[10, 11, 12],
+        terminal_reward=2.0,
+        gamma=0.9,
+    )
+
+    assert assignment.terminal_step_id == 12
+    assert [credit.step_id for credit in assignment.credits] == [12, 11, 10]
+    assert [round(credit.credit, 3) for credit in assignment.credits] == [
+        2.0,
+        1.8,
+        1.62,
+    ]
