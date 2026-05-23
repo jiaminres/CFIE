@@ -24,6 +24,7 @@ KEY_EVIDENCE_TAGS = frozenset(
 
 @dataclass(slots=True, frozen=True)
 class VisionContextPolicy:
+    mode: str = "balanced"
     resolution: str = "1080p"
     max_visual_frames: int = 43
     current_frame: int = 1
@@ -32,6 +33,26 @@ class VisionContextPolicy:
     mid_history_after_frames: int = 25
     key_evidence_frames: int = 5
     estimated_tokens_per_frame: int = 1570
+
+    @classmethod
+    def agility(
+        cls,
+        *,
+        max_visual_frames: int = 43,
+        resolution: str = "1080p",
+        estimated_tokens_per_frame: int = 1570,
+    ) -> "VisionContextPolicy":
+        return cls(
+            mode="agility",
+            resolution=resolution,
+            max_visual_frames=max_visual_frames,
+            current_frame=1,
+            recent_video_steps=0,
+            frames_per_recent_step=0,
+            mid_history_after_frames=max(0, max_visual_frames - 1),
+            key_evidence_frames=0,
+            estimated_tokens_per_frame=estimated_tokens_per_frame,
+        )
 
     @property
     def recent_video_frame_budget(self) -> int:
@@ -63,6 +84,7 @@ class VisionContextPolicy:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "mode": self.mode,
             "resolution": self.resolution,
             "max_visual_frames": self.max_visual_frames,
             "current_frame": self.current_frame,

@@ -13,6 +13,8 @@ MODEL_CALLABLE_TOOLS = (
     "report_blocked",
     "ask_replan",
     "query_memory",
+    "run_action_macro",
+    "navigate_to_target",
 )
 
 HARNESS_INTERNAL_TOOLS = (
@@ -125,6 +127,11 @@ def _default_description(tool_name: str) -> str:
         "report_blocked": "Report that the current task is blocked.",
         "ask_replan": "Ask TaskManager to consider a task transition.",
         "query_memory": "Query workspace or business memory.",
+        "run_action_macro": "Execute a registered low-latency action macro.",
+        "navigate_to_target": (
+            "Ask the harness to move a source element toward a target while "
+            "avoiding model-identified obstacles."
+        ),
     }
     return descriptions.get(tool_name, tool_name)
 
@@ -269,8 +276,54 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
             },
             required=("query",),
         ),
+        "run_action_macro": _object_schema(
+            {
+                "macro_name": {"type": "string", "minLength": 1},
+                "repeat": {"type": "integer", "minimum": 1},
+                "objective": {"type": "string"},
+                "stop_condition": {"type": "string"},
+            },
+            required=("macro_name",),
+        ),
+        "navigate_to_target": _object_schema(
+            {
+                "source": _point_schema(),
+                "target": _point_schema(),
+                "target_label": {"type": "string"},
+                "obstacles": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": _point_schema(),
+                    },
+                },
+                "arrive_radius": {"type": "integer", "minimum": 1},
+                "max_seconds": {"type": "number", "minimum": 0.1},
+                "objective": {"type": "string"},
+            },
+            required=("source", "target"),
+        ),
     }
     return schemas.get(tool_name, _object_schema({}))
+
+
+def _point_schema() -> dict[str, Any]:
+    return {
+        "anyOf": [
+            {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 2,
+            },
+            _object_schema(
+                {
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                },
+                required=("x", "y"),
+            ),
+        ]
+    }
 
 
 def _object_schema(

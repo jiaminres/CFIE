@@ -27,10 +27,24 @@ from cfie_gui_agent.jobs import (
     SubtaskState,
     SwitchEvent,
 )
+from cfie_gui_agent.macros import (
+    ActionMacro,
+    ActionMacroError,
+    ActionMacroRegistry,
+    ActionMacroStep,
+)
 from cfie_gui_agent.monitor import (
     MonitorController,
     MonitorEvent,
     MonitorIngestionResult,
+)
+from cfie_gui_agent.navigation import (
+    NavigationPlan,
+    NavigationPlanError,
+    NavigationPlanner,
+    NavigationRequest,
+    ObstaclePolygon,
+    Point,
 )
 from cfie_gui_agent.policy import PolicyRule, PolicyStore, PolicyUpdate
 from cfie_gui_agent.rewards import (
@@ -76,6 +90,10 @@ from cfie_gui_agent.verifier import (
 __all__ = [
     "AgentToolCall",
     "AgentToolError",
+    "ActionMacro",
+    "ActionMacroError",
+    "ActionMacroRegistry",
+    "ActionMacroStep",
     "ContextManager",
     "CompactionApplication",
     "GuiAgentRunner",
@@ -96,6 +114,12 @@ __all__ = [
     "MonitorController",
     "MonitorEvent",
     "MonitorIngestionResult",
+    "NavigationPlan",
+    "NavigationPlanError",
+    "NavigationPlanner",
+    "NavigationRequest",
+    "ObstaclePolygon",
+    "Point",
     "PromptContextSelection",
     "PerJobContextStore",
     "PolicyRule",

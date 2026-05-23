@@ -16,6 +16,8 @@ from cfie_gui_agent.jobs import (
     PerJobContextStore,
     SubtaskState,
 )
+from cfie_gui_agent.macros import ActionMacroError, ActionMacroRegistry
+from cfie_gui_agent.navigation import NavigationPlanError, NavigationPlanner, NavigationRequest
 from cfie_gui_agent.policy import PolicyStore
 from cfie_gui_agent.runtime_context import RuntimeContextBuilder
 from cfie_gui_agent.specs import GuiAgentResult, GuiAgentTaskSpec
@@ -37,6 +39,8 @@ class GuiAgentRunner:
     step_verifier: StepVerifier = field(default_factory=StepVerifier)
     policy_store: PolicyStore = field(default_factory=PolicyStore)
     trace_store: AgentTraceStore = field(default_factory=AgentTraceStore)
+    action_macros: ActionMacroRegistry = field(default_factory=ActionMacroRegistry)
+    navigation_planner: NavigationPlanner = field(default_factory=NavigationPlanner)
     include_runtime_context: bool = True
     human_loop: HumanLoopManager = field(
         default_factory=lambda: HumanLoopManager(channel=InMemoryHumanChannel())
@@ -261,6 +265,41 @@ class GuiAgentRunner:
                 "tool": call.name,
             }
 
+        if call.name == "run_action_macro":
+            macro_name = str(call.arguments.get("macro_name", ""))
+            repeat = int(call.arguments.get("repeat", 1))
+            try:
+                actions = self.action_macros.expand(macro_name, repeat=repeat)
+            except ActionMacroError as exc:
+                return {
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "macro_name": macro_name,
+                }
+            return {
+                "status": "accepted",
+                "macro_name": macro_name,
+                "repeat": repeat,
+                "expanded_actions": [
+                    action.to_openai_dict() for action in actions
+                ],
+            }
+
+        if call.name == "navigate_to_target":
+            try:
+                request = NavigationRequest.from_arguments(call.arguments)
+                plan = self.navigation_planner.plan(request)
+            except (KeyError, TypeError, ValueError, NavigationPlanError) as exc:
+                return {
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "tool": call.name,
+                }
+            return {
+                "status": "planned",
+                "navigation_plan": plan.to_dict(),
+            }
+
         return {"status": "ignored", "reason": f"tool not handled: {call.name}"}
 
     def _build_initial_job_board(self, task: GuiAgentTaskSpec) -> JobBoard:
@@ -360,6 +399,7 @@ class GuiAgentRunner:
             context_manager=self.context_manager,
             tool_registry=self.tool_registry,
             policy_store=self.policy_store,
+            action_macros=self.action_macros,
         ).build(
             job_board=job_board,
             context_store=context_store,
@@ -398,6 +438,7 @@ class GuiAgentRunner:
             context_manager=self.context_manager,
             tool_registry=self.tool_registry,
             policy_store=self.policy_store,
+            action_macros=self.action_macros,
         ).build(
             job_board=job_board,
             context_store=context_store,

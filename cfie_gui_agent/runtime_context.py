@@ -5,6 +5,7 @@ from typing import Any
 
 from cfie_gui_agent.context import ContextManager
 from cfie_gui_agent.jobs import JobBoard, PerJobContextStore
+from cfie_gui_agent.macros import ActionMacroRegistry
 from cfie_gui_agent.policy import PolicyStore
 from cfie_gui_agent.tools import ModelToolRegistry
 
@@ -22,6 +23,7 @@ class RuntimeContextBuilder:
     context_manager: ContextManager
     tool_registry: ModelToolRegistry
     policy_store: PolicyStore
+    action_macros: ActionMacroRegistry | None = None
 
     def build(
         self,
@@ -49,5 +51,10 @@ class RuntimeContextBuilder:
                 "prompt_context": job_context["prompt_context"],
                 "policy": self.policy_store.to_context_payload(),
                 "model_tools": list(self.tool_registry.allowed_tool_names),
+                "action_macros": (
+                    self.action_macros.to_context_payload()
+                    if self.action_macros is not None
+                    else {"macros": []}
+                ),
             }
         )

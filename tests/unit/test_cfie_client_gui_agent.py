@@ -9,6 +9,9 @@ from cfie_client import ComputerLoop, Qwen35ComputerAdapter, ScreenshotResult
 from cfie_client.executor import ComputerBackend
 from cfie_client.protocol import ComputerAction, ComputerCall
 from cfie_gui_agent import (
+    ActionMacro,
+    ActionMacroRegistry,
+    ActionMacroStep,
     GuiAgentRunner,
     GuiAgentTaskSpec,
     ToolRegistryError,
@@ -349,3 +352,95 @@ def test_gui_agent_runner_persists_update_constraints_tool_call():
     assert result.metadata["policy"]["rules"][0]["text"] == "Ask before refunding."
     assert result.metadata["policy"]["rules"][0]["severity"] == "high"
     assert result.metadata["trace"]["event_count"] == 2
+
+
+def test_gui_agent_runner_handles_action_macro_tool_call():
+    registry = ActionMacroRegistry()
+    registry.register(
+        ActionMacro(
+            name="combo_asd",
+            steps=(
+                ActionMacroStep.keypress("A"),
+                ActionMacroStep.keypress("S"),
+                ActionMacroStep.keypress("D"),
+            ),
+        )
+    )
+    loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
+    runner = GuiAgentRunner(
+        computer_loop=loop,
+        action_macros=registry,
+        max_steps=3,
+    )
+    task = GuiAgentTaskSpec(task_id="task_macro", instruction="Use combo.")
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(conversation) == 2:
+            assert "combo_asd" in conversation[0]["content"][0]["text"]
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "run_action_macro",
+                        "call_id": "macro_1",
+                        "arguments": {"macro_name": "combo_asd"},
+                    }
+                ]
+            }
+        assert conversation[-1]["type"] == "function_call_output"
+        assert conversation[-1]["output"]["status"] == "accepted"
+        assert len(conversation[-1]["output"]["expanded_actions"]) == 3
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Macro planned."}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert result.metadata["step_records"][0]["action"]["name"] == "run_action_macro"
+
+
+def test_gui_agent_runner_handles_navigation_tool_call():
+    loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=3)
+    task = GuiAgentTaskSpec(task_id="task_nav", instruction="Move to target.")
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(conversation) == 2:
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "navigate_to_target",
+                        "call_id": "nav_1",
+                        "arguments": {
+                            "source": [0, 0],
+                            "target": [100, 100],
+                            "obstacles": [[[40, 40], [60, 40], [60, 60], [40, 60]]],
+                            "target_label": "monster",
+                        },
+                    }
+                ]
+            }
+        assert conversation[-1]["type"] == "function_call_output"
+        assert conversation[-1]["output"]["status"] == "planned"
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Route planned."}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    plan = result.metadata["step_records"][0]["metadata"]["output"]["navigation_plan"]
+    assert result.status == "completed"
+    assert plan["target_label"] == "monster"
+    assert len(plan["waypoints"]) >= 2

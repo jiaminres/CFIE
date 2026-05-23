@@ -43,6 +43,9 @@ human-loop state, and scheduler metadata.
   failed, cancelled, and superseded queues under one Job.
 - `MonitorController`: validates monitor events and creates Subtasks under the
   matching Job.
+- `ActionMacroRegistry`: user-registered low-latency shortcut/combo macros.
+- `NavigationPlanner`: harness-owned target navigation planning from source,
+  target, and obstacle coordinates.
 - `ContextManager`: selects current frame, recent video, mid-history
   after-frames, and long summary under the 43-frame default policy.
 - `ModelToolRegistry`: model-callable tool allowlist and harness-internal tool
@@ -55,6 +58,35 @@ human-loop state, and scheduler metadata.
 - `AgentTraceStore`: application-level trace for Job/Subtask/tool/policy events.
 - `RuntimeContextBuilder`: builds the bounded model-facing context payload from
   JobBoard, per-Job context, policy, and tool metadata.
+
+## Low-Latency Mode
+
+For high-frequency interaction such as games, the model should not output every
+single key press. The application can register action macros such as:
+
+```text
+combo_asd = A, S, D
+select_all_then_b = CTRL+A, B
+```
+
+The model calls `run_action_macro` with the macro name. The harness expands and
+validates the registered human-like key sequence.
+
+Agility context mode uses after-action frames only:
+
+```text
+current frame: 1
+recent video: 0
+after-frame history: 42
+total visual frames: 43
+```
+
+This avoids frequent video-prefill overhead in low-latency scenarios.
+
+For continuous movement, the model can call `navigate_to_target` with source and
+target coordinates plus obstacle polygons. The harness owns the route planning,
+real-time tracking, retry, and stop condition; model output is only the semantic
+navigation request.
 
 `TaskStack` still exists as a compatibility/helper structure for local
 interrupt/resume semantics, but the main scheduling model is Job/Subtask.

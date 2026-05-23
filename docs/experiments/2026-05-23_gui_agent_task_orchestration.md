@@ -2532,6 +2532,126 @@ Verification:
 passed
 ```
 
+## Implementation Round 16
+
+Date: 2026-05-23
+
+Low-latency mode and harness-owned continuous movement:
+
+The GUI Agent needs two execution styles:
+
+- normal business automation:
+  - lower operation frequency;
+  - richer recent visual history;
+  - more careful reasoning allowed.
+- game / low-latency automation:
+  - frequent actions;
+  - minimal thinking;
+  - no long video history in every turn;
+  - model should output compact semantic intents.
+
+Added action macro layer:
+
+- added `cfie_gui_agent.macros`;
+- added `ActionMacroStep`;
+- added `ActionMacro`;
+- added `ActionMacroRegistry`;
+- model-callable tool `run_action_macro`;
+- action macros expand into validated `ComputerAction` sequences.
+
+Example:
+
+```text
+combo_asd:
+  keypress A
+  keypress S
+  keypress D
+
+select_all_then_b:
+  keypress CTRL+A
+  keypress B
+```
+
+This allows one model tool call to trigger a known sequence of human-like key
+operations without requiring the model to emit ten individual actions.
+
+Added agility context mode:
+
+- `VisionContextPolicy.agility()`;
+- no recent video window;
+- all history frames are after-action images until compaction is needed.
+
+Default agility visual budget:
+
+```text
+current frame: 1
+recent video steps: 0
+frames per recent step: 0
+mid-history after frames: 42
+key evidence frames: 0
+total: 43 frames
+```
+
+Added navigation planning layer:
+
+- added `cfie_gui_agent.navigation`;
+- added `Point`;
+- added `ObstaclePolygon`;
+- added `NavigationRequest`;
+- added `NavigationPlan`;
+- added `NavigationPlanner`;
+- model-callable tool `navigate_to_target`.
+
+The model provides:
+
+```json
+{
+  "source": [10, 20],
+  "target": [400, 300],
+  "target_label": "monster",
+  "obstacles": [
+    [[100, 100], [180, 100], [180, 200], [100, 200]]
+  ]
+}
+```
+
+The harness owns:
+
+- path planning;
+- real-time target/source tracking;
+- obstacle avoidance;
+- retry;
+- stop condition;
+- future OpenCV integration.
+
+Current implementation is a deterministic geometry skeleton with bounding-box
+detours. It intentionally does not hard-code OpenCV into the runner yet. The
+OpenCV/live-screen execution loop should be added behind this interface.
+
+Runtime context:
+
+- registered action macros are included in `RuntimeContextBuilder` output;
+- the model can see available macro names and descriptions, but cannot invent a
+  macro that the registry has not accepted.
+
+Added tests:
+
+- agility context policy uses after frames only;
+- action macro expands to `ComputerAction` sequence;
+- navigation planner adds a detour around an obstacle;
+- runner handles `run_action_macro`;
+- runner handles `navigate_to_target`.
+
+Verification:
+
+```text
+..\.venv\Scripts\python.exe -m pytest tests\unit\test_responses_video_input.py tests\unit\test_gui_agent_architecture.py tests\unit\test_cfie_client_gui_agent.py -q
+42 passed, 2 dependency warnings
+
+..\.venv\Scripts\python.exe -m py_compile cfie_gui_agent\macros.py cfie_gui_agent\navigation.py cfie_gui_agent\runner.py cfie_gui_agent\runtime_context.py cfie_gui_agent\tools.py cfie_gui_agent\context.py cfie_gui_agent\__init__.py
+passed
+```
+
 ## Future Implementation Checklist
 
 Task orchestration:

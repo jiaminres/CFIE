@@ -3,6 +3,9 @@ from __future__ import annotations
 import pytest
 
 from cfie_gui_agent import (
+    ActionMacro,
+    ActionMacroRegistry,
+    ActionMacroStep,
     AgentTraceStore,
     ContextManager,
     find_agent_tool_calls,
@@ -16,6 +19,10 @@ from cfie_gui_agent import (
     ModelToolRegistry,
     MonitorController,
     MonitorEvent,
+    NavigationPlanner,
+    NavigationRequest,
+    ObstaclePolygon,
+    Point,
     PolicyStore,
     RuntimeContextBuilder,
     SubtaskState,
@@ -135,6 +142,16 @@ def test_context_manager_downgrades_visual_budget_by_usage_ratio():
     assert emergency.policy.recent_video_steps == 1
     assert emergency.policy.mid_history_after_frames == 0
     assert emergency.selected_frame_count < compact.selected_frame_count
+
+
+def test_agility_context_policy_uses_after_frames_only():
+    policy = VisionContextPolicy.agility(max_visual_frames=43)
+
+    assert policy.mode == "agility"
+    assert policy.recent_video_steps == 0
+    assert policy.frames_per_recent_step == 0
+    assert policy.mid_history_after_frames == 42
+    assert policy.configured_frame_budget == 43
 
 
 def test_context_manager_validates_compaction_plan():
@@ -343,6 +360,50 @@ def test_runtime_context_builder_exposes_active_job_subtask_and_policy():
     assert context["active_subtask"]["subtask_id"] == "open_page"
     assert context["policy"]["rules"][0]["text"] == "Do not close the browser."
     assert context["prompt_context"]["current_frame"] == "after.png"
+
+
+def test_action_macro_registry_expands_human_shortcut_sequence():
+    registry = ActionMacroRegistry()
+    registry.register(
+        ActionMacro(
+            name="select_all_then_b",
+            steps=(
+                ActionMacroStep.keypress("CTRL", "A"),
+                ActionMacroStep.wait(0.02),
+                ActionMacroStep.keypress("B"),
+            ),
+        )
+    )
+
+    actions = registry.expand("select_all_then_b")
+
+    assert [action.type for action in actions] == ["keypress", "wait", "keypress"]
+    assert actions[0].keys == ("CTRL", "A")
+    assert registry.to_context_payload()["macros"][0]["name"] == "select_all_then_b"
+
+
+def test_navigation_planner_adds_detour_for_obstacle():
+    request = NavigationRequest(
+        source=Point(0, 0),
+        target=Point(100, 100),
+        obstacles=(
+            ObstaclePolygon(
+                points=(
+                    Point(40, 40),
+                    Point(60, 40),
+                    Point(60, 60),
+                    Point(40, 60),
+                )
+            ),
+        ),
+    )
+
+    plan = NavigationPlanner(obstacle_margin=10).plan(request)
+
+    assert plan.status == "planned"
+    assert len(plan.waypoints) == 3
+    assert plan.waypoints[0] == Point(0, 0)
+    assert plan.waypoints[-1] == Point(100, 100)
 
 
 def test_workspace_profile_serializes_business_context():
