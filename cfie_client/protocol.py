@@ -25,6 +25,12 @@ MOUSE_ACTION_TYPES = frozenset(
     }
 )
 
+COORDINATE_SPACES = (
+    "screenshot",
+    "qwen_normalized_1000",
+    "auto",
+)
+
 
 class ProtocolError(ValueError):
     pass
@@ -110,6 +116,7 @@ class ComputerAction:
 
     @classmethod
     def from_openai(cls, value: Any) -> "ComputerAction":
+        value = _normalize_action_payload(value)
         action_type = str(_read_field(value, "type", "")).strip()
         if action_type not in ACTION_TYPES:
             raise ProtocolError(f"unsupported computer action type: {action_type!r}")
@@ -208,11 +215,63 @@ class ComputerAction:
         return ()
 
 
+def _normalize_action_payload(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    action = dict(value)
+    if "type" not in action and "action" in action:
+        action["type"] = action["action"]
+    action_type = str(action.get("type", "")).strip()
+    aliases = {
+        "left_click": "click",
+        "right_click": "click",
+        "mouse_click": "click",
+        "input": "type",
+        "input_text": "type",
+        "text": "type",
+        "key": "keypress",
+        "key_press": "keypress",
+        "press": "keypress",
+        "hotkey": "keypress",
+        "sleep": "wait",
+    }
+    if action_type in aliases:
+        action["type"] = aliases[action_type]
+        if action_type == "right_click" and "button" not in action:
+            action["button"] = "right"
+    coordinate = (
+        action.get("coordinate")
+        if "coordinate" in action
+        else action.get("coordinates", action.get("point"))
+    )
+    if coordinate is not None and ("x" not in action or "y" not in action):
+        try:
+            x, y = coordinate
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError("coordinate must be a pair [x, y]") from exc
+        action["x"] = x
+        action["y"] = y
+    if action.get("type") == "type" and "text" not in action:
+        text = action.get("content", action.get("value"))
+        if text is not None:
+            action["text"] = text
+    if action.get("type") == "keypress" and "keys" not in action:
+        key = action.get("key")
+        if key is not None:
+            action["keys"] = key
+    if action.get("type") == "wait" and "seconds" not in action:
+        seconds = action.get("duration", action.get("wait_time"))
+        if seconds is not None:
+            action["seconds"] = seconds
+    return action
+
+
 @dataclass(slots=True, frozen=True)
 class ComputerCall:
     call_id: str
     actions: tuple[ComputerAction, ...]
     status: str | None = None
+    coordinate_space: str | None = None
     pending_safety_checks: tuple[dict[str, Any], ...] = ()
     id: str | None = None
 
@@ -234,6 +293,14 @@ class ComputerCall:
             actions_raw = [actions_raw]
 
         actions = tuple(ComputerAction.from_openai(action) for action in actions_raw)
+        coordinate_space = _read_field(value, "coordinate_space")
+        if coordinate_space is not None:
+            coordinate_space = str(coordinate_space).strip()
+            if coordinate_space not in COORDINATE_SPACES:
+                raise ProtocolError(
+                    "computer_call.coordinate_space must be one of "
+                    f"{COORDINATE_SPACES}"
+                )
         pending = tuple(
             dict(check)
             for check in (_read_field(value, "pending_safety_checks", ()) or ())
@@ -243,6 +310,7 @@ class ComputerCall:
             call_id=call_id,
             actions=actions,
             status=_read_field(value, "status"),
+            coordinate_space=coordinate_space,
             pending_safety_checks=pending,
             id=_read_field(value, "id"),
         )
@@ -253,6 +321,8 @@ class ComputerCall:
             "call_id": self.call_id,
             "actions": [action.to_openai_dict() for action in self.actions],
         }
+        if self.coordinate_space is not None:
+            payload["coordinate_space"] = self.coordinate_space
         if self.status is not None:
             payload["status"] = self.status
         if self.pending_safety_checks:
@@ -303,13 +373,14 @@ def build_computer_call_output(
     call_id: str,
     image_url: str | None = None,
     file_id: str | None = None,
+    detail: str | None = "low",
     acknowledged_safety_checks: tuple[dict[str, Any], ...] | None = None,
 ) -> ComputerCallOutput:
     if not image_url and not file_id:
         raise ProtocolError("computer_call_output requires image_url or file_id")
     return ComputerCallOutput(
         call_id=call_id,
-        output=ComputerScreenshot(image_url=image_url, file_id=file_id),
+        output=ComputerScreenshot(image_url=image_url, file_id=file_id, detail=detail),
         acknowledged_safety_checks=tuple(acknowledged_safety_checks or ()),
     )
 

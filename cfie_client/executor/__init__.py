@@ -1,6 +1,7 @@
 from cfie_client.executor.computer import (
     ComputerBackend,
     ComputerExecutor,
+    CoordinateScalingBackend,
     UnsupportedComputerBackend,
     create_default_backend,
 )
@@ -8,6 +9,7 @@ from cfie_client.executor.computer import (
 __all__ = [
     "ComputerBackend",
     "ComputerExecutor",
+    "CoordinateScalingBackend",
     "UnsupportedComputerBackend",
     "create_default_backend",
 ]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Callable
 from typing import Protocol
 
 from cfie_client.protocol import ComputerAction
@@ -75,6 +76,68 @@ class UnsupportedComputerBackend:
 
     def wait(self, seconds: float) -> None:
         time.sleep(seconds)
+
+
+class CoordinateScalingBackend:
+    def __init__(
+        self,
+        backend: ComputerBackend,
+        *,
+        logical_size: tuple[int, int] | Callable[[], tuple[int, int]],
+        physical_size: tuple[int, int] | Callable[[], tuple[int, int]],
+        physical_offset: tuple[int, int] | Callable[[], tuple[int, int]] = (0, 0),
+    ) -> None:
+        self.backend = backend
+        self.logical_size = logical_size
+        self.physical_size = physical_size
+        self.physical_offset = physical_offset
+
+    def move(self, x: int, y: int) -> None:
+        self.backend.move(*self._scale_xy(x, y))
+
+    def click(self, x: int, y: int, button: str = "left") -> None:
+        self.backend.click(*self._scale_xy(x, y), button)
+
+    def double_click(self, x: int, y: int, button: str = "left") -> None:
+        self.backend.double_click(*self._scale_xy(x, y), button)
+
+    def drag(self, path: tuple[tuple[int, int], ...]) -> None:
+        self.backend.drag(tuple(self._scale_xy(x, y) for x, y in path))
+
+    def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+        self.backend.scroll(*self._scale_xy(x, y), scroll_x, scroll_y)
+
+    def type_text(self, text: str) -> None:
+        self.backend.type_text(text)
+
+    def press_keys(self, keys: tuple[str, ...]) -> None:
+        self.backend.press_keys(keys)
+
+    def key_down(self, key: str) -> None:
+        self.backend.key_down(key)
+
+    def key_up(self, key: str) -> None:
+        self.backend.key_up(key)
+
+    def wait(self, seconds: float) -> None:
+        self.backend.wait(seconds)
+
+    def _scale_xy(self, x: int, y: int) -> tuple[int, int]:
+        logical_width, logical_height = self._resolve_size(self.logical_size)
+        physical_width, physical_height = self._resolve_size(self.physical_size)
+        offset_x, offset_y = self._resolve_size(self.physical_offset)
+        if logical_width <= 0 or logical_height <= 0:
+            return (int(x) + offset_x, int(y) + offset_y)
+        return (
+            int(round(int(x) * physical_width / logical_width)) + offset_x,
+            int(round(int(y) * physical_height / logical_height)) + offset_y,
+        )
+
+    @staticmethod
+    def _resolve_size(
+        value: tuple[int, int] | Callable[[], tuple[int, int]],
+    ) -> tuple[int, int]:
+        return value() if callable(value) else value
 
 
 def create_default_backend() -> ComputerBackend:

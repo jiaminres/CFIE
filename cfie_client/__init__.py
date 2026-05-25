@@ -1,4 +1,5 @@
 from cfie_client.adapter import Qwen35ComputerAdapter
+from cfie_client.executor import CoordinateScalingBackend, create_default_backend
 from cfie_client.loop import ComputerLoop
 from cfie_client.protocol import (
     ACTION_TYPES,
@@ -11,7 +12,12 @@ from cfie_client.protocol import (
     find_computer_calls,
 )
 from cfie_client.safety import SafetyGate, SafetyViolation
-from cfie_client.screen import PillowScreenCapture, ScreenCapture, ScreenshotResult
+from cfie_client.screen import (
+    PillowScreenCapture,
+    ScaledPillowScreenCapture,
+    ScreenCapture,
+    ScreenshotResult,
+)
 
 __all__ = [
     "ACTION_TYPES",
@@ -20,13 +26,16 @@ __all__ = [
     "ComputerCallOutput",
     "ComputerLoop",
     "ComputerScreenshot",
+    "CoordinateScalingBackend",
     "PillowScreenCapture",
     "ProtocolError",
     "Qwen35ComputerAdapter",
     "SafetyGate",
     "SafetyViolation",
+    "ScaledPillowScreenCapture",
     "ScreenCapture",
     "ScreenshotResult",
     "build_computer_call_output",
+    "create_default_backend",
     "find_computer_calls",
 ]
