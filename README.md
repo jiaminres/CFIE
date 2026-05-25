@@ -32,6 +32,32 @@ CFIE 使用 MoE tiered cache，把模型权重、CPU 内存、pinned memory 和 
 - Prefill burst pool：长 prefill 中某层触发 expert 数超过 resident slots 时，用临时 burst pool 承接执行。
 - W4A8 / FP8 activation：GPTQ Marlin 路径支持 `--marlin-input-dtype fp8`，当前推荐默认使用。
 
+## GUI Agent 应用场景
+
+GUI Agent 是 CFIE 之上的第一个应用层范式，用来验证本地大模型推理、视觉理解、computer-use 工具执行和人工接管闭环能否在真实桌面任务中稳定工作。它不是单独的测试脚本，而是面向浏览器、桌面软件、后台运营、移动设备控制和后续游戏低延迟场景的通用自动化客户端。
+
+项目分层如下：
+
+```text
+cfie_gui_agent
+  -> 桌面客户端、任务描述、截图/视频上下文、人工接管、轨迹记录
+
+cfie_client
+  -> computer-use 工具协议、Windows 鼠标键盘执行、截图与坐标映射
+
+CFIE 推理引擎
+  -> Qwen3.5 122B/35B 本地 OpenAI Responses / Chat / VL 服务
+
+cfie_training
+  -> 轨迹数据回流、SFT、奖励建模、强化学习与评估闭环
+```
+
+在 GUI Agent 场景中，用户为每个目标 APP 配置任务规则、界面说明和图片/视频引用；模型通过 Responses API 观察当前界面并输出工具调用；`cfie_client` 负责执行受控的鼠标、键盘、截图和文件读写动作；`cfie_gui_agent` 记录每一步输入、模型意图、工具调用、截图证据、人工接管和任务结果。后续这些轨迹可以转成监督微调样本、偏好样本或带 reward 的强化学习数据，用于持续改进本地 Agent。
+
+运行时示例：
+
+![CFIE GUI Agent runtime](docs/assets/gui_agent_runtime.png)
+
 ## 实测环境
 
 以下配置是本文档中推荐参数和测速结果的来源，其他机器需要重新验证：
@@ -207,9 +233,9 @@ curl http://127.0.0.1:8000/v1/responses `
 
 
 
-## 微调模块设计稿
+## 微调与强化学习设计稿
 
-`cfie_training/` 是后续训练、微调和 GUI Agent 闭环数据工作的开发区域。当前微调模块仍在开发中，README 暂不承诺稳定训练 API；设计目标是把本地推理、数据回流、参数分层、训练调度和评估闭环逐步接入同一套客户端智能体基础设施。
+`cfie_training/` 是后续训练、微调、强化学习和 GUI Agent 闭环数据工作的开发区域。当前训练模块仍在开发中，README 暂不承诺稳定训练 API；设计目标是把本地推理、GUI Agent 轨迹回流、参数分层、训练调度、奖励评估和自动化验证逐步接入同一套客户端智能体基础设施。
 
 ![Qwen3.5-122B training base design](docs/assets/qwen35_122b_training_base.svg)
 
