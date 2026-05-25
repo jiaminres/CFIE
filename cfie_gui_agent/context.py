@@ -54,6 +54,26 @@ class VisionContextPolicy:
             estimated_tokens_per_frame=estimated_tokens_per_frame,
         )
 
+    @classmethod
+    def keyframe(
+        cls,
+        *,
+        max_visual_frames: int = 2,
+        resolution: str = "cropped-720p",
+        estimated_tokens_per_frame: int = 1570,
+    ) -> "VisionContextPolicy":
+        return cls(
+            mode="keyframe",
+            resolution=resolution,
+            max_visual_frames=max_visual_frames,
+            current_frame=1,
+            recent_video_steps=0,
+            frames_per_recent_step=0,
+            mid_history_after_frames=max(0, max_visual_frames - 1),
+            key_evidence_frames=0,
+            estimated_tokens_per_frame=estimated_tokens_per_frame,
+        )
+
     @property
     def recent_video_frame_budget(self) -> int:
         return self.recent_video_steps * self.frames_per_recent_step
@@ -294,7 +314,11 @@ class ContextManager:
         policy = self.policy_for_usage(usage_ratio)
         policy.validate()
         ordered = sorted(steps, key=lambda step: step.step_id)
-        recent = tuple(ordered[-policy.recent_video_steps :])
+        recent = (
+            tuple(ordered[-policy.recent_video_steps :])
+            if policy.recent_video_steps > 0
+            else ()
+        )
         recent_ids = {step.step_id for step in recent}
 
         older = [step for step in ordered if step.step_id not in recent_ids]

@@ -39,7 +39,10 @@ class StepVerification:
 @dataclass(slots=True)
 class StepVerifier:
     max_repeated_actions: int = 3
+    max_repeated_semantic_actions: int = 3
+    max_repeated_click_only_actions: int = 2
     recent_action_signatures: deque[str] = field(default_factory=deque)
+    recent_semantic_signatures: deque[str] = field(default_factory=deque)
 
     def verify(self, step: StepRecord) -> StepVerification:
         signature = _action_signature(step.action)
@@ -47,6 +50,23 @@ class StepVerifier:
         self.recent_action_signatures.append(signature)
         while len(self.recent_action_signatures) > self.max_repeated_actions:
             self.recent_action_signatures.popleft()
+        metadata: dict[str, Any] = {}
+        semantic_signature = _semantic_action_signature(step.action)
+        semantic_repeated = 1
+        semantic_threshold = self.max_repeated_semantic_actions
+        if semantic_signature:
+            semantic_repeated = self._count_repeated_semantic(semantic_signature)
+            if (
+                semantic_signature == "computer_click_only"
+                and "computer_text_submit" in self.recent_semantic_signatures
+            ):
+                semantic_threshold = self.max_repeated_click_only_actions
+            self.recent_semantic_signatures.append(semantic_signature)
+            while len(self.recent_semantic_signatures) > self.max_repeated_semantic_actions:
+                self.recent_semantic_signatures.popleft()
+            metadata["semantic_action_signature"] = semantic_signature
+            metadata["semantic_repeated_action_count"] = semantic_repeated
+            repeated = max(repeated, semantic_repeated)
 
         screen_changed: bool | None = None
         if step.before_ref and step.after_ref:
@@ -57,6 +77,8 @@ class StepVerifier:
             status = VERIFICATION_NO_SCREEN_CHANGE
         if repeated >= self.max_repeated_actions:
             status = VERIFICATION_REPEATED_ACTION
+        if semantic_signature and semantic_repeated >= semantic_threshold:
+            status = VERIFICATION_REPEATED_ACTION
 
         return StepVerification(
             step_id=step.step_id,
@@ -64,11 +86,20 @@ class StepVerifier:
             screen_changed=screen_changed,
             repeated_action_count=repeated,
             action_signature=signature,
+            metadata=metadata,
         )
 
     def _count_repeated(self, signature: str) -> int:
         count = 1
         for previous in reversed(self.recent_action_signatures):
+            if previous != signature:
+                break
+            count += 1
+        return count
+
+    def _count_repeated_semantic(self, signature: str) -> int:
+        count = 1
+        for previous in reversed(self.recent_semantic_signatures):
             if previous != signature:
                 break
             count += 1
@@ -96,3 +127,32 @@ def _strip_nonsemantic_action_fields(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_strip_nonsemantic_action_fields(item) for item in value]
     return value
+
+
+def _semantic_action_signature(action: dict[str, Any]) -> str | None:
+    if action.get("type") != "computer_call":
+        return None
+    actions = action.get("actions")
+    if not isinstance(actions, list):
+        return None
+    normalized_actions = [item for item in actions if isinstance(item, dict)]
+    if normalized_actions and all(
+        str(item.get("type") or "").lower() == "click"
+        for item in normalized_actions
+    ):
+        return "computer_click_only"
+    has_text = False
+    has_submit = False
+    for item in normalized_actions:
+        action_type = str(item.get("type") or "").lower()
+        if action_type == "type" and str(item.get("text") or "").strip():
+            has_text = True
+        if action_type in {"keypress", "key"}:
+            keys = item.get("keys") or item.get("key") or ()
+            if isinstance(keys, str):
+                keys = (keys,)
+            if any(str(key).lower() in {"enter", "return"} for key in keys):
+                has_submit = True
+    if has_text and has_submit:
+        return "computer_text_submit"
+    return None

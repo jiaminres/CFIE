@@ -9,6 +9,7 @@ from cfie_gui_agent import (
     AgentTraceStore,
     ContextManager,
     find_agent_tool_calls,
+    find_computer_tool_calls,
     HumanLoopManager,
     HumanReply,
     InMemoryHumanChannel,
@@ -39,6 +40,7 @@ from cfie_gui_agent import (
     TaskStack,
     TaskState,
     ToolRegistryError,
+    VERIFICATION_OK,
     VERIFICATION_NO_SCREEN_CHANGE,
     VERIFICATION_REPEATED_ACTION,
     VisionContextPolicy,
@@ -156,6 +158,30 @@ def test_agility_context_policy_uses_after_frames_only():
     assert policy.configured_frame_budget == 43
 
 
+def test_keyframe_context_policy_uses_current_and_last_after_frame_only():
+    policy = VisionContextPolicy.keyframe(max_visual_frames=2)
+
+    assert policy.mode == "keyframe"
+    assert policy.recent_video_steps == 0
+    assert policy.frames_per_recent_step == 0
+    assert policy.mid_history_after_frames == 1
+    assert policy.configured_frame_budget == 2
+    assert policy.estimated_visual_tokens <= 4192
+
+    manager = ContextManager(policy=policy)
+    selection = manager.select_prompt_context(
+        [
+            StepRecord(step_id=1, after_ref="after_1.png"),
+            StepRecord(step_id=2, after_ref="after_2.png"),
+        ],
+        current_frame_ref="current.png",
+    )
+
+    assert selection.selected_frame_count == 2
+    assert [step.step_id for step in selection.mid_history_after_frames] == [2]
+    assert selection.recent_video_steps == ()
+
+
 def test_context_manager_validates_compaction_plan():
     manager = ContextManager()
     manager.validate_compaction_plan(
@@ -267,6 +293,86 @@ def test_step_verifier_detects_no_screen_change_and_repeated_action():
     assert no_change.status == VERIFICATION_NO_SCREEN_CHANGE
     assert second.repeated_action_count == 2
     assert third.status == VERIFICATION_REPEATED_ACTION
+
+
+def test_step_verifier_detects_semantic_repeated_text_submit():
+    verifier = StepVerifier(
+        max_repeated_actions=3,
+        max_repeated_semantic_actions=3,
+    )
+
+    def make_step(step_id: int, x: int, text: str) -> StepRecord:
+        return StepRecord(
+            step_id=step_id,
+            task_id="task",
+            action={
+                "type": "computer_call",
+                "actions": [
+                    {"type": "click", "x": x, "y": 500},
+                    {"type": "type", "text": text},
+                    {"type": "keypress", "keys": ["enter"]},
+                ],
+            },
+            result="computer_call_output",
+            before_ref=f"before_{step_id}",
+            after_ref=f"after_{step_id}",
+        )
+
+    first = verifier.verify(make_step(1, 240, "hello"))
+    second = verifier.verify(make_step(2, 260, "hello!"))
+    third = verifier.verify(make_step(3, 280, "hello again"))
+
+    assert first.status == VERIFICATION_OK
+    assert second.status == VERIFICATION_OK
+    assert third.status == VERIFICATION_REPEATED_ACTION
+    assert third.metadata["semantic_action_signature"] == "computer_text_submit"
+    assert third.metadata["semantic_repeated_action_count"] == 3
+
+
+def test_step_verifier_detects_semantic_repeated_click_only_probe():
+    verifier = StepVerifier(
+        max_repeated_actions=3,
+        max_repeated_semantic_actions=3,
+        max_repeated_click_only_actions=2,
+    )
+
+    def make_step(step_id: int, x: int, y: int) -> StepRecord:
+        return StepRecord(
+            step_id=step_id,
+            task_id="task",
+            action={
+                "type": "computer_call",
+                "actions": [{"type": "click", "x": x, "y": y}],
+            },
+            result="computer_call_output",
+            before_ref=f"before_{step_id}",
+            after_ref=f"after_{step_id}",
+        )
+
+    verifier.verify(
+        StepRecord(
+            step_id=0,
+            task_id="task",
+            action={
+                "type": "computer_call",
+                "actions": [
+                    {"type": "click", "x": 450, "y": 500},
+                    {"type": "type", "text": "hello"},
+                    {"type": "keypress", "keys": ["enter"]},
+                ],
+            },
+            result="computer_call_output",
+            before_ref="before_0",
+            after_ref="after_0",
+        )
+    )
+    first = verifier.verify(make_step(1, 609, 421))
+    second = verifier.verify(make_step(2, 692, 482))
+
+    assert first.status == VERIFICATION_OK
+    assert second.status == VERIFICATION_REPEATED_ACTION
+    assert second.metadata["semantic_action_signature"] == "computer_click_only"
+    assert second.metadata["semantic_repeated_action_count"] == 2
 
 
 def test_per_job_context_store_keeps_job_histories_separate():
@@ -493,6 +599,15 @@ def test_model_tool_registry_exports_non_empty_openai_schemas():
     assert request_schema["required"] == ["question"]
     assert "urgency" in request_schema["properties"]
     assert "computer_use" in by_name
+    computer_schema = by_name["computer_use"]["function"]["parameters"]
+    assert computer_schema["required"] == ["coordinate_space", "actions"]
+    assert (
+        computer_schema["properties"]["coordinate_space"]["enum"]
+        == ["qwen_normalized_1000", "screenshot"]
+    )
+    assert "set_app_viewport" in by_name
+    viewport_schema = by_name["set_app_viewport"]["function"]["parameters"]
+    assert viewport_schema["required"] == ["x", "y", "width", "height"]
 
 
 def test_policy_store_converts_constraints_to_context_rules():
@@ -560,6 +675,426 @@ def test_find_agent_tool_calls_parses_json_arguments_and_skips_computer_use():
     assert len(calls) == 1
     assert calls[0].name == "request_human_help"
     assert calls[0].arguments == {"question": "Need approval."}
+
+
+def test_find_computer_tool_calls_adapts_function_tool_to_computer_call():
+    calls = find_computer_tool_calls(
+        {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "computer_use",
+                    "call_id": "call_2",
+                    "arguments": {
+                        "actions": (
+                            '[{"action": "click", "coordinate": [10, 20]}, '
+                            '{"action": "text", "content": "hello"}]'
+                        )
+                    },
+                }
+            ]
+        }
+    )
+
+    assert len(calls) == 1
+    assert calls[0].call_id == "call_2"
+    assert [action.type for action in calls[0].actions] == ["click", "type"]
+    assert calls[0].actions[0].x == 10
+    assert calls[0].actions[1].text == "hello"
+
+
+def test_find_computer_tool_calls_repairs_missing_top_level_comma():
+    calls = find_computer_tool_calls(
+        {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "computer_use",
+                    "call_id": "call_3",
+                    "arguments": (
+                        '{"actions": [{"type": "keypress", "keys": "ENTER"}] '
+                        '"call_id": "call_3"}'
+                    ),
+                }
+            ]
+        }
+    )
+
+    assert calls[0].actions[0].type == "keypress"
+    assert calls[0].actions[0].keys == ("ENTER",)
+
+
+def test_find_computer_tool_calls_accepts_bare_actions_json_text():
+    calls = find_computer_tool_calls(
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                '{"actions": [{"button": "left", '
+                                '"type": "click", "x": 695, "y": 483}]}'
+                            ),
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert len(calls) == 1
+    assert calls[0].actions[0].type == "click"
+    assert calls[0].actions[0].x == 695
+    assert calls[0].actions[0].y == 483
+
+
+def test_computer_use_nested_agent_tool_is_routed_to_agent_tools():
+    response = {
+        "output": [
+            {
+                "type": "function_call",
+                "name": "computer_use",
+                "call_id": "call_4",
+                "arguments": {
+                    "actions": (
+                        '[{"type":"read_text_file",'
+                        '"path":".bench_logs/input.jsonl",'
+                        '"purpose":"load inputs"},'
+                        '{"type":"click","x":10,"y":20}]'
+                    )
+                },
+            }
+        ]
+    }
+
+    agent_calls = find_agent_tool_calls(response)
+    computer_calls = find_computer_tool_calls(response)
+
+    assert len(agent_calls) == 1
+    assert agent_calls[0].name == "read_text_file"
+    assert agent_calls[0].arguments == {
+        "path": ".bench_logs/input.jsonl",
+        "purpose": "load inputs",
+    }
+    assert len(computer_calls) == 1
+    assert computer_calls[0].actions[0].type == "click"
+
+
+def test_qwen_text_tool_call_is_routed_to_nested_agent_tool():
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "<tool_call>\n"
+                            "<function=computer_use>\n"
+                            "<parameter=actions>\n"
+                            '[{"type":"set_app_viewport","x":490,"y":0,'
+                            '"width":960,"height":540,'
+                            '"coordinate_space":"screenshot"}]\n'
+                            "</parameter>\n"
+                            "</function>\n"
+                            "</tool_call>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    agent_calls = find_agent_tool_calls(response)
+    computer_calls = find_computer_tool_calls(response)
+
+    assert computer_calls == ()
+    assert len(agent_calls) == 1
+    assert agent_calls[0].name == "set_app_viewport"
+    assert agent_calls[0].arguments["x"] == 490
+    assert agent_calls[0].arguments["coordinate_space"] == "screenshot"
+
+
+def test_qwen_text_tool_call_can_be_real_computer_action():
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "<tool_call><function=computer_use>"
+                            "<parameter=actions>"
+                            '[{"type":"click","x":10,"y":20}]'
+                            "</parameter>"
+                            "</function></tool_call>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    calls = find_computer_tool_calls(response)
+
+    assert len(calls) == 1
+    assert calls[0].actions[0].type == "click"
+    assert calls[0].actions[0].x == 10
+    assert calls[0].actions[0].y == 20
+
+
+def test_qwen_tool_code_print_agent_tool_call_is_parsed():
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "<tool_code>\n"
+                            "print(read_text_file("
+                            "path=\".bench_logs/input.jsonl\", "
+                            "purpose=\"load inputs\"))\n"
+                            "</tool_code>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    calls = find_agent_tool_calls(response)
+
+    assert len(calls) == 1
+    assert calls[0].name == "read_text_file"
+    assert calls[0].arguments == {
+        "path": ".bench_logs/input.jsonl",
+        "purpose": "load inputs",
+    }
+
+
+def test_qwen_tool_code_print_computer_use_call_is_parsed():
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "<tool_code>\n"
+                            "print(computer_use(actions=["
+                            "{\"type\":\"click\",\"x\":10,\"y\":20}"
+                            "]))\n"
+                            "</tool_code>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    calls = find_computer_tool_calls(response)
+
+    assert len(calls) == 1
+    assert calls[0].actions[0].type == "click"
+    assert calls[0].actions[0].x == 10
+    assert calls[0].actions[0].y == 20
+
+
+def test_qwen_text_tool_call_repairs_missing_y_key_for_click_action():
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "<tool_call><function=computer_use>"
+                            "<parameter=actions>"
+                            '[{"type":"click","x":313,464}]'
+                            "</parameter>"
+                            "</function></tool_call>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    calls = find_computer_tool_calls(response)
+
+    assert len(calls) == 1
+    assert calls[0].actions[0].x == 313
+    assert calls[0].actions[0].y == 464
+
+
+def test_qwen_text_tool_call_preserves_computer_use_coordinate_space():
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "<tool_call><function=computer_use>"
+                            "<parameter=coordinate_space>qwen_normalized_1000</parameter>"
+                            "<parameter=actions>"
+                            '[{"type":"click","x":700,"y":950}]'
+                            "</parameter>"
+                            "</function></tool_call>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    calls = find_computer_tool_calls(response)
+
+    assert len(calls) == 1
+    assert calls[0].coordinate_space == "qwen_normalized_1000"
+    assert calls[0].actions[0].x == 700
+    assert calls[0].actions[0].y == 950
+
+
+def test_qwen_text_tool_call_accepts_action_level_coordinate_space():
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "<tool_call><function=computer_use>"
+                            "<parameter=actions>"
+                            '[{"type":"click","x":500,900,'
+                            '"coordinate_space":"qwen_normalized_1000"}]'
+                            "</parameter>"
+                            "</function></tool_call>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    calls = find_computer_tool_calls(response)
+
+    assert len(calls) == 1
+    assert calls[0].coordinate_space == "qwen_normalized_1000"
+    assert calls[0].actions[0].x == 500
+    assert calls[0].actions[0].y == 900
+
+
+def test_qwen_text_tool_call_repairs_missing_y_key_before_next_field():
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "<tool_call><function=computer_use>"
+                            "<parameter=actions>"
+                            '[{"type":"click","x":549,460,"button":"left"}]'
+                            "</parameter>"
+                            "</function></tool_call>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    calls = find_computer_tool_calls(response)
+
+    assert len(calls) == 1
+    assert calls[0].actions[0].x == 549
+    assert calls[0].actions[0].y == 460
+    assert calls[0].actions[0].button == "left"
+
+
+def test_agent_tool_call_repairs_truncated_complete_object():
+    calls = find_agent_tool_calls(
+        {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "request_human_help",
+                    "call_id": "call_human",
+                    "arguments": (
+                        '{"question":"login blocks the task",'
+                        '"urgency":"normal",'
+                        '"risk_reason":"login modal blocks input"'
+                    ),
+                }
+            ]
+        }
+    )
+
+    assert len(calls) == 1
+    assert calls[0].name == "request_human_help"
+    assert calls[0].arguments["question"] == "login blocks the task"
+    assert calls[0].arguments["risk_reason"] == "login modal blocks input"
+
+
+def test_malformed_computer_use_arguments_are_reported_as_tool_error():
+    response = {
+        "output": [
+            {
+                "type": "function_call",
+                "name": "computer_use",
+                "call_id": "bad_computer",
+                "arguments": '{"actions": [{"type": "click", "x": ',
+            }
+        ]
+    }
+
+    agent_calls = find_agent_tool_calls(response)
+    computer_calls = find_computer_tool_calls(response)
+
+    assert computer_calls == ()
+    assert len(agent_calls) == 1
+    assert agent_calls[0].name == "computer_use"
+    assert "_parse_error" in agent_calls[0].arguments
+
+
+def test_malformed_computer_use_actions_string_is_reported_as_tool_error():
+    response = {
+        "output": [
+            {
+                "type": "function_call",
+                "name": "computer_use",
+                "call_id": "bad_actions",
+                "arguments": {"actions": '[{type: "click", "x": 10}]'},
+            }
+        ]
+    }
+
+    agent_calls = find_agent_tool_calls(response)
+    computer_calls = find_computer_tool_calls(response)
+
+    assert computer_calls == ()
+    assert len(agent_calls) == 1
+    assert agent_calls[0].name == "computer_use"
+    assert "computer_use.actions" in agent_calls[0].arguments["_parse_error"]
 
 
 def test_human_loop_reply_becomes_urgent_task():

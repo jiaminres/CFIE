@@ -2,6 +2,8 @@ from cfie_gui_agent.agent_tools import (
     AgentToolCall,
     AgentToolError,
     find_agent_tool_calls,
+    find_computer_tool_calls,
+    normalize_response_tool_calls,
 )
 from cfie_gui_agent.context import (
     CompactionApplication,
@@ -51,6 +53,10 @@ from cfie_gui_agent.navigation import (
     ObstaclePolygon,
     Point,
 )
+from cfie_gui_agent.openai_responses import (
+    OpenAIResponsesAgent,
+    OpenAIResponsesAgentError,
+)
 from cfie_gui_agent.policy import PolicyRule, PolicyStore, PolicyUpdate
 from cfie_gui_agent.rewards import (
     RewardEvent,
@@ -91,6 +97,14 @@ from cfie_gui_agent.verifier import (
     VERIFICATION_OK,
     VERIFICATION_REPEATED_ACTION,
 )
+from cfie_gui_agent.workflow import (
+    WorkflowInputItem,
+    WorkflowRun,
+    build_workflow_target_config,
+    build_workflow_task_description,
+    load_workflow_items,
+    make_operation_event,
+)
 
 __all__ = [
     "AgentToolCall",
@@ -129,6 +143,8 @@ __all__ = [
     "NavigationPlanner",
     "NavigationRequest",
     "ObstaclePolygon",
+    "OpenAIResponsesAgent",
+    "OpenAIResponsesAgentError",
     "Point",
     "PromptContextSelection",
     "PerJobContextStore",
@@ -170,7 +186,15 @@ __all__ = [
     "VERIFICATION_REPEATED_ACTION",
     "VisionContextPolicy",
     "WorkspaceProfile",
+    "WorkflowInputItem",
+    "WorkflowRun",
     "assign_subtask_completion_credit",
+    "build_workflow_target_config",
+    "build_workflow_task_description",
     "find_agent_tool_calls",
+    "find_computer_tool_calls",
+    "normalize_response_tool_calls",
+    "load_workflow_items",
+    "make_operation_event",
     "transition_reward_event",
 ]

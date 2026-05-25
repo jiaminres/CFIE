@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+import base64
+import json
+import re
+import subprocess
+import sys
+import threading
 import tkinter as tk
 import tkinter.font as tkfont
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
+from urllib.parse import unquote, urlparse
+
+try:
+    from PIL import Image, ImageDraw, ImageTk
+except Exception:  # pragma: no cover - optional UI polish dependency
+    Image = None
+    ImageDraw = None
+    ImageTk = None
 
 from cfie_gui_agent.desktop_client import (
     DIRECT_COMMAND_LABELS,
@@ -13,6 +29,7 @@ from cfie_gui_agent.desktop_client import (
     MacroConfig,
     ReferenceAsset,
     TargetAppConfig,
+    build_workflow_run_command,
 )
 from cfie_gui_agent.jobs import JobState
 
@@ -207,8 +224,10 @@ class CanvasButton(tk.Canvas):
         self._outline = outline or fill
         self._radius = radius
         self._height = height
+        self._width = width
         self._font = font
         self._hovered = False
+        self._background_image: Any | None = None
         if self._textvariable is not None:
             self._textvariable.trace_add("write", lambda *_args: self._redraw())
         self.bind("<Configure>", lambda _event: self._redraw())
@@ -238,20 +257,41 @@ class CanvasButton(tk.Canvas):
             self._command()
 
     def _redraw(self) -> None:
-        width = max(self.winfo_width(), 1)
+        width = max(self.winfo_width(), self._width, 2)
         self.delete("all")
         fill = self._hover_fill if self._hovered else self._fill
-        draw_rounded_rect(
-            self,
-            1,
-            1,
-            width - 1,
-            self._height - 1,
-            self._radius,
-            fill=fill,
-            outline=self._outline,
-            width=1,
-        )
+        if Image is not None and ImageDraw is not None and ImageTk is not None:
+            scale = 3
+            image = Image.new("RGBA", (width * scale, self._height * scale), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle(
+                (
+                    scale,
+                    scale,
+                    (width - 1) * scale,
+                    (self._height - 1) * scale,
+                ),
+                radius=self._radius * scale,
+                fill=fill,
+                outline=self._outline,
+                width=scale,
+            )
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            image = image.resize((width, self._height), resampling)
+            self._background_image = ImageTk.PhotoImage(image)
+            self.create_image(0, 0, image=self._background_image, anchor="nw")
+        else:
+            draw_rounded_rect(
+                self,
+                1,
+                1,
+                width - 1,
+                self._height - 1,
+                self._radius,
+                fill=fill,
+                outline=self._outline,
+                width=1,
+            )
         self.create_text(
             width // 2,
             self._height // 2,
@@ -369,29 +409,137 @@ class CanvasChoice(tk.Canvas):
         )
 
 
+class AutoHideScrollbar(tk.Canvas):
+    def __init__(
+        self,
+        master: tk.Misc,
+        *args: Any,
+        orient: str = "vertical",
+        command: Any | None = None,
+        style: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            master,
+            width=9,
+            highlightthickness=0,
+            borderwidth=0,
+            bg=kwargs.pop("bg", "#ffffff"),
+            cursor="hand2",
+        )
+        self._command = command
+        self._first = 0.0
+        self._last = 1.0
+        self._drag_offset = 0
+        self._dragging = False
+        self._hovered = False
+        self.bind("<Configure>", lambda _event: self._redraw())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def set(self, first: Any, last: Any) -> None:
+        try:
+            first_float = float(first)
+            last_float = float(last)
+        except (TypeError, ValueError):
+            first_float = 0.0
+            last_float = 0.0
+        self._first = max(0.0, min(1.0, first_float))
+        self._last = max(self._first, min(1.0, last_float))
+        if first_float <= 0.0 and last_float >= 1.0:
+            self.grid_remove()
+        else:
+            self.grid()
+        self._redraw()
+
+    def _thumb_bounds(self) -> tuple[int, int, int, int]:
+        height = max(1, self.winfo_height())
+        visible = max(0.04, self._last - self._first)
+        thumb_height = max(24, int(height * visible))
+        y1 = int(height * self._first)
+        y1 = max(2, min(height - thumb_height - 2, y1))
+        y2 = min(height - 2, y1 + thumb_height)
+        return (2, y1, 7, y2)
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        x1, y1, x2, y2 = self._thumb_bounds()
+        fill = "#c7c3bf" if self._hovered or self._dragging else "#d4d1cd"
+        draw_rounded_rect(
+            self,
+            x1,
+            y1,
+            x2,
+            y2,
+            4,
+            fill=fill,
+            outline=fill,
+            width=0,
+        )
+
+    def _on_enter(self, _event: tk.Event[Any]) -> None:
+        self._hovered = True
+        self._redraw()
+
+    def _on_leave(self, _event: tk.Event[Any]) -> None:
+        self._hovered = False
+        self._redraw()
+
+    def _on_press(self, event: tk.Event[Any]) -> None:
+        x1, y1, x2, y2 = self._thumb_bounds()
+        if y1 <= event.y <= y2:
+            self._dragging = True
+            self._drag_offset = event.y - y1
+        else:
+            self._move_to_pointer(event.y)
+        self._redraw()
+
+    def _on_drag(self, event: tk.Event[Any]) -> None:
+        if not self._dragging:
+            return
+        self._move_to_pointer(event.y - self._drag_offset)
+
+    def _on_release(self, _event: tk.Event[Any]) -> None:
+        self._dragging = False
+        self._redraw()
+
+    def _move_to_pointer(self, y: int) -> None:
+        if self._command is None:
+            return
+        height = max(1, self.winfo_height())
+        visible = max(0.04, self._last - self._first)
+        thumb_height = max(24, int(height * visible))
+        fraction = y / max(1, height - thumb_height)
+        fraction = max(0.0, min(1.0 - visible, fraction))
+        self._command("moveto", fraction)
+
+
 class GuiAgentDesktopClient(tk.Tk):
     def __init__(self, state: DesktopClientState) -> None:
         super().__init__()
         self.state = state
         self.title("CFIE GUI Agent")
-        self.geometry("1440x860")
         self.minsize(1180, 720)
+        self._configure_initial_window()
 
         self.colors = {
-            "bg": "#fbfaf8",
-            "sidebar": "#f5f1ed",
-            "sidebar_hover": "#ebe6e1",
-            "sidebar_selected": "#e8e2dc",
+            "bg": "#ffffff",
+            "sidebar": "#f7f4f1",
+            "sidebar_hover": "#efebe7",
+            "sidebar_selected": "#ebe7e2",
             "surface": "#ffffff",
-            "surface_soft": "#f7f5f2",
-            "surface_hover": "#f1efeb",
-            "ink": "#252525",
-            "muted": "#77736f",
-            "muted_2": "#aaa39b",
-            "line": "#e6e0d9",
-            "line_soft": "#f0ebe5",
+            "surface_soft": "#f5f5f3",
+            "surface_hover": "#eeeeec",
+            "ink": "#202124",
+            "muted": "#6f6f6f",
+            "muted_2": "#a6a6a6",
+            "line": "#e8e4df",
+            "line_soft": "#eeeeea",
             "brand": "#111827",
-            "brand_soft": "#f0eee9",
+            "brand_soft": "#f1f1ef",
             "accent": "#ff6b2b",
             "accent_soft": "#fff0e8",
             "success": "#0f9f7a",
@@ -399,16 +547,31 @@ class GuiAgentDesktopClient(tk.Tk):
 
         self.selected_app_id = tk.StringVar(value=self._first_app_id())
         self.selected_request_id = tk.StringVar(value="")
-        self.inspector_visible = tk.BooleanVar(value=True)
+        self.inspector_visible = tk.BooleanVar(value=False)
         self.direct_command_label = tk.StringVar(
             value=DIRECT_COMMAND_LABELS[DIRECT_COMMAND_NONE]
         )
         self.decision_type = tk.StringVar(value="人工回复")
+        self.viewport_marker: ViewportMarkerWindow | None = None
+        self.workflow_running = tk.BooleanVar(value=False)
+        self.workflow_run_status = tk.StringVar(value="")
+        self._timeline_images: list[Any] = []
+        self._inspector_images: list[Any] = []
+        self._selected_trace_event: Any | None = None
 
         self._setup_style()
         self._build_layout()
         self.refresh_all()
         self.after(2000, self._periodic_refresh)
+
+    def _configure_initial_window(self) -> None:
+        screen_width = max(1, self.winfo_screenwidth())
+        screen_height = max(1, self.winfo_screenheight())
+        width = min(1440, max(1180, screen_width - 120))
+        height = min(860, max(720, screen_height - 120))
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _setup_style(self) -> None:
         self.configure(bg=self.colors["bg"])
@@ -583,19 +746,19 @@ class GuiAgentDesktopClient(tk.Tk):
         style.configure(
             "Modern.Vertical.TScrollbar",
             gripcount=0,
-            width=9,
-            background="#d7d7d7",
+            width=3,
+            background="#d2d0cc",
             troughcolor=self.colors["surface"],
             bordercolor=self.colors["surface"],
-            lightcolor="#d7d7d7",
-            darkcolor="#d7d7d7",
+            lightcolor="#d2d0cc",
+            darkcolor="#d2d0cc",
             arrowcolor=self.colors["surface"],
             relief="flat",
             borderwidth=0,
         )
         style.map(
             "Modern.Vertical.TScrollbar",
-            background=[("active", "#c8c8c8")],
+            background=[("active", "#c5c1bd")],
         )
 
     def _build_layout(self) -> None:
@@ -604,6 +767,8 @@ class GuiAgentDesktopClient(tk.Tk):
         self._build_sidebar()
         self._build_chat_area()
         self._build_inspector()
+        if not self.inspector_visible.get():
+            self.inspector.grid_remove()
 
     def _build_sidebar(self) -> None:
         sidebar = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 14))
@@ -621,7 +786,7 @@ class GuiAgentDesktopClient(tk.Tk):
             text="+",
             width=3,
             style="Icon.TButton",
-            command=self._add_app_dialog,
+            command=self._show_create_menu,
         ).grid(
             row=0, column=1, sticky="e"
         )
@@ -729,9 +894,6 @@ class GuiAgentDesktopClient(tk.Tk):
         settings_button.configure(height=42)
         settings_button.grid(row=0, column=0, sticky="ew")
         settings_button.after_idle(settings_button.raise_widget)
-        ttk.Button(bottom, text="设置", command=self._open_settings).grid(
-            row=0, column=0, sticky="ew"
-        )
         self.status_text = tk.StringVar(value="生产模式")
         ttk.Label(
             bottom,
@@ -757,46 +919,36 @@ class GuiAgentDesktopClient(tk.Tk):
             style="Hint.TLabel",
         )
         self.app_subtitle.grid(row=1, column=0, sticky="w", pady=(3, 0))
-        ttk.Button(
+        run_button = CanvasButton(
             header,
-            text="任务定义",
-            command=self._edit_selected_app,
-        ).grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
-        ttk.Button(
-            header,
-            text="检查器",
-            command=self._toggle_inspector,
-        ).grid(row=0, column=2, rowspan=2, sticky="e", padx=(8, 0))
-
-        task_def_button = CanvasButton(
-            header,
-            text="任务定义",
-            command=self._edit_selected_app,
+            text="▶",
+            command=self._start_selected_workflow_run,
             fill=self.colors["surface"],
             hover_fill=self.colors["surface_hover"],
             foreground=self.colors["ink"],
             outline=self.colors["line"],
-            radius=13,
+            radius=14,
             height=36,
-            width=104,
+            width=44,
             canvas_bg=self.colors["surface"],
-            font=("Microsoft YaHei UI", 9, "normal"),
+            font=("Microsoft YaHei UI", 12, "bold"),
         )
-        task_def_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
-        task_def_button.after_idle(task_def_button.raise_widget)
+        run_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
+        run_button.after_idle(run_button.raise_widget)
+
         inspector_button = CanvasButton(
             header,
-            text="检查器",
+            text="◨",
             command=self._toggle_inspector,
             fill=self.colors["surface"],
             hover_fill=self.colors["surface_hover"],
             foreground=self.colors["ink"],
             outline=self.colors["line"],
-            radius=13,
+            radius=14,
             height=36,
-            width=92,
+            width=44,
             canvas_bg=self.colors["surface"],
-            font=("Microsoft YaHei UI", 9, "normal"),
+            font=("Microsoft YaHei UI", 13, "normal"),
         )
         inspector_button.grid(row=0, column=2, rowspan=2, sticky="e", padx=(8, 0))
         inspector_button.after_idle(inspector_button.raise_widget)
@@ -812,7 +964,7 @@ class GuiAgentDesktopClient(tk.Tk):
             highlightthickness=0,
         )
         self.chat_canvas.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(
+        scroll = AutoHideScrollbar(
             canvas_holder,
             orient="vertical",
             command=self.chat_canvas.yview,
@@ -828,21 +980,18 @@ class GuiAgentDesktopClient(tk.Tk):
         )
         self.messages_frame.bind("<Configure>", self._on_messages_configure)
         self.chat_canvas.bind("<Configure>", self._on_canvas_configure)
+        self._bind_mousewheel_tree(canvas_holder, self.chat_canvas)
 
         composer = ttk.Frame(self.chat_frame, style="Surface.TFrame", padding=(18, 12))
         composer.grid(row=2, column=0, sticky="ew")
         composer.columnconfigure(0, weight=1)
         composer.columnconfigure(1, weight=0)
-        self.composer_mode_text = tk.StringVar(value="向当前 APP 发送输入")
-        self.send_button_text = tk.StringVar(value="发送给 Agent")
+        self.composer_mode_text = tk.StringVar(value="")
+        self.send_button_text = tk.StringVar(value="发送")
         toolbar = ttk.Frame(composer, style="Surface.TFrame")
+        self.composer_toolbar = toolbar
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         toolbar.columnconfigure(0, weight=1)
-        ttk.Label(
-            toolbar,
-            textvariable=self.composer_mode_text,
-            style="Hint.TLabel",
-        ).grid(row=0, column=0, sticky="w")
         self.direct_command_combo = CanvasChoice(
             toolbar,
             textvariable=self.direct_command_label,
@@ -864,7 +1013,7 @@ class GuiAgentDesktopClient(tk.Tk):
             highlightthickness=0,
             borderwidth=0,
         )
-        composer_text_shell.grid(row=1, column=0, sticky="ew")
+        composer_text_shell.grid(row=1, column=0, columnspan=2, sticky="ew")
         self.composer_text = tk.Text(
             composer_text_shell,
             height=4,
@@ -885,6 +1034,26 @@ class GuiAgentDesktopClient(tk.Tk):
             window=self.composer_text,
             anchor="nw",
         )
+        send_button = CanvasButton(
+            composer_text_shell,
+            textvariable=self.send_button_text,
+            command=self._submit_user_message,
+            fill=self.colors["brand"],
+            hover_fill="#2b313c",
+            foreground="#ffffff",
+            outline=self.colors["brand"],
+            radius=14,
+            height=42,
+            width=82,
+            canvas_bg=self.colors["surface"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        send_button_window = composer_text_shell.create_window(
+            0,
+            0,
+            window=send_button,
+            anchor="se",
+        )
 
         def redraw_composer_text(event: tk.Event[Any]) -> None:
             composer_text_shell.delete("composer_bg")
@@ -902,32 +1071,13 @@ class GuiAgentDesktopClient(tk.Tk):
             composer_text_shell.tag_lower("composer_bg")
             composer_text_shell.itemconfigure(
                 composer_text_window,
-                width=max(40, event.width - 24),
+                width=max(260, event.width - 128),
                 height=80,
             )
+            composer_text_shell.coords(send_button_window, event.width - 12, 92)
+            send_button.raise_widget()
 
         composer_text_shell.bind("<Configure>", redraw_composer_text)
-        ttk.Button(
-            composer,
-            textvariable=self.send_button_text,
-            style="Primary.TButton",
-            command=self._submit_user_message,
-        ).grid(row=1, column=1, sticky="se", padx=(10, 0))
-        send_button = CanvasButton(
-            composer,
-            textvariable=self.send_button_text,
-            command=self._submit_user_message,
-            fill=self.colors["brand"],
-            hover_fill="#2b313c",
-            foreground="#ffffff",
-            outline=self.colors["brand"],
-            radius=14,
-            height=42,
-            width=118,
-            canvas_bg=self.colors["surface"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        )
-        send_button.grid(row=1, column=1, sticky="se", padx=(10, 0))
         send_button.after_idle(send_button.raise_widget)
 
     def _build_inspector(self) -> None:
@@ -939,22 +1089,19 @@ class GuiAgentDesktopClient(tk.Tk):
         header = ttk.Frame(self.inspector, style="Surface.TFrame")
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="检查器", style="Title.TLabel").grid(
+        ttk.Label(header, text="记录", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
-        )
-        ttk.Button(header, text="收起", command=self._toggle_inspector).grid(
-            row=0, column=1, sticky="e"
         )
         ttk.Label(
             self.inspector,
-            text="模型与 harness 的交互历史、素材和人工请求。",
+            text="最近的模型意图、工具调用、验证结果与人工介入。",
             style="Hint.TLabel",
             wraplength=330,
         ).grid(row=1, column=0, sticky="w", pady=(4, 12))
 
         collapse_button = CanvasButton(
             header,
-            text="收起",
+            text="›",
             command=self._toggle_inspector,
             fill=self.colors["surface"],
             hover_fill=self.colors["surface_hover"],
@@ -962,9 +1109,9 @@ class GuiAgentDesktopClient(tk.Tk):
             outline=self.colors["line"],
             radius=13,
             height=34,
-            width=76,
+            width=38,
             canvas_bg=self.colors["surface"],
-            font=("Microsoft YaHei UI", 9, "normal"),
+            font=("Microsoft YaHei UI", 15, "normal"),
         )
         collapse_button.grid(row=0, column=1, sticky="e")
         collapse_button.after_idle(collapse_button.raise_widget)
@@ -980,7 +1127,7 @@ class GuiAgentDesktopClient(tk.Tk):
             borderwidth=0,
         )
         self.inspector_canvas.grid(row=0, column=0, sticky="nsew")
-        inspector_scroll = ttk.Scrollbar(
+        inspector_scroll = AutoHideScrollbar(
             inspector_list_holder,
             orient="vertical",
             command=self.inspector_canvas.yview,
@@ -1010,6 +1157,7 @@ class GuiAgentDesktopClient(tk.Tk):
                 width=event.width,
             ),
         )
+        self._bind_mousewheel_tree(inspector_list_holder, self.inspector_canvas)
 
         inspector_detail_shell = tk.Canvas(
             self.inspector,
@@ -1018,12 +1166,13 @@ class GuiAgentDesktopClient(tk.Tk):
             highlightthickness=0,
             borderwidth=0,
         )
+        self.inspector_detail_shell = inspector_detail_shell
         inspector_detail_shell.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         self.inspector_detail = tk.Text(
             inspector_detail_shell,
             height=12,
             wrap="word",
-            bg="#fbfaf8",
+            bg=self.colors["surface_soft"],
             fg=self.colors["ink"],
             relief="flat",
             borderwidth=0,
@@ -1048,7 +1197,7 @@ class GuiAgentDesktopClient(tk.Tk):
                 event.width - 1,
                 153,
                 16,
-                fill="#fbfaf8",
+                fill=self.colors["surface_soft"],
                 outline=self.colors["line_soft"],
                 tags="detail_bg",
             )
@@ -1061,6 +1210,7 @@ class GuiAgentDesktopClient(tk.Tk):
 
         inspector_detail_shell.bind("<Configure>", redraw_inspector_detail)
         self.inspector_detail.configure(state="disabled")
+        inspector_detail_shell.grid_remove()
 
     def refresh_all(self) -> None:
         self.refresh_apps()
@@ -1076,8 +1226,8 @@ class GuiAgentDesktopClient(tk.Tk):
         app_ids = list(self.state.target_apps)
         for app_id in app_ids:
             config = self.state.target_apps[app_id]
-            waiting = self._waiting_count_for_job(config.job_id)
-            self._add_app_card(app_id=app_id, config=config, waiting=waiting)
+            subtitle = self._app_status_text(app_id, config.job_id)
+            self._add_app_card(app_id=app_id, config=config, subtitle=subtitle)
         if current not in self.state.target_apps and app_ids:
             current = app_ids[0]
             self.selected_app_id.set(current)
@@ -1091,84 +1241,118 @@ class GuiAgentDesktopClient(tk.Tk):
         refs = len(config.reference_assets)
         macros = len(self._macros_for_app(config.app_id))
         self.app_title.configure(text=config.app_name)
-        self.app_subtitle.configure(
-            text=f"任务定义 · {refs} 个素材引用 · {macros} 个可用宏"
-        )
+        parts = []
+        if (config.metadata or {}).get("manual_viewport"):
+            parts.append("视野已标定")
+        if refs:
+            parts.append(f"{refs} 个素材")
+        if macros:
+            parts.append(f"{macros} 个宏")
+        if self.workflow_running.get():
+            parts.append("运行中")
+        elif self.workflow_run_status.get():
+            parts.append(self.workflow_run_status.get())
+        else:
+            status_text = self._app_status_text(config.app_id, config.job_id)
+            if status_text != "就绪":
+                parts.append(status_text)
+        self.app_subtitle.configure(text=" · ".join(parts) if parts else "就绪")
 
     def refresh_messages(self) -> None:
         for child in self.messages_frame.winfo_children():
             child.destroy()
+        self._timeline_images.clear()
         config = self._selected_config()
         if config is None:
             self._add_empty_message()
             return
-        self._add_message(
-            role="system",
-            title="任务定义",
-            text=config.task_description.strip() or "尚未填写任务定义。",
-            align="left",
-        )
-        if config.reference_assets:
-            text = "\n".join(
-                f"{asset.citation}  {asset.title or Path(asset.path).name}"
-                for asset in config.reference_assets
-            )
-            self._add_message(
-                role="asset",
-                title="素材引用",
-                text=text,
-                align="left",
-            )
+        has_visible_content = False
+        events = self._events_for_selected_app(config.app_id)
+        self._ensure_pending_human_request_from_waiting_workflow(config, events)
+        for event in events[-28:]:
+            if self._add_operation_card(event):
+                has_visible_content = True
         for item in self.state.human_loop.list_requests(include_completed=True):
             request = item["request"]
             metadata = request.get("metadata") or {}
             if metadata.get("job_id") != config.job_id:
                 continue
-            title = "人工介入" if item["status"] != "resolved" else "人工回复"
-            text = self._human_request_text(item)
-            self._add_message(role="human", title=title, text=text, align="right")
-        for event in self.state.trace_store.events[-12:]:
-            self._add_message(
-                role="trace",
-                title=self._trace_kind_label(event.kind),
-                text=short_payload(event.payload),
-                align="left",
-            )
+            self._add_human_request_card(item)
+            has_visible_content = True
+        if not has_visible_content:
+            self._add_empty_trace_message()
         self.after_idle(self._scroll_messages_to_bottom)
+
+    def _ensure_pending_human_request_from_waiting_workflow(
+        self,
+        config: TargetAppConfig,
+        events: list[Any],
+    ) -> None:
+        latest_waiting: Any | None = None
+        for event in reversed(events):
+            payload = event.payload
+            if (
+                event.kind == "operation"
+                and payload.get("kind") == "workflow"
+                and payload.get("status") == "waiting_human"
+            ):
+                latest_waiting = event
+                break
+        if latest_waiting is None:
+            return
+        key = ":".join(self._workflow_operation_key(latest_waiting.payload))
+        if not key.strip(":"):
+            key = str(latest_waiting.payload.get("summary") or "waiting_human")
+        for item in self.state.human_loop.list_requests(include_completed=True):
+            request = item["request"]
+            metadata = request.get("metadata") or {}
+            if metadata.get("job_id") != config.job_id:
+                continue
+            if metadata.get("workflow_waiting_key") == key:
+                return
+            if item["status"] != "resolved":
+                return
+        payload = latest_waiting.payload
+        nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        reason = self._friendly_reason(
+            str(nested.get("result_reason") or payload.get("summary") or "")
+        )
+        self.state.human_loop.request_help(
+            question="当前任务需要人工处理后才能继续。",
+            task_id=None,
+            risk_reason=reason or "Agent 等待人工介入。",
+            proposed_action="请查看上方执行记录，输入下一步处理意见或约束。",
+            urgency="normal",
+            metadata={
+                "job_id": config.job_id,
+                "app_id": config.app_id,
+                "source": "workflow_trace",
+                "workflow_waiting_key": key,
+            },
+        )
 
     def refresh_composer(self) -> None:
         pending = self._current_pending_request()
         if pending is None:
-            self.composer_mode_text.set("向当前 APP 发送输入")
-            self.send_button_text.set("发送给 Agent")
+            self.composer_mode_text.set("")
+            self.send_button_text.set("发送")
             self.direct_command_combo.configure(state="disabled")
             self.direct_command_label.set(DIRECT_COMMAND_LABELS[DIRECT_COMMAND_NONE])
+            self.composer_toolbar.grid_remove()
             return
-        request = pending["request"]
-        self.composer_mode_text.set(
-            f"正在处理：{str(request.get('question') or '')[:36]}"
-        )
-        self.send_button_text.set("提交处理")
+        self.composer_mode_text.set("")
+        self.send_button_text.set("提交")
+        self.composer_toolbar.grid()
         self.direct_command_combo.configure(state="readonly")
 
     def refresh_inspector(self) -> None:
         for child in self.inspector_list_frame.winfo_children():
             child.destroy()
+        self._inspector_images.clear()
+        if self._selected_trace_event is not None:
+            self._render_trace_event_detail(self._selected_trace_event)
+            return
         config = self._selected_config()
-        if config is not None:
-            self._add_inspector_card(
-                item_id="task_definition",
-                kind="任务",
-                title="任务定义",
-                summary=config.task_description[:80] or "未填写",
-            )
-            for asset in config.reference_assets:
-                self._add_inspector_card(
-                    item_id=f"asset:{asset.asset_id}",
-                    kind=asset.kind,
-                    title=asset.title or Path(asset.path).name,
-                    summary=asset.citation,
-                )
         for index, item in enumerate(
             self.state.human_loop.list_requests(include_completed=True)
         ):
@@ -1179,20 +1363,27 @@ class GuiAgentDesktopClient(tk.Tk):
                 title="人工介入",
                 summary=request.get("question") or "",
             )
-        for index, event in enumerate(self.state.trace_store.events[-30:]):
+        if config is not None:
             self._add_inspector_card(
-                item_id=f"trace:{index}",
-                kind=self._trace_kind_label(event.kind),
-                title=self._trace_kind_label(event.kind),
-                summary=short_payload(event.payload),
+                item_id="task_definition",
+                kind="任务",
+                title="任务",
+                summary=self._task_brief(config.task_description),
             )
-        self._set_text(self.inspector_detail, "选择左侧记录查看详情。")
+            visible_events = self._events_for_selected_app(config.app_id)[-30:]
+            for index, event in enumerate(visible_events):
+                self._add_inspector_card(
+                    item_id=f"trace:{index}",
+                    kind=self._trace_kind_label(event.kind),
+                    title=self._operation_title(event.kind, event.payload),
+                    summary=self._operation_summary(event.kind, event.payload),
+                )
+        self.inspector_detail_shell.grid_remove()
+        self._set_text(self.inspector_detail, "")
 
     def _periodic_refresh(self) -> None:
         self.refresh_apps()
         self.refresh_header()
-        self.refresh_messages()
-        self.refresh_inspector()
         self.refresh_composer()
         self.after(2000, self._periodic_refresh)
 
@@ -1207,13 +1398,22 @@ class GuiAgentDesktopClient(tk.Tk):
             foreground=self.colors["muted"],
             font=("Microsoft YaHei UI", 13, "bold"),
         ).grid(row=0, column=0)
+        self._bind_mousewheel_tree(holder, self.chat_canvas)
+
+    def _add_empty_trace_message(self) -> None:
+        self._add_message(
+            role="trace",
+            title="",
+            text="还没有执行记录。启动后，这里会显示模型的意图、电脑操作和关键截图。",
+            align="left",
+        )
 
     def _add_message(self, *, role: str, title: str, text: str, align: str) -> None:
         row = len(self.messages_frame.winfo_children())
         outer = ttk.Frame(self.messages_frame, style="Surface.TFrame", padding=(18, 8))
         outer.grid(row=row, column=0, sticky="ew")
         outer.columnconfigure(0, weight=1)
-        canvas_width = min(780, max(420, self.chat_canvas.winfo_width() - 180))
+        canvas_width = min(820, max(620, self.chat_canvas.winfo_width() - 180))
         fill = self._role_color(role)
         outline = "#ebe5de" if role in {"system", "trace"} else fill
         bubble = tk.Canvas(
@@ -1232,18 +1432,22 @@ class GuiAgentDesktopClient(tk.Tk):
         )
         title_font = tkfont.Font(family="Microsoft YaHei UI", size=8, weight="bold")
         body_font = tkfont.Font(family="Microsoft YaHei UI", size=10)
-        bubble.create_text(
-            18,
-            13,
-            text=title,
-            anchor="w",
-            justify="left",
-            fill=self.colors["muted"],
-            font=title_font,
-        )
+        body_y = 34
+        if title:
+            bubble.create_text(
+                18,
+                13,
+                text=title,
+                anchor="w",
+                justify="left",
+                fill=self.colors["muted"],
+                font=title_font,
+            )
+        else:
+            body_y = 20
         body = bubble.create_text(
             18,
-            34,
+            body_y,
             text=text or "",
             anchor="nw",
             justify="left",
@@ -1267,6 +1471,840 @@ class GuiAgentDesktopClient(tk.Tk):
             tags="bubble_bg",
         )
         bubble.tag_lower("bubble_bg")
+        self._bind_mousewheel_tree(outer, self.chat_canvas)
+
+    def _add_operation_card(self, event: Any) -> bool:
+        view = self._timeline_view_for_event(event)
+        if view is None:
+            return False
+        title = view["title"]
+        body = view["body"]
+        detail = view.get("detail") or ""
+        accent = view["accent"]
+        image_refs = tuple(view.get("image_refs") or ())
+        status = view.get("status") or ""
+        row = len(self.messages_frame.winfo_children())
+        outer = ttk.Frame(self.messages_frame, style="Surface.TFrame", padding=(18, 6))
+        outer.grid(row=row, column=0, sticky="ew")
+        outer.columnconfigure(0, weight=1)
+        width = min(880, max(560, self.chat_canvas.winfo_width() - 150))
+        shell = tk.Canvas(
+            outer,
+            width=width,
+            height=96,
+            bg=self.colors["surface"],
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="hand2",
+        )
+        shell.grid(row=0, column=0, sticky="w", padx=(0, 96))
+        content = tk.Frame(shell, bg="#ffffff")
+        content_window = shell.create_window(18, 16, window=content, anchor="nw")
+
+        top = tk.Frame(content, bg="#ffffff")
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=1)
+        tk.Label(
+            top,
+            text=title,
+            bg="#ffffff",
+            fg=self.colors["ink"],
+            anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        if status:
+            tk.Label(
+                top,
+                text=status,
+                bg=accent[1],
+                fg=accent[0],
+                padx=10,
+                pady=3,
+                font=("Microsoft YaHei UI", 8, "bold"),
+            ).grid(row=0, column=1, sticky="e")
+
+        if body:
+            tk.Label(
+                content,
+                text=body,
+                bg="#ffffff",
+                fg=self.colors["ink"],
+                anchor="w",
+                justify="left",
+                wraplength=max(360, width - 84),
+                font=("Microsoft YaHei UI", 10),
+            ).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        if detail:
+            tk.Label(
+                content,
+                text=detail,
+                bg="#ffffff",
+                fg=self.colors["muted"],
+                anchor="w",
+                justify="left",
+                wraplength=max(360, width - 84),
+                font=("Microsoft YaHei UI", 9),
+            ).grid(row=2, column=0, sticky="ew", pady=(5, 0))
+        image_labels: list[tuple[tk.Label, str]] = []
+        if image_refs:
+            images = tk.Frame(content, bg="#ffffff")
+            images.grid(row=3, column=0, sticky="w", pady=(10, 0))
+            rendered = 0
+            for ref in image_refs[:4]:
+                photo = self._timeline_thumbnail(ref)
+                if photo is None:
+                    continue
+                self._timeline_images.append(photo)
+                label = tk.Label(
+                    images,
+                    image=photo,
+                    bg="#ffffff",
+                    highlightthickness=1,
+                    highlightbackground=self.colors["line_soft"],
+                    borderwidth=0,
+                )
+                label.grid(row=0, column=rendered, padx=(0, 8))
+                image_labels.append((label, ref))
+                rendered += 1
+
+        def redraw(_event: tk.Event[Any] | None = None) -> None:
+            card_width = max(shell.winfo_width(), width)
+            content_width = max(120, card_width - 36)
+            shell.itemconfigure(content_window, width=content_width)
+            content.update_idletasks()
+            height = max(88, content.winfo_reqheight() + 32)
+            shell.configure(height=height)
+            shell.delete("bg")
+            draw_rounded_rect(
+                shell,
+                2,
+                2,
+                card_width - 2,
+                height - 2,
+                18,
+                fill="#ffffff",
+                outline=self.colors["line_soft"],
+                width=1,
+                tags="bg",
+            )
+            draw_rounded_rect(
+                shell,
+                2,
+                2,
+                7,
+                height - 2,
+                3,
+                fill=accent[0],
+                outline=accent[0],
+                tags="bg",
+            )
+            shell.tag_lower("bg")
+
+        content.bind("<Configure>", redraw)
+        shell.bind("<Configure>", redraw)
+        shell.bind("<Button-1>", lambda _event, value=event: self._select_trace_event(value))
+        self._bind_click_tree(content, lambda value=event: self._select_trace_event(value))
+        for label, ref in image_labels:
+            label.configure(cursor="hand2")
+            label.bind(
+                "<Button-1>",
+                lambda _event, value=ref: self._open_image_ref_window(value, "截图"),
+            )
+        self._bind_mousewheel_tree(outer, self.chat_canvas)
+        redraw()
+        return True
+
+    def _add_human_request_card(self, item: dict[str, Any]) -> None:
+        request = item["request"]
+        is_resolved = item.get("status") == "resolved"
+        row = len(self.messages_frame.winfo_children())
+        outer = ttk.Frame(self.messages_frame, style="Surface.TFrame", padding=(18, 8))
+        outer.grid(row=row, column=0, sticky="ew")
+        outer.columnconfigure(0, weight=1)
+        width = min(880, max(560, self.chat_canvas.winfo_width() - 150))
+        shell = tk.Canvas(
+            outer,
+            width=width,
+            height=190 if not is_resolved else 110,
+            bg=self.colors["surface"],
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        shell.grid(row=0, column=0, sticky="w", padx=(0, 96))
+        content = tk.Frame(shell, bg="#fff8f1")
+        content_window = shell.create_window(18, 16, window=content, anchor="nw")
+
+        tk.Label(
+            content,
+            text="需要人工处理" if not is_resolved else "人工处理已提交",
+            bg="#fff8f1",
+            fg="#9a4f00",
+            anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        body = self._human_request_user_text(item)
+        tk.Label(
+            content,
+            text=body,
+            bg="#fff8f1",
+            fg=self.colors["ink"],
+            anchor="w",
+            justify="left",
+            wraplength=max(360, width - 80),
+            font=("Microsoft YaHei UI", 10),
+        ).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+        if not is_resolved:
+            input_shell = tk.Canvas(
+                content,
+                height=72,
+                bg="#fff8f1",
+                highlightthickness=0,
+                borderwidth=0,
+            )
+            input_shell.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+            reply_text = tk.Text(
+                input_shell,
+                height=3,
+                wrap="word",
+                relief="flat",
+                borderwidth=0,
+                highlightthickness=0,
+                bg="#ffffff",
+                fg=self.colors["ink"],
+                insertbackground=self.colors["ink"],
+                padx=10,
+                pady=8,
+                font=("Microsoft YaHei UI", 10),
+            )
+            reply_window = input_shell.create_window(12, 10, window=reply_text, anchor="nw")
+            submit = CanvasButton(
+                input_shell,
+                text="提交",
+                command=lambda value=item, widget=reply_text: self._submit_human_card_reply(value, widget),
+                fill=self.colors["brand"],
+                hover_fill="#2b313c",
+                foreground="#ffffff",
+                outline=self.colors["brand"],
+                radius=13,
+                height=36,
+                width=70,
+                canvas_bg="#fff8f1",
+                font=("Microsoft YaHei UI", 9, "bold"),
+            )
+            submit_window = input_shell.create_window(0, 0, window=submit, anchor="se")
+
+            def redraw_input(event: tk.Event[Any]) -> None:
+                input_shell.delete("input_bg")
+                draw_rounded_rect(
+                    input_shell,
+                    1,
+                    1,
+                    event.width - 1,
+                    71,
+                    14,
+                    fill="#ffffff",
+                    outline=self.colors["line"],
+                    tags="input_bg",
+                )
+                input_shell.tag_lower("input_bg")
+                input_shell.itemconfigure(reply_window, width=max(180, event.width - 108), height=52)
+                input_shell.coords(submit_window, event.width - 10, 62)
+                submit.raise_widget()
+
+            input_shell.bind("<Configure>", redraw_input)
+
+        def redraw(_event: tk.Event[Any] | None = None) -> None:
+            card_width = max(shell.winfo_width(), width)
+            shell.itemconfigure(content_window, width=max(120, card_width - 36))
+            content.update_idletasks()
+            height = max(100, content.winfo_reqheight() + 32)
+            shell.configure(height=height)
+            shell.delete("bg")
+            draw_rounded_rect(
+                shell,
+                2,
+                2,
+                card_width - 2,
+                height - 2,
+                18,
+                fill="#fff8f1",
+                outline="#f0d8c7",
+                width=1,
+                tags="bg",
+            )
+            shell.tag_lower("bg")
+
+        content.bind("<Configure>", redraw)
+        shell.bind("<Configure>", redraw)
+        self._bind_mousewheel_tree(outer, self.chat_canvas)
+        redraw()
+
+    def _timeline_view_for_event(self, event: Any) -> dict[str, Any] | None:
+        payload = event.payload
+        if event.kind == "model_response":
+            return None
+        if event.kind == "step":
+            action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+            result = str(payload.get("result") or payload.get("status") or "")
+            model_event = self._model_response_event_for_trace_event(event)
+            intent = (
+                self._model_intent_text(model_event.payload)
+                if model_event is not None
+                else ""
+            )
+            if action.get("type") == "computer_call":
+                actions = action.get("actions") if isinstance(action.get("actions"), list) else []
+                title, body = self._computer_action_timeline_text(actions)
+                if intent:
+                    body = f"意图：{intent}\n\n{body}" if body else f"意图：{intent}"
+                verification = payload.get("metadata", {}).get("verification", {})
+                detail_parts = []
+                if verification.get("screen_changed") is True:
+                    detail_parts.append("界面已发生变化")
+                elif verification.get("screen_changed") is False:
+                    detail_parts.append("界面暂未检测到变化")
+                if payload.get("before_ref") or payload.get("after_ref"):
+                    detail_parts.append("下方为本步相关截图")
+                return {
+                    "title": title,
+                    "body": body,
+                    "detail": " · ".join(detail_parts),
+                    "accent": ("#155eef", "#eef4ff"),
+                    "status": "已执行" if result == "computer_call_output" else self._status_label_text(result),
+                    "image_refs": self._step_image_refs(payload),
+                }
+            if action.get("type") == "agent_tool":
+                name = str(action.get("name") or "")
+                if result == "rejected":
+                    output = payload.get("metadata", {}).get("output", {})
+                    reason = ""
+                    if isinstance(output, dict):
+                        reason = str(output.get("parse_error") or output.get("reason") or "")
+                    return {
+                        "title": "动作未通过",
+                        "body": "这一步没有执行，系统已把问题反馈给模型重新处理。",
+                        "detail": self._friendly_reason(reason),
+                        "accent": ("#b42318", "#fff0ed"),
+                        "status": "已退回",
+                        "image_refs": (),
+                    }
+                body = self._agent_tool_timeline_body(name, payload)
+                if intent:
+                    body = f"意图：{intent}\n\n{body}" if body else f"意图：{intent}"
+                return {
+                    "title": self._agent_tool_timeline_title(name),
+                    "body": body,
+                    "detail": "",
+                    "accent": ("#087443", "#eaf7ef"),
+                    "status": self._status_label_text(result),
+                    "image_refs": (),
+                }
+            summary = str(payload.get("summary") or "").strip()
+            if not summary:
+                return None
+            return {
+                "title": "步骤",
+                "body": summary,
+                "detail": "",
+                "accent": (self.colors["brand"], self.colors["surface_soft"]),
+                "status": self._status_label_text(result),
+                "image_refs": (),
+            }
+        if event.kind == "workflow_result":
+            item_id = str(payload.get("item_id") or "").strip()
+            output = str(payload.get("output_text") or "").strip()
+            status = self._status_label_text(str(payload.get("status") or ""))
+            return {
+                "title": f"结果 {item_id}".strip(),
+                "body": output or status,
+                "detail": str(payload.get("reason") or "").strip(),
+                "accent": ("#087443", "#eaf7ef"),
+                "status": status,
+                "image_refs": tuple(payload.get("artifact_refs") or ()),
+            }
+        if event.kind == "operation":
+            kind = str(payload.get("kind") or "")
+            status = str(payload.get("status") or "")
+            if kind == "workflow" and status == "running":
+                return {
+                    "title": "开始执行",
+                    "body": "Agent 已开始处理当前应用任务。",
+                    "detail": "",
+                    "accent": ("#155eef", "#eef4ff"),
+                    "status": "运行中",
+                    "image_refs": (),
+                }
+            if kind == "workflow" and status == "waiting_human":
+                nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                reason = str(nested.get("result_reason") or payload.get("summary") or "")
+                return {
+                    "title": "等待人工处理",
+                    "body": self._friendly_reason(reason) or "Agent 需要你确认下一步。",
+                    "detail": "可在下方人工处理卡片中输入处理意见。",
+                    "accent": ("#b45f06", "#fff6e5"),
+                    "status": "待处理",
+                    "image_refs": tuple(payload.get("artifact_refs") or ()),
+                }
+            title = str(payload.get("title") or "").strip()
+            summary = str(payload.get("summary") or "").strip()
+            if not title and not summary:
+                return None
+            return {
+                "title": title or "记录",
+                "body": summary,
+                "detail": "",
+                "accent": self._operation_accent(status=status, kind=kind),
+                "status": self._status_label_text(status),
+                "image_refs": tuple(payload.get("artifact_refs") or ()),
+            }
+        return None
+
+    def _model_response_event_for_trace_event(self, event: Any) -> Any | None:
+        if event.kind == "model_response":
+            return event
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        step_id = payload.get("step_id")
+        events = self._events_for_selected_app(self.selected_app_id.get())
+        if step_id is not None:
+            for candidate in reversed(events):
+                if candidate.kind != "model_response":
+                    continue
+                if candidate.payload.get("step") == step_id:
+                    return candidate
+        try:
+            index = next(i for i, candidate in enumerate(events) if candidate is event)
+        except StopIteration:
+            return None
+        for candidate in reversed(events[:index]):
+            if candidate.kind == "model_response":
+                return candidate
+        return None
+
+    def _bind_click_tree(self, widget: tk.Widget, command: Any) -> None:
+        widget.bind("<Button-1>", lambda _event: command())
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Widget):
+                self._bind_click_tree(child, command)
+
+    def _bind_mousewheel_tree(self, widget: tk.Widget, canvas: tk.Canvas) -> None:
+        if isinstance(widget, (tk.Text, tk.Entry, ttk.Entry, ttk.Combobox)):
+            return
+        widget.bind(
+            "<MouseWheel>",
+            lambda event, target=canvas: self._scroll_canvas_from_mousewheel(
+                event,
+                target,
+            ),
+            add="+",
+        )
+        widget.bind(
+            "<Button-4>",
+            lambda event, target=canvas: self._scroll_canvas_from_mousewheel(
+                event,
+                target,
+            ),
+            add="+",
+        )
+        widget.bind(
+            "<Button-5>",
+            lambda event, target=canvas: self._scroll_canvas_from_mousewheel(
+                event,
+                target,
+            ),
+            add="+",
+        )
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Widget):
+                self._bind_mousewheel_tree(child, canvas)
+
+    def _scroll_canvas_from_mousewheel(
+        self,
+        event: tk.Event[Any],
+        canvas: tk.Canvas,
+    ) -> str:
+        if not canvas.winfo_exists():
+            return "break"
+        event_num = getattr(event, "num", None)
+        if event_num == 4:
+            units = -3
+        elif event_num == 5:
+            units = 3
+        else:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return "break"
+            units = -max(1, abs(delta) // 120) if delta > 0 else max(1, abs(delta) // 120)
+        canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _model_intent_text(self, payload: dict[str, Any]) -> str:
+        reasoning = str(
+            payload.get("reasoning_text") or payload.get("reasoning_text_preview") or ""
+        ).strip()
+        visible = str(
+            payload.get("output_text") or payload.get("output_text_preview") or ""
+        ).strip()
+        text = reasoning or self._strip_tool_markup(visible)
+        text = text.replace("Thinking Process:", "").replace("Plan:", "").strip()
+        if not text:
+            return ""
+        return self._clamp_text(text, 220)
+
+    @staticmethod
+    def _strip_tool_markup(text: str) -> str:
+        if not text:
+            return ""
+        text = re.sub(
+            r"<tool_call\b.*",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        text = re.sub(
+            r"<tool_code\b.*",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        cleaned = re.sub(
+            r"<tool_call>.*?</tool_call>",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        cleaned = re.sub(
+            r"<tool_code>.*?</tool_code>",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return cleaned.strip()
+
+    def _computer_action_timeline_text(
+        self,
+        actions: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        if not actions:
+            return "执行动作", "模型请求执行一步电脑操作。"
+        types = {str(action.get("type") or "") for action in actions}
+        if types <= {"click", "double_click", "move"}:
+            title = "点击"
+        elif "type" in types and ("click" in types or "move" in types):
+            title = "定位并输入"
+        elif types == {"type"}:
+            title = "输入文本"
+        elif "keypress" in types:
+            title = "按键"
+        elif "scroll" in types:
+            title = "滚动"
+        elif "wait" in types:
+            title = "等待"
+        else:
+            title = "执行动作"
+        lines = [format_computer_action(action) for action in actions[:4]]
+        if len(actions) > 4:
+            lines.append(f"另有 {len(actions) - 4} 个动作")
+        return title, "\n".join(lines)
+
+    def _agent_tool_timeline_title(self, name: str) -> str:
+        return {
+            "read_text_file": "读取清单",
+            "record_workflow_result": "保存结果",
+            "set_app_viewport": "记录视野",
+            "submit_current_input": "提交输入",
+            "request_human_help": "请求人工处理",
+            "finish_subtask": "完成任务",
+        }.get(name, "处理信息")
+
+    def _agent_tool_timeline_body(self, name: str, payload: dict[str, Any]) -> str:
+        output = payload.get("metadata", {}).get("output", {})
+        if not isinstance(output, dict):
+            output = {}
+        if name == "read_text_file":
+            chars = output.get("chars")
+            path = Path(str(output.get("path") or "")).name
+            if chars:
+                return f"已读取输入清单 {chars} 字。{path}".strip()
+            return f"已读取输入清单。{path}".strip()
+        if name == "record_workflow_result":
+            result = output.get("workflow_result") if isinstance(output.get("workflow_result"), dict) else {}
+            item_id = str(result.get("item_id") or "").strip()
+            status = self._status_label_text(str(result.get("status") or output.get("status") or ""))
+            return f"{item_id} {status}".strip() or "结果已写入轨迹。"
+        if name == "request_human_help":
+            return "Agent 需要人工确认后再继续。"
+        if name == "submit_current_input":
+            return "已提交当前输入框中的内容。"
+        return self._step_summary(payload)
+
+    def _step_image_refs(self, payload: dict[str, Any]) -> tuple[str, ...]:
+        refs = []
+        before = str(payload.get("before_ref") or "").strip()
+        after = str(payload.get("after_ref") or "").strip()
+        if before:
+            refs.append(before)
+        if after and after != before:
+            refs.append(after)
+        return tuple(refs)
+
+    def _timeline_thumbnail(self, image_ref: str) -> Any | None:
+        if Image is None or ImageTk is None:
+            return None
+        try:
+            image = self._load_image_ref(image_ref)
+        except Exception:
+            return None
+        if image is None:
+            return None
+        image = image.convert("RGB")
+        image.thumbnail((142, 82))
+        return ImageTk.PhotoImage(image)
+
+    def _load_image_ref(self, image_ref: str) -> Any | None:
+        if not image_ref:
+            return None
+        if image_ref.startswith("data:image/"):
+            _, encoded = image_ref.split(",", 1)
+            return Image.open(BytesIO(base64.b64decode(encoded)))
+        if image_ref.startswith("file:"):
+            parsed = urlparse(image_ref)
+            path = Path(unquote(parsed.path))
+            if sys.platform == "win32" and str(path).startswith("\\"):
+                path = Path(str(path).lstrip("\\"))
+            return Image.open(path)
+        path = Path(image_ref)
+        if path.exists():
+            return Image.open(path)
+        return None
+
+    def _human_request_user_text(self, item: dict[str, Any]) -> str:
+        request = item["request"]
+        lines = [str(request.get("question") or "当前任务需要你确认。")]
+        reason = self._friendly_reason(str(request.get("risk_reason") or ""))
+        if reason:
+            lines.append(f"原因：{reason}")
+        proposed = str(request.get("proposed_action") or "").strip()
+        if proposed:
+            lines.append(f"建议：{self._friendly_reason(proposed)}")
+        reply = item.get("reply")
+        if reply:
+            lines.append(f"你的回复：{reply.get('text') or ''}")
+        return "\n".join(lines)
+
+    def _submit_human_card_reply(self, item: dict[str, Any], widget: tk.Text) -> None:
+        text = widget.get("1.0", tk.END).strip()
+        if not text:
+            messagebox.showwarning("缺少输入", "请填写处理意见。")
+            return
+        request_id = item["request"]["request_id"]
+        try:
+            self.state.human_loop.claim_request(request_id, source="client")
+            self.state.submit_structured_human_reply(
+                request_id=request_id,
+                manager_input=text,
+                decision_type="人工回复",
+                direct_command=DIRECT_COMMAND_NONE,
+            )
+        except Exception as exc:
+            messagebox.showerror("提交失败", f"{exc}\n\n该请求可能已经被其他入口处理。")
+            self.refresh_all()
+            return
+        self.status_text.set("人工处理已提交")
+        self.refresh_all()
+
+    @staticmethod
+    def _friendly_reason(text: str) -> str:
+        replacements = {
+            "Harness requested human input after repeated computer actions.": "连续操作没有带来有效进展，需要你确认下一步。",
+            "The same computer action repeated without useful progress.": "同一个操作反复执行但没有进展。",
+            "Human should unblock the current UI state.": "请根据当前界面给出下一步处理意见。",
+            "repeated_action": "重复操作",
+        }
+        result = text.strip()
+        for source, target in replacements.items():
+            result = result.replace(source, target)
+        return result.strip()
+
+    @staticmethod
+    def _clamp_text(text: str, limit: int) -> str:
+        text = " ".join(line.strip() for line in text.splitlines() if line.strip())
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3].rstrip() + "..."
+
+    def _operation_icon(self, kind: str) -> str:
+        return {
+            "model_response": "M",
+            "step": "S",
+            "computer_call": "C",
+            "agent_tool": "T",
+            "read_text_file": "R",
+            "record_workflow_result": "W",
+            "computer_use": "C",
+            "mouse": "↖",
+            "keyboard": "⌨",
+            "switch": "⇄",
+            "observe": "◉",
+            "model_intent": "◇",
+            "harness_check": "✓",
+            "verification": "✓",
+            "human": "!",
+            "failure": "!",
+            "workflow": "W",
+            "workflow_configured": "W",
+            "workflow_result": "R",
+            "viewport": "▣",
+        }.get(kind, "T")
+
+    def _operation_title(self, event_kind: str, payload: dict[str, Any]) -> str:
+        if event_kind == "model_response":
+            return "模型响应"
+        if event_kind == "step":
+            action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+            action_type = str(action.get("type") or "")
+            if action_type == "computer_call":
+                return "电脑操作"
+            if action_type == "agent_tool":
+                return self._tool_display_name(str(action.get("name") or "agent_tool"))
+            return "执行步骤"
+        if event_kind == "workflow_configured":
+            return "任务流已配置"
+        if event_kind == "workflow_result":
+            item_id = str(payload.get("item_id") or "").strip()
+            return f"条目结果：{item_id}" if item_id else "条目结果"
+        if event_kind == "operation":
+            title = str(payload.get("title") or "").strip()
+            if title:
+                return title
+        return self._trace_kind_label(event_kind)
+
+    def _operation_summary(self, event_kind: str, payload: dict[str, Any]) -> str:
+        if event_kind == "model_response":
+            parts = []
+            latency = payload.get("latency_seconds")
+            if isinstance(latency, (int, float)):
+                parts.append(f"响应 {latency:.1f}s")
+            tool_count = payload.get("function_call_count")
+            if isinstance(tool_count, int):
+                parts.append(f"工具 {tool_count} 次")
+            text_chars = payload.get("output_text_chars")
+            if isinstance(text_chars, int) and text_chars:
+                parts.append(f"输出 {text_chars} 字")
+            warnings = payload.get("warnings")
+            if warnings:
+                parts.append("关注：" + self._warning_summary(warnings))
+            return " / ".join(parts) or "模型返回已记录"
+        if event_kind == "step":
+            return self._step_summary(payload)
+        if event_kind == "workflow_configured":
+            trace_name = Path(str(payload.get("trace_path") or "")).name
+            return (
+                f"{payload.get('app_name', '')} / "
+                f"{payload.get('item_count', 0)} 条 / "
+                f"轨迹 {trace_name}"
+            )
+        if event_kind == "workflow_result":
+            status = self._status_label_text(str(payload.get("status") or ""))
+            output = str(payload.get("output_text") or "").strip()
+            if output:
+                return f"{status} / {output[:96]}"
+            return status
+        if event_kind == "operation":
+            summary = str(payload.get("summary") or "").strip()
+            if summary:
+                return summary
+        return short_payload(payload)
+
+    def _step_summary(self, payload: dict[str, Any]) -> str:
+        action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+        result = str(payload.get("result") or payload.get("status") or "")
+        status = self._status_label_text(result) if result else ""
+        if action.get("type") == "computer_call":
+            actions = action.get("actions")
+            count = len(actions) if isinstance(actions, list) else 0
+            verification = payload.get("metadata", {}).get("verification", {})
+            changed = verification.get("screen_changed")
+            suffix = ""
+            if changed is True:
+                suffix = "，界面有变化"
+            elif changed is False:
+                suffix = "，界面未变化"
+            return f"执行 {count} 个电脑动作{suffix}"
+        if action.get("type") == "agent_tool":
+            name = str(action.get("name") or "")
+            if result == "rejected":
+                output = payload.get("metadata", {}).get("output", {})
+                reason = str(output.get("parse_error") or output.get("reason") or "")
+                return f"工具参数被拒绝，已反馈给模型重试。{reason[:72]}"
+            if name == "read_text_file":
+                output = payload.get("metadata", {}).get("output", {})
+                chars = output.get("chars")
+                return f"读取输入清单 {chars} 字" if chars else "读取输入清单"
+            if name == "record_workflow_result":
+                output = payload.get("metadata", {}).get("output", {})
+                workflow_result = output.get("workflow_result", {})
+                item_id = workflow_result.get("item_id") or ""
+                return f"保存条目结果 {item_id}".strip()
+            return f"{self._tool_display_name(name)} / {status or '已处理'}"
+        summary = str(payload.get("summary") or "").strip()
+        return summary or status or short_payload(payload)
+
+    @staticmethod
+    def _tool_display_name(name: str) -> str:
+        return {
+            "computer_use": "电脑操作",
+            "read_text_file": "读取文件",
+            "read_image": "读取图片",
+            "read_video_frames": "读取视频帧",
+            "record_workflow_result": "记录结果",
+            "set_app_viewport": "设置视野",
+            "request_human_help": "请求人工协助",
+            "report_blocked": "报告阻塞",
+            "finish_subtask": "结束子任务",
+        }.get(name, name or "工具调用")
+
+    @staticmethod
+    def _warning_summary(warnings: Any) -> str:
+        if not isinstance(warnings, list):
+            return str(warnings)
+        labels = {
+            "long_output_text": "输出偏长",
+            "large_response_json": "响应体偏大",
+            "slow_model_response": "响应偏慢",
+            "thinking_text_visible": "显式思考",
+            "long_reasoning_text": "思考偏长",
+        }
+        return "、".join(labels.get(str(item), str(item)) for item in warnings[:3])
+
+    def _operation_accent(self, *, status: str, kind: str) -> tuple[str, str]:
+        if status in {"failed", "error", "rejected"} or kind == "failure":
+            return ("#b42318", "#fff0ed")
+        if status in {"waiting", "waiting_human", "pending"} or kind == "human":
+            return ("#b45f06", "#fff6e5")
+        if status in {"verified", "completed", "passed", "accepted"}:
+            return ("#067647", "#eaf7ef")
+        return (self.colors["brand"], self.colors["surface_soft"])
+
+    def _status_label_text(self, status: str) -> str:
+        return {
+            "configured": "已配置",
+            "running": "运行中",
+            "recorded": "已记录",
+            "planned": "已计划",
+            "accepted": "已接受",
+            "rejected": "已退回",
+            "executed": "已执行",
+            "computer_call_output": "已执行",
+            "verified": "已验证",
+            "completed": "已完成",
+            "passed": "通过",
+            "failed": "失败",
+            "error": "错误",
+            "pending": "等待",
+            "waiting": "等待",
+            "waiting_human": "等人工",
+        }.get(status, status)
 
     def _role_color(self, role: str) -> str:
         return {
@@ -1275,6 +2313,29 @@ class GuiAgentDesktopClient(tk.Tk):
             "trace": "#f7f5f2",
             "system": "#f7f5f2",
         }.get(role, "#f7f5f2")
+
+    @staticmethod
+    def _task_brief(text: str) -> str:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return "尚未填写任务定义。"
+        keep_prefixes = ("目标", "目标网址", "输入清单", "计划题目数", "正确性优先")
+        selected: list[str] = []
+        for line in lines:
+            if line.startswith(keep_prefixes):
+                if line.startswith("输入清单"):
+                    label, _, value = line.partition("：")
+                    selected.append(f"{label}：{Path(value).name if value else value}")
+                else:
+                    selected.append(line)
+            if len(selected) >= 4:
+                break
+        if not selected:
+            selected = lines[:4]
+        brief = "\n".join(selected)
+        if len(brief) > 360:
+            brief = brief[:357].rstrip() + "..."
+        return brief
 
     def _add_app_card_legacy(
         self,
@@ -1323,7 +2384,7 @@ class GuiAgentDesktopClient(tk.Tk):
         *,
         app_id: str,
         config: TargetAppConfig,
-        waiting: int,
+        subtitle: str,
     ) -> None:
         selected = app_id == self.selected_app_id.get()
         card = tk.Canvas(
@@ -1377,13 +2438,12 @@ class GuiAgentDesktopClient(tk.Tk):
                 fill=self.colors["ink"],
                 font=title_font,
             )
-            subtitle_text = "待处理 " + str(waiting) if waiting else "就绪"
             card.create_text(
                 text_x,
                 42,
-                text=subtitle_text,
+                text=subtitle,
                 anchor="w",
-                fill=self.colors["accent"] if waiting else self.colors["muted"],
+                fill=self.colors["accent"] if subtitle != "就绪" else self.colors["muted"],
                 font=hint_font,
             )
 
@@ -1454,12 +2514,12 @@ class GuiAgentDesktopClient(tk.Tk):
     ) -> None:
         card = tk.Canvas(
             self.inspector_list_frame,
-            height=82,
+            height=76,
             bg=self.colors["surface"],
             highlightthickness=0,
             borderwidth=0,
         )
-        card.pack(fill="x", pady=(0, 8))
+        card.pack(fill="x", pady=(0, 7))
 
         def redraw(_event: tk.Event[Any] | None = None) -> None:
             width = max(card.winfo_width(), 280)
@@ -1469,9 +2529,9 @@ class GuiAgentDesktopClient(tk.Tk):
                 2,
                 2,
                 width - 2,
-                80,
+                74,
                 14,
-                fill=self.colors["surface_soft"],
+                fill="#fbfbfa",
                 outline=self.colors["line_soft"],
                 width=1,
             )
@@ -1479,14 +2539,14 @@ class GuiAgentDesktopClient(tk.Tk):
                 card,
                 12,
                 12,
-                72,
+                58,
                 34,
                 10,
                 fill=self.colors["brand_soft"],
                 outline=self.colors["brand_soft"],
             )
             card.create_text(
-                42,
+                35,
                 23,
                 text=kind,
                 anchor="center",
@@ -1498,12 +2558,13 @@ class GuiAgentDesktopClient(tk.Tk):
                 23,
                 text=title,
                 anchor="w",
+                width=width - 100,
                 fill=self.colors["ink"],
                 font=tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold"),
             )
             card.create_text(
                 14,
-                48,
+                45,
                 text=summary,
                 anchor="nw",
                 width=width - 28,
@@ -1513,6 +2574,7 @@ class GuiAgentDesktopClient(tk.Tk):
 
         card.bind("<Configure>", redraw)
         card.bind("<Button-1>", lambda _event, value=item_id: self._select_inspector_item(value))
+        self._bind_mousewheel_tree(card, self.inspector_canvas)
         redraw()
 
     def _on_messages_configure(self, _event: tk.Event[Any]) -> None:
@@ -1526,18 +2588,38 @@ class GuiAgentDesktopClient(tk.Tk):
 
     def _select_app(self, app_id: str) -> None:
         self.selected_app_id.set(app_id)
+        self._selected_trace_event = None
         self.refresh_apps()
         self.refresh_header()
         self.refresh_messages()
         self.refresh_inspector()
         self.refresh_composer()
 
+    def _show_create_menu(self) -> None:
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="新建 APP", command=self._add_app_dialog)
+        menu.add_command(label="导入执行清单", command=self._open_workflow_template_dialog)
+        menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+
     def _show_app_menu(self, event: tk.Event[Any], app_id: str | None = None) -> None:
         if app_id is not None:
             self.selected_app_id.set(app_id)
             self.refresh_apps()
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="编辑任务定义", command=self._edit_selected_app)
+        menu.add_command(label="开始执行", command=self._start_selected_workflow_run)
+        menu.add_separator()
+        menu.add_command(label="查看应用设定", command=self._show_selected_task_definition)
+        menu.add_command(label="编辑应用设定", command=self._edit_selected_app)
+        menu.add_separator()
+        menu.add_command(label="标定 APP 视野", command=self._open_viewport_marker)
+        menu.add_command(label="隐藏视野框", command=self._hide_viewport_marker)
+        menu.add_command(label="复制视野坐标", command=self._copy_selected_viewport)
+        menu.add_command(label="清除视野标定", command=self._clear_selected_viewport)
+        menu.add_separator()
+        menu.add_command(label="执行记录", command=self._show_selected_trace)
+        menu.add_command(label="复制轨迹文件路径", command=self._copy_selected_trace_path)
+        menu.add_command(label="打开轨迹文件目录", command=self._open_selected_trace_folder)
+        menu.add_command(label="复制输入清单路径", command=self._copy_selected_input_path)
         menu.add_command(label="复制 APP ID", command=self._copy_selected_app_id)
         menu.add_separator()
         menu.add_command(label="打开设置", command=self._open_settings)
@@ -1579,7 +2661,7 @@ class GuiAgentDesktopClient(tk.Tk):
         if config is None:
             messagebox.showinfo("没有 APP", "请先新建或选择一个 APP。")
             return
-        dialog = AppConfigDialog(self, title="任务定义", config=config)
+        dialog = AppConfigDialog(self, title="应用设定", config=config)
         result = dialog.result
         if result is None:
             return
@@ -1600,8 +2682,50 @@ class GuiAgentDesktopClient(tk.Tk):
                     goal=updated.app_name,
                 )
             )
-        self.status_text.set("任务定义已更新")
+        self.status_text.set("应用设定已更新")
         self.refresh_all()
+
+    def _show_selected_task_definition(self) -> None:
+        config = self._selected_config()
+        if config is None:
+            messagebox.showinfo("没有 APP", "请先新建或选择一个 APP。")
+            return
+        details = [
+            f"APP：{config.app_name}",
+            f"APP ID：{config.app_id}",
+            f"JOB：{config.job_id}",
+        ]
+        viewport = (config.metadata or {}).get("manual_viewport")
+        if isinstance(viewport, dict):
+            details.append(
+                "视野："
+                f"x={viewport.get('x')}, y={viewport.get('y')}, "
+                f"{viewport.get('width')}x{viewport.get('height')}"
+            )
+        details.extend(["", config.task_description or "尚未填写任务定义。"])
+        if config.reference_assets:
+            details.extend(["", "素材引用："])
+            details.extend(
+                f"- {asset.citation}  {asset.title or Path(asset.path).name}"
+                for asset in config.reference_assets
+            )
+        self._show_inspector_detail("\n".join(details))
+        if not self.inspector_visible.get():
+            self._toggle_inspector()
+
+    def _show_selected_trace(self) -> None:
+        config = self._selected_config()
+        if config is None:
+            messagebox.showinfo("没有 APP", "请先新建或选择一个 APP。")
+            return
+        self.refresh_inspector()
+        events = self._events_for_selected_app(config.app_id)
+        if events:
+            self._select_trace_event(events[-1])
+        else:
+            self._show_inspector_detail("还没有操作记录。")
+            if not self.inspector_visible.get():
+                self._toggle_inspector()
 
     def _copy_selected_app_id(self) -> None:
         config = self._selected_config()
@@ -1611,8 +2735,175 @@ class GuiAgentDesktopClient(tk.Tk):
         self.clipboard_append(config.app_id)
         self.status_text.set("已复制 APP ID")
 
+    def _copy_selected_trace_path(self) -> None:
+        path = self._trace_path_for_selected_app()
+        if not path:
+            self.status_text.set("当前 APP 未配置轨迹文件")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self.status_text.set("已复制轨迹文件路径")
+
+    def _copy_selected_input_path(self) -> None:
+        config = self._selected_config()
+        path = str((config.metadata or {}).get("input_path") or "") if config else ""
+        if not path:
+            self.status_text.set("当前 APP 未配置输入清单")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self.status_text.set("已复制输入清单路径")
+
+    def _open_selected_trace_folder(self) -> None:
+        path = self._trace_path_for_selected_app()
+        if not path:
+            self.status_text.set("当前 APP 未配置轨迹文件")
+            return
+        folder = Path(path).expanduser().parent
+        if not folder.exists():
+            self.status_text.set("轨迹文件目录不存在")
+            return
+        try:
+            import os
+
+            os.startfile(folder)  # type: ignore[attr-defined]
+        except OSError as exc:
+            messagebox.showerror("打开失败", str(exc))
+
+    def _open_viewport_marker(self) -> None:
+        config = self._selected_config()
+        if config is None:
+            messagebox.showinfo("没有 APP", "请先新建或选择一个 APP。")
+            return
+        if self.viewport_marker is not None and self.viewport_marker.winfo_exists():
+            self.viewport_marker.destroy()
+        box = self._initial_viewport_box(config)
+        self.viewport_marker = ViewportMarkerWindow(
+            self,
+            app_id=config.app_id,
+            app_name=config.app_name,
+            initial_box=box,
+        )
+        self.status_text.set("拖动视野框到目标 APP 区域，保存后隐藏。")
+
+    def _hide_viewport_marker(self) -> None:
+        if self.viewport_marker is not None and self.viewport_marker.winfo_exists():
+            self.viewport_marker.destroy()
+        self.viewport_marker = None
+        self.status_text.set("视野框已隐藏")
+
+    def _save_manual_viewport_from_marker(
+        self,
+        *,
+        app_id: str,
+        box: tuple[int, int, int, int],
+    ) -> None:
+        x, y, width, height = box
+        try:
+            viewport = self.state.update_target_viewport(
+                app_id,
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+            )
+        except Exception as exc:
+            messagebox.showerror("保存失败", str(exc))
+            return
+        self.state.record_operation_summary(
+            app_id=app_id,
+            kind="viewport",
+            title="APP 视野已标定",
+            summary=(
+                f"x={viewport['x']}, y={viewport['y']}, "
+                f"{viewport['width']}x{viewport['height']}"
+            ),
+            status="configured",
+            payload={"manual_viewport": viewport},
+        )
+        self._hide_viewport_marker()
+        self.refresh_all()
+
+    def _clear_selected_viewport(self) -> None:
+        config = self._selected_config()
+        if config is None:
+            return
+        self.state.clear_target_viewport(config.app_id)
+        self.state.record_operation_summary(
+            app_id=config.app_id,
+            kind="viewport",
+            title="APP 视野标定已清除",
+            summary="后续将重新使用完整屏幕或运行时视野。",
+            status="recorded",
+        )
+        self.status_text.set("已清除视野标定")
+        self.refresh_all()
+
+    def _copy_selected_viewport(self) -> None:
+        config = self._selected_config()
+        viewport = (config.metadata or {}).get("manual_viewport") if config else None
+        if not isinstance(viewport, dict):
+            self.status_text.set("当前 APP 尚未标定视野")
+            return
+        try:
+            text = (
+                f"{int(viewport['x'])},"
+                f"{int(viewport['y'])},"
+                f"{int(viewport['width'])},"
+                f"{int(viewport['height'])}"
+            )
+        except (KeyError, TypeError, ValueError):
+            self.status_text.set("当前 APP 的视野坐标无效")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_text.set("已复制视野坐标")
+
+    def _initial_viewport_box(self, config: TargetAppConfig) -> tuple[int, int, int, int]:
+        saved = (config.metadata or {}).get("manual_viewport")
+        if isinstance(saved, dict):
+            try:
+                x = int(saved.get("x", 0))
+                y = int(saved.get("y", 0))
+                width = int(saved.get("width", 0))
+                height = int(saved.get("height", 0))
+                if width > 0 and height > 0:
+                    return (x, y, width, height)
+            except (TypeError, ValueError):
+                pass
+        screen_width = max(1, self.winfo_screenwidth())
+        screen_height = max(1, self.winfo_screenheight())
+        width = min(1100, max(640, int(screen_width * 0.62)))
+        height = min(720, max(420, int(screen_height * 0.62)))
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        return (x, y, width, height)
+
+    def _trace_path_for_selected_app(self) -> str:
+        config = self._selected_config()
+        if config is None:
+            return ""
+        return str((config.metadata or {}).get("trace_path") or "")
+
     def _open_settings(self) -> None:
         SettingsDialog(self, self.state, self.selected_app_id.get())
+        self.refresh_all()
+
+    def _open_workflow_template_dialog(self) -> None:
+        dialog = WorkflowTemplateDialog(self)
+        result = dialog.result
+        if result is None:
+            return
+        try:
+            configured = self.state.configure_workflow(**result)
+        except Exception as exc:
+            messagebox.showerror("任务流配置失败", str(exc))
+            return
+        app_id = configured["app"]["app_id"]
+        self.selected_app_id.set(app_id)
+        self.status_text.set(
+            f"任务流已配置：{configured['item_count']} 条"
+        )
         self.refresh_all()
 
     def _toggle_inspector(self) -> None:
@@ -1622,6 +2913,255 @@ class GuiAgentDesktopClient(tk.Tk):
         else:
             self.inspector.grid(row=0, column=2, sticky="nsew")
             self.inspector_visible.set(True)
+
+    def _start_selected_workflow_run(self) -> None:
+        config = self._selected_config()
+        if config is None:
+            messagebox.showinfo("未选择 APP", "请先选择一个应用会话。")
+            return
+        if self.workflow_running.get():
+            messagebox.showinfo("正在运行", "当前已有一次 Agent 执行在进行。")
+            return
+        metadata = config.metadata or {}
+        trace_path = str(metadata.get("trace_path") or "").strip()
+        if not trace_path:
+            messagebox.showinfo(
+                "缺少轨迹文件",
+                "当前应用还没有配置输入清单和轨迹文件。请在应用右键菜单中编辑应用设定。",
+            )
+            return
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        result_json = Path(trace_path).with_suffix(f".client_run_{run_id}.json")
+        try:
+            command = build_workflow_run_command(
+                config,
+                python_executable=sys.executable,
+                result_json=result_json,
+                max_steps=int(metadata.get("max_steps") or 8),
+                max_output_tokens=int(metadata.get("max_output_tokens") or 512),
+            )
+        except Exception as exc:
+            messagebox.showerror("无法启动", str(exc))
+            return
+
+        self.workflow_running.set(True)
+        self.workflow_run_status.set("运行中")
+        self.state.trace_store.path = Path(trace_path)
+        self.state.record_operation_summary(
+            app_id=config.app_id,
+            kind="workflow",
+            title="Agent 已启动",
+            summary=f"结果写入 {result_json.name}",
+            status="running",
+            payload={
+                "run_id": run_id,
+                "command": command,
+                "result_json": str(result_json),
+            },
+        )
+        self.refresh_all()
+        worker = threading.Thread(
+            target=self._run_workflow_command_worker,
+            args=(config.app_id, Path(trace_path), result_json, command),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_workflow_command_worker(
+        self,
+        app_id: str,
+        trace_path: Path,
+        result_json: Path,
+        command: list[str],
+    ) -> None:
+        log_path = result_json.with_suffix(".log")
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=None,
+            )
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(
+                "COMMAND:\n"
+                + " ".join(command)
+                + "\n\nSTDOUT:\n"
+                + completed.stdout
+                + "\n\nSTDERR:\n"
+                + completed.stderr,
+                encoding="utf-8",
+            )
+            self.after(
+                0,
+                lambda: self._finish_workflow_run(
+                    app_id=app_id,
+                    trace_path=trace_path,
+                    result_json=result_json,
+                    log_path=log_path,
+                    returncode=completed.returncode,
+                ),
+            )
+        except Exception as exc:
+            error_text = str(exc)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(error_text, encoding="utf-8")
+            self.after(
+                0,
+                lambda: self._finish_workflow_run(
+                    app_id=app_id,
+                    trace_path=trace_path,
+                    result_json=result_json,
+                    log_path=log_path,
+                    returncode=-1,
+                    error=error_text,
+                ),
+            )
+
+    def _finish_workflow_run(
+        self,
+        *,
+        app_id: str,
+        trace_path: Path,
+        result_json: Path,
+        log_path: Path,
+        returncode: int,
+        error: str | None = None,
+    ) -> None:
+        self.workflow_running.set(False)
+        result_summary = self._load_workflow_result_summary(result_json)
+        workflow_status = (
+            str(result_summary.get("status") or "completed")
+            if returncode == 0
+            else "failed"
+        )
+        self.workflow_run_status.set(self._workflow_status_label(workflow_status))
+        if trace_path.exists():
+            self.state.trace_store.load_existing(trace_path)
+        self.state.trace_store.path = trace_path
+        self._import_workflow_human_requests(app_id, result_summary)
+        self.state.record_operation_summary(
+            app_id=app_id,
+            kind="workflow",
+            title=self._workflow_completion_title(workflow_status, returncode),
+            summary=self._workflow_completion_summary(
+                result_json=result_json,
+                log_path=log_path,
+                result_summary=result_summary,
+                error=error,
+            ),
+            status=workflow_status,
+            payload={
+                "result_json": str(result_json),
+                "log_path": str(log_path),
+                "returncode": returncode,
+                "error": error,
+                "result_status": workflow_status,
+                "result_reason": result_summary.get("reason"),
+                "result_steps": result_summary.get("steps"),
+            },
+        )
+        self.refresh_all()
+
+    def _load_workflow_result_summary(self, result_json: Path) -> dict[str, Any]:
+        if not result_json.exists():
+            return {}
+        try:
+            data = json.loads(result_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        result = data.get("result") if isinstance(data, dict) else None
+        return dict(result) if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _workflow_status_label(status: str) -> str:
+        return {
+            "completed": "完成",
+            "waiting_human": "等待人工",
+            "blocked": "阻塞",
+            "failed": "异常",
+            "max_steps_exceeded": "达到步数上限",
+        }.get(status, status or "完成")
+
+    def _workflow_completion_title(self, status: str, returncode: int) -> str:
+        if returncode != 0:
+            return "Agent 执行异常"
+        if status == "waiting_human":
+            return "Agent 等待人工"
+        if status == "blocked":
+            return "Agent 已阻塞"
+        if status == "max_steps_exceeded":
+            return "Agent 达到步数上限"
+        if status == "completed":
+            return "Agent 执行完成"
+        return f"Agent 状态：{self._workflow_status_label(status)}"
+
+    def _workflow_completion_summary(
+        self,
+        *,
+        result_json: Path,
+        log_path: Path,
+        result_summary: dict[str, Any],
+        error: str | None,
+    ) -> str:
+        if error is not None:
+            return error
+        reason = str(result_summary.get("reason") or "").strip()
+        steps = result_summary.get("steps")
+        parts = [f"结果 {result_json.name}", f"日志 {log_path.name}"]
+        if steps is not None:
+            parts.append(f"{steps} 步")
+        if reason:
+            parts.append(reason)
+        return " / ".join(parts)
+
+    def _import_workflow_human_requests(
+        self,
+        app_id: str,
+        result_summary: dict[str, Any],
+    ) -> None:
+        status = str(result_summary.get("status") or "")
+        if status != "waiting_human":
+            return
+        config = self.state.target_apps.get(app_id)
+        job_id = config.job_id if config is not None else app_id
+        metadata = result_summary.get("metadata")
+        imported = False
+        if isinstance(metadata, dict):
+            for item in metadata.get("human_requests") or ():
+                if not isinstance(item, dict):
+                    continue
+                request = item.get("request")
+                if not isinstance(request, dict):
+                    continue
+                self.state.human_loop.request_help(
+                    question=str(request.get("question") or "当前任务需要人工介入。"),
+                    task_id=request.get("task_id"),
+                    evidence_refs=tuple(request.get("evidence_refs") or ()),
+                    risk_reason=request.get("risk_reason"),
+                    proposed_action=request.get("proposed_action"),
+                    allowed_reply_format=request.get("allowed_reply_format"),
+                    urgency=str(request.get("urgency") or "normal"),
+                    metadata={
+                        **dict(request.get("metadata") or {}),
+                        "job_id": job_id,
+                        "source": "workflow_result",
+                    },
+                )
+                imported = True
+        if imported:
+            return
+        self.state.human_loop.request_help(
+            question="当前子任务需要人工确认：是否继续执行？",
+            task_id=None,
+            risk_reason=str(result_summary.get("reason") or "Agent 等待人工介入。"),
+            proposed_action="请查看执行轨迹后输入下一步约束或处理结果。",
+            urgency="normal",
+            metadata={"job_id": job_id, "source": "workflow_result"},
+        )
 
     def _submit_user_message(self) -> None:
         text = self.composer_text.get("1.0", tk.END).strip()
@@ -1673,25 +3213,598 @@ class GuiAgentDesktopClient(tk.Tk):
             return
         config = self._selected_config()
         if selected == "task_definition" and config is not None:
-            self._set_text(self.inspector_detail, config.task_description)
+            self._show_inspector_detail(config.task_description)
             return
         if selected.startswith("asset:") and config is not None:
             asset_id = selected.split(":", 1)[1]
             for asset in config.reference_assets:
                 if asset.asset_id == asset_id:
-                    self._set_text(self.inspector_detail, format_asset(asset))
+                    self._show_inspector_detail(format_asset(asset))
                     return
         if selected.startswith("human:"):
             index = int(selected.split(":", 1)[1])
             items = list(self.state.human_loop.list_requests(include_completed=True))
             if 0 <= index < len(items):
-                self._set_text(self.inspector_detail, self._human_request_text(items[index]))
+                self._show_inspector_detail(self._human_request_text(items[index]))
             return
         if selected.startswith("trace:"):
             index = int(selected.split(":", 1)[1])
-            events = self.state.trace_store.events[-30:]
-            if 0 <= index < len(events):
-                self._set_text(self.inspector_detail, format_payload(events[index].payload))
+            if config is not None:
+                events = self._events_for_selected_app(config.app_id)[-30:]
+                if 0 <= index < len(events):
+                    self._show_inspector_detail(self._format_trace_detail(events[index]))
+
+    def _select_trace_event(self, event: Any) -> None:
+        self._selected_trace_event = event
+        if not self.inspector_visible.get():
+            self._toggle_inspector()
+        self._render_trace_event_detail(event)
+
+    def _render_trace_event_detail(self, event: Any) -> None:
+        for child in self.inspector_list_frame.winfo_children():
+            child.destroy()
+        self._inspector_images.clear()
+        self.inspector_detail_shell.grid_remove()
+        self._set_text(self.inspector_detail, "")
+
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        model_event = self._model_response_event_for_trace_event(event)
+        model_payload = (
+            model_event.payload
+            if model_event is not None and isinstance(model_event.payload, dict)
+            else {}
+        )
+        title = self._operation_title(event.kind, payload)
+        summary = self._operation_summary(event.kind, payload)
+        overview = summary or ""
+        self._add_detail_text_section(
+            "记录概要",
+            "\n".join(str(part) for part in (title, overview) if part),
+        )
+
+        input_lines: list[str] = []
+        input_text = str(model_payload.get("input_text_preview") or "").strip()
+        if input_text:
+            input_lines.append(input_text)
+        elif event.kind == "step":
+            input_lines.append("当前轨迹没有记录完整文本输入；下方截图为本轮操作前传给模型的界面证据。")
+        if input_lines:
+            self._add_detail_text_section("本轮输入文本", "\n\n".join(input_lines))
+
+        screenshot_refs = self._detail_screenshot_refs(event)
+        if screenshot_refs:
+            self._add_detail_image_section("本轮截图输入与结果", screenshot_refs)
+
+        if model_payload:
+            reasoning = str(
+                model_payload.get("reasoning_text")
+                or model_payload.get("reasoning_text_preview")
+                or ""
+            ).strip()
+            output_text = str(
+                model_payload.get("output_text")
+                or model_payload.get("output_text_preview")
+                or ""
+            ).strip()
+            visible_text = self._strip_tool_markup(output_text)
+            if reasoning:
+                self._add_detail_text_section("思考", reasoning)
+            response_object = model_payload.get("response_object")
+            response_output_summary = ""
+            if response_object is not None:
+                response_output_summary = self._format_response_protocol_output(
+                    response_object
+                )
+                if response_output_summary:
+                    self._add_detail_text_section("Responses 输出", response_output_summary)
+                self._add_detail_text_section(
+                    "Responses 返回对象",
+                    json.dumps(
+                        response_object,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    ),
+                )
+            if visible_text and not response_output_summary:
+                self._add_detail_text_section("模型文字输出", visible_text)
+            elif response_object is None and output_text:
+                self._add_detail_text_section("模型原始输出", output_text)
+
+            stats = self._model_response_stats_text(model_payload)
+            if stats:
+                self._add_detail_text_section("响应统计", stats)
+
+        tool_text = self._trace_tool_detail_text(event)
+        if tool_text:
+            self._add_detail_text_section("工具调用", tool_text)
+
+    def _add_detail_text_section(self, title: str, text: str) -> None:
+        if not text.strip():
+            return
+        card = tk.Frame(
+            self.inspector_list_frame,
+            bg="#fbfbfa",
+            padx=12,
+            pady=10,
+            highlightthickness=1,
+            highlightbackground=self.colors["line_soft"],
+        )
+        card.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            card,
+            text=title,
+            bg="#fbfbfa",
+            fg=self.colors["ink"],
+            anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(fill="x")
+        tk.Label(
+            card,
+            text=text,
+            bg="#fbfbfa",
+            fg=self.colors["ink"],
+            anchor="w",
+            justify="left",
+            wraplength=360,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(fill="x", pady=(7, 0))
+        self._bind_mousewheel_tree(card, self.inspector_canvas)
+
+    def _add_detail_image_section(self, title: str, image_refs: tuple[tuple[str, str], ...]) -> None:
+        card = tk.Frame(
+            self.inspector_list_frame,
+            bg="#fbfbfa",
+            padx=12,
+            pady=10,
+            highlightthickness=1,
+            highlightbackground=self.colors["line_soft"],
+        )
+        card.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            card,
+            text=title,
+            bg="#fbfbfa",
+            fg=self.colors["ink"],
+            anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(fill="x")
+        grid = tk.Frame(card, bg="#fbfbfa")
+        grid.pack(fill="x", pady=(8, 0))
+        column = 0
+        for label_text, ref in image_refs:
+            photo = self._timeline_thumbnail(ref)
+            if photo is None:
+                continue
+            self._inspector_images.append(photo)
+            holder = tk.Frame(grid, bg="#fbfbfa")
+            holder.grid(row=0, column=column, sticky="w", padx=(0, 10), pady=(0, 8))
+            thumb = tk.Label(
+                holder,
+                image=photo,
+                bg="#ffffff",
+                cursor="hand2",
+                highlightthickness=1,
+                highlightbackground=self.colors["line_soft"],
+                borderwidth=0,
+            )
+            thumb.pack()
+            thumb.bind(
+                "<Button-1>",
+                lambda _event, value=ref, title=label_text: self._open_image_ref_window(
+                    value,
+                    title,
+                ),
+            )
+            tk.Label(
+                holder,
+                text=label_text,
+                bg="#fbfbfa",
+                fg=self.colors["muted"],
+                font=("Microsoft YaHei UI", 8),
+            ).pack(fill="x", pady=(4, 0))
+            column += 1
+        self._bind_mousewheel_tree(card, self.inspector_canvas)
+
+    def _detail_screenshot_refs(self, event: Any) -> tuple[tuple[str, str], ...]:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        refs: list[tuple[str, str]] = []
+        before = str(payload.get("before_ref") or "").strip()
+        after = str(payload.get("after_ref") or "").strip()
+        if before:
+            refs.append(("输入截图", before))
+        if after and after != before:
+            refs.append(("操作后截图", after))
+        for index, ref in enumerate(payload.get("artifact_refs") or ()):
+            if isinstance(ref, str) and ref:
+                refs.append((f"证据 {index + 1}", ref))
+        return tuple(refs)
+
+    def _format_response_protocol_output(self, response_object: Any) -> str:
+        if not isinstance(response_object, dict):
+            return ""
+        output = response_object.get("output")
+        if not isinstance(output, list):
+            return ""
+        sections: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type == "message":
+                role = str(item.get("role") or "assistant")
+                content_lines: list[str] = []
+                for content in item.get("content") or []:
+                    if not isinstance(content, dict):
+                        continue
+                    content_type = str(content.get("type") or "")
+                    text = str(content.get("text") or "").strip()
+                    if text:
+                        content_lines.append(f"{content_type or 'text'}：{text}")
+                if content_lines:
+                    sections.append(f"message / {role}\n" + "\n".join(content_lines))
+                continue
+            if item_type in {"function_call", "tool_call"}:
+                function = item.get("function")
+                function_name = (
+                    function.get("name")
+                    if isinstance(function, dict)
+                    else ""
+                )
+                name = str(item.get("name") or function_name or "")
+                arguments = item.get("arguments")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False, default=str)
+                sections.append(
+                    "tool call"
+                    + (f" / {name}" if name else "")
+                    + "\n"
+                    + str(arguments).strip()
+                )
+                continue
+            if item_type == "reasoning":
+                summary = item.get("summary")
+                if summary:
+                    sections.append(
+                        "reasoning\n"
+                        + json.dumps(summary, ensure_ascii=False, default=str)
+                    )
+        return "\n\n".join(section for section in sections if section.strip())
+
+    def _model_response_stats_text(self, payload: dict[str, Any]) -> str:
+        lines: list[str] = []
+        latency = payload.get("latency_seconds")
+        if isinstance(latency, (int, float)):
+            lines.append(f"响应耗时：{latency:.3f}s")
+        for source_key, label in (
+            ("input_tokens", "输入 token"),
+            ("output_tokens", "输出 token"),
+            ("reasoning_tokens", "思考 token"),
+            ("total_tokens", "总 token"),
+            ("output_text_chars", "可见输出字符"),
+            ("reasoning_text_chars", "思考字符"),
+            ("tool_argument_chars", "工具参数字符"),
+            ("response_json_chars", "响应体字符"),
+        ):
+            value = payload.get(source_key)
+            if isinstance(value, (int, float)) and value:
+                lines.append(f"{label}：{value}")
+        warnings = payload.get("warnings")
+        if warnings:
+            lines.append(f"关注：{self._warning_summary(warnings)}")
+        return "\n".join(lines)
+
+    def _trace_tool_detail_text(self, event: Any) -> str:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.kind != "step":
+            return ""
+        action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+        if action.get("type") == "computer_call":
+            actions = action.get("actions") if isinstance(action.get("actions"), list) else []
+            lines = ["工具：computer_use"]
+            coordinate_space = action.get("coordinate_space")
+            if coordinate_space:
+                lines.append(f"坐标口径：{coordinate_space}")
+            for item in actions:
+                lines.append(f"- {format_computer_action(item)}")
+            lines.append("")
+            lines.append("原始参数：")
+            lines.append(json.dumps(action, ensure_ascii=False, indent=2, default=str))
+            return "\n".join(lines)
+        if action.get("type") == "agent_tool":
+            name = str(action.get("name") or "")
+            lines = [f"工具：{self._tool_display_name(name)} ({name})"]
+            arguments = action.get("arguments")
+            if arguments is not None:
+                lines.append("参数：")
+                lines.append(json.dumps(arguments, ensure_ascii=False, indent=2, default=str))
+            output = payload.get("metadata", {}).get("output", {})
+            if output:
+                lines.append("结果：")
+                lines.append(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+            return "\n".join(lines)
+        return ""
+
+    def _open_image_ref_window(self, image_ref: str, title: str) -> None:
+        if Image is None or ImageTk is None:
+            messagebox.showinfo("无法预览", "当前环境没有可用的图片预览依赖。")
+            return
+        try:
+            image = self._load_image_ref(image_ref)
+        except Exception as exc:
+            messagebox.showerror("图片加载失败", str(exc))
+            return
+        if image is None:
+            messagebox.showerror("图片加载失败", "未找到这张截图。")
+            return
+        original = image.convert("RGB")
+        max_width = min(1280, max(720, self.winfo_screenwidth() - 120))
+        max_height = min(900, max(520, self.winfo_screenheight() - 120))
+        canvas_width = max(520, max_width - 24)
+        canvas_height = max(360, max_height - 70)
+        fit_zoom = min(
+            canvas_width / max(1, original.width),
+            canvas_height / max(1, original.height),
+            1.0,
+        )
+        fit_zoom = max(0.05, fit_zoom)
+        zoom = {"value": fit_zoom}
+        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+
+        window = tk.Toplevel(self)
+        window.title(title)
+        window.geometry(f"{max_width}x{max_height}")
+        window.configure(bg="#ffffff")
+        window.transient(self)
+        toolbar = ttk.Frame(window, style="Surface.TFrame", padding=(10, 8))
+        toolbar.pack(fill="x")
+        zoom_text = tk.StringVar(value="")
+        ttk.Label(
+            toolbar,
+            text=title,
+            style="Section.TLabel",
+        ).pack(side="left")
+        ttk.Button(toolbar, text="－", width=3, command=lambda: set_zoom(zoom["value"] / 1.25)).pack(
+            side="right",
+            padx=(4, 0),
+        )
+        ttk.Button(toolbar, text="＋", width=3, command=lambda: set_zoom(zoom["value"] * 1.25)).pack(
+            side="right",
+            padx=(4, 0),
+        )
+        ttk.Button(toolbar, text="100%", width=6, command=lambda: set_zoom(1.0)).pack(
+            side="right",
+            padx=(4, 0),
+        )
+        ttk.Button(toolbar, text="适应", width=6, command=lambda: set_zoom(fit_zoom)).pack(
+            side="right",
+            padx=(4, 0),
+        )
+        ttk.Label(toolbar, textvariable=zoom_text, style="Hint.TLabel").pack(
+            side="right",
+            padx=(0, 8),
+        )
+        canvas = tk.Canvas(
+            window,
+            bg="#111827",
+            highlightthickness=0,
+            borderwidth=0,
+            width=canvas_width,
+            height=canvas_height,
+        )
+        canvas.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        image_item = canvas.create_image(0, 0, anchor="nw")
+
+        def render() -> None:
+            width = max(1, int(original.width * zoom["value"]))
+            height = max(1, int(original.height * zoom["value"]))
+            resized = original.resize((width, height), resampling)
+            photo = ImageTk.PhotoImage(resized)
+            canvas.image = photo
+            canvas.itemconfigure(image_item, image=photo)
+            canvas.configure(scrollregion=(0, 0, width, height))
+            zoom_text.set(f"{int(zoom['value'] * 100)}%")
+
+        def set_zoom(value: float) -> None:
+            zoom["value"] = max(0.05, min(8.0, float(value)))
+            render()
+
+        def on_wheel(event: tk.Event[Any]) -> str:
+            event_num = getattr(event, "num", None)
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta and (int(getattr(event, "state", 0)) & 0x0004):
+                set_zoom(zoom["value"] * (1.15 if delta > 0 else 1 / 1.15))
+                return "break"
+            if event_num == 4:
+                canvas.yview_scroll(-3, "units")
+            elif event_num == 5:
+                canvas.yview_scroll(3, "units")
+            elif delta:
+                units = -max(1, abs(delta) // 120) if delta > 0 else max(1, abs(delta) // 120)
+                canvas.yview_scroll(units, "units")
+            return "break"
+
+        canvas.bind("<MouseWheel>", on_wheel)
+        canvas.bind("<Button-4>", on_wheel)
+        canvas.bind("<Button-5>", on_wheel)
+        canvas.bind("<ButtonPress-1>", lambda event: canvas.scan_mark(event.x, event.y))
+        canvas.bind(
+            "<B1-Motion>",
+            lambda event: canvas.scan_dragto(event.x, event.y, gain=1),
+        )
+        window.bind("<Escape>", lambda _event: window.destroy())
+        render()
+
+    def _format_trace_detail(self, event: Any) -> str:
+        payload = event.payload
+        title = self._operation_title(event.kind, payload)
+        summary = self._operation_summary(event.kind, payload)
+        lines = [title]
+        if summary:
+            lines.append(summary)
+        if event.kind == "model_response":
+            latency = payload.get("latency_seconds")
+            if isinstance(latency, (int, float)):
+                lines.append(f"耗时：{latency:.3f}s")
+            lines.append(f"可见文本：{payload.get('output_text_chars', 0)} 字")
+            lines.append(f"工具参数：{payload.get('tool_argument_chars', 0)} 字")
+            reasoning_chars = payload.get("reasoning_text_chars")
+            if isinstance(reasoning_chars, int):
+                lines.append(f"思考文本：{reasoning_chars} 字")
+            preview = str(payload.get("output_text_preview") or "").strip()
+            if preview:
+                lines.append("")
+                lines.append("模型文本输出：")
+                lines.append(preview)
+            reasoning_preview = str(payload.get("reasoning_text_preview") or "").strip()
+            if reasoning_preview:
+                lines.append("")
+                lines.append("模型思考摘要：")
+                lines.append(reasoning_preview)
+            return "\n".join(lines)
+        if event.kind == "workflow_result":
+            output_text = str(payload.get("output_text") or "").strip()
+            if output_text:
+                lines.append("")
+                lines.append("实际输出：")
+                lines.append(output_text)
+            reason = str(payload.get("reason") or "").strip()
+            if reason:
+                lines.append(f"说明：{reason}")
+            refs = payload.get("artifact_refs") or []
+            if refs:
+                lines.append("")
+                lines.append("证据：")
+                lines.extend(f"- {ref}" for ref in refs)
+            return "\n".join(lines)
+        if event.kind == "step":
+            action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+            if action.get("type") == "computer_call":
+                actions = action.get("actions") if isinstance(action.get("actions"), list) else []
+                lines.append("")
+                lines.append("电脑动作：")
+                lines.extend(f"- {format_computer_action(action_item)}" for action_item in actions)
+            elif action.get("type") == "agent_tool":
+                name = str(action.get("name") or "")
+                lines.append(f"工具：{self._tool_display_name(name)}")
+                output = payload.get("metadata", {}).get("output", {})
+                if isinstance(output, dict):
+                    reason = str(output.get("parse_error") or output.get("reason") or "").strip()
+                    if reason:
+                        lines.append(f"处理结果：{reason}")
+                    if name == "read_text_file" and output.get("path"):
+                        lines.append(f"文件：{output.get('path')}")
+            before = str(payload.get("before_ref") or "").strip()
+            after = str(payload.get("after_ref") or "").strip()
+            if before or after:
+                lines.append("")
+                lines.append("证据截图：")
+                if before:
+                    lines.append(f"- 操作前：{before}")
+                if after:
+                    lines.append(f"- 操作后：{after}")
+            return "\n".join(lines)
+        return "\n".join(lines)
+
+    def _show_inspector_detail(self, text: str) -> None:
+        self.inspector_detail_shell.grid()
+        self._set_text(self.inspector_detail, text)
+
+    def _events_for_selected_app(self, app_id: str) -> list[Any]:
+        result: list[Any] = []
+        for event in self.state.trace_store.events:
+            if self._is_configuration_event(event):
+                continue
+            payload = event.payload
+            event_app_id = payload.get("app_id")
+            if event_app_id == app_id:
+                result.append(event)
+                continue
+            if event.kind == "workflow_configured" and payload.get("app_id") == app_id:
+                result.append(event)
+                continue
+            if event.kind in {"model_response", "step", "workflow_result"} and not event_app_id:
+                result.append(event)
+                continue
+            if event.kind == "operation" and not event_app_id:
+                result.append(event)
+        return self._dedupe_workflow_config_events(result)
+
+    @staticmethod
+    def _is_configuration_event(event: Any) -> bool:
+        payload = event.payload
+        return event.kind == "workflow_configured" or (
+            event.kind == "operation"
+            and payload.get("kind") == "workflow"
+            and payload.get("status") == "configured"
+        )
+
+    @staticmethod
+    def _dedupe_workflow_config_events(events: list[Any]) -> list[Any]:
+        terminal_workflow_keys: set[tuple[str, str]] = set()
+        for event in events:
+            payload = event.payload
+            if (
+                event.kind == "operation"
+                and payload.get("kind") == "workflow"
+                and payload.get("status") not in {"configured", "running"}
+            ):
+                key = GuiAgentDesktopClient._workflow_operation_key(payload)
+                if key[1]:
+                    terminal_workflow_keys.add(key)
+
+        filtered_reversed: list[Any] = []
+        seen: set[tuple[str, str]] = set()
+        for event in reversed(events):
+            payload = event.payload
+            if (
+                event.kind == "operation"
+                and payload.get("kind") == "workflow"
+                and payload.get("status") == "running"
+                and GuiAgentDesktopClient._workflow_operation_key(payload)
+                in terminal_workflow_keys
+            ):
+                continue
+            is_config = event.kind == "workflow_configured"
+            is_config_operation = (
+                event.kind == "operation"
+                and payload.get("kind") == "workflow"
+                and payload.get("status") == "configured"
+            )
+            if is_config or is_config_operation:
+                nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                key = (
+                    str(payload.get("app_id") or ""),
+                    str(
+                        payload.get("run_id")
+                        or nested.get("run_id")
+                        or payload.get("trace_path")
+                        or payload.get("manifest_path")
+                        or payload.get("summary")
+                        or nested.get("manifest_path")
+                        or payload.get("title")
+                        or ""
+                    ),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+            filtered_reversed.append(event)
+        return list(reversed(filtered_reversed))
+
+    @staticmethod
+    def _workflow_operation_key(payload: dict[str, Any]) -> tuple[str, str]:
+        nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        key = (
+            nested.get("result_json")
+            or payload.get("result_json")
+            or nested.get("run_id")
+            or nested.get("log_path")
+            or payload.get("summary")
+            or payload.get("title")
+            or ""
+        )
+        return (str(payload.get("app_id") or ""), str(key))
 
     def _current_pending_request(self) -> dict[str, Any] | None:
         config = self._selected_config()
@@ -1730,6 +3843,25 @@ class GuiAgentDesktopClient(tk.Tk):
             if metadata.get("job_id") == job_id and item["status"] != "resolved":
                 count += 1
         return count
+
+    def _app_status_text(self, app_id: str, job_id: str) -> str:
+        waiting = self._waiting_count_for_job(job_id)
+        if waiting:
+            return f"待处理 {waiting}"
+        latest_status = self._latest_workflow_status(app_id)
+        if latest_status:
+            return self._workflow_status_label(latest_status)
+        return "就绪"
+
+    def _latest_workflow_status(self, app_id: str) -> str:
+        for event in reversed(self._events_for_selected_app(app_id)):
+            payload = event.payload
+            if event.kind != "operation" or payload.get("kind") != "workflow":
+                continue
+            status = str(payload.get("status") or "")
+            if status and status != "configured":
+                return status
+        return ""
 
     def _macros_for_app(self, app_id: str) -> list[Any]:
         return [
@@ -1772,6 +3904,24 @@ class GuiAgentDesktopClient(tk.Tk):
             "manager_note": "输入",
             "policy_update": "规则",
             "result": "结果",
+            "operation": "操作",
+            "workflow_configured": "配置",
+            "workflow_result": "结果",
+            "model_response": "响应",
+            "computer_call": "电脑",
+            "agent_tool": "工具",
+            "computer_use": "电脑",
+            "read_text_file": "文件",
+            "record_workflow_result": "记录",
+            "viewport": "视野",
+            "mouse": "鼠标",
+            "keyboard": "键盘",
+            "observe": "观察",
+            "model_intent": "意图",
+            "harness_check": "校验",
+            "verification": "验证",
+            "human": "人工",
+            "failure": "异常",
         }.get(kind, kind)
 
     @staticmethod
@@ -1790,6 +3940,266 @@ class GuiAgentDesktopClient(tk.Tk):
         widget.delete("1.0", tk.END)
         widget.insert("1.0", text)
         widget.configure(state="disabled")
+
+
+class ViewportMarkerWindow(tk.Toplevel):
+    def __init__(
+        self,
+        parent: GuiAgentDesktopClient,
+        *,
+        app_id: str,
+        app_name: str,
+        initial_box: tuple[int, int, int, int],
+    ) -> None:
+        super().__init__(parent)
+        self.parent = parent
+        self.app_id = app_id
+        self.app_name = app_name
+        self.min_width = 260
+        self.min_height = 180
+        self._transparent = "#ff00ff"
+        self._action = ""
+        self._start_pointer = (0, 0)
+        self._start_geometry = initial_box
+        self._button_bounds: dict[str, tuple[int, int, int, int]] = {}
+
+        x, y, width, height = initial_box
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-transparentcolor", self._transparent)
+        except tk.TclError:
+            self.attributes("-alpha", 0.88)
+        self.geometry(f"{max(self.min_width, width)}x{max(self.min_height, height)}+{x}+{y}")
+
+        self.canvas = tk.Canvas(
+            self,
+            bg=self._transparent,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda _event: self._redraw())
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.bind("<Escape>", lambda _event: self._close())
+        self._redraw()
+
+    def _current_box(self) -> tuple[int, int, int, int]:
+        return (
+            max(0, self.winfo_x()),
+            max(0, self.winfo_y()),
+            max(self.min_width, self.winfo_width()),
+            max(self.min_height, self.winfo_height()),
+        )
+
+    def _redraw(self) -> None:
+        width = max(self.canvas.winfo_width(), self.min_width)
+        height = max(self.canvas.winfo_height(), self.min_height)
+        self.canvas.delete("all")
+        self._button_bounds = {}
+        border = "#2563eb"
+        fill = "#eff6ff"
+        bar = "#111827"
+        self.canvas.create_rectangle(
+            2,
+            2,
+            width - 2,
+            height - 2,
+            outline=border,
+            width=3,
+        )
+        self.canvas.create_rectangle(
+            3,
+            3,
+            width - 3,
+            35,
+            fill=bar,
+            outline=bar,
+        )
+        box = self._current_box()
+        self.canvas.create_text(
+            14,
+            19,
+            text=f"{self.app_name}  视野标定  {box[0]},{box[1]}  {box[2]}x{box[3]}",
+            anchor="w",
+            fill="#ffffff",
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        save_bounds = (width - 204, 7, width - 112, 31)
+        hide_bounds = (width - 104, 7, width - 42, 31)
+        close_bounds = (width - 34, 7, width - 10, 31)
+        self._button_bounds = {
+            "save": save_bounds,
+            "hide": hide_bounds,
+            "close": close_bounds,
+        }
+        self._draw_button(save_bounds, "保存隐藏", "#ffffff", "#111827")
+        self._draw_button(hide_bounds, "隐藏", "#374151", "#ffffff")
+        self._draw_button(close_bounds, "×", "#374151", "#ffffff")
+
+        label = "把目标 APP 窗口拖到蓝框内；必要时拖动边框缩放。保存后该区域会作为当前 APP 的人工视野。"
+        self.canvas.create_rectangle(
+            14,
+            height - 38,
+            min(width - 14, 670),
+            height - 12,
+            fill=fill,
+            outline=fill,
+        )
+        self.canvas.create_text(
+            24,
+            height - 25,
+            text=label,
+            anchor="w",
+            fill="#1d4ed8",
+            font=("Microsoft YaHei UI", 8),
+        )
+        for handle in (
+            (width - 18, height - 18, width - 5, height - 5),
+            (4, height - 18, 17, height - 5),
+            (width - 18, 36, width - 5, 49),
+        ):
+            self.canvas.create_rectangle(*handle, fill=border, outline=border)
+
+    def _draw_button(
+        self,
+        bounds: tuple[int, int, int, int],
+        text: str,
+        fill: str,
+        foreground: str,
+    ) -> None:
+        x1, y1, x2, y2 = bounds
+        draw_rounded_rect(
+            self.canvas,
+            x1,
+            y1,
+            x2,
+            y2,
+            8,
+            fill=fill,
+            outline=fill,
+        )
+        self.canvas.create_text(
+            (x1 + x2) // 2,
+            (y1 + y2) // 2,
+            text=text,
+            anchor="center",
+            fill=foreground,
+            font=("Microsoft YaHei UI", 8, "bold"),
+        )
+
+    def _on_press(self, event: tk.Event[Any]) -> None:
+        button = self._button_at(event.x, event.y)
+        if button == "save":
+            self.parent._save_manual_viewport_from_marker(
+                app_id=self.app_id,
+                box=self._current_box(),
+            )
+            return
+        if button in {"hide", "close"}:
+            self._close()
+            return
+        self._action = self._hit_test(event.x, event.y)
+        self._start_pointer = (event.x_root, event.y_root)
+        self._start_geometry = self._current_box()
+
+    def _on_drag(self, event: tk.Event[Any]) -> None:
+        if not self._action:
+            return
+        dx = event.x_root - self._start_pointer[0]
+        dy = event.y_root - self._start_pointer[1]
+        x, y, width, height = self._start_geometry
+        if self._action == "move":
+            self.geometry(f"{width}x{height}+{max(0, x + dx)}+{max(0, y + dy)}")
+            return
+        left = x
+        top = y
+        right = x + width
+        bottom = y + height
+        if "e" in self._action:
+            right += dx
+        if "s" in self._action:
+            bottom += dy
+        if "w" in self._action:
+            left += dx
+        if "n" in self._action:
+            top += dy
+        if right - left < self.min_width:
+            if "w" in self._action:
+                left = right - self.min_width
+            else:
+                right = left + self.min_width
+        if bottom - top < self.min_height:
+            if "n" in self._action:
+                top = bottom - self.min_height
+            else:
+                bottom = top + self.min_height
+        self.geometry(
+            f"{int(right - left)}x{int(bottom - top)}+{max(0, int(left))}+{max(0, int(top))}"
+        )
+
+    def _on_release(self, _event: tk.Event[Any]) -> None:
+        self._action = ""
+        self._redraw()
+
+    def _on_motion(self, event: tk.Event[Any]) -> None:
+        if self._action:
+            return
+        hit = self._hit_test(event.x, event.y)
+        cursor = {
+            "move": "fleur",
+            "e": "sb_h_double_arrow",
+            "w": "sb_h_double_arrow",
+            "n": "sb_v_double_arrow",
+            "s": "sb_v_double_arrow",
+            "se": "size_nw_se",
+            "nw": "size_nw_se",
+            "ne": "size_ne_sw",
+            "sw": "size_ne_sw",
+        }.get(hit, "arrow")
+        self.canvas.configure(cursor=cursor)
+
+    def _button_at(self, x: int, y: int) -> str:
+        for name, bounds in self._button_bounds.items():
+            if _point_in_rect(x, y, bounds):
+                return name
+        return ""
+
+    def _hit_test(self, x: int, y: int) -> str:
+        width = max(self.winfo_width(), self.min_width)
+        height = max(self.winfo_height(), self.min_height)
+        margin = 12
+        if y <= 36 and not self._button_at(x, y):
+            return "move"
+        west = x <= margin
+        east = x >= width - margin
+        north = y <= margin
+        south = y >= height - margin
+        if north and west:
+            return "nw"
+        if north and east:
+            return "ne"
+        if south and west:
+            return "sw"
+        if south and east:
+            return "se"
+        if west:
+            return "w"
+        if east:
+            return "e"
+        if north:
+            return "n"
+        if south:
+            return "s"
+        return ""
+
+    def _close(self) -> None:
+        if self.parent.viewport_marker is self:
+            self.parent.viewport_marker = None
+        self.destroy()
 
 
 class AppConfigDialog(tk.Toplevel):
@@ -1831,7 +4241,7 @@ class AppConfigDialog(tk.Toplevel):
         self.job_id = ttk.Entry(frame)
         self.job_id.grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
 
-        ttk.Label(frame, text="任务定义", style="Section.TLabel").grid(
+        ttk.Label(frame, text="应用说明与任务规则", style="Section.TLabel").grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(14, 4)
         )
         ttk.Label(
@@ -1939,6 +4349,161 @@ class AppConfigDialog(tk.Toplevel):
             "job_id": self.job_id.get(),
             "task_description": self.task_text.get("1.0", tk.END),
             "assets": list(self.assets),
+        }
+        self.destroy()
+
+
+class WorkflowTemplateDialog(tk.Toplevel):
+    def __init__(self, parent: GuiAgentDesktopClient) -> None:
+        super().__init__(parent)
+        self.title("配置任务流模板")
+        self.transient(parent)
+        self.grab_set()
+        self.geometry("780x560")
+        self.minsize(700, 520)
+        self.configure(bg=parent.colors["bg"])
+        self.result: dict[str, Any] | None = None
+
+        frame = ttk.Frame(self, style="Surface.TFrame", padding=16)
+        frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="网页任务流模板", style="Title.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Label(
+            frame,
+            text="用于把输入清单逐条交给目标网页，并记录结构化轨迹。",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 14))
+
+        ttk.Label(frame, text="APP 名称", style="Hint.TLabel").grid(
+            row=2, column=0, sticky="w", pady=5
+        )
+        self.app_name = ttk.Entry(frame)
+        self.app_name.insert(0, "网页应用")
+        self.app_name.grid(row=2, column=1, columnspan=2, sticky="ew", pady=5)
+
+        ttk.Label(frame, text="目标网址", style="Hint.TLabel").grid(
+            row=3, column=0, sticky="w", pady=5
+        )
+        self.target_url = ttk.Entry(frame)
+        self.target_url.insert(0, "https://example.com/")
+        self.target_url.grid(row=3, column=1, columnspan=2, sticky="ew", pady=5)
+
+        ttk.Label(frame, text="输入清单", style="Hint.TLabel").grid(
+            row=4, column=0, sticky="w", pady=5
+        )
+        self.input_path = ttk.Entry(frame)
+        self.input_path.grid(row=4, column=1, sticky="ew", pady=5)
+        ttk.Button(frame, text="选择", command=self._choose_input).grid(
+            row=4, column=2, sticky="ew", padx=(8, 0)
+        )
+
+        ttk.Label(frame, text="轨迹文件", style="Hint.TLabel").grid(
+            row=5, column=0, sticky="w", pady=5
+        )
+        self.trace_path = ttk.Entry(frame)
+        default_trace = Path("runs") / "workflows" / "trace.jsonl"
+        self.trace_path.insert(0, str(default_trace))
+        self.trace_path.grid(row=5, column=1, sticky="ew", pady=5)
+        ttk.Button(frame, text="选择", command=self._choose_trace).grid(
+            row=5, column=2, sticky="ew", padx=(8, 0)
+        )
+
+        ttk.Label(frame, text="Chrome 路径", style="Hint.TLabel").grid(
+            row=6, column=0, sticky="w", pady=5
+        )
+        self.executable_path = ttk.Entry(frame)
+        self.executable_path.insert(
+            0,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        )
+        self.executable_path.grid(row=6, column=1, columnspan=2, sticky="ew", pady=5)
+
+        ttk.Label(frame, text="进程名", style="Hint.TLabel").grid(
+            row=7, column=0, sticky="w", pady=5
+        )
+        self.process_name = ttk.Entry(frame)
+        self.process_name.insert(0, "chrome.exe")
+        self.process_name.grid(row=7, column=1, columnspan=2, sticky="ew", pady=5)
+
+        ttk.Label(frame, text="窗口标题匹配", style="Hint.TLabel").grid(
+            row=8, column=0, sticky="w", pady=5
+        )
+        self.window_title_pattern = ttk.Entry(frame)
+        self.window_title_pattern.insert(0, ".*")
+        self.window_title_pattern.grid(row=8, column=1, columnspan=2, sticky="ew", pady=5)
+
+        ttk.Label(frame, text="条目上限", style="Hint.TLabel").grid(
+            row=9, column=0, sticky="w", pady=5
+        )
+        self.limit = ttk.Entry(frame)
+        self.limit.insert(0, "")
+        self.limit.grid(row=9, column=1, columnspan=2, sticky="ew", pady=5)
+
+        ttk.Label(
+            frame,
+            text=(
+                "输入清单支持 jsonl/json/csv；字段可使用 input_text/input，"
+                "也兼容 question/answer 类导入格式。"
+            ),
+            style="Hint.TLabel",
+            wraplength=680,
+        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(16, 0))
+
+        buttons = ttk.Frame(frame, style="Surface.TFrame")
+        buttons.grid(row=11, column=0, columnspan=3, sticky="e", pady=(18, 0))
+        ttk.Button(buttons, text="取消", command=self.destroy).grid(row=0, column=0, padx=5)
+        ttk.Button(
+            buttons,
+            text="创建任务流",
+            style="Primary.TButton",
+            command=self._save,
+        ).grid(row=0, column=1, padx=5)
+        self.wait_window(self)
+
+    def _choose_input(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择输入清单",
+            filetypes=[
+                ("Workflow input files", "*.jsonl;*.json;*.csv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self.input_path.delete(0, tk.END)
+            self.input_path.insert(0, path)
+
+    def _choose_trace(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="选择轨迹文件",
+            defaultextension=".jsonl",
+            filetypes=[("JSONL trace", "*.jsonl"), ("All files", "*.*")],
+        )
+        if path:
+            self.trace_path.delete(0, tk.END)
+            self.trace_path.insert(0, path)
+
+    def _save(self) -> None:
+        input_path = self.input_path.get().strip()
+        trace_path = self.trace_path.get().strip()
+        if not input_path or not trace_path:
+            messagebox.showwarning("输入不完整", "请填写输入清单和轨迹文件。")
+            return
+        raw_limit = self.limit.get().strip()
+        limit = int(raw_limit) if raw_limit else None
+        self.result = {
+            "app_name": self.app_name.get().strip() or "Web App",
+            "target_url": self.target_url.get().strip(),
+            "input_path": input_path,
+            "trace_path": trace_path,
+            "process_name": self.process_name.get().strip() or "chrome.exe",
+            "executable_path": self.executable_path.get().strip(),
+            "window_title_pattern": self.window_title_pattern.get().strip() or ".*",
+            "limit": limit,
         }
         self.destroy()
 
@@ -2118,6 +4683,27 @@ def short_payload(payload: dict[str, Any]) -> str:
     return format_payload(payload).splitlines()[0] if payload else ""
 
 
+def format_computer_action(action: dict[str, Any]) -> str:
+    action_type = str(action.get("type") or "")
+    if action_type == "click":
+        button = action.get("button") or "left"
+        return f"鼠标点击 ({action.get('x')}, {action.get('y')}) / {button}"
+    if action_type == "type":
+        text = str(action.get("text") or "")
+        preview = text[:80] + ("..." if len(text) > 80 else "")
+        return f"输入文本：{preview}"
+    if action_type in {"keypress", "key"}:
+        keys = action.get("keys") or action.get("key") or ""
+        return f"按键：{keys}"
+    if action_type == "wait":
+        return f"等待 {action.get('seconds', '')} 秒"
+    if action_type == "move":
+        return f"鼠标移动到 ({action.get('x')}, {action.get('y')})"
+    if action_type == "scroll":
+        return f"滚动：dx={action.get('dx', 0)}, dy={action.get('dy', 0)}"
+    return action_type or "电脑动作"
+
+
 def format_asset(asset: ReferenceAsset) -> str:
     return "\n".join(
         [
@@ -2128,6 +4714,11 @@ def format_asset(asset: ReferenceAsset) -> str:
             f"说明：{asset.description}",
         ]
     )
+
+
+def _point_in_rect(x: int, y: int, bounds: tuple[int, int, int, int]) -> bool:
+    x1, y1, x2, y2 = bounds
+    return x1 <= x <= x2 and y1 <= y <= y2
 
 
 def unique_app_id(app_name: str, existing: dict[str, TargetAppConfig]) -> str:

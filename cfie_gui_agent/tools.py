@@ -14,7 +14,12 @@ MODEL_CALLABLE_TOOLS = (
     "ask_replan",
     "query_memory",
     "run_action_macro",
+    "submit_current_input",
     "navigate_to_target",
+    "read_text_file",
+    "append_trace_note",
+    "set_app_viewport",
+    "record_workflow_result",
 )
 
 HARNESS_INTERNAL_TOOLS = (
@@ -39,6 +44,7 @@ HARNESS_INTERNAL_TOOLS = (
     "serialize_prompt_context",
     "retry_tool_execution",
     "check_human_reply",
+    "run_shell_command",
 )
 
 
@@ -118,7 +124,11 @@ class ModelToolRegistry:
 
 def _default_description(tool_name: str) -> str:
     descriptions = {
-        "computer_use": "Perform validated desktop computer actions.",
+        "computer_use": (
+            "Perform validated desktop computer actions. For Qwen VL grounding, "
+            "set coordinate_space to qwen_normalized_1000 and express mouse "
+            "coordinates on a 0..1000 image grid."
+        ),
         "read_image": "Read a referenced image artifact into model context.",
         "read_video_clip": "Read a bounded video clip or selected frame set.",
         "request_human_help": "Ask a manager for human intervention.",
@@ -128,9 +138,24 @@ def _default_description(tool_name: str) -> str:
         "ask_replan": "Ask TaskManager to consider a task transition.",
         "query_memory": "Query workspace or business memory.",
         "run_action_macro": "Execute a registered low-latency action macro.",
+        "submit_current_input": (
+            "Submit the currently focused text input. Prefer this after typing "
+            "into a chat-style input when a visible send button should be pressed."
+        ),
         "navigate_to_target": (
             "Ask the harness to move a source element toward a target while "
             "avoiding model-identified obstacles."
+        ),
+        "read_text_file": "Read a bounded UTF-8 text file that the harness has allowed.",
+        "append_trace_note": "Append a structured note to the current trace.",
+        "set_app_viewport": (
+            "Set the APP viewport crop box so later screenshots include only "
+            "the useful application region."
+        ),
+        "record_workflow_result": (
+            "Persist one workflow item result. Keep arguments short; when item_id "
+            "is available, omit input_text and expected_output because the harness "
+            "can recover them from the workflow input file."
         ),
     }
     return descriptions.get(tool_name, tool_name)
@@ -140,6 +165,16 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
     schemas: dict[str, dict[str, Any]] = {
         "computer_use": _object_schema(
             {
+                "coordinate_space": {
+                    "type": "string",
+                    "enum": ["qwen_normalized_1000", "screenshot"],
+                    "description": (
+                        "Required. Use qwen_normalized_1000 for Qwen VL: "
+                        "(0,0) is the current image top-left and "
+                        "(1000,1000) is bottom-right. Use screenshot only "
+                        "when actions are already in screenshot pixel coordinates."
+                    ),
+                },
                 "actions": {
                     "type": "array",
                     "minItems": 1,
@@ -169,7 +204,7 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                     },
                 }
             },
-            required=("actions",),
+            required=("coordinate_space", "actions"),
         ),
         "read_image": _object_schema(
             {
@@ -285,6 +320,15 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
             },
             required=("macro_name",),
         ),
+        "submit_current_input": _object_schema(
+            {
+                "method": {
+                    "type": "string",
+                    "enum": ["auto", "click_send_button", "enter"],
+                },
+                "reason": {"type": "string"},
+            },
+        ),
         "navigate_to_target": _object_schema(
             {
                 "source": _point_schema(),
@@ -302,6 +346,70 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                 "objective": {"type": "string"},
             },
             required=("source", "target"),
+        ),
+        "read_text_file": _object_schema(
+            {
+                "path": {"type": "string", "minLength": 1},
+                "max_chars": {"type": "integer", "minimum": 1},
+                "purpose": {"type": "string"},
+            },
+            required=("path",),
+        ),
+        "append_trace_note": _object_schema(
+            {
+                "title": {"type": "string", "minLength": 1},
+                "summary": {"type": "string"},
+                "status": {"type": "string"},
+                "artifact_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "metadata": {"type": "object"},
+            },
+            required=("title",),
+        ),
+        "set_app_viewport": _object_schema(
+            {
+                "x": {"type": "integer", "minimum": 0},
+                "y": {"type": "integer", "minimum": 0},
+                "width": {"type": "integer", "minimum": 1},
+                "height": {"type": "integer", "minimum": 1},
+                "coordinate_space": {
+                    "type": "string",
+                    "enum": ["screenshot", "physical"],
+                    "description": (
+                        "Use 'screenshot' when coordinates refer to the image "
+                        "shown to the model; use 'physical' for full desktop pixels."
+                    ),
+                },
+                "reason": {"type": "string"},
+            },
+            required=("x", "y", "width", "height"),
+        ),
+        "record_workflow_result": _object_schema(
+            {
+                "item_id": {"type": "string", "minLength": 1},
+                "input_text": {
+                    "type": "string",
+                    "description": "Optional. Prefer omitting this to keep tool output short.",
+                },
+                "expected_output": {
+                    "type": "string",
+                    "description": "Optional. Prefer omitting this to keep tool output short.",
+                },
+                "output_text": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["passed", "failed", "uncertain", "skipped", "error"],
+                },
+                "latency_seconds": {"type": "number"},
+                "artifact_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "reason": {"type": "string"},
+            },
+            required=("item_id", "output_text", "status"),
         ),
     }
     return schemas.get(tool_name, _object_schema({}))

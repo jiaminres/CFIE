@@ -28,6 +28,42 @@ class AgentTraceStore:
     path: Path | None = None
     events: list[AgentTraceEvent] = field(default_factory=list)
 
+    def load_existing(
+        self,
+        path: str | Path,
+        *,
+        append: bool = False,
+    ) -> int:
+        trace_path = Path(path)
+        self.path = trace_path
+        if not append:
+            self.events.clear()
+        if not trace_path.exists():
+            return 0
+        loaded = 0
+        with trace_path.open("r", encoding="utf-8") as source:
+            for line in source:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    value = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                kind = value.get("kind")
+                payload = value.get("payload")
+                if not isinstance(kind, str) or not isinstance(payload, dict):
+                    continue
+                self.events.append(
+                    AgentTraceEvent(
+                        kind=kind,
+                        payload=payload,
+                        time_unix_nano=int(value.get("time_unix_nano", 0) or 0),
+                    )
+                )
+                loaded += 1
+        return loaded
+
     def record(self, kind: str, payload: dict[str, Any]) -> AgentTraceEvent:
         event = AgentTraceEvent(kind=kind, payload=payload)
         self.events.append(event)
