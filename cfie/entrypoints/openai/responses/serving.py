@@ -100,6 +100,9 @@ from cfie.entrypoints.openai.responses.streaming_events import (
     emit_previous_item_done_events,
     emit_tool_action_events,
 )
+from cfie.entrypoints.openai.responses.tool_call_normalizer import (
+    normalize_text_tool_calls_in_response_outputs,
+)
 from cfie.entrypoints.openai.responses.utils import (
     construct_input_messages,
     construct_tool_dicts,
@@ -723,6 +726,8 @@ class OpenAIServingResponses(OpenAIServing):
             # Calculate usage.
             assert final_res.prompt_token_ids is not None
             num_tool_output_tokens = 0
+
+        output = normalize_text_tool_calls_in_response_outputs(output)
 
         assert isinstance(context, (SimpleContext, HarmonyContext, ParsableContext))
         num_prompt_tokens = context.num_prompt_tokens
