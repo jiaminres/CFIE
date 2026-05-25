@@ -4,6 +4,8 @@
 
 from collections.abc import Iterable
 from itertools import islice
+import os
+import time as _time
 
 import torch
 import cfie._custom_ops as ops
@@ -108,6 +110,18 @@ from .utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+
+def _qwen35_timing_enabled() -> bool:
+    return (
+        os.getenv("CFIE_QWEN35_TIMING", "") == "1"
+        or os.getenv("CFIE_BENCH_TIMING", "") == "1"
+    )
+
+
+def _qwen35_timing_sync(enabled: bool) -> None:
+    if enabled and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def _try_precompiled_fused_gdn_gating(
@@ -843,6 +857,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         中文说明：3. Output projection
         """
         num_tokens = hidden_states.size(0)
+        _timing = _qwen35_timing_enabled()
+        _t0 = _time.perf_counter() if _timing else 0.0
 
         # ============================================================
         # 中文注释：Part 1: Input Projection
@@ -856,6 +872,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
         )
         mixed_qkv = torch.cat((query, key, value), dim=-1)
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _t1 = _time.perf_counter()
 
         # ============================================================
         # 中文注释：Part 2: Core Attention (Custom Op)
@@ -875,6 +894,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out,
             self.prefix,
         )
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _t2 = _time.perf_counter()
 
         # ============================================================
         # 中文注释：Part 3: Output Projection
@@ -887,6 +909,19 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _t3 = _time.perf_counter()
+            logger.info(
+                "CFIE_QWEN35_TIMING layer=%s tokens=%d proj=%.3fms "
+                "core=%.3fms out=%.3fms total=%.3fms",
+                self.prefix,
+                int(num_tokens),
+                (_t1 - _t0) * 1000.0,
+                (_t2 - _t1) * 1000.0,
+                (_t3 - _t2) * 1000.0,
+                (_t3 - _t0) * 1000.0,
+            )
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
         """在 V1 画像阶段预热 GDN 预填充内核。
@@ -1105,6 +1140,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+        _timing = _qwen35_timing_enabled()
+        _core_t0 = _time.perf_counter() if _timing else 0.0
         # conv_weights 形状: [当前 TP rank 上的融合 qkv 维度, 卷积核长度]
 
         # ------- 按 speculative / non-spec 分开 token -------
@@ -1189,6 +1226,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             # [non-spec token 数, 每个 token 的融合 qkv 维度]
         else:
             mixed_qkv_non_spec = None
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _core_t1 = _time.perf_counter()
 
         # ------- 把 mixed_qkv 拆成 query / key / value -------
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
@@ -1201,6 +1241,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
             mixed_qkv_non_spec
         )
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _core_t2 = _time.perf_counter()
         # 若 mixed_qkv_non_spec 非 None:
         # query_non_spec 形状: [1, non-spec token 数, 当前 TP rank 上的 key 头数, 每个 key 头的维度]
         # key_non_spec   形状: [1, non-spec token 数, 当前 TP rank 上的 key 头数, 每个 key 头的维度]
@@ -1227,6 +1270,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         else:
             g_non_spec = None
             beta_non_spec = None
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _core_t3 = _time.perf_counter()
+            _core_state_t0 = _core_t3
+            _core_state_t1 = _core_t3
+            _core_state_t2 = _core_t3
+            _core_state_t3 = _core_t3
 
         # ------- speculative 部分核心递推 -------
         if spec_sequence_masks is not None:
@@ -1266,12 +1316,36 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # ------- non-spec 部分核心递推 -------
         if attn_metadata.num_prefills > 0:
+            if _timing:
+                _qwen35_timing_sync(_timing)
+                _core_state_t0 = _time.perf_counter()
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             # 取出 non-spec 序列对应的初始状态
             # 常见形状:
             # [non-spec 序列条数, 当前 TP rank 上的 value 头数, 每个 value 头的维度, 每个 key 头的维度]
 
             initial_state[~has_initial_state, ...] = 0
+            if _timing:
+                _qwen35_timing_sync(_timing)
+                _core_state_t1 = _time.perf_counter()
+                if self.layer_idx == 0:
+                    logger.info(
+                        "CFIE_QWEN35_RECURRENT_INPUT layer=%s tokens=%d "
+                        "nseq=%d q_shape=%s v_shape=%s g_shape=%s "
+                        "state_shape=%s q_dtype=%s g_dtype=%s beta_dtype=%s "
+                        "state_dtype=%s",
+                        self.prefix,
+                        int(num_actual_tokens),
+                        int(non_spec_query_start_loc.numel() - 1),
+                        tuple(query_non_spec.shape),
+                        tuple(value_non_spec.shape),
+                        tuple(g_non_spec.shape),
+                        tuple(initial_state.shape),
+                        str(query_non_spec.dtype),
+                        str(g_non_spec.dtype),
+                        str(beta_non_spec.dtype),
+                        str(initial_state.dtype),
+                    )
             # 对没有历史状态的序列置零
             # 形状不变
 
@@ -1303,6 +1377,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
                 use_qk_l2norm_in_kernel=True,
             )
+            if _timing:
+                _qwen35_timing_sync(_timing)
+                _core_state_t2 = _time.perf_counter()
             # core_attn_out_non_spec 形状:
             # [1, non-spec token 数, 当前 TP rank 上的 value 头数, 每个 value 头的维度]
             #
@@ -1312,6 +1389,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            if _timing:
+                _qwen35_timing_sync(_timing)
+                _core_state_t3 = _time.perf_counter()
             # 写回后 ssm_state 形状不变，仍然是:
             # [状态槽数量, 当前 TP rank 上的 value 头数, 每个 value 头的维度, 每个 key 头的维度]
 
@@ -1388,6 +1468,25 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
             # core_attn_out_non_spec.squeeze(0) 形状:
             # [本次真正参与计算的 token 数, 当前 TP rank 上的 value 头数, 每个 value 头的维度]
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _core_t4 = _time.perf_counter()
+            logger.info(
+                "CFIE_QWEN35_CORE_TIMING layer=%s tokens=%d "
+                "conv=%.3fms rearrange=%.3fms gating=%.3fms "
+                "state_prep=%.3fms recurrent=%.3fms state_write=%.3fms "
+                "merge=%.3fms total=%.3fms",
+                self.prefix,
+                int(num_actual_tokens),
+                (_core_t1 - _core_t0) * 1000.0,
+                (_core_t2 - _core_t1) * 1000.0,
+                (_core_t3 - _core_t2) * 1000.0,
+                (_core_state_t1 - _core_state_t0) * 1000.0,
+                (_core_state_t2 - _core_state_t1) * 1000.0,
+                (_core_state_t3 - _core_state_t2) * 1000.0,
+                (_core_t4 - _core_state_t3) * 1000.0,
+                (_core_t4 - _core_t0) * 1000.0,
+            )
 
     def _forward_core_decode_non_spec(
             self,

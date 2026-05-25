@@ -696,7 +696,14 @@ class SharedPrefillBurstPool:
             topk_ids: torch.Tensor,
             shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        bench_timing = _bench_timing_enabled()
+        timing_t0 = _time.perf_counter() if bench_timing else 0.0
         stats = self.prepare(controller, topk_ids)
+        if bench_timing:
+            timing_t1 = _time.perf_counter()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            timing_t1_sync = _time.perf_counter()
         try:
             # 闁瑰灚鎸稿畵鍐亹閹惧啿顤?burst 闁圭瑳鍡╂斀闁汇劌瀚弳鐔煎箲椤旇姤闄嶆繝褎鍔曢幊鈩冪▔椤撶喎鍓伴柛鎰暜缁辨繈宕犻崨顔碱仾 resident 闁告稒鍨濋懙鎴﹀Υ娑撳摉U 闁告稒鍨濋懙鎴炵▔?NVMe 闁告梻濮惧ù鍥р枎閳╁啯娈堕柕?
             logger.debug(
@@ -718,6 +725,28 @@ class SharedPrefillBurstPool:
                 topk_ids=topk_ids,
                 shared_experts_input=shared_experts_input,
             )
+            if bench_timing:
+                timing_t2 = _time.perf_counter()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                timing_t2_sync = _time.perf_counter()
+                logger.info(
+                    "CFIE_BENCH_TIMING prefill_burst layer=%s tokens=%d "
+                    "unique=%d slots=%d prepare=%.3fms prepare_sync=%.3fms "
+                    "apply=%.3fms total_sync=%.3fms resident_hits=%d "
+                    "cpu_hits=%d nvme_loads=%d",
+                    controller.layer_key,
+                    int(topk_ids.shape[0]),
+                    int(torch.unique(topk_ids.detach()).numel()),
+                    self.num_slots,
+                    (timing_t1 - timing_t0) * 1000.0,
+                    (timing_t1_sync - timing_t0) * 1000.0,
+                    (timing_t2_sync - timing_t1_sync) * 1000.0,
+                    (timing_t2_sync - timing_t0) * 1000.0,
+                    stats.resident_hits,
+                    stats.cpu_hits,
+                    stats.nvme_loads,
+                )
             self.release(record_use=True)
             return result
         finally:

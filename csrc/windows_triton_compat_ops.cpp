@@ -8,6 +8,8 @@
 #include <ATen/ops/scaled_dot_product_attention.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <vector>
 
@@ -2745,6 +2747,63 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_precompiled(
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() &&
                 beta.is_cuda() && initial_state.is_cuda(),
                 "chunk_gated_delta_rule_precompiled expects CUDA tensors");
+    std::optional<torch::Tensor> cu_seqlens_for_fast = cu_seqlens;
+    if (cu_seqlens_for_fast.has_value() &&
+        (!cu_seqlens_for_fast.value().is_cuda() ||
+         cu_seqlens_for_fast.value().scalar_type() != torch::kInt64)) {
+        cu_seqlens_for_fast = cu_seqlens_for_fast.value()
+                .to(q.device(), torch::kInt64, false, true)
+                .contiguous();
+    }
+    const bool fast_supported =
+            chunk_gated_delta_rule_recurrent_cuda_fast_supported(
+                    q, k, v, g, beta, initial_state, cu_seqlens_for_fast);
+    const bool log_fast_path =
+            std::getenv("CFIE_QWEN35_TIMING") != nullptr ||
+            std::getenv("CFIE_BENCH_TIMING") != nullptr;
+    static bool logged_fast_used = false;
+    static bool logged_fast_skipped = false;
+    if (fast_supported) {
+        if (log_fast_path && !logged_fast_used) {
+            logged_fast_used = true;
+            std::cerr << "CFIE_GDN_FAST_PATH used"
+                      << " q=" << q.sizes()
+                      << " v=" << v.sizes()
+                      << " g_dtype=" << g.scalar_type()
+                      << " beta_dtype=" << beta.scalar_type()
+                      << " state_dtype=" << initial_state.scalar_type()
+                      << " cu_cuda="
+                      << (cu_seqlens_for_fast.has_value() &&
+                          cu_seqlens_for_fast.value().is_cuda())
+                      << std::endl;
+        }
+        return chunk_gated_delta_rule_recurrent_cuda_fast(
+                q, k, v, g, beta, scale, initial_state, output_final_state,
+                cu_seqlens_for_fast, use_qk_l2norm_in_kernel);
+    }
+    if (log_fast_path && !logged_fast_skipped) {
+        logged_fast_skipped = true;
+        std::cerr << "CFIE_GDN_FAST_PATH skipped"
+                  << " q=" << q.sizes()
+                  << " k=" << k.sizes()
+                  << " v=" << v.sizes()
+                  << " g=" << g.sizes()
+                  << " beta=" << beta.sizes()
+                  << " state=" << initial_state.sizes()
+                  << " q_cuda=" << q.is_cuda()
+                  << " g_cuda=" << g.is_cuda()
+                  << " beta_cuda=" << beta.is_cuda()
+                  << " state_cuda=" << initial_state.is_cuda()
+                  << " q_dtype=" << q.scalar_type()
+                  << " g_dtype=" << g.scalar_type()
+                  << " beta_dtype=" << beta.scalar_type()
+                  << " state_dtype=" << initial_state.scalar_type()
+                  << " cu_defined=" << cu_seqlens_for_fast.has_value()
+                  << " cu_cuda="
+                  << (cu_seqlens_for_fast.has_value() &&
+                      cu_seqlens_for_fast.value().is_cuda())
+                  << std::endl;
+    }
 
     // B/T/H/K/V/N: 批次、长度、value 头数、状态 K/V 维与序列数
     const int64_t B = q.size(0);

@@ -7,6 +7,7 @@ from argparse import Namespace
 from types import SimpleNamespace
 
 from cfie.cli.native_chat import (
+    _count_prompt_tokens,
     _fit_messages_to_context,
     _history_assistant_content,
     run_native_chat,
@@ -277,6 +278,37 @@ def test_fit_messages_to_context_drops_oldest_turns():
         {"role": "user", "content": "latest"},
     ]
     assert "old question" not in prompt
+
+
+def test_count_prompt_tokens_prefers_encode_when_fast_call_rejects_text():
+    class _Tokenizer:
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return [ord(ch) for ch in str(text)]
+
+        def __call__(self, text, add_special_tokens=False):
+            raise TypeError("TextEncodeInput must be Union[...]")
+
+    assert _count_prompt_tokens(_Tokenizer(), "你好") == 2
+
+
+def test_fit_messages_to_context_stringifies_message_content():
+    tokenizer = _FakeTokenizer()
+    args = _make_args(max_model_len=128, max_new_tokens=12)
+
+    trimmed_messages, prompt, _ = _fit_messages_to_context(
+        tokenizer,
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": 123},
+            {"role": "user", "content": None},
+        ],
+        args,
+    )
+
+    assert trimmed_messages[-2]["content"] == "123"
+    assert trimmed_messages[-1]["content"] == ""
+    assert "assistant:123" in prompt
 
 
 def test_history_assistant_content_drops_thinking_only_text():

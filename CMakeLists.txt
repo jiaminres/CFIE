@@ -553,6 +553,7 @@ set(VLLM_EXT_SRC
         "csrc/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"
         "csrc/quantization/gguf/gguf_kernel.cu"
         "csrc/quantization/activation_kernels.cu"
+        "csrc/fla_gated_delta_recurrent_fast.cu"
         "csrc/moe_runtime_scatter.cu"
         "csrc/cuda_utils_kernels.cu"
         "csrc/custom_all_reduce.cu"

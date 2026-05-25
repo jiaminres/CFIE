@@ -26,6 +26,7 @@
 
 import typing
 from collections.abc import Callable, Iterable
+import time as _time
 
 import torch
 from einops import rearrange
@@ -80,6 +81,8 @@ from .qwen3_next import (
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
+    _qwen35_timing_enabled,
+    _qwen35_timing_sync,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -176,6 +179,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         3. 输出投影
         """
         num_tokens = hidden_states.size(0)
+        _timing = _qwen35_timing_enabled()
+        _t0 = _time.perf_counter() if _timing else 0.0
 
         # ============================================================
         # 第一部分：输入投影
@@ -192,6 +197,9 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
 
         b = b.contiguous()
         a = a.contiguous()
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _t1 = _time.perf_counter()
 
         # ============================================================
         # 第二部分：核心注意力（自定义算子）
@@ -211,6 +219,9 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             core_attn_out,
             self.prefix,
         )
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _t2 = _time.perf_counter()
 
         # ============================================================
         # 第三部分：输出投影
@@ -223,6 +234,19 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
+        if _timing:
+            _qwen35_timing_sync(_timing)
+            _t3 = _time.perf_counter()
+            logger.info(
+                "CFIE_QWEN35_TIMING layer=%s tokens=%d proj=%.3fms "
+                "core=%.3fms out=%.3fms total=%.3fms",
+                self.prefix,
+                int(num_tokens),
+                (_t1 - _t0) * 1000.0,
+                (_t2 - _t1) * 1000.0,
+                (_t3 - _t2) * 1000.0,
+                (_t3 - _t0) * 1000.0,
+            )
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):

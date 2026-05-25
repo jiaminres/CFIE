@@ -344,6 +344,20 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_precompiled(
     const std::optional<torch::Tensor>& cu_seqlens,
     bool use_qk_l2norm_in_kernel);
 
+bool chunk_gated_delta_rule_recurrent_cuda_fast_supported(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& g, const torch::Tensor& beta,
+    const torch::Tensor& initial_state,
+    const std::optional<torch::Tensor>& cu_seqlens);
+
+std::tuple<torch::Tensor, torch::Tensor>
+chunk_gated_delta_rule_recurrent_cuda_fast(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& g, const torch::Tensor& beta, double scale,
+    const torch::Tensor& initial_state, bool output_final_state,
+    const std::optional<torch::Tensor>& cu_seqlens,
+    bool use_qk_l2norm_in_kernel);
+
 std::tuple<torch::Tensor, torch::Tensor>
 fused_recurrent_gated_delta_rule_packed_decode_precompiled(
     const torch::Tensor& mixed_qkv, const torch::Tensor& a,

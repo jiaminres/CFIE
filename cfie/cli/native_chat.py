@@ -266,14 +266,28 @@ def _render_engine_chat_prompt(
 
 # 计算一段 prompt 在当前 tokenizer 下会占用多少 token。
 def _count_prompt_tokens(tokenizer: Any, prompt: str) -> int:
-    # 不添加额外 special tokens，因为 prompt 已经是模板渲染后的最终文本。
-    encoded = tokenizer(prompt, add_special_tokens=False)
+    return len(_tokenize_text_ids(tokenizer, prompt))
+
+
+def _tokenize_text_ids(tokenizer: Any, text: str) -> list[int]:
+    # 不添加额外 special tokens，因为 text 已经是模板渲染后的最终文本。
+    normalized_text = str(text)
+    encode = getattr(tokenizer, "encode", None)
+    if encode is not None:
+        try:
+            ids = encode(normalized_text, add_special_tokens=False)
+            if ids is not None:
+                return list(ids)
+        except TypeError:
+            pass
+
+    encoded = tokenizer(normalized_text, add_special_tokens=False)
 
     input_ids = getattr(encoded, "input_ids", None)
     if input_ids is None:
         raise TypeError("tokenizer did not return input_ids for prompt counting")
 
-    return len(input_ids)
+    return list(input_ids)
 
 
 # 把消息列表渲染成最终 prompt 文本，并顺手统计 prompt token 数。
@@ -291,6 +305,7 @@ def _render_prompt(
     # 当前逻辑要求渲染结果必须是字符串。
     if not isinstance(prompt, str):
         raise TypeError("chat template rendering must return a string prompt")
+    prompt = str(prompt)
 
     # 返回 prompt 本身及其 token 数。
     return prompt, _count_prompt_tokens(tokenizer, prompt)
@@ -325,7 +340,13 @@ def _fit_messages_to_context(
         raise ValueError("max_model_len must be greater than max_new_tokens")
 
     # 拷贝一份 messages，避免原地修改调用方的历史数据。
-    trimmed_messages = [dict(message) for message in messages]
+    trimmed_messages = [
+        {
+            "role": str(message["role"]),
+            "content": "" if message.get("content") is None else str(message.get("content")),
+        }
+        for message in messages
+    ]
 
     # 如果第一条是 system，则从索引 1 开始裁剪，确保 system prompt 永远保留。
     preserve_index = 1 if trimmed_messages and trimmed_messages[0]["role"] == "system" else 0
@@ -401,8 +422,20 @@ def _remaining_retry_tokens(
         generated_text: str,
         args: Namespace,
 ) -> int:
-    generated_ids = tokenizer(generated_text, add_special_tokens=False).input_ids
+    generated_ids = _tokenize_text_ids(tokenizer, generated_text)
     return max(0, int(args.max_new_tokens) - len(generated_ids))
+
+
+def _destroy_process_group_if_needed() -> None:
+    try:
+        import torch.distributed as dist
+    except Exception:
+        return
+    try:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        logger.debug("failed to destroy torch distributed process group", exc_info=True)
 
 
 def _build_answer_retry_prompt(prompt: str, generated_text: str) -> str:
@@ -753,3 +786,4 @@ def run_native_chat(args: Namespace) -> int:
             engine.engine_core.shutdown()
         except Exception:
             logger.exception("failed to shutdown native CFIE engine cleanly")
+        _destroy_process_group_if_needed()
