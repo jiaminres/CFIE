@@ -256,6 +256,267 @@ The key rule is:
 Model proposes -> Scheduler/TaskManager validates -> Harness executes -> Verifier checks.
 ```
 
+## Multi-App Monitor Policy
+
+The GUI_Agent should support multiple target APPs / Jobs without forcing the
+model to constantly switch windows and inspect every APP. The agreed principle
+is a three-layer fallback:
+
+```text
+mechanical signal + model judgment + max unchecked timeout
+```
+
+The program should keep monitoring lightweight and generic. It should not encode
+heavy business-specific rules unless a target APP exposes a reliable API. The
+default monitor should focus on signals that are easy for software to capture:
+
+- taskbar icon flashing;
+- taskbar icon color or badge changes;
+- notification/toast events when available;
+- window title changes;
+- foreground/background/window existence changes;
+- optional small screenshot crops around configured UI regions.
+
+Each APP configuration can include visual hints and taskbar icon references:
+
+```yaml
+app_id: app_customer_service
+name: Customer Service Console
+taskbar_icon_ref: refs/customer_service_taskbar.png
+max_unchecked_seconds: 300
+monitor:
+  taskbar_icon_change: true
+  taskbar_flash: true
+  taskbar_badge: true
+state_change_hints:
+  - "Taskbar flashing usually means the APP is requesting attention."
+  - "A red badge on the APP icon usually means unread messages or pending work."
+  - "A number in the title bar usually means unread items."
+  - "If a conversation list item has a red dot, inspect that conversation first."
+```
+
+The monitor creates structured evidence, not a final scheduling decision:
+
+```json
+{
+  "type": "monitor_event",
+  "app_id": "app_customer_service",
+  "signals": [
+    {"kind": "taskbar_flash", "confidence": 0.95},
+    {"kind": "max_unchecked_timeout", "seconds": 320}
+  ],
+  "evidence_refs": ["artifact://monitor/taskbar_crop_001.png"]
+}
+```
+
+The model receives this evidence in runtime context and decides whether the
+current task should continue, pause, or switch to another Job. The harness still
+enforces safe interruption points. A high-confidence monitor event should not
+interrupt a critical action such as an unsaved form submission. It should become
+a pending switch candidate until the current workflow reaches a recoverable
+state.
+
+Recommended responsibilities:
+
+- Program monitor:
+  - capture taskbar/icon/title/window changes;
+  - compare configured icon references;
+  - track last-checked time per Job;
+  - emit monitor events with evidence refs.
+- Model:
+  - reason over monitor events, current Job state, task priority, and state
+    change hints;
+  - decide whether to switch, continue, defer, or ask for human help.
+- Scheduler/harness:
+  - respect safe interruption points;
+  - update Job switch history;
+  - rebuild current Job context when switching APPs;
+  - prevent excessive oscillation between Jobs.
+
+Max unchecked timeout is the final fallback. If a Job has not been observed for
+longer than `max_unchecked_seconds`, the monitor should emit a low-priority
+event even if no visual change was detected. The model then judges whether to
+switch and inspect the APP. This prevents silent misses while avoiding constant
+blind polling.
+
+Future implementation notes:
+
+- The UI should let users register a taskbar icon reference for each APP.
+- Users can add `state_change_hints` in the APP task definition.
+- The system prompt should explain the meaning of monitor signals and the safe
+  interruption rule.
+- The context should include a compact per-Job monitor summary:
+
+  ```json
+  {
+    "job_id": "job_customer_service",
+    "last_checked_seconds_ago": 318,
+    "pending_monitor_events": 2,
+    "strongest_signal": "taskbar_flash",
+    "safe_to_switch_now": false
+  }
+  ```
+
+The intent is to avoid over-engineered business logic while still combining
+mechanical observation, model judgment, and timeout-based safety checks.
+
+## Main Window Recent Operation View
+
+The desktop client should not leave the main window as an empty chat surface.
+The main window is the operator cockpit and should always show a compact recent
+operation stream. The detailed / folded window remains the audit surface.
+
+Main window responsibilities:
+
+- show current APP and current task state;
+- show the latest model intent in a concise, user-readable form;
+- show recent executed actions as formatted operation cards;
+- show whether each action was validated, executed, verified, failed, or waiting;
+- surface human intervention requests prominently;
+- keep raw JSON, full prompt context, screenshots, and videos out of the default
+  view unless the user opens details.
+
+Recent operation cards should be compact and visual, for example:
+
+```text
+[mouse] Click "Send" button
+Target: chat composer send button
+Status: executed and verified
+
+[keyboard] Type reply
+Preview: "Hello, I have checked your order..."
+Status: executed
+
+[switch] Switch to Customer Service Console
+Reason: taskbar icon flashed; current task reached safe point
+Status: pending switch
+
+[human] Human input required
+Reason: seller requested manual confirmation
+Status: waiting for manager input
+```
+
+The main window should render common action types with distinct icons and
+semantic styling:
+
+- mouse actions;
+- keyboard input;
+- window/app switch;
+- screenshot/video observation;
+- model decision;
+- harness validation;
+- verification result;
+- human intervention;
+- failure/retry/rollback.
+
+The detailed / folded window should show the selected step with full evidence:
+
+- before image;
+- after image;
+- operation video;
+- model input context references;
+- model raw output;
+- parsed tool call;
+- harness validation;
+- execution result;
+- verifier result;
+- latency breakdown;
+- linked human intervention record if any.
+
+Both windows should read from the same trace/event store. The main window should
+render a bounded recent summary, while the detail window renders complete history
+and artifacts. This keeps daily use simple while preserving auditability.
+
+Recommended data split:
+
+```text
+TraceEvent / StepRecord
+  -> main window: icon + title + short summary + status
+  -> detail window: payload + artifact refs + screenshots/videos + debug data
+```
+
+Implementation note:
+
+- Keep only the latest N recent operation cards in the main window, for example
+  20-50.
+- Clicking any main-window operation card should open/focus the detail window on
+  the matching step.
+- Human intervention cards should include an obvious action button, but the
+  structured input form can live in the detail window.
+
+## First Validation Workflow Template
+
+The first practical GUI_Agent validation task can use a web application because
+it stresses input, waiting, observation, trace recording, and human fallback
+without immediately adding low-latency game movement. This is a validation
+scenario for the generic GUI_Agent product, not a product-level mode. In code
+and UI it must remain a normal APP/session workflow.
+
+```text
+Target APP: Chrome running a configured web app
+Input list: jsonl/json/csv items, with input_text preferred and question fields
+            accepted only as import compatibility
+Goal: input every item, wait for the output, collect trace/evidence/result,
+      stop after all items are processed
+```
+
+Recommended APP configuration for this first scenario:
+
+```yaml
+app_name: Web App
+process_name: chrome.exe
+executable_path: C:\Program Files\Google\Chrome\Application\chrome.exe
+target_url: https://example.com/
+window_title_pattern: ".*"
+browser_url_pattern: https://example.com/
+input_path: datasets/workflow_items.jsonl
+trace_path: runs/workflows/trace.jsonl
+max_unchecked_seconds: 300
+```
+
+Recommended task prompt:
+
+```text
+Open the target URL in Chrome. For each workflow item, input the item text
+exactly as provided, submit it, wait until the output is complete, then save a
+structured workflow result containing item_id, input_text, expected_output,
+output_text, status, latency, and evidence refs. Do not skip items. If login,
+captcha, timeout, missing input box, or unclear completion occurs, request human
+help. When all items are processed and the trace file is written, finish the
+subtask.
+```
+
+Useful reference images for this APP:
+
+- browser page after the target web app is loaded;
+- chat input area and send button;
+- output area after a normal response completes;
+- loading state / streaming output state;
+- login or blocked state if encountered.
+
+These images should be attached as APP reference assets and cited in the task
+description, for example `[image:web_input]` and `[image:web_output_done]`.
+
+Additional model-callable tools needed for this workflow:
+
+- `computer_use`: operate Chrome.
+- `read_image`: inspect reference screenshots when needed.
+- `read_video_clip`: inspect recorded operation clips when debugging.
+- `read_text_file`: read bounded local workflow/config text.
+- `append_trace_note`: add structured operation notes.
+- `record_workflow_result`: persist one workflow item result.
+- `request_human_help`: ask for manual input on login/captcha/unclear UI.
+- `finish_subtask`: stop after all workflow items are completed.
+
+Harness-internal responsibilities:
+
+- create a run manifest beside the trace file;
+- persist trace events as JSONL;
+- keep recent operation cards in the main window;
+- keep screenshots/videos/model context in the detailed evidence view;
+- validate that every workflow item has a terminal result before marking the run
+  complete.
+
 ## Prompt and Runtime Context Split
 
 Stable orchestration rules belong in system/developer instructions and code.
@@ -2929,6 +3190,11 @@ Desktop console / human loop:
 - Add business/workspace profile design.
 - Add UI surface for long task prompt, constraints, reference images, reference
   videos, and SOP documents.
+- Add main-window recent operation stream with formatted action cards.
+- Add click-through from main-window operation card to detailed evidence view.
+- Add per-APP taskbar icon reference registration.
+- Add per-APP `state_change_hints` and `max_unchecked_seconds`.
+- Add lightweight taskbar/title/window monitor events for multi-APP scheduling.
 - Add runtime monitor fields for model proposal, harness validation, executed
   action, verifier result, and task state.
 - Add `HumanLoopManager`.
@@ -2960,6 +3226,12 @@ Engine/application validation:
 Testing:
 
 - Unit test task stack transitions.
+- Unit test main-window recent operation stream keeps only bounded latest cards.
+- Unit test clicking a recent operation card opens matching detail record.
+- Unit test taskbar icon change creates monitor event but does not directly
+  force Job switch.
+- Unit test max unchecked timeout creates low-priority monitor event.
+- Unit test model switch proposal still waits for safe interruption point.
 - Unit test interrupt -> resume behavior.
 - Unit test override does not resume old task.
 - Unit test rollback checkpoint metadata.
@@ -2987,6 +3259,128 @@ Testing:
   change.
 - Later game-like simulation test: death interrupt, revive, resume original
   task.
+
+## Product Abstraction Boundary - 2026-05-24
+
+Hard rule:
+
+- The application being built is **GUI Agent**, not an AI-application testing
+  product.
+- AI application testing is only the current validation scenario. It is used to
+  check whether the GUI Agent architecture, tool loop, trace recording, context
+  management, human intervention, and scheduler are effective.
+- Product code must not bind the generic GUI Agent architecture to one concrete
+  scenario such as testing/evaluation/Doubao/GAIA.
+- Concrete scenarios belong to user-created APP conversation objects in the
+  left-side session list. A scenario is represented by:
+  - the selected APP/session object;
+  - that object's task description;
+  - its reference images/videos/files;
+  - its macros and monitor hints;
+  - its trace/history artifacts.
+- The same product surface must support web AI application automation, desktop
+  operation, game-like low-latency control, e-commerce operation, or any later
+  workflow without renaming core modules or top-level UI concepts.
+
+Naming rule:
+
+- Product/runtime modules should use generic terms such as `workflow`,
+  `task_spec`, `run`, `trace`, `artifact`, `record`, `tool`, `monitor`, and
+  `human_request`.
+- Avoid scenario-bound names such as `test`, `testing`, `evaluation`,
+  `ai_app_test`, or `doubao` in product/runtime abstractions.
+- Unit test filenames may keep pytest's `test_*.py` convention. That is not
+  product vocabulary.
+- Scenario templates may mention their scenario in sample data or user-visible
+  task descriptions, but not as permanent top-level UI buttons or core class
+  names.
+
+UI rule:
+
+- The left session list is the product-level object model: one APP/session is
+  one configured automation context.
+- Right-clicking a session is the place to edit task definition, references,
+  macros, and scenario-specific settings.
+- The global toolbar should expose only generic controls such as creating a
+  session, opening settings, and toggling the trace/detail pane.
+- Do not expose "AI app testing" or similar special-case text as a permanent
+  top-level product mode.
+
+Implementation update:
+
+- Replaced the scenario-bound runtime module with `cfie_gui_agent.workflow`.
+- Replaced product/runtime naming with generic workflow terms:
+  - `WorkflowInputItem`
+  - `WorkflowRun`
+  - `load_workflow_items`
+  - `build_workflow_target_config`
+  - `configure_workflow`
+  - `record_workflow_result`
+  - `workflow_configured`
+  - `workflow_result`
+- The desktop client's left `+` menu now creates either a plain APP or a generic
+  workflow template. The top toolbar no longer exposes a scenario-specific
+  testing/evaluation button.
+- The detail pane toggle is icon-only; task definition editing stays attached to
+  the APP/session object context menu.
+- The right trace/detail pane no longer shows an empty "select record" prompt.
+  Details appear only after the user selects a record.
+- Scrollbars and neutral surfaces were lightened to reduce visual weight.
+
+Verification:
+
+```powershell
+..\.venv\Scripts\python.exe -m py_compile cfie_gui_agent/workflow.py cfie_gui_agent/desktop_client.py cfie_gui_agent/desktop_client_ui.py cfie_gui_agent/tools.py cfie_gui_agent/runner.py cfie_gui_agent/__init__.py
+..\.venv\Scripts\python.exe -m pytest tests\unit\test_responses_video_input.py tests\unit\test_gui_agent_workflow.py tests\unit\test_gui_agent_desktop_client.py tests\unit\test_gui_agent_console.py tests\unit\test_gui_agent_architecture.py tests\unit\test_cfie_client_gui_agent.py -q
+```
+
+Result: 54 passed, 2 warnings. A Tk desktop-client smoke instantiation also
+passed.
+
+## Implementation Round 22
+
+Date: 2026-05-25
+
+Low-latency visual context policy after engine prefill timing:
+
+- The GUI Agent runner keeps historical screenshots in the conversation so the
+  model can use them to avoid loops and inconsistent decisions.
+- The latency rule is not "only give the model two images". The rule is:
+  keep the historical visual prefix stable and let KV cache reuse it; each new
+  turn should append only one operation-result keyframe plus a small tool/result
+  message.
+- The default prompt reconstruction policy remains an after-frame history
+  policy: current frame plus bounded after-action screenshots, no routine video
+  clips.
+- The 2096/4192-token target refers to the per-turn newly appended prompt delta,
+  not the full cached historical context.
+- Full video is now treated as diagnostic or replay evidence. It should not be
+  part of the normal per-step prompt unless the task explicitly requires motion
+  understanding.
+- The stable runtime-context developer message should not be rewritten each
+  step. Rewriting it would invalidate prefix-cache reuse.
+
+Viewport crop policy:
+
+- Added model-callable `set_app_viewport`.
+- The model can identify the active application rectangle in the current
+  screenshot and call `set_app_viewport(x, y, width, height)`.
+- The harness stores that rectangle as the screenshot crop box. Later
+  screenshots contain only the application region.
+- `computer_use` coordinates remain in the screenshot coordinate system. The
+  client maps scaled/cropped screenshot coordinates back to physical desktop
+  coordinates before executing mouse actions.
+- This directly supports the expected GUI Agent workflow:
+  observe full desktop once -> locate useful APP region -> crop future
+  screenshots -> use one keyframe per step.
+
+Verification:
+
+```powershell
+..\.venv\Scripts\python.exe -m pytest tests\unit\test_cfie_client_gui_agent.py tests\unit\test_gui_agent_architecture.py tests\unit\test_gui_agent_workflow.py tests\unit\test_gui_agent_openai_responses.py -q
+```
+
+Result: 60 passed.
 
 ## Interview Framing
 
