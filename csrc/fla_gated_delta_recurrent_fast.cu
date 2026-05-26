@@ -31,6 +31,33 @@ __device__ float block_sum(float value, float* shared) {
   return result;
 }
 
+template <int V_TILE>
+__device__ void block_sum_tile(float (&values)[V_TILE],
+                               float (&results)[V_TILE],
+                               float* shared) {
+  const int tid = threadIdx.x;
+#pragma unroll
+  for (int tile = 0; tile < V_TILE; ++tile) {
+    shared[tile * blockDim.x + tid] = values[tile];
+  }
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+#pragma unroll
+      for (int tile = 0; tile < V_TILE; ++tile) {
+        shared[tile * blockDim.x + tid] +=
+            shared[tile * blockDim.x + tid + stride];
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int tile = 0; tile < V_TILE; ++tile) {
+    results[tile] = shared[tile * blockDim.x];
+  }
+  __syncthreads();
+}
+
 template <typename scalar_t, typename gate_t, typename beta_t>
 __global__ void gated_delta_recurrent_kernel(
     const scalar_t* __restrict__ q,
@@ -97,16 +124,21 @@ __global__ void gated_delta_recurrent_kernel(
       k_val *= k_inv_norm;
     }
 
-    const float delta_dot = block_sum(lane_valid ? state * k_val : 0.0f, shared);
     const int64_t gate_idx = (batch_idx * T + tok) * H + head;
     const float beta_val = static_cast<float>(beta[gate_idx]);
     const float decay = expf(static_cast<float>(g[gate_idx]));
     const int64_t v_idx = (((batch_idx * T + tok) * H + head) * V + v_col);
     const float v_val = static_cast<float>(v[v_idx]);
+
+    if (lane_valid) {
+      state *= decay;
+    }
+
+    const float delta_dot = block_sum(lane_valid ? state * k_val : 0.0f, shared);
     const float delta_v = (v_val - delta_dot) * beta_val;
 
     if (lane_valid) {
-      state = state * decay + delta_v * k_val;
+      state += delta_v * k_val;
     }
 
     const float out_dot = block_sum(lane_valid ? state * q_val : 0.0f, shared);
@@ -121,6 +153,133 @@ __global__ void gated_delta_recurrent_kernel(
   }
 }
 
+template <typename scalar_t, typename gate_t, typename beta_t, int V_TILE>
+__global__ void gated_delta_recurrent_vtile_kernel(
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v,
+    const gate_t* __restrict__ g,
+    const beta_t* __restrict__ beta,
+    const float* __restrict__ initial_state,
+    const int64_t* __restrict__ cu_seqlens,
+    scalar_t* __restrict__ output,
+    float* __restrict__ final_state,
+    int64_t B,
+    int64_t T,
+    int64_t Hq,
+    int64_t H,
+    int64_t K,
+    int64_t V,
+    int64_t N,
+    float scale,
+    bool has_cu_seqlens,
+    bool output_final_state) {
+  extern __shared__ float shared[];
+
+  const int64_t v_start = static_cast<int64_t>(blockIdx.x) * V_TILE;
+  const int64_t head = blockIdx.y;
+  const int64_t seq_idx = blockIdx.z;
+  const int tid = threadIdx.x;
+  const bool lane_valid = tid < K;
+
+  const int64_t heads_per_group = H / Hq;
+  const int64_t key_head = head / heads_per_group;
+
+  int64_t batch_idx = seq_idx;
+  int64_t start = 0;
+  int64_t end = T;
+  if (has_cu_seqlens) {
+    batch_idx = 0;
+    start = cu_seqlens[seq_idx];
+    end = cu_seqlens[seq_idx + 1];
+  }
+
+  float state[V_TILE];
+#pragma unroll
+  for (int tile = 0; tile < V_TILE; ++tile) {
+    state[tile] = 0.0f;
+    const int64_t v_col = v_start + tile;
+    if (lane_valid && v_col < V) {
+      const int64_t state_idx =
+          (((seq_idx * H + head) * V + v_col) * K + tid);
+      state[tile] = initial_state[state_idx];
+    }
+  }
+
+  for (int64_t tok = start; tok < end; ++tok) {
+    float q_val = 0.0f;
+    float k_val = 0.0f;
+    if (lane_valid) {
+      const int64_t qk_idx =
+          (((batch_idx * T + tok) * Hq + key_head) * K + tid);
+      q_val = static_cast<float>(q[qk_idx]);
+      k_val = static_cast<float>(k[qk_idx]);
+    }
+
+    const int64_t gate_idx = (batch_idx * T + tok) * H + head;
+    const float beta_val = static_cast<float>(beta[gate_idx]);
+    const float decay = expf(static_cast<float>(g[gate_idx]));
+
+    float delta_terms[V_TILE];
+#pragma unroll
+    for (int tile = 0; tile < V_TILE; ++tile) {
+      const int64_t v_col = v_start + tile;
+      if (lane_valid && v_col < V) {
+        state[tile] *= decay;
+        delta_terms[tile] = state[tile] * k_val;
+      } else {
+        delta_terms[tile] = 0.0f;
+      }
+    }
+
+    float delta_dot[V_TILE];
+    block_sum_tile<V_TILE>(delta_terms, delta_dot, shared);
+
+    float out_terms[V_TILE];
+#pragma unroll
+    for (int tile = 0; tile < V_TILE; ++tile) {
+      const int64_t v_col = v_start + tile;
+      if (lane_valid && v_col < V) {
+        const int64_t v_idx =
+            (((batch_idx * T + tok) * H + head) * V + v_col);
+        const float v_val = static_cast<float>(v[v_idx]);
+        const float delta_v = (v_val - delta_dot[tile]) * beta_val;
+        state[tile] += delta_v * k_val;
+        out_terms[tile] = state[tile] * q_val;
+      } else {
+        out_terms[tile] = 0.0f;
+      }
+    }
+
+    float out_dot[V_TILE];
+    block_sum_tile<V_TILE>(out_terms, out_dot, shared);
+
+    if (tid == 0) {
+#pragma unroll
+      for (int tile = 0; tile < V_TILE; ++tile) {
+        const int64_t v_col = v_start + tile;
+        if (v_col < V) {
+          const int64_t v_idx =
+              (((batch_idx * T + tok) * H + head) * V + v_col);
+          output[v_idx] = static_cast<scalar_t>(out_dot[tile] * scale);
+        }
+      }
+    }
+  }
+
+  if (output_final_state && lane_valid) {
+#pragma unroll
+    for (int tile = 0; tile < V_TILE; ++tile) {
+      const int64_t v_col = v_start + tile;
+      if (v_col < V) {
+        const int64_t state_idx =
+            (((seq_idx * H + head) * V + v_col) * K + tid);
+        final_state[state_idx] = state[tile];
+      }
+    }
+  }
+}
+
 bool is_supported_dtype(const torch::Tensor& t) {
   return t.scalar_type() == torch::kBFloat16 || t.scalar_type() == torch::kFloat16;
 }
@@ -128,6 +287,25 @@ bool is_supported_dtype(const torch::Tensor& t) {
 bool is_supported_gate_dtype(const torch::Tensor& t,
                              const torch::ScalarType q_dtype) {
   return t.scalar_type() == q_dtype || t.scalar_type() == torch::kFloat32;
+}
+
+template <typename scalar_t, typename gate_t, typename beta_t, int V_TILE>
+void launch_gated_delta_recurrent_vtile_cuda(
+    const torch::Tensor& q_c, const torch::Tensor& k_c,
+    const torch::Tensor& v_c, const torch::Tensor& g_c,
+    const torch::Tensor& beta_c, const torch::Tensor& initial_c,
+    const std::optional<torch::Tensor>& cu_c, torch::Tensor& output,
+    torch::Tensor& final_state, int64_t B, int64_t T, int64_t Hq, int64_t H,
+    int64_t K, int64_t V, int64_t N, float scale, bool output_final_state,
+    dim3 grid, int threads, size_t shared_bytes, cudaStream_t stream) {
+  gated_delta_recurrent_vtile_kernel<scalar_t, gate_t, beta_t, V_TILE>
+      <<<grid, threads, shared_bytes, stream>>>(
+          q_c.data_ptr<scalar_t>(), k_c.data_ptr<scalar_t>(),
+          v_c.data_ptr<scalar_t>(), g_c.data_ptr<gate_t>(),
+          beta_c.data_ptr<beta_t>(), initial_c.data_ptr<float>(),
+          cu_c.has_value() ? cu_c.value().data_ptr<int64_t>() : nullptr,
+          output.data_ptr<scalar_t>(), final_state.data_ptr<float>(), B, T, Hq,
+          H, K, V, N, scale, cu_c.has_value(), output_final_state);
 }
 
 template <typename scalar_t, typename gate_t, typename beta_t>
@@ -149,6 +327,64 @@ void launch_gated_delta_recurrent_cuda(
           output.data_ptr<scalar_t>(), final_state.data_ptr<float>(), B, T, Hq,
           H, K, V, N, scale, cu_c.has_value(), output_final_state,
           use_qk_l2norm_in_kernel);
+}
+
+template <typename scalar_t, typename gate_t, typename beta_t>
+void dispatch_gated_delta_recurrent_cuda(
+    const torch::Tensor& q_c, const torch::Tensor& k_c,
+    const torch::Tensor& v_c, const torch::Tensor& g_c,
+    const torch::Tensor& beta_c, const torch::Tensor& initial_c,
+    const std::optional<torch::Tensor>& cu_c, torch::Tensor& output,
+    torch::Tensor& final_state, int64_t B, int64_t T, int64_t Hq, int64_t H,
+    int64_t K, int64_t V, int64_t N, float scale, bool output_final_state,
+    bool use_qk_l2norm_in_kernel, dim3 grid, int threads, size_t shared_bytes,
+    cudaStream_t stream, int v_tile) {
+  if (!use_qk_l2norm_in_kernel) {
+    if (v_tile == 16) {
+      const dim3 tiled_grid(static_cast<unsigned int>((V + 15) / 16),
+                            static_cast<unsigned int>(H),
+                            static_cast<unsigned int>(N));
+      launch_gated_delta_recurrent_vtile_cuda<scalar_t, gate_t, beta_t, 16>(
+          q_c, k_c, v_c, g_c, beta_c, initial_c, cu_c, output, final_state, B,
+          T, Hq, H, K, V, N, scale, output_final_state, tiled_grid, threads,
+          static_cast<size_t>(threads) * 16 * sizeof(float), stream);
+      return;
+    }
+    if (v_tile == 8) {
+      const dim3 tiled_grid(static_cast<unsigned int>((V + 7) / 8),
+                            static_cast<unsigned int>(H),
+                            static_cast<unsigned int>(N));
+      launch_gated_delta_recurrent_vtile_cuda<scalar_t, gate_t, beta_t, 8>(
+          q_c, k_c, v_c, g_c, beta_c, initial_c, cu_c, output, final_state, B,
+          T, Hq, H, K, V, N, scale, output_final_state, tiled_grid, threads,
+          static_cast<size_t>(threads) * 8 * sizeof(float), stream);
+      return;
+    }
+    if (v_tile == 4) {
+      const dim3 tiled_grid(static_cast<unsigned int>((V + 3) / 4),
+                            static_cast<unsigned int>(H),
+                            static_cast<unsigned int>(N));
+      launch_gated_delta_recurrent_vtile_cuda<scalar_t, gate_t, beta_t, 4>(
+          q_c, k_c, v_c, g_c, beta_c, initial_c, cu_c, output, final_state, B,
+          T, Hq, H, K, V, N, scale, output_final_state, tiled_grid, threads,
+          static_cast<size_t>(threads) * 4 * sizeof(float), stream);
+      return;
+    }
+    if (v_tile == 2) {
+      const dim3 tiled_grid(static_cast<unsigned int>((V + 1) / 2),
+                            static_cast<unsigned int>(H),
+                            static_cast<unsigned int>(N));
+      launch_gated_delta_recurrent_vtile_cuda<scalar_t, gate_t, beta_t, 2>(
+          q_c, k_c, v_c, g_c, beta_c, initial_c, cu_c, output, final_state, B,
+          T, Hq, H, K, V, N, scale, output_final_state, tiled_grid, threads,
+          static_cast<size_t>(threads) * 2 * sizeof(float), stream);
+      return;
+    }
+  }
+  launch_gated_delta_recurrent_cuda<scalar_t, gate_t, beta_t>(
+      q_c, k_c, v_c, g_c, beta_c, initial_c, cu_c, output, final_state, B, T,
+      Hq, H, K, V, N, scale, output_final_state, use_qk_l2norm_in_kernel, grid,
+      threads, shared_bytes, stream);
 }
 
 }  // namespace
@@ -252,37 +488,38 @@ chunk_gated_delta_rule_recurrent_cuda_fast(
                   static_cast<unsigned int>(N));
   const size_t shared_bytes = static_cast<size_t>(threads) * sizeof(float);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr int v_tile = 8;
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, q_c.scalar_type(),
       "gated_delta_recurrent_kernel", [&] {
         if (g_c.scalar_type() == torch::kFloat32) {
           if (beta_c.scalar_type() == torch::kFloat32) {
-            launch_gated_delta_recurrent_cuda<scalar_t, float, float>(
+            dispatch_gated_delta_recurrent_cuda<scalar_t, float, float>(
                 q_c, k_c, v_c, g_c, beta_c, initial_c, cu_c, output,
                 final_state, B, T, Hq, H, K, V, N, static_cast<float>(scale),
                 output_final_state, use_qk_l2norm_in_kernel, grid, threads,
-                shared_bytes, stream);
+                shared_bytes, stream, v_tile);
           } else {
-            launch_gated_delta_recurrent_cuda<scalar_t, float, scalar_t>(
+            dispatch_gated_delta_recurrent_cuda<scalar_t, float, scalar_t>(
                 q_c, k_c, v_c, g_c, beta_c, initial_c, cu_c, output,
                 final_state, B, T, Hq, H, K, V, N, static_cast<float>(scale),
                 output_final_state, use_qk_l2norm_in_kernel, grid, threads,
-                shared_bytes, stream);
+                shared_bytes, stream, v_tile);
           }
         } else {
           if (beta_c.scalar_type() == torch::kFloat32) {
-            launch_gated_delta_recurrent_cuda<scalar_t, scalar_t, float>(
+            dispatch_gated_delta_recurrent_cuda<scalar_t, scalar_t, float>(
                 q_c, k_c, v_c, g_c, beta_c, initial_c, cu_c, output,
                 final_state, B, T, Hq, H, K, V, N, static_cast<float>(scale),
                 output_final_state, use_qk_l2norm_in_kernel, grid, threads,
-                shared_bytes, stream);
+                shared_bytes, stream, v_tile);
           } else {
-            launch_gated_delta_recurrent_cuda<scalar_t, scalar_t, scalar_t>(
+            dispatch_gated_delta_recurrent_cuda<scalar_t, scalar_t, scalar_t>(
                 q_c, k_c, v_c, g_c, beta_c, initial_c, cu_c, output,
                 final_state, B, T, Hq, H, K, V, N, static_cast<float>(scale),
                 output_final_state, use_qk_l2norm_in_kernel, grid, threads,
-                shared_bytes, stream);
+                shared_bytes, stream, v_tile);
           }
         }
       });

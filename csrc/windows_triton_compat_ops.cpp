@@ -2777,6 +2777,13 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_precompiled(
                           cu_seqlens_for_fast.value().is_cuda())
                       << std::endl;
         }
+        if (use_qk_l2norm_in_kernel) {
+            auto q_norm = l2norm_last_dim(q.to(torch::kFloat32)).to(q.scalar_type());
+            auto k_norm = l2norm_last_dim(k.to(torch::kFloat32)).to(k.scalar_type());
+            return chunk_gated_delta_rule_recurrent_cuda_fast(
+                    q_norm, k_norm, v, g, beta, scale, initial_state,
+                    output_final_state, cu_seqlens_for_fast, false);
+        }
         return chunk_gated_delta_rule_recurrent_cuda_fast(
                 q, k, v, g, beta, scale, initial_state, output_final_state,
                 cu_seqlens_for_fast, use_qk_l2norm_in_kernel);
