@@ -215,8 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default="")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--max-output-tokens", type=int, default=256)
-    parser.add_argument("--screenshot-max-width", type=int, default=960)
-    parser.add_argument("--screenshot-max-height", type=int, default=540)
+    parser.add_argument("--screenshot-max-width", type=int, default=1920)
+    parser.add_argument("--screenshot-max-height", type=int, default=1080)
     parser.add_argument("--screenshot-grid", choices=("off", "coarse", "fine"), default="off")
     parser.add_argument(
         "--layout",

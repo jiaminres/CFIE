@@ -154,6 +154,9 @@ def test_protocol_accepts_single_action_dict_wait_and_key_chord():
     key_press_alias_action = ComputerAction.from_openai(
         {"type": "key_press", "keys": ["Enter"]}
     )
+    keys_alias_action = ComputerAction.from_openai(
+        {"type": "keys", "keys": ["ctrl", "a"]}
+    )
 
     assert call.actions[0].duration == 0.25
     assert call.coordinate_space == "qwen_normalized_1000"
@@ -162,6 +165,21 @@ def test_protocol_accepts_single_action_dict_wait_and_key_chord():
     assert key_alias_action.keys == ("enter",)
     assert key_press_alias_action.type == "keypress"
     assert key_press_alias_action.keys == ("Enter",)
+    assert keys_alias_action.type == "keypress"
+    assert keys_alias_action.keys == ("ctrl", "a")
+
+
+def test_protocol_unquotes_coordinate_space_from_qwen_text_tool_output():
+    call = ComputerCall.from_openai(
+        {
+            "type": "computer_call",
+            "call_id": "call_quoted_space",
+            "coordinate_space": '"qwen_normalized_1000"',
+            "actions": {"type": "click", "x": 500, "y": 900},
+        }
+    )
+
+    assert call.coordinate_space == "qwen_normalized_1000"
 
 
 def test_qwen_adapter_extracts_computer_call_from_json_text():
@@ -266,6 +284,39 @@ def test_computer_call_coordinate_space_overrides_loop_default():
     assert backend.calls == [("click", (560, 570, "left"))]
 
 
+def test_computer_loop_defaults_scroll_to_viewport_center():
+    backend = FakeBackend()
+    screen = FakeScreen()
+    loop = ComputerLoop(backend=backend, screen=screen)
+    call = ComputerCall.from_openai(
+        {
+            "type": "computer_call",
+            "call_id": "scroll_center",
+            "coordinate_space": "qwen_normalized_1000",
+            "actions": [{"type": "scroll", "scroll_y": -300}],
+        }
+    )
+
+    loop.handle_call(call)
+
+    assert backend.calls == [("scroll", (400, 300, 0, -300))]
+
+
+def test_computer_loop_defensively_maps_out_of_bounds_screenshot_coordinates():
+    backend = FakeBackend()
+    screen = FakeScreen()
+    loop = ComputerLoop(backend=backend, screen=screen)
+    call = ComputerCall(
+        call_id="qwen_grounding_mislabeled",
+        coordinate_space="screenshot",
+        actions=(ComputerAction(type="click", x=500, y=950, button="left"),),
+    )
+
+    loop.handle_call(call)
+
+    assert backend.calls == [("click", (400, 570, "left"))]
+
+
 def test_computer_loop_auto_maps_qwen_normalized_coordinates_when_out_of_bounds():
     backend = FakeBackend()
     screen = FakeScaledScreen(logical_size=(960, 524), physical_size=(1920, 1048))
@@ -282,6 +333,22 @@ def test_computer_loop_auto_maps_qwen_normalized_coordinates_when_out_of_bounds(
     loop.handle_call(call)
 
     assert backend.calls == [("click", (1444, 1046, "left"))]
+
+
+def test_computer_loop_maps_local_refinement_coordinates_to_screen_box():
+    backend = FakeBackend()
+    screen = FakeScreen()
+    loop = ComputerLoop(backend=backend, screen=screen)
+    loop.set_local_refinement_box((100, 200, 400, 300))
+    call = ComputerCall(
+        call_id="local_refinement",
+        coordinate_space="local_refinement_1000",
+        actions=(ComputerAction(type="click", x=500, y=500, button="left"),),
+    )
+
+    loop.handle_call(call)
+
+    assert backend.calls == [("click", (300, 350, "left"))]
 
 
 def test_scaled_screen_capture_can_emit_file_url(
@@ -340,6 +407,64 @@ def test_scaled_screen_capture_can_overlay_coordinate_grid(
     assert image.getpixel((100, 10)) != (255, 255, 255)
 
 
+def test_scaled_screen_capture_draws_cursor_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    background = (120, 120, 120)
+    monkeypatch.setattr(
+        screen_mod.ImageGrab,
+        "grab",
+        lambda *args, **kwargs: Image.new("RGB", (160, 90), background),
+    )
+    screen = screen_mod.ScaledPillowScreenCapture(
+        max_width=160,
+        max_height=90,
+        image_format="PNG",
+        url_mode="file",
+        output_dir=tmp_path,
+        cursor_position_provider=lambda: (20, 20),
+    )
+
+    shot = screen.screenshot()
+    parsed = urlparse(shot.image_url)
+    path = Path(url2pathname(parsed.path))
+    image = Image.open(path).convert("RGB")
+
+    assert image.getpixel((20, 20)) != background
+
+
+def test_scaled_screen_capture_can_emit_local_region_around_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured_bboxes: list[tuple[int, int, int, int] | None] = []
+
+    def fake_grab(*, bbox=None):
+        captured_bboxes.append(bbox)
+        if bbox is None:
+            return Image.new("RGB", (200, 100), "white")
+        left, top, right, bottom = bbox
+        return Image.new("RGB", (right - left, bottom - top), "white")
+
+    monkeypatch.setattr(screen_mod.ImageGrab, "grab", fake_grab)
+    screen = screen_mod.ScaledPillowScreenCapture(
+        max_width=100,
+        max_height=50,
+        image_format="PNG",
+        url_mode="file",
+        output_dir=tmp_path,
+        crop_box=(0, 0, 200, 100),
+        draw_cursor=False,
+    )
+
+    shot = screen.screenshot_region_around(x=50, y=25, radius=10)
+
+    assert shot.width == 80
+    assert shot.height == 80
+    assert captured_bboxes == [(60, 10, 140, 90)]
+
+
 def test_gui_agent_runner_executes_computer_call_until_final_message():
     backend = FakeBackend()
     loop = ComputerLoop(backend=backend, screen=FakeScreen())
@@ -349,7 +474,8 @@ def test_gui_agent_runner_executes_computer_call_until_final_message():
     def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
         if len(conversation) == 2:
             assert conversation[0]["role"] == "developer"
-            assert "Runtime context JSON" in conversation[0]["content"][0]["text"]
+            assert "运行规则" in conversation[0]["content"][0]["text"]
+            assert "active_app" in conversation[0]["content"][1]["text"]
             first = conversation[1]
             assert first["role"] == "user"
             assert first["content"][1]["type"] == "input_image"
@@ -367,10 +493,13 @@ def test_gui_agent_runner_executes_computer_call_until_final_message():
                 ]
             }
 
+        assert conversation[-3]["type"] == "computer_call"
+        assert conversation[-3]["call_id"] == "call_1"
         assert conversation[-2]["type"] == "computer_call_output"
         assert conversation[-2]["output"]["detail"] == "low"
+        assert "click(10,20)" in conversation[-2]["output"]["summary"]
         assert conversation[-1]["role"] == "user"
-        assert "Coordinate reminder" in conversation[-1]["content"][0]["text"]
+        assert "坐标提醒" in conversation[-1]["content"][0]["text"]
         return {
             "output": [
                 {
@@ -402,6 +531,81 @@ def test_gui_agent_runner_executes_computer_call_until_final_message():
     assert "computer_use" in result.metadata["model_tools"]
     assert ("click", (10, 20, "left")) in backend.calls
     assert ("wait", (0.1,)) in backend.calls
+
+
+def test_gui_agent_runner_adds_local_crop_after_click_only_action():
+    class LocalCropScreen(FakeScreen):
+        def __init__(self) -> None:
+            self.local_requests: list[tuple[int, int, int]] = []
+
+        def screenshot_region_around(
+            self,
+            *,
+            x: int,
+            y: int,
+            radius: int = 180,
+            max_width: int = 720,
+            max_height: int = 720,
+        ) -> ScreenshotResult:
+            self.local_requests.append((x, y, radius))
+            return ScreenshotResult(
+                image_url="data:image/png;base64,LOCAL",
+                width=320,
+                height=240,
+            )
+
+    backend = FakeBackend()
+    screen = LocalCropScreen()
+    loop = ComputerLoop(backend=backend, screen=screen)
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=2)
+    task = GuiAgentTaskSpec(task_id="task_refine", instruction="Click target.")
+    saw_local_refinement = False
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal saw_local_refinement
+        if len(conversation) == 2:
+            return {
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_refine",
+                        "coordinate_space": "qwen_normalized_1000",
+                        "actions": [{"type": "click", "x": 500, "y": 500}],
+                    }
+                ]
+            }
+        saw_local_refinement = any(
+            any(
+                isinstance(part, dict)
+                and (
+                    "局部定位兜底"
+                    in str(part.get("text", ""))
+                    or part.get("image_url") == "data:image/png;base64,LOCAL"
+                )
+                for part in message.get("content", [])
+            )
+            for message in conversation
+            if isinstance(message, dict)
+        )
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert saw_local_refinement is True
+    assert screen.local_requests == [(400, 300, 520)]
+    local_refinement = result.metadata["step_records"][0]["metadata"][
+        "local_refinement"
+    ]
+    assert local_refinement["coordinate_space"] == "local_refinement_1000"
+    assert local_refinement["local_refinement_box"] == [0, 0, 800, 600]
 
 
 def test_gui_agent_runner_does_not_complete_on_truncated_text_tool_call():
@@ -599,6 +803,8 @@ def test_gui_agent_runner_handles_finish_subtask_tool_call():
                     }
                 ]
             }
+        assert conversation[-2]["type"] == "function_call"
+        assert conversation[-2]["name"] == "finish_subtask"
         assert conversation[-1]["type"] == "function_call_output"
         assert conversation[-1]["output"]["status"] == "accepted"
         return {
@@ -639,6 +845,8 @@ def test_gui_agent_runner_handles_human_help_tool_call():
                     }
                 ]
             }
+        assert conversation[-2]["type"] == "function_call"
+        assert conversation[-2]["name"] == "request_human_help"
         assert conversation[-1]["type"] == "function_call_output"
         assert conversation[-1]["output"]["status"] == "waiting_human"
         return {
@@ -818,7 +1026,7 @@ def test_gui_agent_runner_handles_action_macro_tool_call():
 
     def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
         if len(conversation) == 2:
-            assert "combo_asd" in conversation[0]["content"][0]["text"]
+            assert "combo_asd" in conversation[0]["content"][1]["text"]
             return {
                 "output": [
                     {
@@ -964,10 +1172,11 @@ def test_gui_agent_runner_keeps_stable_history_prefix_between_steps():
                     }
                 ]
             }
-        if len(conversation) == 4:
+        if len(conversation) == 5:
             assert conversation[1]["content"][1]["type"] == "input_image"
-            assert conversation[2]["type"] == "computer_call_output"
-            assert "Coordinate reminder" in conversation[3]["content"][0]["text"]
+            assert conversation[2]["type"] == "computer_call"
+            assert conversation[3]["type"] == "computer_call_output"
+            assert "坐标提醒" in conversation[4]["content"][0]["text"]
             return {
                 "output": [
                     {
@@ -989,10 +1198,41 @@ def test_gui_agent_runner_keeps_stable_history_prefix_between_steps():
     result = runner.run_task(task, agent)
 
     assert result.status == "completed"
-    assert conversation_lengths == [2, 4, 6]
+    assert conversation_lengths == [2, 5, 8]
     assert screenshot_output_counts == [0, 1, 2]
     assert developer_texts[0] == developer_texts[1] == developer_texts[2]
     assert result.metadata["prompt_context"]["selected_frame_count"] >= 3
+
+
+def test_gui_agent_runner_omits_inline_media_from_runtime_text_context():
+    loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=1)
+    captured: list[list[dict[str, Any]]] = []
+    task = GuiAgentTaskSpec(task_id="task_inline_context", instruction="Inspect.")
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        captured.append(conversation)
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }
+            ]
+        }
+
+    runner.run_task(task, agent)
+
+    runtime_text = "\n".join(
+        str(part.get("text", ""))
+        for part in captured[0][0]["content"]
+        if isinstance(part, dict) and part.get("type") == "input_text"
+    )
+    image_part = captured[0][1]["content"][1]
+    assert "data:image" not in runtime_text
+    assert "图片已作为 input_image 提供" in runtime_text
+    assert image_part["type"] == "input_image"
+    assert image_part["image_url"].startswith("data:image")
 
 
 def test_gui_agent_runner_clicks_inside_cropped_app_viewport():
@@ -1040,7 +1280,7 @@ def test_gui_agent_runner_clicks_inside_cropped_app_viewport():
                 ]
             }
         assert conversation[-2]["type"] == "computer_call_output"
-        assert "Coordinate reminder" in conversation[-1]["content"][0]["text"]
+        assert "坐标提醒" in conversation[-1]["content"][0]["text"]
         return {
             "output": [
                 {

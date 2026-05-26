@@ -3,13 +3,19 @@ from __future__ import annotations
 import json
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
+
+from PIL import Image, ImageChops, ImageStat
 
 from cfie_gui_agent.context import StepRecord
 
 VERIFICATION_OK = "ok"
 VERIFICATION_NO_SCREEN_CHANGE = "no_screen_change"
 VERIFICATION_REPEATED_ACTION = "repeated_action"
+VISUAL_CHANGE_THRESHOLD = 2.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -67,10 +73,19 @@ class StepVerifier:
             metadata["semantic_action_signature"] = semantic_signature
             metadata["semantic_repeated_action_count"] = semantic_repeated
             repeated = max(repeated, semantic_repeated)
+        elif step.action.get("type") == "computer_call":
+            self.recent_semantic_signatures.append("computer_other")
+            while len(self.recent_semantic_signatures) > self.max_repeated_semantic_actions:
+                self.recent_semantic_signatures.popleft()
 
         screen_changed: bool | None = None
         if step.before_ref and step.after_ref:
-            screen_changed = step.before_ref != step.after_ref
+            screen_changed, visual_difference = _screen_refs_changed(
+                step.before_ref,
+                step.after_ref,
+            )
+            if visual_difference is not None:
+                metadata["visual_difference"] = visual_difference
 
         status = VERIFICATION_OK
         if screen_changed is False:
@@ -156,3 +171,46 @@ def _semantic_action_signature(action: dict[str, Any]) -> str | None:
     if has_text and has_submit:
         return "computer_text_submit"
     return None
+
+
+def _screen_refs_changed(
+    before_ref: str,
+    after_ref: str,
+) -> tuple[bool, float | None]:
+    if before_ref == after_ref:
+        return False, 0.0
+    difference = _visual_difference(before_ref, after_ref)
+    if difference is None:
+        return before_ref != after_ref, None
+    return difference >= VISUAL_CHANGE_THRESHOLD, difference
+
+
+def _visual_difference(before_ref: str, after_ref: str) -> float | None:
+    before_path = _local_image_path(before_ref)
+    after_path = _local_image_path(after_ref)
+    if before_path is None or after_path is None:
+        return None
+    try:
+        with Image.open(before_path) as before_image, Image.open(after_path) as after_image:
+            before = before_image.convert("L").resize((64, 64))
+            after = after_image.convert("L").resize((64, 64))
+            diff = ImageChops.difference(before, after)
+            return float(ImageStat.Stat(diff).mean[0])
+    except Exception:
+        return None
+
+
+def _local_image_path(ref: str) -> Path | None:
+    parsed = urlparse(ref)
+    if parsed.scheme == "file":
+        path = Path(url2pathname(unquote(parsed.path)))
+        if parsed.netloc:
+            path = Path(f"//{parsed.netloc}{unquote(parsed.path)}")
+    elif not parsed.scheme:
+        path = Path(ref)
+    else:
+        return None
+    try:
+        return path if path.exists() else None
+    except OSError:
+        return None

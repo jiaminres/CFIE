@@ -14,7 +14,6 @@ MODEL_CALLABLE_TOOLS = (
     "ask_replan",
     "query_memory",
     "run_action_macro",
-    "submit_current_input",
     "navigate_to_target",
     "read_text_file",
     "append_trace_note",
@@ -127,7 +126,8 @@ def _default_description(tool_name: str) -> str:
         "computer_use": (
             "Perform validated desktop computer actions. For Qwen VL grounding, "
             "set coordinate_space to qwen_normalized_1000 and express mouse "
-            "coordinates on a 0..1000 image grid."
+            "coordinates on a 0..1000 image grid. Use local_refinement_1000 "
+            "only after the harness provides a local refinement crop."
         ),
         "read_image": "Read a referenced image artifact into model context.",
         "read_video_clip": "Read a bounded video clip or selected frame set.",
@@ -138,10 +138,6 @@ def _default_description(tool_name: str) -> str:
         "ask_replan": "Ask TaskManager to consider a task transition.",
         "query_memory": "Query workspace or business memory.",
         "run_action_macro": "Execute a registered low-latency action macro.",
-        "submit_current_input": (
-            "Submit the currently focused text input. Prefer this after typing "
-            "into a chat-style input when a visible send button should be pressed."
-        ),
         "navigate_to_target": (
             "Ask the harness to move a source element toward a target while "
             "avoiding model-identified obstacles."
@@ -167,11 +163,17 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
             {
                 "coordinate_space": {
                     "type": "string",
-                    "enum": ["qwen_normalized_1000", "screenshot"],
+                    "enum": [
+                        "qwen_normalized_1000",
+                        "local_refinement_1000",
+                        "screenshot",
+                    ],
                     "description": (
                         "Required. Use qwen_normalized_1000 for Qwen VL: "
                         "(0,0) is the current image top-left and "
-                        "(1000,1000) is bottom-right. Use screenshot only "
+                        "(1000,1000) is bottom-right. Use "
+                        "local_refinement_1000 only when the harness has just "
+                        "provided a local refinement crop. Use screenshot only "
                         "when actions are already in screenshot pixel coordinates."
                     ),
                 },
@@ -319,15 +321,6 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                 "stop_condition": {"type": "string"},
             },
             required=("macro_name",),
-        ),
-        "submit_current_input": _object_schema(
-            {
-                "method": {
-                    "type": "string",
-                    "enum": ["auto", "click_send_button", "enter"],
-                },
-                "reason": {"type": "string"},
-            },
         ),
         "navigate_to_target": _object_schema(
             {

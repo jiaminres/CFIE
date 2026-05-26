@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ast
 import json
 import re
 import subprocess
@@ -558,6 +559,11 @@ class GuiAgentDesktopClient(tk.Tk):
         self._timeline_images: list[Any] = []
         self._inspector_images: list[Any] = []
         self._selected_trace_event: Any | None = None
+        self._inspector_width = 500
+        self._inspector_min_width = 360
+        self._inspector_max_width = 980
+        self._inspector_resize_origin_x = 0
+        self._inspector_resize_origin_width = self._inspector_width
 
         self._setup_style()
         self._build_layout()
@@ -763,11 +769,14 @@ class GuiAgentDesktopClient(tk.Tk):
 
     def _build_layout(self) -> None:
         self.columnconfigure(1, weight=1)
+        self.columnconfigure(2, minsize=6)
+        self.columnconfigure(3, minsize=self._inspector_width)
         self.rowconfigure(0, weight=1)
         self._build_sidebar()
         self._build_chat_area()
         self._build_inspector()
         if not self.inspector_visible.get():
+            self.inspector_resize_handle.grid_remove()
             self.inspector.grid_remove()
 
     def _build_sidebar(self) -> None:
@@ -1081,8 +1090,45 @@ class GuiAgentDesktopClient(tk.Tk):
         send_button.after_idle(send_button.raise_widget)
 
     def _build_inspector(self) -> None:
+        self.inspector_resize_handle = tk.Canvas(
+            self,
+            width=6,
+            bg=self.colors["bg"],
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="sb_h_double_arrow",
+        )
+        self.inspector_resize_handle.grid(row=0, column=2, sticky="ns")
+        self.inspector_resize_handle.create_rectangle(
+            2,
+            0,
+            4,
+            5000,
+            fill=self.colors["line_soft"],
+            outline="",
+            tags="line",
+        )
+        self.inspector_resize_handle.bind("<ButtonPress-1>", self._start_inspector_resize)
+        self.inspector_resize_handle.bind("<B1-Motion>", self._drag_inspector_resize)
+        self.inspector_resize_handle.bind(
+            "<Enter>",
+            lambda _event: self.inspector_resize_handle.itemconfigure(
+                "line",
+                fill="#d8d3cd",
+            ),
+        )
+        self.inspector_resize_handle.bind(
+            "<Leave>",
+            lambda _event: self.inspector_resize_handle.itemconfigure(
+                "line",
+                fill=self.colors["line_soft"],
+            ),
+        )
+
         self.inspector = ttk.Frame(self, style="Surface.TFrame", padding=(14, 14))
-        self.inspector.grid(row=0, column=2, sticky="nsew")
+        self.inspector.configure(width=self._inspector_width)
+        self.inspector.grid(row=0, column=3, sticky="nsew")
+        self.inspector.grid_propagate(False)
         self.inspector.columnconfigure(0, weight=1)
         self.inspector.rowconfigure(2, weight=1)
 
@@ -1096,7 +1142,7 @@ class GuiAgentDesktopClient(tk.Tk):
             self.inspector,
             text="最近的模型意图、工具调用、验证结果与人工介入。",
             style="Hint.TLabel",
-            wraplength=330,
+            wraplength=self._detail_wraplength(90),
         ).grid(row=1, column=0, sticky="w", pady=(4, 12))
 
         collapse_button = CanvasButton(
@@ -1154,7 +1200,7 @@ class GuiAgentDesktopClient(tk.Tk):
             "<Configure>",
             lambda event: self.inspector_canvas.itemconfigure(
                 self.inspector_canvas_window,
-                width=event.width,
+                width=max(1, event.width),
             ),
         )
         self._bind_mousewheel_tree(inspector_list_holder, self.inspector_canvas)
@@ -1211,6 +1257,30 @@ class GuiAgentDesktopClient(tk.Tk):
         inspector_detail_shell.bind("<Configure>", redraw_inspector_detail)
         self.inspector_detail.configure(state="disabled")
         inspector_detail_shell.grid_remove()
+
+    def _start_inspector_resize(self, event: tk.Event[Any]) -> None:
+        self._inspector_resize_origin_x = int(event.x_root)
+        self._inspector_resize_origin_width = self._inspector_width
+
+    def _drag_inspector_resize(self, event: tk.Event[Any]) -> None:
+        delta = self._inspector_resize_origin_x - int(event.x_root)
+        self._set_inspector_width(self._inspector_resize_origin_width + delta)
+
+    def _set_inspector_width(self, width: int) -> None:
+        width = max(self._inspector_min_width, min(self._inspector_max_width, int(width)))
+        if width == self._inspector_width:
+            return
+        self._inspector_width = width
+        self.columnconfigure(3, minsize=width)
+        self.inspector.configure(width=width)
+        self.inspector_canvas.configure(scrollregion=self.inspector_canvas.bbox("all"))
+
+    def _detail_wraplength(self, reserved: int = 80) -> int:
+        canvas = getattr(self, "inspector_canvas", None)
+        width = canvas.winfo_width() if canvas is not None else 0
+        if width <= 1:
+            width = self._inspector_width
+        return max(240, width - reserved)
 
     def refresh_all(self) -> None:
         self.refresh_apps()
@@ -2012,7 +2082,6 @@ class GuiAgentDesktopClient(tk.Tk):
             "read_text_file": "读取清单",
             "record_workflow_result": "保存结果",
             "set_app_viewport": "记录视野",
-            "submit_current_input": "提交输入",
             "request_human_help": "请求人工处理",
             "finish_subtask": "完成任务",
         }.get(name, "处理信息")
@@ -2034,8 +2103,6 @@ class GuiAgentDesktopClient(tk.Tk):
             return f"{item_id} {status}".strip() or "结果已写入轨迹。"
         if name == "request_human_help":
             return "Agent 需要人工确认后再继续。"
-        if name == "submit_current_input":
-            return "已提交当前输入框中的内容。"
         return self._step_summary(payload)
 
     def _step_image_refs(self, payload: dict[str, Any]) -> tuple[str, ...]:
@@ -2908,10 +2975,12 @@ class GuiAgentDesktopClient(tk.Tk):
 
     def _toggle_inspector(self) -> None:
         if self.inspector_visible.get():
+            self.inspector_resize_handle.grid_remove()
             self.inspector.grid_remove()
             self.inspector_visible.set(False)
         else:
-            self.inspector.grid(row=0, column=2, sticky="nsew")
+            self.inspector_resize_handle.grid(row=0, column=2, sticky="ns")
+            self.inspector.grid(row=0, column=3, sticky="nsew")
             self.inspector_visible.set(True)
 
     def _start_selected_workflow_run(self) -> None:
@@ -3262,14 +3331,27 @@ class GuiAgentDesktopClient(tk.Tk):
             "\n".join(str(part) for part in (title, overview) if part),
         )
 
-        input_lines: list[str] = []
-        input_text = str(model_payload.get("input_text_preview") or "").strip()
-        if input_text:
-            input_lines.append(input_text)
+        request_context = model_payload.get("request_context")
+        if isinstance(request_context, list) and request_context:
+            latest_context = self._latest_request_context_items(request_context)
+            if latest_context:
+                self._add_detail_request_context_section(
+                    "最新新增输入",
+                    latest_context,
+                    collapsed=False,
+                    include_note=False,
+                )
+            self._add_detail_request_context_section(
+                "完整请求上下文",
+                request_context,
+                collapsed=True,
+                include_note=True,
+            )
         elif event.kind == "step":
-            input_lines.append("当前轨迹没有记录完整文本输入；下方截图为本轮操作前传给模型的界面证据。")
-        if input_lines:
-            self._add_detail_text_section("本轮输入文本", "\n\n".join(input_lines))
+            self._add_detail_text_section(
+                "最新新增输入",
+                "当前轨迹没有记录完整请求上下文；下方截图为本轮操作前传给模型的界面证据。",
+            )
 
         screenshot_refs = self._detail_screenshot_refs(event)
         if screenshot_refs:
@@ -3290,23 +3372,13 @@ class GuiAgentDesktopClient(tk.Tk):
             if reasoning:
                 self._add_detail_text_section("思考", reasoning)
             response_object = model_payload.get("response_object")
-            response_output_summary = ""
             if response_object is not None:
-                response_output_summary = self._format_response_protocol_output(
-                    response_object
-                )
-                if response_output_summary:
-                    self._add_detail_text_section("Responses 输出", response_output_summary)
-                self._add_detail_text_section(
+                self._add_detail_json_section(
                     "Responses 返回对象",
-                    json.dumps(
-                        response_object,
-                        ensure_ascii=False,
-                        indent=2,
-                        default=str,
-                    ),
+                    response_object,
+                    collapsed=True,
                 )
-            if visible_text and not response_output_summary:
+            if visible_text and response_object is None:
                 self._add_detail_text_section("模型文字输出", visible_text)
             elif response_object is None and output_text:
                 self._add_detail_text_section("模型原始输出", output_text)
@@ -3346,10 +3418,548 @@ class GuiAgentDesktopClient(tk.Tk):
             fg=self.colors["ink"],
             anchor="w",
             justify="left",
-            wraplength=360,
+            wraplength=self._detail_wraplength(70),
             font=("Microsoft YaHei UI", 9),
         ).pack(fill="x", pady=(7, 0))
         self._bind_mousewheel_tree(card, self.inspector_canvas)
+
+    def _add_detail_collapsible_section(
+        self,
+        title: str,
+        build_body: Any,
+        *,
+        parent: tk.Widget | None = None,
+        subtitle: str = "",
+        collapsed: bool = True,
+    ) -> None:
+        parent = parent or self.inspector_list_frame
+        card = tk.Frame(
+            parent,
+            bg="#fbfbfa",
+            padx=12,
+            pady=10,
+            highlightthickness=1,
+            highlightbackground=self.colors["line_soft"],
+        )
+        card.pack(fill="x", pady=(0, 10))
+        header = tk.Frame(card, bg="#fbfbfa")
+        header.pack(fill="x")
+        text_holder = tk.Frame(header, bg="#fbfbfa")
+        text_holder.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            text_holder,
+            text=title,
+            bg="#fbfbfa",
+            fg=self.colors["ink"],
+            anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(fill="x")
+        if subtitle:
+            subtitle_label = tk.Label(
+                text_holder,
+                text=subtitle,
+                bg="#fbfbfa",
+                fg=self.colors["muted"],
+                anchor="w",
+                justify="left",
+                wraplength=self._detail_wraplength(120),
+                font=("Microsoft YaHei UI", 8),
+            )
+            subtitle_label.pack(fill="x", pady=(3, 0))
+            subtitle_label.bind(
+                "<Configure>",
+                lambda _event, label=subtitle_label: label.configure(
+                    wraplength=self._detail_wraplength(120)
+                ),
+            )
+        button_text = tk.StringVar(value="展开" if collapsed else "收起")
+        body = tk.Frame(card, bg="#fbfbfa")
+        built = {"value": False}
+
+        def ensure_body() -> None:
+            if built["value"]:
+                return
+            build_body(body)
+            built["value"] = True
+            self._bind_mousewheel_tree(card, self.inspector_canvas)
+            self.inspector_canvas.configure(scrollregion=self.inspector_canvas.bbox("all"))
+
+        def toggle() -> None:
+            if body.winfo_manager():
+                body.pack_forget()
+                button_text.set("展开")
+            else:
+                ensure_body()
+                body.pack(fill="x", pady=(10, 0))
+                button_text.set("收起")
+            self.inspector_canvas.configure(scrollregion=self.inspector_canvas.bbox("all"))
+
+        tk.Button(
+            header,
+            textvariable=button_text,
+            command=toggle,
+            bg="#f3f2f0",
+            fg=self.colors["ink"],
+            activebackground="#ece9e5",
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            font=("Microsoft YaHei UI", 8),
+        ).pack(side="right", padx=(8, 0))
+        if not collapsed:
+            ensure_body()
+            body.pack(fill="x", pady=(10, 0))
+        self._bind_mousewheel_tree(card, self.inspector_canvas)
+
+    def _add_detail_json_section(
+        self,
+        title: str,
+        value: Any,
+        *,
+        parent: tk.Widget | None = None,
+        collapsed: bool = True,
+    ) -> None:
+        def build(body: tk.Frame) -> None:
+            self._add_json_tree(body, value)
+
+        self._add_detail_collapsible_section(
+            title,
+            build,
+            parent=parent,
+            subtitle=self._json_root_summary(value),
+            collapsed=collapsed,
+        )
+
+    def _add_json_tree(self, parent: tk.Widget, value: Any) -> None:
+        if isinstance(value, dict):
+            if not value:
+                self._add_nested_text_block(parent, "空对象", "{}")
+                return
+            for key, child in value.items():
+                self._add_json_node(parent, str(key), child)
+            return
+        if isinstance(value, list):
+            if not value:
+                self._add_nested_text_block(parent, "空数组", "[]")
+                return
+            for index, child in enumerate(value):
+                self._add_json_node(parent, f"[{index}]", child)
+            return
+        self._add_nested_text_block(parent, "值", self._format_json_scalar(value))
+
+    def _add_json_node(self, parent: tk.Widget, label: str, value: Any) -> None:
+        if isinstance(value, (dict, list)):
+            self._add_detail_collapsible_section(
+                label,
+                lambda body, child=value: self._add_json_tree(body, child),
+                parent=parent,
+                subtitle=self._json_root_summary(value),
+                collapsed=True,
+            )
+            return
+        if isinstance(value, str):
+            prose, parsed_json = self._split_json_tail(value)
+            if parsed_json is not None:
+                if prose:
+                    self._add_nested_text_block(parent, f"{label} / 文本", prose)
+                    json_label = f"{label} / JSON"
+                else:
+                    json_label = label
+                self._add_detail_collapsible_section(
+                    json_label,
+                    lambda body, child=parsed_json: self._add_json_tree(body, child),
+                    parent=parent,
+                    subtitle=self._json_root_summary(parsed_json),
+                    collapsed=True,
+                )
+                return
+        parsed = self._try_parse_json_text(value)
+        if parsed is not None:
+            self._add_detail_collapsible_section(
+                label,
+                lambda body, child=parsed: self._add_json_tree(body, child),
+                parent=parent,
+                subtitle=self._json_root_summary(parsed),
+                collapsed=True,
+            )
+            return
+        self._add_nested_text_block(parent, label, self._format_json_scalar(value))
+
+    @staticmethod
+    def _json_root_summary(value: Any) -> str:
+        if isinstance(value, dict):
+            keys = list(value.keys())
+            if not keys:
+                return "JSON 对象，0 个字段。"
+            head = "、".join(str(key) for key in keys[:4])
+            suffix = "..." if len(keys) > 4 else ""
+            return f"JSON 对象，{len(keys)} 个字段：{head}{suffix}"
+        if isinstance(value, list):
+            return f"JSON 数组，{len(value)} 项。"
+        return "JSON 标量。"
+
+    @staticmethod
+    def _format_json_scalar(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    def _add_json_text_widget(self, parent: tk.Widget, text: str) -> None:
+        line_count = max(4, min(22, text.count("\n") + 1))
+        shell = tk.Frame(parent, bg="#fbfbfa")
+        shell.pack(fill="x")
+        widget = tk.Text(
+            shell,
+            height=line_count,
+            wrap="none",
+            bg="#ffffff",
+            fg=self.colors["ink"],
+            relief="flat",
+            padx=8,
+            pady=8,
+            font=("Consolas", 8),
+            highlightthickness=1,
+            highlightbackground=self.colors["line_soft"],
+        )
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+        widget.pack(side="left", fill="x", expand=True)
+        scroll = ttk.Scrollbar(shell, orient="vertical", command=widget.yview)
+        scroll.pack(side="right", fill="y")
+        widget.configure(yscrollcommand=scroll.set)
+        self._bind_mousewheel_tree(shell, self.inspector_canvas)
+
+    def _add_detail_request_context_section(
+        self,
+        title: str,
+        request_context: list[Any],
+        *,
+        collapsed: bool = True,
+        include_note: bool = True,
+    ) -> None:
+        def build(body: tk.Frame) -> None:
+            if include_note:
+                self._add_nested_text_block(
+                    body,
+                    "说明",
+                    "这是本轮真正发送给 Responses API 的标准化 input。图片和视频只显示占位符，避免把 base64 当作文本渲染。",
+                )
+            for index, item in enumerate(request_context, start=1):
+                if isinstance(item, dict):
+                    self._add_request_context_item(body, index, item)
+                else:
+                    self._add_detail_json_section(
+                        f"第 {index} 条",
+                        item,
+                        parent=body,
+                        collapsed=True,
+                    )
+
+        self._add_detail_collapsible_section(
+            title,
+            build,
+            subtitle=f"{len(request_context)} 条 input item；system、user、tool 分开显示。",
+            collapsed=collapsed,
+        )
+
+    def _add_request_context_item(
+        self,
+        parent: tk.Widget,
+        index: int,
+        item: dict[str, Any],
+    ) -> None:
+        role = str(item.get("role") or self._request_item_role(item))
+        item_type = str(item.get("type") or "item")
+        title = f"第 {index} 条 / {self._role_label(role)} / {item_type}"
+        subtitle = self._request_item_summary(item)
+
+        def build(body: tk.Frame) -> None:
+            if item_type == "message":
+                content = item.get("content")
+                if isinstance(content, list):
+                    counts = self._request_content_type_counts(content)
+                    seen: dict[str, int] = {}
+                    for part in content:
+                        part_type = (
+                            str(part.get("type") or "")
+                            if isinstance(part, dict)
+                            else "part"
+                        )
+                        seen[part_type] = seen.get(part_type, 0) + 1
+                        self._add_request_content_part(
+                            body,
+                            part,
+                            counts=counts,
+                            ordinal=seen[part_type],
+                        )
+                    return
+                if isinstance(content, str):
+                    self._add_text_or_json_block(body, "content", content)
+                    return
+            if item_type == "function_call_output":
+                output = item.get("output")
+                parsed = self._try_parse_json_text(output)
+                if parsed is not None:
+                    self._add_detail_json_section(
+                        "工具结果 output",
+                        parsed,
+                        parent=body,
+                        collapsed=True,
+                    )
+                else:
+                    self._add_text_or_json_block(body, "工具结果 output", str(output or ""))
+                return
+            self._add_detail_json_section("原始 item", item, parent=body, collapsed=True)
+
+        self._add_detail_collapsible_section(
+            title,
+            build,
+            parent=parent,
+            subtitle=subtitle,
+            collapsed=True,
+        )
+
+    def _add_request_content_part(
+        self,
+        parent: tk.Widget,
+        part: Any,
+        *,
+        counts: dict[str, int] | None = None,
+        ordinal: int = 1,
+    ) -> None:
+        if not isinstance(part, dict):
+            self._add_text_or_json_block(parent, "内容", str(part))
+            return
+        counts = counts or {}
+        part_type = str(part.get("type") or "part")
+        if part_type == "input_text":
+            label = self._content_part_label("文本内容", counts, part_type, ordinal)
+            self._add_text_or_json_block(
+                parent,
+                label,
+                str(part.get("text") or ""),
+            )
+            return
+        if part_type in {"input_image", "input_video"}:
+            key = "image_url" if part_type == "input_image" else "video_url"
+            base_label = "图片内容" if part_type == "input_image" else "视频内容"
+            label = self._content_part_label(base_label, counts, part_type, ordinal)
+            self._add_nested_text_block(
+                parent,
+                label,
+                self._format_media_placeholder(part.get(key)),
+            )
+            return
+        self._add_detail_json_section(
+            self._content_part_label(part_type, counts, part_type, ordinal),
+            part,
+            parent=parent,
+            collapsed=True,
+        )
+
+    @staticmethod
+    def _request_content_type_counts(content: list[Any]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for part in content:
+            part_type = (
+                str(part.get("type") or "part")
+                if isinstance(part, dict)
+                else "part"
+            )
+            counts[part_type] = counts.get(part_type, 0) + 1
+        return counts
+
+    @staticmethod
+    def _content_part_label(
+        base_label: str,
+        counts: dict[str, int],
+        part_type: str,
+        ordinal: int,
+    ) -> str:
+        total = counts.get(part_type, 0)
+        if total <= 1:
+            return base_label
+        return f"{base_label} {ordinal}/{total}"
+
+    def _latest_request_context_items(
+        self,
+        request_context: list[Any],
+    ) -> list[Any]:
+        latest: list[Any] = []
+        for item in reversed(request_context):
+            if not isinstance(item, dict):
+                if not latest:
+                    latest.append(item)
+                break
+            item_type = str(item.get("type") or "")
+            role = str(item.get("role") or self._request_item_role(item))
+            if role in {"assistant", "system", "developer"}:
+                if latest:
+                    break
+                continue
+            if item_type in {"function_call", "tool_call", "computer_call"}:
+                if latest:
+                    break
+                continue
+            latest.append(item)
+            if len(latest) >= 3:
+                break
+        return list(reversed(latest))
+
+    def _add_text_or_json_block(
+        self,
+        parent: tk.Widget,
+        title: str,
+        text: str,
+    ) -> None:
+        prose, parsed_json = self._split_json_tail(text)
+        if prose:
+            self._add_nested_text_block(parent, title, prose)
+        elif parsed_json is None:
+            self._add_nested_text_block(parent, title, text)
+        if parsed_json is not None:
+            json_title = title if not prose else f"{title} / JSON"
+            self._add_detail_json_section(
+                json_title,
+                parsed_json,
+                parent=parent,
+                collapsed=True,
+            )
+
+    def _add_nested_text_block(self, parent: tk.Widget, title: str, text: str) -> None:
+        if not str(text).strip():
+            return
+        block = tk.Frame(parent, bg="#ffffff", padx=10, pady=8)
+        block.pack(fill="x", pady=(0, 8))
+        block.configure(highlightthickness=1, highlightbackground=self.colors["line_soft"])
+        tk.Label(
+            block,
+            text=title,
+            bg="#ffffff",
+            fg=self.colors["muted"],
+            anchor="w",
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(fill="x")
+        text_label = tk.Label(
+            block,
+            text=str(text),
+            bg="#ffffff",
+            fg=self.colors["ink"],
+            anchor="w",
+            justify="left",
+            wraplength=self._detail_wraplength(110),
+            font=("Microsoft YaHei UI", 8),
+        )
+        text_label.pack(fill="x", pady=(5, 0))
+        text_label.bind(
+            "<Configure>",
+            lambda _event, label=text_label: label.configure(
+                wraplength=self._detail_wraplength(110)
+            ),
+        )
+        self._bind_mousewheel_tree(block, self.inspector_canvas)
+
+    def _split_json_tail(self, text: str) -> tuple[str, Any | None]:
+        raw = str(text or "").strip()
+        if not raw:
+            return "", None
+        parsed = self._try_parse_json_text(raw)
+        if parsed is not None:
+            return "", parsed
+        for index, char in enumerate(raw):
+            if char not in "{[":
+                continue
+            prefix = raw[:index].strip()
+            suffix = raw[index:].strip()
+            parsed = self._try_parse_json_text(suffix)
+            if parsed is not None:
+                return prefix, parsed
+        return raw, None
+
+    @staticmethod
+    def _try_parse_json_text(value: Any) -> Any | None:
+        if not isinstance(value, str):
+            return value if isinstance(value, (dict, list)) else None
+        stripped = value.strip()
+        if not stripped or stripped[0] not in "{[":
+            return None
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (SyntaxError, ValueError, TypeError):
+                return None
+            return parsed if isinstance(parsed, (dict, list)) else None
+
+    @staticmethod
+    def _request_item_role(item: dict[str, Any]) -> str:
+        item_type = str(item.get("type") or "")
+        if item_type in {"function_call_output", "computer_call_output"}:
+            return "tool"
+        if item_type in {"function_call", "tool_call", "computer_call"}:
+            return "assistant"
+        return item_type or "unknown"
+
+    @staticmethod
+    def _role_label(role: str) -> str:
+        return {
+            "system": "系统",
+            "developer": "开发者",
+            "user": "用户",
+            "assistant": "模型",
+            "tool": "工具",
+            "function_call_output": "工具结果",
+        }.get(role, role)
+
+    def _request_item_summary(self, item: dict[str, Any]) -> str:
+        item_type = str(item.get("type") or "")
+        if item_type == "message":
+            content = item.get("content")
+            if isinstance(content, list):
+                text_count = sum(
+                    1
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "input_text"
+                )
+                image_count = sum(
+                    1
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "input_image"
+                )
+                video_count = sum(
+                    1
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "input_video"
+                )
+                return f"文本 {text_count} 段 / 图片 {image_count} 张 / 视频 {video_count} 段"
+        if item_type in {"function_call_output", "computer_call_output"}:
+            return f"call_id={item.get('call_id', '')}".strip()
+        return ""
+
+    @staticmethod
+    def _format_media_placeholder(value: Any) -> str:
+        if isinstance(value, dict):
+            parts = [str(value.get("placeholder") or "[媒体]")]
+            for key, label in (
+                ("source_type", "来源"),
+                ("mime_type", "类型"),
+                ("bytes", "字节"),
+                ("path", "路径"),
+                ("sha256", "sha256"),
+                ("chars", "字符"),
+            ):
+                if value.get(key) not in (None, ""):
+                    parts.append(f"{label}: {value.get(key)}")
+            return "\n".join(parts)
+        return str(value or "[媒体]")
 
     def _add_detail_image_section(self, title: str, image_refs: tuple[tuple[str, str], ...]) -> None:
         card = tk.Frame(

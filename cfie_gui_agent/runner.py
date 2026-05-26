@@ -2,18 +2,13 @@ from __future__ import annotations
 
 import json
 import re
-import base64
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from io import BytesIO
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
-from urllib.parse import unquote, urlparse
 
-from PIL import Image
-
-from cfie_client import ComputerAction, ComputerCall, ComputerLoop, find_computer_calls
+from cfie_client import ComputerCall, ComputerLoop, find_computer_calls
 
 from cfie_gui_agent.agent_tools import (
     AgentToolError,
@@ -37,7 +32,11 @@ from cfie_gui_agent.runtime_context import RuntimeContextBuilder
 from cfie_gui_agent.specs import GuiAgentResult, GuiAgentTaskSpec
 from cfie_gui_agent.tools import ModelToolRegistry, ToolRegistryError
 from cfie_gui_agent.trace import AgentTraceStore
-from cfie_gui_agent.verifier import StepVerifier, VERIFICATION_REPEATED_ACTION
+from cfie_gui_agent.verifier import (
+    StepVerifier,
+    VERIFICATION_NO_SCREEN_CHANGE,
+    VERIFICATION_REPEATED_ACTION,
+)
 
 
 class ResponseAgent(Protocol):
@@ -64,6 +63,7 @@ class GuiAgentRunner:
     response_json_warning_chars: int = 12000
     response_latency_warning_seconds: float = 10.0
     refresh_runtime_context_each_step: bool = False
+    max_repair_turns: int = 4
     human_loop: HumanLoopManager = field(
         default_factory=lambda: HumanLoopManager(channel=InMemoryHumanChannel())
     )
@@ -91,7 +91,8 @@ class GuiAgentRunner:
                 ),
             )
 
-        for step in range(1, self.max_steps + 1):
+        max_model_turns = self.max_steps + max(0, self.max_repair_turns)
+        for step in range(1, max_model_turns + 1):
             if self.include_runtime_context and self.refresh_runtime_context_each_step:
                 conversation[0] = self._runtime_context_message(
                     job_board=job_board,
@@ -161,9 +162,134 @@ class GuiAgentRunner:
                 )
                 computer_calls = ()
                 agent_tool_calls = (human_help_override, *agent_tool_calls)
+            conflicting_tools = _mentioned_agent_tools_in_text(
+                _extract_response_text(response) or "",
+                self.tool_registry.allowed_tool_names,
+            )
+            if conflicting_tools and computer_calls and not agent_tool_calls:
+                recovered_agent_calls = _recover_agent_tool_calls_from_text_intent(
+                    step=step,
+                    text=_extract_response_text(response) or "",
+                    tool_names=conflicting_tools,
+                    job=job_board.jobs[active_job_id],
+                    trace_store=self.trace_store,
+                )
+                if recovered_agent_calls:
+                    self.trace_store.record(
+                        "tool_call_safety_override",
+                        {
+                            "step": step,
+                            "reason": "recovered_agent_tool_intent",
+                            "recovered_tools": [
+                                call.name for call in recovered_agent_calls
+                            ],
+                            "preview": (_extract_response_text(response) or "")[:500],
+                        },
+                    )
+                    computer_calls = ()
+                    agent_tool_calls = (*recovered_agent_calls, *agent_tool_calls)
+                else:
+                    self.trace_store.record(
+                        "tool_call_parse_retry",
+                        {
+                            "step": step,
+                            "reason": "agent_tool_intent_with_computer_action",
+                            "mentioned_tools": list(conflicting_tools),
+                            "preview": (_extract_response_text(response) or "")[:500],
+                        },
+                    )
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "Your text said the next step requires the "
+                                        f"Agent tool {', '.join(conflicting_tools)}, "
+                                        "but the returned structured call was "
+                                        "computer_use. Do not use mouse clicks or "
+                                        "keyboard actions as a substitute for Agent "
+                                        "tools. Return exactly one function_call now. "
+                                        "The function_call name must be one of: "
+                                        f"{', '.join(conflicting_tools)}. Put all "
+                                        "parameters in that tool's arguments. Do not "
+                                        "return computer_use in this repair turn."
+                                    ),
+                                }
+                            ],
+                        }
+                    )
+                    continue
+
+            computer_calls, agent_tool_calls = _select_single_tool_turn(
+                step=step,
+                computer_calls=computer_calls,
+                agent_tool_calls=agent_tool_calls,
+                trace_store=self.trace_store,
+            )
+            if _workflow_input_read_is_required(
+                job_board.jobs[active_job_id],
+                conversation=conversation,
+            ) and computer_calls:
+                input_path = job_board.jobs[active_job_id].metadata.get("input_path")
+                self.trace_store.record(
+                    "workflow_input_read_required",
+                    {
+                        "step": step,
+                        "input_path": str(input_path or ""),
+                        "blocked_computer_calls": len(computer_calls),
+                        "blocked_agent_tools": [call.name for call in agent_tool_calls],
+                    },
+                )
+                conversation.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "当前任务配置了输入清单，但你还没有读取清单正文。"
+                                    "在执行任何电脑操作或记录结果之前，必须先调用 "
+                                    f"read_text_file 读取：{input_path}。"
+                                    "只返回这一个工具调用，不要调用 computer_use。"
+                                ),
+                            }
+                        ],
+                    }
+                )
+                continue
 
             if not computer_calls and not agent_tool_calls:
                 final_text = _extract_response_text(response)
+                running = job_board.jobs[active_job_id].queues.running
+                if running is not None and not (final_text or "").strip():
+                    self.trace_store.record(
+                        "tool_call_parse_retry",
+                        {
+                            "step": step,
+                            "reason": "empty_response_without_tool_call",
+                            "preview": "",
+                        },
+                    )
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "The previous response did not contain "
+                                        "any executable tool call or final text. "
+                                        "The task is still active. Return exactly "
+                                        "one complete tool call now. Do not spend "
+                                        "the response budget on reasoning only."
+                                    ),
+                                }
+                            ],
+                        }
+                    )
+                    continue
                 if _looks_like_incomplete_tool_call(final_text):
                     self.trace_store.record(
                         "tool_call_parse_retry",
@@ -244,6 +370,13 @@ class GuiAgentRunner:
                     ),
             )
 
+            _append_assistant_tool_context(
+                conversation,
+                response=response,
+                computer_calls=computer_calls,
+                agent_tool_calls=agent_tool_calls,
+            )
+
             for call in computer_calls:
                 self.tool_registry.validate_model_tool("computer_use")
                 try:
@@ -297,7 +430,9 @@ class GuiAgentRunner:
                     context_store.append_step(active_job_id, record)
                     self.trace_store.record_step(record)
                     continue
-                conversation.append(output.to_openai_dict())
+                conversation.append(
+                    _computer_call_output_context_item(output, call=call)
+                )
                 conversation.append(_coordinate_bounds_message(self.computer_loop.screen))
                 running = job_board.jobs[active_job_id].queues.running
                 record = StepRecord(
@@ -313,6 +448,15 @@ class GuiAgentRunner:
                 )
                 verification = self.step_verifier.verify(record)
                 record.metadata["verification"] = verification.to_dict()
+                local_refinement = _local_click_refinement_message(
+                    computer_loop=self.computer_loop,
+                    call=call,
+                    verification_status=verification.status,
+                    image_detail=self.image_detail,
+                )
+                if local_refinement is not None:
+                    conversation.append(local_refinement["message"])
+                    record.metadata["local_refinement"] = local_refinement["metadata"]
                 if not verification.is_ok:
                     record = replace(
                         record,
@@ -414,23 +558,6 @@ class GuiAgentRunner:
                             )
                         )
                 if (
-                    call.name == "submit_current_input"
-                    and output.get("status") == "accepted"
-                ):
-                    screenshot_ref = str(output.get("screenshot_image_url") or "")
-                    if screenshot_ref:
-                        current_frame_ref = screenshot_ref
-                        conversation.append(
-                            _screen_observation_message(
-                                text=(
-                                    "Input submitted. The next image is the "
-                                    "current APP screenshot after submission."
-                                ),
-                                image_url=screenshot_ref,
-                                image_detail=self.image_detail,
-                            )
-                        )
-                if (
                     call.name == "finish_subtask"
                     and output.get("status") == "accepted"
                 ):
@@ -484,8 +611,11 @@ class GuiAgentRunner:
         return GuiAgentResult(
             task_id=task.task_id,
             status="max_steps_exceeded",
-            reason=f"Exceeded max_steps={self.max_steps}",
-            steps=self.max_steps,
+            reason=(
+                f"Exceeded max_steps={self.max_steps} "
+                f"and max_repair_turns={self.max_repair_turns}"
+            ),
+            steps=len(step_records),
             metadata=self._build_result_metadata(
                 job_board=job_board,
                 context_store=context_store,
@@ -702,18 +832,6 @@ class GuiAgentRunner:
                 ],
             }
 
-        if call.name == "submit_current_input":
-            method = str(arguments.get("method") or "auto")
-            result = _submit_current_input(
-                self.computer_loop,
-                method=method,
-                call_id=call.call_id,
-            )
-            return {
-                **result,
-                "reason": arguments.get("reason", ""),
-            }
-
         if call.name == "navigate_to_target":
             try:
                 request = NavigationRequest.from_arguments(arguments)
@@ -812,9 +930,16 @@ class GuiAgentRunner:
         viewport_note = ""
         if viewport:
             viewport_note = (
-                "\n\nScreenshot viewport: "
+                "\n\n截图视口："
                 f"{json.dumps(viewport, ensure_ascii=False, sort_keys=True)}"
             )
+        viewport_guidance = (
+            "如果有效应用区域只占截图的一部分，先调用 "
+            "set_app_viewport 写入应用轮廓；后续截图和点击坐标"
+            "都会使用裁剪后的应用视口。"
+            if self.tool_registry.is_model_callable("set_app_viewport")
+            else "应用视口由客户端和 harness 维护；不要调用或假设存在视口裁剪工具。"
+        )
         content: list[dict[str, Any]] = [
             {
                 "type": "input_text",
@@ -828,9 +953,7 @@ class GuiAgentRunner:
                     'coordinate_space="qwen_normalized_1000"，并使用 0..1000 '
                     "归一化图像坐标；左上角是 (0,0)，右下角是 "
                     "(1000,1000)。不要使用物理屏幕坐标。"
-                    "如果有效应用区域只占截图的一部分，先调用 "
-                    "set_app_viewport 写入应用轮廓；后续截图和点击坐标"
-                    "都会使用裁剪后的应用视口。"
+                    f"{viewport_guidance}"
                     f"{viewport_note}"
                 ),
             },
@@ -864,6 +987,13 @@ class GuiAgentRunner:
             ensure_ascii=False,
             sort_keys=True,
         )
+        viewport_rule = (
+            "当 APP 区域清晰后，尽早调用 set_app_viewport，后续截图会裁剪到"
+            "活动应用区域，使每轮新增 prefill 尽量接近 2096/4192 token 预算。"
+            if self.tool_registry.is_model_callable("set_app_viewport")
+            else "应用视口由客户端或 harness 负责裁剪；当前工具列表没有 "
+            "set_app_viewport 时，不要在输出中计划或调用它。"
+        )
         return {
             "type": "message",
             "role": "developer",
@@ -871,29 +1001,22 @@ class GuiAgentRunner:
                 {
                     "type": "input_text",
                     "text": (
-                        "Runtime context JSON for this GUI Agent turn. Follow "
-                        "this state instead of inventing task queues.\n"
-                        "Efficiency policy: keep every response concise. Do not "
-                        "describe screenshots or videos unless that description is "
-                        "the actual task result. Prefer tool calls over prose. "
-                        "Do not emit long thinking text. Do not write visible "
-                        "'previous state' or 'next action' text before a tool call; "
-                        "when an action is needed, emit the tool call only. "
-                        "For record_workflow_result, "
-                        "send only item_id, output_text, status, reason, and "
-                        "artifact_refs unless other fields are truly needed. "
-                        "If thinking is enabled, keep it to two short clauses: "
-                        "previous state and next action. Keep each new turn's "
-                        "extra text minimal so prefix cache can reuse the stable "
-                        "conversation prefix. Historical screenshots already in "
-                        "the conversation should stay stable and be reused by KV "
-                        "cache; each new step should add only one operation-result "
-                        "keyframe plus a small tool/result message. Use "
-                        "set_app_viewport once the APP region is clear, so later "
-                        "screenshots crop to the active application and each turn's "
-                        "new prefill delta stays near the 2096/4192-token budget.\n"
-                        f"{runtime_context_json}"
+                        "运行规则：下面另一段 content 是本轮 GUI Agent 的运行状态 JSON，"
+                        "你必须以该状态为准，不要自行编造任务队列或工具状态。\n"
+                        "效率要求：回复保持简短。除非截图或视频描述本身就是任务结果，"
+                        "否则不要复述画面内容。需要行动时优先调用工具，不要在工具调用前"
+                        "输出可见的“上一步状态”或“下一步计划”。不要输出长篇思考；"
+                        "如果启用思考，只保留两个短句：上一步状态和下一步动作。"
+                        "调用 record_workflow_result 时，除非确有必要，只传 item_id、"
+                        "output_text、status、reason、artifact_refs。每轮新增文本要尽量少，"
+                        "让 prefix cache 复用稳定历史；历史截图已经在对话中，不要重复描述。"
+                        "每一步只新增必要的操作结果关键帧和简短工具结果。"
+                        f"{viewport_rule}"
                     ),
+                },
+                {
+                    "type": "input_text",
+                    "text": runtime_context_json,
                 }
             ],
         }
@@ -927,7 +1050,7 @@ class GuiAgentRunner:
                 if running is not None
                 else None
             ),
-            "current_frame": current_frame_ref,
+            "current_frame": _model_context_ref(current_frame_ref),
             "screen_viewport": _screen_viewport_context(self.computer_loop.screen),
             "context_budget": self.context_manager.policy.to_dict(),
             "recent_steps": [
@@ -936,7 +1059,7 @@ class GuiAgentRunner:
                     "summary": _short_text(step.summary or "", 160),
                     "result": step.result,
                     "tags": list(step.tags),
-                    "after_ref": step.after_ref,
+                    "after_ref": _model_context_ref(step.after_ref),
                 }
                 for step in recent_steps
             ],
@@ -1103,11 +1226,10 @@ def _coordinate_bounds_message(screen: Any) -> dict[str, Any]:
             {
                 "type": "input_text",
                 "text": (
-                    "Coordinate reminder for the next computer_use: "
-                    f"{_screen_bounds_text(screen)}. For Qwen VL, set "
-                    'coordinate_space="qwen_normalized_1000" and use 0..1000 '
-                    "normalized image coordinates. Do not use physical screen "
-                    "coordinates."
+                    "坐标提醒：下一次 computer_use 的当前截图范围是 "
+                    f"{_screen_bounds_text(screen)}。Qwen VL 必须设置 "
+                    'coordinate_space="qwen_normalized_1000"，并使用 0..1000 '
+                    "归一化图像坐标；不要使用物理屏幕坐标。"
                 ),
             }
         ],
@@ -1130,6 +1252,130 @@ def _screen_observation_message(
             image_part["detail"] = image_detail
         content.append(image_part)
     return {"type": "message", "role": "user", "content": content}
+
+
+def _local_click_refinement_message(
+    *,
+    computer_loop: ComputerLoop,
+    call: Any,
+    verification_status: str,
+    image_detail: str | None,
+) -> dict[str, Any] | None:
+    if verification_status not in {
+        VERIFICATION_NO_SCREEN_CHANGE,
+        VERIFICATION_REPEATED_ACTION,
+    }:
+        return None
+    if not _is_click_only_call(call):
+        return None
+    screen = computer_loop.screen
+    point = _last_click_logical_point(call, screen)
+    if point is None:
+        return None
+    local_box = _local_refinement_logical_box(point, screen, radius=520)
+    screenshot_region_around = getattr(screen, "screenshot_region_around", None)
+    if not callable(screenshot_region_around):
+        return None
+    try:
+        crop = screenshot_region_around(x=point[0], y=point[1], radius=520)
+    except Exception:
+        return None
+    set_local_refinement_box = getattr(computer_loop, "set_local_refinement_box", None)
+    if callable(set_local_refinement_box):
+        set_local_refinement_box(local_box)
+    text = (
+        "局部定位兜底：上一次点击可能有轻微偏差。下一张图是以上次尝试点击点"
+        f" x={point[0]}, y={point[1]} 为中心的高清局部截图，坐标仍来自当前"
+        "截图坐标系。请先在这个局部图中重新确认目标位置，再决定下一次"
+        " computer_use。若下一次鼠标操作基于局部图定位，必须设置 "
+        'coordinate_space="local_refinement_1000"；harness 会把局部 0..1000 '
+        "坐标转换回完整截图坐标。"
+    )
+    return {
+        "message": _screen_observation_message(
+            text=text,
+            image_url=crop.image_url,
+            image_detail=image_detail,
+        ),
+        "metadata": {
+            "attempted_click": {"x": point[0], "y": point[1]},
+            "local_refinement_box": list(local_box),
+            "coordinate_space": "local_refinement_1000",
+            "crop_width": crop.width,
+            "crop_height": crop.height,
+            "reason": verification_status,
+        },
+    }
+
+
+def _is_click_only_call(call: Any) -> bool:
+    actions = getattr(call, "actions", ())
+    if not actions:
+        return False
+    return all(getattr(action, "type", "") in {"click", "double_click"} for action in actions)
+
+
+def _last_click_logical_point(call: Any, screen: Any) -> tuple[int, int] | None:
+    actions = list(getattr(call, "actions", ()) or ())
+    for action in reversed(actions):
+        if getattr(action, "type", "") not in {"click", "double_click", "move"}:
+            continue
+        x = getattr(action, "x", None)
+        y = getattr(action, "y", None)
+        if x is None or y is None:
+            continue
+        return _map_model_point_to_logical_screen(
+            int(x),
+            int(y),
+            coordinate_space=str(getattr(call, "coordinate_space", "") or "screenshot"),
+            screen=screen,
+        )
+    return None
+
+
+def _map_model_point_to_logical_screen(
+    x: int,
+    y: int,
+    *,
+    coordinate_space: str,
+    screen: Any,
+) -> tuple[int, int]:
+    try:
+        width, height = screen.size()
+    except Exception:
+        return (x, y)
+    if width <= 0 or height <= 0:
+        return (x, y)
+    if coordinate_space == "qwen_normalized_1000":
+        return (
+            max(0, min(width - 1, int(round(x * width / 1000)))),
+            max(0, min(height - 1, int(round(y * height / 1000)))),
+        )
+    return (
+        max(0, min(width - 1, x)),
+        max(0, min(height - 1, y)),
+    )
+
+
+def _local_refinement_logical_box(
+    point: tuple[int, int],
+    screen: Any,
+    *,
+    radius: int,
+) -> tuple[int, int, int, int]:
+    try:
+        width, height = screen.size()
+    except Exception:
+        width, height = (0, 0)
+    if width <= 0 or height <= 0:
+        x, y = point
+        return (max(0, x - radius), max(0, y - radius), radius * 2, radius * 2)
+    x, y = point
+    left = max(0, x - radius)
+    top = max(0, y - radius)
+    right = min(width, x + radius)
+    bottom = min(height, y + radius)
+    return (left, top, max(1, right - left), max(1, bottom - top))
 
 
 def _set_screen_viewport(
@@ -1173,244 +1419,6 @@ def _set_screen_viewport(
     }
 
 
-def _submit_current_input(
-    computer_loop: ComputerLoop,
-    *,
-    method: str,
-    call_id: str,
-) -> dict[str, Any]:
-    normalized_method = method if method in {"auto", "click_send_button", "enter"} else "auto"
-    if normalized_method == "enter":
-        return _execute_submit_call(
-            computer_loop,
-            call_id=call_id,
-            actions=(ComputerAction(type="keypress", keys=("ENTER",)),),
-            method="enter",
-            detected=False,
-        )
-
-    try:
-        screenshot = computer_loop.screen.screenshot()
-        image = _decode_image_url_to_pil(screenshot.image_url)
-        point = _detect_chat_send_point(image)
-    except Exception as exc:
-        point = None
-        detect_error = f"{type(exc).__name__}: {exc}"
-    else:
-        detect_error = ""
-
-    if point is not None:
-        x, y = point
-        model_x, model_y = _screenshot_point_to_loop_model_point(
-            computer_loop,
-            x=x,
-            y=y,
-        )
-        return _execute_submit_call(
-            computer_loop,
-            call_id=call_id,
-            actions=(
-                ComputerAction(
-                    type="click",
-                    x=model_x,
-                    y=model_y,
-                    button="left",
-                ),
-            ),
-            method="click_send_button",
-            detected=True,
-            screenshot_point=(x, y),
-        )
-
-    if normalized_method == "click_send_button":
-        return {
-            "status": "rejected",
-            "tool": "submit_current_input",
-            "method": normalized_method,
-            "reason": f"send button was not detected: {detect_error}",
-        }
-    return _execute_submit_call(
-        computer_loop,
-        call_id=call_id,
-        actions=(ComputerAction(type="keypress", keys=("ENTER",)),),
-        method="enter",
-        detected=False,
-        detection_error=detect_error,
-    )
-
-
-def _execute_submit_call(
-    computer_loop: ComputerLoop,
-    *,
-    call_id: str,
-    actions: tuple[ComputerAction, ...],
-    method: str,
-    detected: bool,
-    screenshot_point: tuple[int, int] | None = None,
-    detection_error: str = "",
-) -> dict[str, Any]:
-    output = computer_loop.handle_call(
-        ComputerCall(
-            call_id=f"{call_id}:submit_current_input",
-            actions=actions,
-            coordinate_space=getattr(
-                computer_loop,
-                "model_coordinate_mode",
-                "screenshot",
-            ),
-        )
-    )
-    payload: dict[str, Any] = {
-        "status": "accepted",
-        "tool": "submit_current_input",
-        "method": method,
-        "detected_send_button": detected,
-        "screenshot_image_url": output.output.image_url,
-    }
-    if screenshot_point is not None:
-        payload["screenshot_point"] = list(screenshot_point)
-    if detection_error:
-        payload["detection_error"] = detection_error
-    return payload
-
-
-def _screenshot_point_to_loop_model_point(
-    computer_loop: ComputerLoop,
-    *,
-    x: int,
-    y: int,
-) -> tuple[int, int]:
-    mode = getattr(computer_loop, "model_coordinate_mode", "screenshot")
-    if mode != "qwen_normalized_1000":
-        return (x, y)
-    width, height = computer_loop.screen.size()
-    if width <= 0 or height <= 0:
-        return (x, y)
-    return (
-        max(0, min(1000, int(round(x * 1000 / width)))),
-        max(0, min(1000, int(round(y * 1000 / height)))),
-    )
-
-
-def _decode_image_url_to_pil(image_url: str) -> Image.Image:
-    parsed = urlparse(image_url)
-    if parsed.scheme == "data":
-        header, encoded = image_url.split(",", 1)
-        if ";base64" not in header:
-            raise ValueError("data image URL must be base64 encoded")
-        return Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB")
-    if parsed.scheme == "file":
-        path_text = unquote(parsed.path)
-        if re.match(r"^/[A-Za-z]:/", path_text):
-            path_text = path_text[1:]
-        return Image.open(Path(path_text)).convert("RGB")
-    raise ValueError(f"unsupported screenshot URL scheme: {parsed.scheme}")
-
-
-def _detect_chat_send_point(image: Image.Image) -> tuple[int, int] | None:
-    width, height = image.size
-    if width <= 0 or height <= 0:
-        return None
-    components = _connected_components_for_pixels(
-        image,
-        x_range=(int(width * 0.20), int(width * 0.90)),
-        y_range=(int(height * 0.55), height),
-        predicate=_looks_like_input_border_pixel,
-        min_pixels=10,
-    )
-    candidates: list[tuple[float, tuple[int, int]]] = []
-    for area, x1, y1, x2, y2 in components:
-        box_width = x2 - x1 + 1
-        box_height = y2 - y1 + 1
-        if box_width < 30 or box_height > 12:
-            continue
-        if y2 < int(height * 0.82):
-            continue
-        point = (max(0, x2 - 14), max(0, min(height - 1, y2 - 14)))
-        score = x2 * 2 + y2 + min(area, 300) * 0.01
-        candidates.append((score, point))
-    if candidates:
-        return max(candidates, key=lambda item: item[0])[1]
-
-    icon_components = _connected_components_for_pixels(
-        image,
-        x_range=(int(width * 0.35), int(width * 0.95)),
-        y_range=(int(height * 0.70), height),
-        predicate=_looks_like_submit_icon_pixel,
-        min_pixels=5,
-    )
-    icon_candidates: list[tuple[float, tuple[int, int]]] = []
-    for area, x1, y1, x2, y2 in icon_components:
-        box_width = x2 - x1 + 1
-        box_height = y2 - y1 + 1
-        if box_width <= 2 and box_height > 18:
-            continue
-        if box_height <= 2 and box_width > 30:
-            continue
-        if box_width > 80 or box_height > 80:
-            continue
-        center = ((x1 + x2) // 2, (y1 + y2) // 2)
-        score = center[0] * 2 + center[1] + min(area, 200) * 0.02
-        icon_candidates.append((score, center))
-    if icon_candidates:
-        return max(icon_candidates, key=lambda item: item[0])[1]
-    return None
-
-
-def _looks_like_input_border_pixel(rgb: tuple[int, int, int]) -> bool:
-    r, g, b = rgb
-    return b > 165 and g > 145 and r > 100 and b - r > 15 and b - g >= -10
-
-
-def _looks_like_submit_icon_pixel(rgb: tuple[int, int, int]) -> bool:
-    r, g, b = rgb
-    if b > 120 and g > 80 and r < 180 and b - r > 20:
-        return True
-    return max(r, g, b) < 235 and max(r, g, b) - min(r, g, b) < 80
-
-
-def _connected_components_for_pixels(
-    image: Image.Image,
-    *,
-    x_range: tuple[int, int],
-    y_range: tuple[int, int],
-    predicate: Callable[[tuple[int, int, int]], bool],
-    min_pixels: int,
-) -> list[tuple[int, int, int, int, int]]:
-    pixels = image.load()
-    x_start, x_stop = x_range
-    y_start, y_stop = y_range
-    x_start = max(0, min(image.width, x_start))
-    x_stop = max(x_start, min(image.width, x_stop))
-    y_start = max(0, min(image.height, y_start))
-    y_stop = max(y_start, min(image.height, y_stop))
-    mask: set[tuple[int, int]] = set()
-    for y in range(y_start, y_stop):
-        for x in range(x_start, x_stop):
-            if predicate(pixels[x, y]):
-                mask.add((x, y))
-    seen: set[tuple[int, int]] = set()
-    components: list[tuple[int, int, int, int, int]] = []
-    for point in tuple(mask):
-        if point in seen:
-            continue
-        stack = [point]
-        seen.add(point)
-        xs: list[int] = []
-        ys: list[int] = []
-        while stack:
-            x, y = stack.pop()
-            xs.append(x)
-            ys.append(y)
-            for neighbor in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-                if neighbor in mask and neighbor not in seen:
-                    seen.add(neighbor)
-                    stack.append(neighbor)
-        if len(xs) >= min_pixels:
-            components.append((len(xs), min(xs), min(ys), max(xs), max(ys)))
-    return components
-
-
 def _viewport_screenshot_to_physical(
     screen: Any,
     crop_box: tuple[int, int, int, int],
@@ -1443,24 +1451,58 @@ def _viewport_screenshot_to_physical(
 
 
 def _workflow_item_defaults(job: JobState, item_id: str) -> dict[str, str]:
-    if not item_id:
+    item = _current_workflow_item(job, item_id=item_id)
+    if item is None:
         return {}
+    return {
+        "input_text": item.input_text,
+        "expected_output": item.expected_output,
+    }
+
+
+def _current_workflow_item(job: JobState, item_id: str = "") -> Any | None:
     input_path = job.metadata.get("input_path")
     if not input_path:
-        return {}
+        return None
     try:
         from cfie_gui_agent.workflow import load_workflow_items
 
         items = load_workflow_items(str(input_path))
     except (OSError, ValueError, json.JSONDecodeError):
-        return {}
+        return None
+    if item_id:
+        for item in items:
+            if item.item_id == item_id:
+                return item
+        return None
     for item in items:
-        if item.item_id == item_id:
-            return {
-                "input_text": item.input_text,
-                "expected_output": item.expected_output,
-            }
-    return {}
+        return item
+    return None
+
+
+def _next_unrecorded_workflow_item(
+    job: JobState,
+    *,
+    trace_store: AgentTraceStore,
+) -> Any | None:
+    input_path = job.metadata.get("input_path")
+    if not input_path:
+        return None
+    try:
+        from cfie_gui_agent.workflow import load_workflow_items
+
+        items = load_workflow_items(str(input_path))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    recorded = {
+        str(event.payload.get("item_id") or "")
+        for event in trace_store.events
+        if event.kind == "workflow_result"
+    }
+    for item in items:
+        if item.item_id not in recorded:
+            return item
+    return items[-1] if items else None
 
 
 def _maybe_record_final_workflow_result(
@@ -1500,6 +1542,216 @@ def _maybe_record_final_workflow_result(
     return payload
 
 
+def _append_assistant_tool_context(
+    conversation: list[dict[str, Any]],
+    *,
+    response: Any,
+    computer_calls: tuple[ComputerCall, ...],
+    agent_tool_calls: tuple[AgentToolCall, ...],
+) -> None:
+    if not computer_calls and not agent_tool_calls:
+        return
+    conversation.extend(
+        _assistant_tool_context_items(
+            response=response,
+            computer_calls=computer_calls,
+            agent_tool_calls=agent_tool_calls,
+        )
+    )
+
+
+def _assistant_tool_context_items(
+    *,
+    response: Any,
+    computer_calls: tuple[ComputerCall, ...],
+    agent_tool_calls: tuple[AgentToolCall, ...],
+) -> list[dict[str, Any]]:
+    wanted_call_ids = {
+        str(call.call_id)
+        for call in (*computer_calls, *agent_tool_calls)
+        if str(call.call_id)
+    }
+    output_items = tuple(_read_field(response, "output", response) or ())
+    context_items: list[dict[str, Any]] = []
+    included_call_ids: set[str] = set()
+
+    for item in output_items:
+        item_type = _read_field(item, "type")
+        if item_type not in {"function_call", "tool_call", "computer_call"}:
+            continue
+        call_id = str(_read_field(item, "call_id", _read_field(item, "id", "")))
+        if call_id not in wanted_call_ids:
+            continue
+        context_items.append(_plain_response_item(item))
+        included_call_ids.add(call_id)
+
+    for call in computer_calls:
+        if call.call_id not in included_call_ids:
+            context_items.append(_computer_call_as_function_call_item(call))
+            included_call_ids.add(call.call_id)
+    for call in agent_tool_calls:
+        if call.call_id not in included_call_ids:
+            context_items.append(_agent_call_as_function_call_item(call))
+            included_call_ids.add(call.call_id)
+    return context_items
+
+
+def _select_single_tool_turn(
+    *,
+    step: int,
+    computer_calls: tuple[ComputerCall, ...],
+    agent_tool_calls: tuple[AgentToolCall, ...],
+    trace_store: AgentTraceStore,
+) -> tuple[tuple[ComputerCall, ...], tuple[AgentToolCall, ...]]:
+    total_calls = len(computer_calls) + len(agent_tool_calls)
+    if total_calls <= 1:
+        return computer_calls, agent_tool_calls
+
+    if agent_tool_calls:
+        kept_computer_calls: tuple[ComputerCall, ...] = ()
+        kept_agent_tool_calls = (agent_tool_calls[0],)
+        kept = {
+            "kind": "agent_tool",
+            "name": kept_agent_tool_calls[0].name,
+            "call_id": kept_agent_tool_calls[0].call_id,
+        }
+    else:
+        kept_computer_calls = (computer_calls[0],)
+        kept_agent_tool_calls = ()
+        kept = {
+            "kind": "computer_use",
+            "name": "computer_use",
+            "call_id": kept_computer_calls[0].call_id,
+        }
+
+    dropped = [
+        {"kind": "computer_use", "name": "computer_use", "call_id": call.call_id}
+        for call in computer_calls
+        if call not in kept_computer_calls
+    ]
+    dropped.extend(
+        {"kind": "agent_tool", "name": call.name, "call_id": call.call_id}
+        for call in agent_tool_calls
+        if call not in kept_agent_tool_calls
+    )
+    trace_store.record(
+        "parallel_tool_call_pruned",
+        {
+            "step": step,
+            "kept": kept,
+            "dropped": dropped,
+        },
+    )
+    return kept_computer_calls, kept_agent_tool_calls
+
+
+def _workflow_input_read_is_required(
+    job: JobState,
+    *,
+    conversation: list[dict[str, Any]],
+) -> bool:
+    if not job.metadata.get("input_path"):
+        return False
+    return not _workflow_input_has_been_read(conversation)
+
+
+def _workflow_input_has_been_read(conversation: list[dict[str, Any]]) -> bool:
+    read_call_ids: set[str] = set()
+    for item in conversation:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in {"function_call", "tool_call"} and item.get("name") == "read_text_file":
+            call_id = str(item.get("call_id") or item.get("id") or "")
+            if call_id:
+                read_call_ids.add(call_id)
+        elif item_type == "function_call_output":
+            call_id = str(item.get("call_id") or "")
+            if call_id in read_call_ids:
+                return True
+    return False
+
+
+def _plain_response_item(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        result = dict(item)
+    elif hasattr(item, "model_dump"):
+        result = item.model_dump(exclude_none=True)
+    else:
+        result = {
+            "type": _read_field(item, "type"),
+            "call_id": _read_field(item, "call_id", _read_field(item, "id", "")),
+            "name": _read_field(item, "name", ""),
+            "arguments": _read_field(item, "arguments", {}),
+        }
+    arguments = result.get("arguments")
+    if arguments is not None and not isinstance(arguments, str):
+        result["arguments"] = json.dumps(arguments, ensure_ascii=False)
+    return result
+
+
+def _computer_call_as_function_call_item(call: ComputerCall) -> dict[str, Any]:
+    arguments: dict[str, Any] = {
+        "actions": [action.to_openai_dict() for action in call.actions],
+    }
+    if call.coordinate_space is not None:
+        arguments["coordinate_space"] = call.coordinate_space
+    return {
+        "type": "function_call",
+        "name": "computer_use",
+        "call_id": call.call_id,
+        "arguments": json.dumps(arguments, ensure_ascii=False),
+    }
+
+
+def _computer_call_output_context_item(
+    output: Any,
+    *,
+    call: ComputerCall,
+) -> dict[str, Any]:
+    item = output.to_openai_dict()
+    output_payload = item.get("output")
+    if isinstance(output_payload, dict):
+        output_payload["summary"] = _computer_action_summary(call)
+    return item
+
+
+def _computer_action_summary(call: ComputerCall) -> str:
+    parts: list[str] = []
+    for action in call.actions:
+        action_type = action.type
+        if action_type in {"click", "double_click", "move"}:
+            parts.append(f"{action_type}({action.x},{action.y})")
+        elif action_type == "type":
+            text = (action.text or "").replace("\n", " ")
+            if len(text) > 80:
+                text = text[:77] + "..."
+            parts.append(f"type({text!r})")
+        elif action_type == "keypress":
+            parts.append("keypress(" + "+".join(action.keys) + ")")
+        elif action_type == "wait":
+            parts.append(f"wait({action.duration or 0:g}s)")
+        elif action_type == "scroll":
+            parts.append(f"scroll({action.scroll_x},{action.scroll_y})")
+        elif action_type == "drag":
+            parts.append(f"drag({len(action.path)} points)")
+        else:
+            parts.append(action_type)
+    return "Executed actions: " + "; ".join(parts)
+
+
+def _agent_call_as_function_call_item(call: AgentToolCall) -> dict[str, Any]:
+    raw = _plain_response_item(call.raw) if call.raw else {}
+    if raw.get("type") in {"function_call", "tool_call"}:
+        return raw
+    return {
+        "type": "function_call",
+        "name": call.name,
+        "call_id": call.call_id,
+        "arguments": json.dumps(call.arguments, ensure_ascii=False),
+    }
+
+
 def _build_model_response_metrics(
     response: Any,
     *,
@@ -1537,9 +1789,16 @@ def _build_model_response_metrics(
             tool_argument_chars += len(arguments)
     function_call_count += text_tool_call_count
     try:
-        response_json = json.dumps(response, ensure_ascii=False, default=str)
+        request_debug = _read_field(response, "_cfie_request_debug", None)
+        response_for_json = _response_without_private_debug(response)
+        response_json = json.dumps(
+            response_for_json,
+            ensure_ascii=False,
+            default=str,
+        )
         response_object = json.loads(response_json)
     except TypeError:
+        request_debug = None
         response_json = str(response)
         response_object = {"repr": response_json[:4000]}
     warnings: list[str] = []
@@ -1569,9 +1828,25 @@ def _build_model_response_metrics(
         "message_count": message_count,
         "function_call_count": function_call_count,
         "input_text_preview": input_text_preview,
+        "request_context": (
+            request_debug.get("input", [])
+            if isinstance(request_debug, dict)
+            else []
+        ),
+        "request_payload_debug": request_debug if isinstance(request_debug, dict) else {},
         **usage,
         "warnings": warnings,
     }
+
+
+def _response_without_private_debug(response: Any) -> Any:
+    if isinstance(response, dict):
+        return {
+            key: value
+            for key, value in response.items()
+            if not str(key).startswith("_cfie_")
+        }
+    return response
 
 
 def _extract_response_usage(response: Any) -> dict[str, int]:
@@ -1616,6 +1891,16 @@ def _conversation_text_preview(conversation: list[dict[str, Any]]) -> str:
             if text:
                 texts.append(text)
     return _short_text("\n\n".join(texts), 1600)
+
+
+def _model_context_ref(ref: str | None) -> str | None:
+    if not ref:
+        return ref
+    if ref.startswith("data:image/"):
+        return "<内联图片已从文本中省略；图片已作为 input_image 提供>"
+    if ref.startswith("data:video/"):
+        return "<inline video omitted from text; provided as input_video>"
+    return ref
 
 
 def _extract_response_text(response: Any) -> str | None:
@@ -1689,6 +1974,151 @@ def _looks_like_unexecuted_tool_plan(
         "工具",
     )
     return any(marker in lower for marker in call_markers)
+
+
+def _mentioned_agent_tools_in_text(
+    text: str | None,
+    tool_names: tuple[str, ...],
+) -> tuple[str, ...]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return ()
+    lower = stripped.lower()
+    mentioned = [
+        tool_name
+        for tool_name in tool_names
+        if tool_name
+        and tool_name != "computer_use"
+        and tool_name.lower() in lower
+    ]
+    if (
+        "record_workflow_result" in tool_names
+        and _has_workflow_result_evidence(stripped)
+        and (
+            re.search(r"(记录|保存).{0,20}(结果|答案|任务|状态)", stripped)
+            or re.search(
+                r"\b(record|save).{0,30}(result|answer|status)\b",
+                lower,
+            )
+        )
+    ):
+        mentioned.append("record_workflow_result")
+    if "finish_subtask" in tool_names and re.search(
+        r"(结束|完成).{0,12}(任务|子任务|流程)",
+        stripped,
+    ):
+        mentioned.append("finish_subtask")
+    if not mentioned and not _looks_like_unexecuted_tool_plan(stripped, tool_names):
+        return ()
+    return tuple(dict.fromkeys(mentioned))
+
+
+def _recover_agent_tool_calls_from_text_intent(
+    *,
+    step: int,
+    text: str,
+    tool_names: tuple[str, ...],
+    job: JobState,
+    trace_store: AgentTraceStore,
+) -> tuple[AgentToolCall, ...]:
+    """Recover obvious Agent tool calls when Qwen wraps intent as computer_use.
+
+    This is intentionally conservative: it only reconstructs workflow bookkeeping
+    tools from explicit text intent. UI actions still require a real computer_use
+    call from the model.
+    """
+
+    requested = set(tool_names)
+    calls: list[AgentToolCall] = []
+    if "record_workflow_result" in requested:
+        if not _has_workflow_result_evidence(text):
+            return ()
+        item = _next_unrecorded_workflow_item(job, trace_store=trace_store)
+        item_id = str(getattr(item, "item_id", "") or "").strip()
+        output_text = _extract_workflow_output_from_text(text)
+        if item_id and output_text:
+            status = "failed" if _looks_like_failed_workflow_result(text) else "passed"
+            calls.append(
+                AgentToolCall(
+                    name="record_workflow_result",
+                    call_id=f"call_recovered_record_{step}",
+                    arguments={
+                        "item_id": item_id,
+                        "output_text": output_text,
+                        "status": status,
+                        "reason": _short_text(text, 320),
+                    },
+                )
+            )
+    if "finish_subtask" in requested:
+        calls.append(
+            AgentToolCall(
+                name="finish_subtask",
+                call_id=f"call_recovered_finish_{step}",
+                arguments={"completion_reason": _short_text(text, 240)},
+            )
+        )
+    return tuple(calls)
+
+
+def _has_workflow_result_evidence(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if re.search(r"等待.{0,12}(输出|回答|结果).{0,12}(后|再)?记录", stripped):
+        return False
+    return bool(
+        re.search(
+            r"(已得到|已获取|已收到|得到|收到|显示|回复|回答|答案|失败|无法|不能)",
+            stripped,
+        )
+        or re.search(
+            r"\b(got|received|showed|shows|answered|answer|result|failed|unable|cannot)\b",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_failed_workflow_result(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(failed|失败|无法访问|不能访问|区域限制|不可用|无法观看|无法完成)",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _extract_workflow_output_from_text(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped:
+        return ""
+    if _looks_like_failed_workflow_result(stripped):
+        return _short_text(stripped, 180)
+    patterns = (
+        r"答案[是为：:\s]*[“\"']([^”\"'，。；;\n]+)[”\"']?",
+        r"\banswer\s*(?:is|=|:)\s*[“\"']?([^”\"'，。；;\n]+)[”\"']?",
+        r"output_text[\"']?\s*[:=]\s*[\"']([^\"']+)[\"']",
+        r"(\d+(?:\.\d+)?)\s*(?:studio albums?|albums?|张专辑|张录音室专辑|首|本|次)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, stripped, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        sentence_number = re.match(
+            r"^(\d+(?:\.\d+)?)(?:\.\s+(?:next|then|record|call)\b|$)",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if sentence_number:
+            return sentence_number.group(1)
+        number_match = re.fullmatch(r"(\d+(?:\.\d+)?)(?:\s+\S.*)?", value)
+        if number_match and re.search(r"\d", value):
+            return number_match.group(1)
+        return _short_text(value, 120)
+    return ""
 
 
 def _human_help_call_from_text(

@@ -179,6 +179,7 @@ def test_build_workflow_run_command_uses_manual_viewport():
     assert command[command.index("--screenshot-crop") + 1] == "10,20,800,500"
     assert "--focus-window-title-pattern" not in command
     assert command[command.index("--item-limit") + 1] == "2"
+    assert command[command.index("--max-steps") + 1] == "20"
     assert command[command.index("--result-json") + 1] == "runs/result.json"
 
 
@@ -219,8 +220,11 @@ def test_build_workflow_run_command_defaults_to_data_screenshot_urls():
 
     command = build_workflow_run_command(config, python_executable="python")
 
-    assert command[command.index("--screenshot-url-mode") + 1] == "data"
+    assert command[command.index("--screenshot-url-mode") + 1] == "file"
     assert command[command.index("--screenshot-grid") + 1] == "off"
+    assert command[command.index("--screenshot-max-width") + 1] == "1920"
+    assert command[command.index("--screenshot-max-height") + 1] == "1080"
+    assert command[command.index("--image-detail") + 1] == "high"
 
 
 def test_completed_workflow_hides_stale_running_card():

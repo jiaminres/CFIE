@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,7 @@ MOUSE_ACTION_TYPES = frozenset(
 COORDINATE_SPACES = (
     "screenshot",
     "qwen_normalized_1000",
+    "local_refinement_1000",
     "auto",
 )
 
@@ -135,7 +137,7 @@ class ComputerAction:
             _read_field(value, "duration", _read_field(value, "timeout", None)),
         )
 
-        if action_type in {"click", "double_click", "move", "scroll"}:
+        if action_type in {"click", "double_click", "move"}:
             x = _require_int(x, "x")
             y = _require_int(y, "y")
         else:
@@ -230,6 +232,7 @@ def _normalize_action_payload(value: Any) -> Any:
         "input_text": "type",
         "text": "type",
         "key": "keypress",
+        "keys": "keypress",
         "key_press": "keypress",
         "press": "keypress",
         "hotkey": "keypress",
@@ -295,7 +298,7 @@ class ComputerCall:
         actions = tuple(ComputerAction.from_openai(action) for action in actions_raw)
         coordinate_space = _read_field(value, "coordinate_space")
         if coordinate_space is not None:
-            coordinate_space = str(coordinate_space).strip()
+            coordinate_space = _normalize_coordinate_space(coordinate_space)
             if coordinate_space not in COORDINATE_SPACES:
                 raise ProtocolError(
                     "computer_call.coordinate_space must be one of "
@@ -330,6 +333,17 @@ class ComputerCall:
         if self.id is not None:
             payload["id"] = self.id
         return payload
+
+
+def _normalize_coordinate_space(value: Any) -> str:
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        try:
+            decoded = json.loads(text) if text[0] == '"' else text[1:-1]
+        except json.JSONDecodeError:
+            decoded = text[1:-1]
+        text = str(decoded).strip()
+    return text
 
 
 @dataclass(slots=True, frozen=True)

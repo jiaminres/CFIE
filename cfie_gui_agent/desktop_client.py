@@ -202,6 +202,8 @@ class DesktopClientState:
         executable_path: str = r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         window_title_pattern: str = ".*",
         limit: int | None = None,
+        reasoning_effort: str = "none",
+        max_output_tokens: int | None = None,
         record_trace: bool = True,
     ) -> dict[str, Any]:
         from cfie_gui_agent.workflow import (
@@ -224,6 +226,14 @@ class DesktopClientState:
             process_name=process_name,
             executable_path=executable_path,
             window_title_pattern=window_title_pattern,
+        )
+        config = replace(
+            config,
+            metadata={
+                **config.metadata,
+                "reasoning_effort": reasoning_effort,
+                "max_output_tokens": max_output_tokens,
+            },
         )
         self.add_target_app(config)
         if config.job_id not in self.job_board.jobs:
@@ -250,6 +260,8 @@ class DesktopClientState:
                 "executable_path": executable_path,
                 "window_title_pattern": window_title_pattern,
                 "first_item_id": items[0].item_id,
+                "reasoning_effort": reasoning_effort,
+                "max_output_tokens": max_output_tokens,
             },
         )
         manifest_path = write_run_manifest(run, items=items)
@@ -404,6 +416,9 @@ def build_workflow_run_command(
         raw_limit = metadata.get("expected_item_count")
         if isinstance(raw_limit, int):
             resolved_limit = raw_limit
+    effective_max_steps = max_steps
+    if resolved_limit is not None:
+        effective_max_steps = max(effective_max_steps, int(resolved_limit) * 8 + 4)
 
     command = [
         python_executable,
@@ -425,25 +440,25 @@ def build_workflow_run_command(
         "--chrome-path",
         executable_path,
         "--max-steps",
-        str(max_steps),
+        str(effective_max_steps),
         "--max-output-tokens",
         str(max_output_tokens),
         "--tool-profile",
         "workflow",
         "--reasoning-effort",
-        "none",
+        str(metadata.get("reasoning_effort") or "none"),
         "--screenshot-max-width",
-        str(metadata.get("screenshot_max_width") or 960),
+            str(metadata.get("screenshot_max_width") or 1920),
         "--screenshot-max-height",
-        str(metadata.get("screenshot_max_height") or 540),
+            str(metadata.get("screenshot_max_height") or 1080),
         "--screenshot-jpeg-quality",
-        str(metadata.get("screenshot_jpeg_quality") or 85),
+        str(metadata.get("screenshot_jpeg_quality") or 90),
         "--screenshot-url-mode",
-        str(metadata.get("screenshot_url_mode") or "data"),
+        str(metadata.get("screenshot_url_mode") or "file"),
         "--screenshot-grid",
         str(metadata.get("screenshot_grid") or "off"),
         "--image-detail",
-        str(metadata.get("image_detail") or "low"),
+        str(metadata.get("image_detail") or "high"),
     ]
     if resolved_limit is not None:
         command.extend(["--item-limit", str(max(1, int(resolved_limit)))])
@@ -518,11 +533,14 @@ def parse_macro_sequence(sequence: str) -> tuple[tuple[str, ...], ...]:
 def run_desktop_client(
     *,
     state: DesktopClientState | None = None,
+    auto_start: bool = False,
 ) -> None:
     from cfie_gui_agent.desktop_client_ui import GuiAgentDesktopClient
 
     app_state = state if state is not None else DesktopClientState()
     app = GuiAgentDesktopClient(app_state)
+    if auto_start:
+        app.after(800, app._start_selected_workflow_run)
     app.mainloop()
 
 
@@ -542,10 +560,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window-title-pattern", default=".*")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
+        "--reasoning-effort",
+        choices=("none", "low", "medium", "high"),
+        default="none",
+    )
+    parser.add_argument("--max-output-tokens", type=int, default=None)
+    parser.add_argument(
         "--load-trace",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Load existing trace events from --trace-path before opening the UI.",
+    )
+    parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        help="Start the selected configured workflow after the client opens.",
     )
     return parser
 
@@ -584,6 +613,8 @@ def build_initial_state(args: argparse.Namespace) -> DesktopClientState:
         executable_path=args.executable_path,
         window_title_pattern=args.window_title_pattern,
         limit=args.limit,
+        reasoning_effort=args.reasoning_effort,
+        max_output_tokens=args.max_output_tokens,
         record_trace=record_trace,
     )
     if args.load_trace and trace_exists:
@@ -593,7 +624,7 @@ def build_initial_state(args: argparse.Namespace) -> DesktopClientState:
 
 def main() -> None:
     args = build_parser().parse_args()
-    run_desktop_client(state=build_initial_state(args))
+    run_desktop_client(state=build_initial_state(args), auto_start=args.auto_start)
 
 
 if __name__ == "__main__":

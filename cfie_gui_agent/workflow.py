@@ -136,9 +136,9 @@ def build_workflow_task_description(
             "执行规则：",
             "1. 打开目标网页应用，确认已经进入可输入任务内容的界面。",
             "2. 逐条读取输入清单中的 input_text/question 字段，并输入到网页应用。",
-            "3. 每次输入后必须提交。网页聊天应用在完成 type 后，优先调用 submit_current_input 让 harness 点击发送按钮；Enter 只作为备选。提交后等待输出完成，再采集输出文本、截图和必要的视频证据。",
-            "4. 如果输入框已经可见，并且已经知道 input_text，不要只点击输入框；先用 computer_use 完成 click/type，再用 submit_current_input 提交。",
-            "5. 如果输入框里已经有待发送文本，不要再次输入同一段文字；下一步应调用 submit_current_input。不要连续重复同一个点击动作；如果两次点击后仍无法输入或提交，应调用 request_human_help。",
+            "3. 每次输入后必须提交。网页聊天应用在完成 type 后，用 computer_use 点击可见发送按钮；如果应用明确支持 Enter 发送，也可以用 computer_use 发送 Enter。",
+            "4. 如果输入框已经可见，并且已经知道 input_text，不要只点击输入框；先用 computer_use 完成 click/type，再用 computer_use 提交。",
+            "5. 如果输入框里已经有待发送文本，不要再次输入同一段文字；下一步应提交或等待输出。不要连续重复同一个点击动作；如果两次点击后仍无法输入或提交，应调用 request_human_help。",
             "6. 将输入、期望输出、实际输出、耗时、截图/视频引用、完成状态写入轨迹文件。",
             "7. 如页面卡住、登录失效、输出超时、控件不可见或需要人工确认，调用 request_human_help。",
             "8. 所有条目处理完成并确认轨迹文件写入后，调用 finish_subtask 结束任务。",
@@ -165,7 +165,7 @@ def build_workflow_target_config(
 ) -> TargetAppConfig:
     resolved_app_id = app_id or _slug_id("app", app_name)
     resolved_job_id = job_id or _slug_id("job", app_name)
-    description = build_workflow_task_description(
+    description = build_workflow_task_description_v2(
         app_name=app_name,
         target_url=target_url,
         input_path=input_path,
@@ -193,6 +193,35 @@ def build_workflow_target_config(
                 "输出完成后需要记录实际文本和执行证据。",
             ],
         },
+    )
+
+
+def build_workflow_task_description_v2(
+    *,
+    app_name: str,
+    target_url: str,
+    input_path: str,
+    item_count: int,
+    answer_timeout_seconds: int = 180,
+) -> str:
+    return "\n".join(
+        [
+            f"目标：在网页应用 {app_name} 中执行当前任务流。",
+            f"目标网址：{target_url}",
+            f"输入清单：{input_path}",
+            f"计划条目数：{item_count}",
+            "",
+            "执行规则：",
+            "1. 打开目标网页应用，确认已经进入可输入任务内容的界面。",
+            "2. 使用通用文件读取工具读取输入清单，逐条处理 input_text/question 字段。",
+            "3. 每次输入后必须提交，并等待网页应用输出稳定。",
+            "4. 将题目、实际输出、状态、原因和证据写入轨迹文件。",
+            "5. 页面卡住、登录失效、验证码、控件不可见或需要人工确认时，请求人工协助。",
+            "6. 所有条目处理完成并确认轨迹写入后，结束当前子任务。",
+            "",
+            f"正确性优先：无法判断输出完成时最多等待 {answer_timeout_seconds} 秒，然后记录失败或请求人工。",
+            "响应优先：模型只保留短思考，优先输出工具调用，不复述截图内容。",
+        ]
     )
 
 

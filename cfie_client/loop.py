@@ -41,13 +41,20 @@ class ComputerLoop:
         if model_coordinate_mode not in COORDINATE_SPACES:
             raise ValueError(
                 "model_coordinate_mode must be screenshot, "
-                "qwen_normalized_1000, or auto"
+                "qwen_normalized_1000, local_refinement_1000, or auto"
             )
         self.model_coordinate_mode = model_coordinate_mode
+        self.local_refinement_box: tuple[int, int, int, int] | None = None
         self.trace = TraceStore(
             Path(trace_path) if trace_path is not None else None,
             Path(trace_artifact_dir) if trace_artifact_dir is not None else None,
         )
+
+    def set_local_refinement_box(
+        self,
+        box: tuple[int, int, int, int] | None,
+    ) -> None:
+        self.local_refinement_box = box
 
     def handle_call(self, call_like) -> ComputerCallOutput:
         call = (
@@ -60,7 +67,9 @@ class ComputerLoop:
             call,
             screen_size=screen_size,
             mode=self.model_coordinate_mode,
+            local_refinement_box=self.local_refinement_box,
         )
+        call = _default_scroll_coordinates(call, screen_size=screen_size)
         self.safety.check_call(call, screen_size=screen_size)
         self.trace.record_tool_call(call.to_openai_dict())
         executor_call = (
@@ -77,6 +86,8 @@ class ComputerLoop:
             acknowledged_safety_checks=call.pending_safety_checks,
         )
         self.trace.record_tool_result(output.to_openai_dict())
+        if call.coordinate_space == "screenshot":
+            self.local_refinement_box = None
         return output
 
     def handle_response(self, response_or_items) -> tuple[ComputerCallOutput, ...]:
@@ -91,8 +102,29 @@ def _normalize_model_coordinate_space(
     *,
     screen_size: tuple[int, int],
     mode: str,
+    local_refinement_box: tuple[int, int, int, int] | None = None,
 ) -> ComputerCall:
     mode = call.coordinate_space or mode
+    if mode == "local_refinement_1000":
+        if local_refinement_box is None:
+            return call
+        return replace(
+            call,
+            coordinate_space="screenshot",
+            actions=tuple(
+                _map_action_from_local_refinement_1000(
+                    action,
+                    screen_size=screen_size,
+                    local_box=local_refinement_box,
+                )
+                for action in call.actions
+            ),
+        )
+    if (
+        call.coordinate_space == "screenshot"
+        and _looks_like_qwen_normalized_call(call, screen_size)
+    ):
+        mode = "qwen_normalized_1000"
     if mode == "screenshot":
         return call
     if mode == "auto" and not _looks_like_qwen_normalized_call(call, screen_size):
@@ -105,6 +137,35 @@ def _normalize_model_coordinate_space(
             for action in call.actions
         ),
     )
+
+
+def _default_scroll_coordinates(
+    call: ComputerCall,
+    *,
+    screen_size: tuple[int, int],
+) -> ComputerCall:
+    width, height = screen_size
+    if width <= 0 or height <= 0:
+        return call
+    center_x = max(0, width // 2)
+    center_y = max(0, height // 2)
+    changed = False
+    actions: list[ComputerAction] = []
+    for action in call.actions:
+        if action.type == "scroll" and (action.x is None or action.y is None):
+            changed = True
+            actions.append(
+                replace(
+                    action,
+                    x=center_x if action.x is None else action.x,
+                    y=center_y if action.y is None else action.y,
+                )
+            )
+        else:
+            actions.append(action)
+    if not changed:
+        return call
+    return replace(call, actions=tuple(actions))
 
 
 def _looks_like_qwen_normalized_call(
@@ -132,6 +193,43 @@ def _map_action_from_qwen_normalized_1000(
         return (
             max(0, min(width - 1, int(round(x * width / 1000)))),
             max(0, min(height - 1, int(round(y * height / 1000)))),
+        )
+
+    if action.path:
+        return replace(action, path=tuple(map_xy(x, y) for x, y in action.path))
+    if action.x is None or action.y is None:
+        return action
+    if action.type not in {"click", "double_click", "move", "scroll"}:
+        return action
+    x, y = map_xy(action.x, action.y)
+    return replace(action, x=x, y=y)
+
+
+def _map_action_from_local_refinement_1000(
+    action: ComputerAction,
+    *,
+    screen_size: tuple[int, int],
+    local_box: tuple[int, int, int, int],
+) -> ComputerAction:
+    screen_width, screen_height = screen_size
+    box_x, box_y, box_width, box_height = local_box
+
+    def map_xy(x: int, y: int) -> tuple[int, int]:
+        return (
+            max(
+                0,
+                min(
+                    screen_width - 1,
+                    box_x + int(round(int(x) * box_width / 1000)),
+                ),
+            ),
+            max(
+                0,
+                min(
+                    screen_height - 1,
+                    box_y + int(round(int(y) * box_height / 1000)),
+                ),
+            ),
         )
 
     if action.path:

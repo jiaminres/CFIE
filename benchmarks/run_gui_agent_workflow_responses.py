@@ -30,8 +30,6 @@ from cfie_gui_agent.workflow import load_workflow_items
 WORKFLOW_TOOL_NAMES = (
     "computer_use",
     "read_text_file",
-    "submit_current_input",
-    "set_app_viewport",
     "record_workflow_result",
     "request_human_help",
     "finish_subtask",
@@ -79,9 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use a smaller tool schema for workflow runs to reduce prompt cost.",
     )
     parser.add_argument("--item-limit", type=int, default=1)
-    parser.add_argument("--screenshot-max-width", type=int, default=960)
-    parser.add_argument("--screenshot-max-height", type=int, default=540)
-    parser.add_argument("--screenshot-jpeg-quality", type=int, default=85)
+    parser.add_argument("--screenshot-max-width", type=int, default=1920)
+    parser.add_argument("--screenshot-max-height", type=int, default=1080)
+    parser.add_argument("--screenshot-jpeg-quality", type=int, default=90)
     parser.add_argument(
         "--screenshot-crop",
         default=None,
@@ -122,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--image-detail",
         choices=("low", "auto", "high", "original", "none"),
-        default="low",
+        default="high",
         help="Responses image detail for initial screenshots and computer outputs.",
     )
     parser.add_argument("--open-url", action=argparse.BooleanOptionalAction, default=True)
@@ -225,7 +223,9 @@ def build_instruction(
     input_path: Path,
     trace_path: Path,
     item_limit: int,
+    items: tuple[Any, ...],
 ) -> str:
+    item_lines = _workflow_items_prompt(items)
     return "\n".join(
         [
             f"当前 APP：{app_name}",
@@ -234,24 +234,95 @@ def build_instruction(
             f"轨迹文件：{trace_path}",
             f"本轮最多处理 {item_limit} 条输入。",
             "",
+            "当前待处理条目已经由 harness 读取，不需要再读文件：",
+            item_lines,
+            "",
             "你是 GUI Agent，目标是在当前浏览器页面完成这个任务流。",
             "先观察屏幕。如果页面未打开或不可用，使用 computer_use 打开/定位目标页面。",
             "如果浏览器或目标网页只占当前截图的一部分，先调用 set_app_viewport 记录应用区域；后续截图会裁剪到该区域，以降低每轮视觉输入延迟。",
-            "截图可能带有浅色坐标网格。所有 click/move/drag 坐标都使用你看到的截图坐标，不要换算到物理屏幕。",
-            "必须先调用 read_text_file 读取输入清单。",
-            "对每个条目：把 input_text 输入到网页并提交。网页聊天应用在完成 type 后，优先调用 submit_current_input 让 harness 点击发送按钮；Enter 只作为备选。提交后等待网页输出完成，记录输出文本和证据。",
-            "如果输入框已经可见，并且你已经知道 input_text，不要只点击输入框；先用 computer_use 完成 click/type，再用 submit_current_input 提交。",
-            "如果输入框里已经有待发送文本，不要再次输入同一段文字；下一步应调用 submit_current_input。不要连续重复同一个点击动作；如果两次点击后仍无法输入或提交，应调用 request_human_help。",
+            "computer_use 坐标一律使用 coordinate_space=\"qwen_normalized_1000\"，鼠标坐标是当前模型图像的 0..1000 归一化坐标，不要使用物理屏幕坐标或截图像素坐标。",
+            "对每个条目：用 computer_use 点击并聚焦输入框，然后用 computer_use 的 type 动作输入该条目的 input_text，之后用 computer_use 点击可见发送按钮；如果应用明确支持 Enter 发送，也可以用 computer_use 发送 Enter。",
+            "如果输入框已经可见，不要连续只点击输入框；应在同一次或下一次 computer_use 中完成 type。如果输入框里已经有待发送文本，下一步必须提交或等待输出，不要再次输入同一段文字。",
+            "如果两次点击后仍无法输入或提交，应调用 request_human_help。",
             "每个条目结束时调用 record_workflow_result。为了保持响应快速，优先只传 item_id、output_text、status、reason；不要重复 input_text 和 expected_output，harness 会按 item_id 从输入清单回填。",
             "协议硬约束：如果当前任务还没完成，普通文本不会被视为完成；必须调用工具推进。",
-            "Tool protocol: if a tool is needed, return exactly one complete tool call and nothing else. Do not write Thinking Process, Plan, Analysis, or explanatory prose before a tool call.",
-            "Coordinate protocol for Qwen VL: every computer_use call must include coordinate_space=\"qwen_normalized_1000\". Mouse x/y and drag path coordinates must use 0..1000 normalized image coordinates: (0,0) is the current image top-left and (1000,1000) is bottom-right. The local harness converts them to screenshot pixels before execution. Do not use physical desktop coordinates and do not use raw screenshot pixels in this workflow.",
+            "工具协议：如果下一步需要工具，只返回一个完整工具调用，不要在工具调用前输出“思考过程”“计划”“分析”或解释性文字。",
+            "坐标协议：每个 computer_use 都必须包含 coordinate_space=\"qwen_normalized_1000\"。鼠标 x/y 和拖拽路径坐标必须使用当前图像的 0..1000 归一化坐标：(0,0) 是当前图像左上角，(1000,1000) 是右下角。harness 会在本地转换为截图像素坐标。不要使用物理桌面坐标，也不要在这个任务流中使用原始截图像素坐标。",
             "不要输出长篇思考过程，也不要复述截图或视频内容；除非这是任务结果，否则只给必要工具调用或极短摘要。",
             "如果下一步是调用工具，不要先输出 visible previous state / next action 文本；直接调用工具。",
             "如果登录、验证码、页面卡住、控件不可见或无法判断输出完成，调用 request_human_help。",
             "如果提交后出现登录、授权、解锁更多功能等弹窗，立即调用 request_human_help；不要关闭弹窗，也不要继续尝试点击页面。",
             "完成本轮所有条目后调用 finish_subtask。",
             "computer_use 每次返回的截图已经在下一轮输入中直接给你；不要为了检查刚刚的截图再调用 read_image。",
+            "不要把当前场景当成产品模式；这只是当前 APP 会话的任务流配置。",
+        ]
+    )
+
+
+def _workflow_items_prompt(items: tuple[Any, ...]) -> str:
+    rows: list[dict[str, str]] = []
+    for item in items:
+        rows.append(
+            {
+                "item_id": str(getattr(item, "item_id", "")),
+                "input_text": str(getattr(item, "input_text", "")),
+                "expected_output": str(getattr(item, "expected_output", "")),
+            }
+        )
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def _workflow_item_manifest_prompt(items: tuple[Any, ...]) -> str:
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        rows.append(
+            {
+                "item_id": str(getattr(item, "item_id", "")),
+                "source": str(getattr(item, "source", "")),
+                "has_expected_output": bool(getattr(item, "expected_output", "")),
+                "has_attachment": bool(getattr(item, "attachment_path", None)),
+            }
+        )
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def build_instruction_v2(
+    *,
+    app_name: str,
+    target_url: str,
+    input_path: Path,
+    trace_path: Path,
+    item_limit: int,
+    items: tuple[Any, ...],
+) -> str:
+    item_manifest = _workflow_item_manifest_prompt(items)
+    return "\n".join(
+        [
+            f"当前 APP：{app_name}",
+            f"目标网址：{target_url}",
+            f"输入清单：{input_path}",
+            f"轨迹文件：{trace_path}",
+            f"本轮最多处理 {item_limit} 条输入。",
+            "",
+            "第一步必须调用 read_text_file 读取输入清单；不要根据下面的清单概览直接执行任务。",
+            "下面只给出 item_id 和来源概览，用于核对进度，不包含题目正文：",
+            item_manifest,
+            "",
+            "你是通用 GUI Agent，目标是在当前浏览器页面完成这个 APP 会话的任务流。",
+            "先观察屏幕。如果页面未打开或不可用，用 computer_use 打开或定位目标页面。",
+            "不要调用任何 APP 专用工具；只能使用通用工具读取文件、操作电脑、记录结果、请求人工和结束子任务。",
+            "每个 computer_use 都必须包含 coordinate_space=\"qwen_normalized_1000\"。鼠标 x/y 和拖拽路径必须使用当前模型图像的 0..1000 归一化坐标：(0,0) 是当前图像左上角，(1000,1000) 是右下角。不要使用物理屏幕坐标，也不要使用截图像素坐标。",
+            "对每个条目：读取 input_text 或 question 字段，点击并聚焦输入框，输入该文本，提交给网页应用，等待并读取网页输出，然后调用 record_workflow_result。",
+            "网页聊天输入框完成 type 后，优先用 computer_use 的 keypress Enter 提交；只有明确 Enter 不能发送时才点击可见发送按钮。不要反复点击同一个发送位置。",
+            "如果输入框已经可见，不要连续只点击输入框；应在同一次或下一次 computer_use 中完成 type。如果输入框里已有待发送文本，下一步必须提交或等待输出，不要再次输入同一段文字。",
+            "如果两次尝试后仍无法输入、提交或判断输出完成，调用 request_human_help。",
+            "record_workflow_result 为了保持响应快，优先只传 item_id、output_text、status、reason；不要重复 input_text 和 expected_output，harness 会按 item_id 从输入清单回填。",
+            "协议约束：如果当前任务还没完成，普通文本不会被视为完成；必须调用工具推进。",
+            "工具约束：如果下一步需要工具，只返回一个完整工具调用，不要在工具调用前输出“思考过程”“计划”“分析”或解释性文字。",
+            "不要输出长篇思考过程，也不要复述截图或视频内容；除非这是任务结果，否则只给必要工具调用或极短摘要。",
+            "如果登录、验证码、页面卡住、控件不可见、需要人工判断、或提交后出现登录/授权/解锁功能弹窗，立即调用 request_human_help。",
+            "完成本轮所有条目并记录结果后，调用 finish_subtask。",
+            "computer_use 每次返回的截图已经会在下一轮输入中直接给你；不要为了检查刚才的截图再调用 read_image。",
             "不要把当前场景当成产品模式；这只是当前 APP 会话的任务流配置。",
         ]
     )
@@ -275,6 +346,7 @@ def main() -> None:
         artifact_dir=artifact_dir,
         item_limit=args.item_limit,
     )
+    run_items = load_workflow_items(run_input_path, limit=args.item_limit)
 
     if args.open_url:
         open_target_url(chrome_path=args.chrome_path, target_url=args.target_url)
@@ -303,14 +375,15 @@ def main() -> None:
         )
 
     task = GuiAgentTaskSpec(
-        task_id="workflow:doubao",
+        task_id=f"workflow:{args.app_name.lower().replace(' ', '_')}",
         target_app=args.app_name,
-        instruction=build_instruction(
+        instruction=build_instruction_v2(
             app_name=args.app_name,
             target_url=args.target_url,
             input_path=run_input_path,
             trace_path=trace_path,
             item_limit=args.item_limit,
+            items=run_items,
         ),
         expected_outcome="Workflow item results are recorded in the trace.",
         metadata={

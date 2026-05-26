@@ -126,10 +126,12 @@ def find_computer_tool_calls(response_or_items: Any) -> tuple[ComputerCall, ...]
         if actions:
             coordinate_space = call.arguments.get("coordinate_space")
             if coordinate_space is not None:
-                coordinate_space = str(coordinate_space).strip()
+                coordinate_space = _normalize_coordinate_space_text(coordinate_space)
             if coordinate_space is None and action_coordinate_spaces:
                 unique_spaces = {
-                    item for item in action_coordinate_spaces if item
+                    _normalize_coordinate_space_text(item)
+                    for item in action_coordinate_spaces
+                    if item
                 }
                 if len(unique_spaces) == 1:
                     coordinate_space = next(iter(unique_spaces))
@@ -260,7 +262,7 @@ def _strip_text_tool_calls_from_item(item: Any) -> Any | None:
 
 def _has_text_tool_call_marker(text: str) -> bool:
     lower = text.lower()
-    return "<tool_call" in lower or "<tool_code" in lower
+    return "<tool_call" in lower or "<tool_code" in lower or "<function=" in lower
 
 
 def _strip_text_tool_call_blocks(text: str) -> str:
@@ -276,7 +278,24 @@ def _strip_text_tool_call_blocks(text: str) -> str:
         stripped,
         flags=re.IGNORECASE | re.DOTALL,
     )
+    stripped = re.sub(
+        r"<function=([A-Za-z_][A-Za-z0-9_]*)>.*?</function>",
+        "",
+        stripped,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     return stripped.strip()
+
+
+def _normalize_coordinate_space_text(value: Any) -> str:
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        try:
+            decoded = json.loads(text) if text[0] == '"' else text[1:-1]
+        except json.JSONDecodeError:
+            decoded = text[1:-1]
+        text = str(decoded).strip()
+    return text
 
 
 def _extract_text_tool_call_items(items: tuple[Any, ...]) -> tuple[dict[str, Any], ...]:
@@ -302,6 +321,26 @@ def _extract_text_tool_call_items(items: tuple[Any, ...]) -> tuple[dict[str, Any
                             "arguments": arguments,
                         }
                     )
+            bare_text = re.sub(
+                r"<tool_call\b[^>]*>.*?</tool_call>",
+                "",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            for name, body in re.findall(
+                r"<function=([A-Za-z_][A-Za-z0-9_]*)>(.*?)</function>",
+                bare_text,
+                flags=re.IGNORECASE | re.DOTALL,
+            ):
+                arguments = _parse_text_tool_arguments(body)
+                calls.append(
+                    {
+                        "type": "function_call",
+                        "name": name.strip(),
+                        "call_id": f"text_tool_call_{len(calls) + 1}",
+                        "arguments": arguments,
+                    }
+                )
     return tuple(calls)
 
 
@@ -490,12 +529,44 @@ def _nested_agent_tool_calls_from_computer_use(
         if not _is_nested_agent_tool_action(action):
             continue
         assert isinstance(action, dict)
-        name = str(action.get("type") or action.get("name")).strip()
-        arguments = {
-            key: value
-            for key, value in action.items()
-            if key not in {"type", "name", "call_id"}
-        }
+        action_type = str(action.get("type") or "").strip()
+        function_spec = action.get("function")
+        if action_type in {"call_function", "call_tool"}:
+            if isinstance(function_spec, dict):
+                name = str(
+                    function_spec.get("name")
+                    or action.get("function_name")
+                    or action.get("tool_name")
+                    or action.get("name")
+                    or ""
+                ).strip()
+                parameters = (
+                    function_spec.get("parameters")
+                    if "parameters" in function_spec
+                    else function_spec.get("arguments")
+                )
+            else:
+                name = str(
+                    action.get("function_name")
+                    or action.get("tool_name")
+                    or action.get("name")
+                    or ""
+                ).strip()
+                parameters = (
+                    action.get("parameters")
+                    if "parameters" in action
+                    else action.get("arguments")
+                )
+            arguments = dict(parameters) if isinstance(parameters, dict) else {}
+            if parameters is not None and not isinstance(parameters, dict):
+                arguments["parameters"] = parameters
+        else:
+            name = str(action.get("type") or action.get("name")).strip()
+            arguments = {
+                key: value
+                for key, value in action.items()
+                if key not in {"type", "name", "call_id"}
+            }
         nested_call_id = str(
             action.get("call_id")
             or f"{call.call_id}:{name}:{index}"
@@ -531,7 +602,22 @@ def _computer_use_actions_parse_error(call: AgentToolCall) -> str | None:
 def _is_nested_agent_tool_action(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
-    name = str(value.get("type") or value.get("name") or "").strip()
+    action_type = str(value.get("type") or "").strip()
+    if action_type in {"call_function", "call_tool"}:
+        function_spec = value.get("function")
+        if isinstance(function_spec, dict):
+            function_name = function_spec.get("name")
+        else:
+            function_name = None
+        name = str(
+            function_name
+            or value.get("function_name")
+            or value.get("tool_name")
+            or value.get("name")
+            or ""
+        ).strip()
+    else:
+        name = str(value.get("type") or value.get("name") or "").strip()
     return name in MODEL_CALLABLE_TOOLS and name != "computer_use"
 
 

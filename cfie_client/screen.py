@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -28,8 +29,27 @@ class ScreenCapture(Protocol):
 
 
 class PillowScreenCapture:
+    def __init__(
+        self,
+        *,
+        draw_cursor: bool = True,
+        cursor_position_provider: Callable[[], tuple[int, int] | None] | None = None,
+    ) -> None:
+        self.draw_cursor = draw_cursor
+        self.cursor_position_provider = cursor_position_provider
+
     def screenshot(self) -> ScreenshotResult:
         image = ImageGrab.grab()
+        if self.draw_cursor:
+            image = _draw_cursor_overlay(
+                image,
+                cursor_position=_resolve_cursor_position(
+                    self.cursor_position_provider
+                ),
+                physical_origin=(0, 0),
+                physical_size=image.size,
+                logical_size=image.size,
+            )
         width, height = image.size
         buffer = BytesIO()
         image.save(buffer, format="PNG")
@@ -64,6 +84,8 @@ class ScaledPillowScreenCapture:
         filename_prefix: str = "screen",
         crop_box: tuple[int, int, int, int] | None = None,
         grid_overlay: str = "off",
+        draw_cursor: bool = True,
+        cursor_position_provider: Callable[[], tuple[int, int] | None] | None = None,
     ) -> None:
         self.max_width = max(1, int(max_width))
         self.max_height = max(1, int(max_height))
@@ -76,6 +98,8 @@ class ScaledPillowScreenCapture:
         self.filename_prefix = filename_prefix
         self.crop_box = crop_box
         self.grid_overlay = grid_overlay
+        self.draw_cursor = draw_cursor
+        self.cursor_position_provider = cursor_position_provider
         if self.grid_overlay not in {"off", "coarse", "fine"}:
             raise ValueError("grid_overlay must be 'off', 'coarse', or 'fine'")
 
@@ -111,6 +135,67 @@ class ScaledPillowScreenCapture:
             image = image.resize((width, height))
         if self.grid_overlay != "off":
             image = _draw_grid_overlay(image, mode=self.grid_overlay)
+        if self.draw_cursor:
+            image = _draw_cursor_overlay(
+                image,
+                cursor_position=_resolve_cursor_position(
+                    self.cursor_position_provider
+                ),
+                physical_origin=self.physical_origin(),
+                physical_size=(physical_width, physical_height),
+                logical_size=(width, height),
+            )
+        return self._encode_image(image, width=width, height=height)
+
+    def screenshot_region_around(
+        self,
+        *,
+        x: int,
+        y: int,
+        radius: int = 180,
+        max_width: int = 720,
+        max_height: int = 720,
+    ) -> ScreenshotResult:
+        logical_width, logical_height = self.size()
+        physical_width, physical_height = self.physical_size()
+        origin_x, origin_y = self.physical_origin()
+        if logical_width <= 0 or logical_height <= 0:
+            raise ValueError("screen logical size must be positive")
+        radius = max(20, int(radius))
+        center_x = origin_x + int(round(int(x) * physical_width / logical_width))
+        center_y = origin_y + int(round(int(y) * physical_height / logical_height))
+        radius_x = max(1, int(round(radius * physical_width / logical_width)))
+        radius_y = max(1, int(round(radius * physical_height / logical_height)))
+        left = max(origin_x, center_x - radius_x)
+        top = max(origin_y, center_y - radius_y)
+        right = min(origin_x + physical_width, center_x + radius_x)
+        bottom = min(origin_y + physical_height, center_y + radius_y)
+        if right <= left or bottom <= top:
+            raise ValueError("local screenshot crop is empty")
+        image = ImageGrab.grab(bbox=(left, top, right, bottom))
+        crop_physical_width, crop_physical_height = image.size
+        scale = min(
+            max(1, int(max_width)) / crop_physical_width,
+            max(1, int(max_height)) / crop_physical_height,
+            1.0,
+        )
+        width = max(1, int(crop_physical_width * scale))
+        height = max(1, int(crop_physical_height * scale))
+        if (width, height) != (crop_physical_width, crop_physical_height):
+            image = image.resize((width, height))
+        if self.draw_cursor:
+            image = _draw_cursor_overlay(
+                image,
+                cursor_position=_resolve_cursor_position(
+                    self.cursor_position_provider
+                ),
+                physical_origin=(left, top),
+                physical_size=(crop_physical_width, crop_physical_height),
+                logical_size=(width, height),
+            )
+        return self._encode_image(image, width=width, height=height)
+
+    def _encode_image(self, image, *, width: int, height: int) -> ScreenshotResult:
         if self.image_format == "JPEG":
             image = image.convert("RGB")
             suffix = "jpg"
@@ -213,4 +298,62 @@ def _draw_grid_overlay(image, *, mode: str):
         if y:
             draw.text((3, y + 3), str(y), fill=label_color)
             draw.text((max(3, width - 36), y + 3), str(y), fill=label_color)
+    return result
+
+
+def _resolve_cursor_position(
+    provider: Callable[[], tuple[int, int] | None] | None,
+) -> tuple[int, int] | None:
+    if provider is not None:
+        return provider()
+    return _current_cursor_position()
+
+
+def _current_cursor_position() -> tuple[int, int] | None:
+    if sys.platform != "win32":
+        return None
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    point = POINT()
+    user32 = ctypes.windll.user32
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return None
+    return (int(point.x), int(point.y))
+
+
+def _draw_cursor_overlay(
+    image,
+    *,
+    cursor_position: tuple[int, int] | None,
+    physical_origin: tuple[int, int],
+    physical_size: tuple[int, int],
+    logical_size: tuple[int, int],
+):
+    if cursor_position is None:
+        return image
+    physical_width, physical_height = physical_size
+    logical_width, logical_height = logical_size
+    if physical_width <= 0 or physical_height <= 0:
+        return image
+    local_x = cursor_position[0] - physical_origin[0]
+    local_y = cursor_position[1] - physical_origin[1]
+    if not (0 <= local_x < physical_width and 0 <= local_y < physical_height):
+        return image
+    x = int(round(local_x * logical_width / physical_width))
+    y = int(round(local_y * logical_height / physical_height))
+    result = image.convert("RGB")
+    draw = ImageDraw.Draw(result)
+    pointer = [
+        (x, y),
+        (x, y + 24),
+        (x + 6, y + 18),
+        (x + 10, y + 29),
+        (x + 16, y + 27),
+        (x + 12, y + 16),
+        (x + 22, y + 16),
+    ]
+    draw.polygon(pointer, fill="white", outline="black")
+    draw.line((x + 1, y + 1, x + 1, y + 20), fill="black", width=1)
     return result

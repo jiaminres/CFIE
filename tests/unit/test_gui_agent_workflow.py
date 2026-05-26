@@ -95,7 +95,7 @@ def test_build_workflow_target_config_records_browser_and_trace_metadata():
 
     assert config.app_id.startswith("app_")
     assert config.job_id.startswith("job_")
-    assert "执行自动化任务流" in config.task_description
+    assert "执行当前任务流" in config.task_description
     assert config.metadata["process_name"] == "chrome.exe"
     assert config.metadata["browser_url_pattern"] == "https://example.com/"
     assert config.metadata["expected_item_count"] == 3
@@ -125,6 +125,55 @@ def test_desktop_state_configures_workflow_and_records_operation(tmp_path: Path)
     assert state.trace_store.events[-1].kind == "operation"
     assert state.trace_store.events[-1].payload["kind"] == "workflow"
     assert trace.exists()
+
+
+def test_runner_retries_reasoning_only_response_for_active_task():
+    runner = GuiAgentRunner(
+        computer_loop=ComputerLoop(backend=FakeBackend(), screen=FakeScreen()),
+        max_steps=1,
+    )
+    task = GuiAgentTaskSpec(
+        task_id="reasoning_only_retry",
+        instruction="Keep working until done.",
+    )
+    calls = 0
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "content": [
+                            {
+                                "type": "reasoning_text",
+                                "text": "I am thinking but not acting yet.",
+                            }
+                        ],
+                    }
+                ]
+            }
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    retry_events = [
+        event.payload
+        for event in runner.trace_store.events
+        if event.kind == "tool_call_parse_retry"
+    ]
+    assert result.status == "completed"
+    assert calls == 2
+    assert retry_events[-1]["reason"] == "empty_response_without_tool_call"
 
 
 def test_model_tool_registry_allows_workflow_trace_tools():
@@ -227,6 +276,146 @@ def test_runner_handles_workflow_file_and_trace_tools(tmp_path: Path):
     ] == ["step", "workflow_result", "step"]
 
 
+def test_runner_executes_only_one_tool_when_model_returns_parallel_calls(
+    tmp_path: Path,
+):
+    text_file = tmp_path / "items.txt"
+    text_file.write_text("input_text: What is 2+2?", encoding="utf-8")
+    backend = FakeBackend()
+    runner = GuiAgentRunner(
+        computer_loop=ComputerLoop(backend=backend, screen=FakeScreen()),
+        max_steps=3,
+    )
+    task = GuiAgentTaskSpec(task_id="workflow", instruction="Run workflow.")
+    saw_read_output = False
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal saw_read_output
+        if len(conversation) == 2:
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "computer_use",
+                        "call_id": "click_1",
+                        "arguments": {
+                            "coordinate_space": "qwen_normalized_1000",
+                            "actions": [{"type": "click", "x": 500, "y": 900}],
+                        },
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "read_text_file",
+                        "call_id": "read_1",
+                        "arguments": {"path": str(text_file), "max_chars": 32},
+                    },
+                ]
+            }
+        assert not backend.calls
+        assert not any(
+            item.get("call_id") == "click_1"
+            for item in conversation
+            if isinstance(item, dict)
+        )
+        assert conversation[-2]["type"] == "function_call"
+        assert conversation[-2]["name"] == "read_text_file"
+        assert conversation[-1]["type"] == "function_call_output"
+        assert conversation[-1]["call_id"] == "read_1"
+        saw_read_output = True
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert saw_read_output
+    assert backend.calls == []
+    assert any(
+        event.kind == "parallel_tool_call_pruned"
+        for event in runner.trace_store.events
+    )
+
+
+def test_runner_requires_workflow_input_read_before_computer_actions(
+    tmp_path: Path,
+):
+    text_file = tmp_path / "items.txt"
+    text_file.write_text("input_text: What is 2+2?", encoding="utf-8")
+    backend = FakeBackend()
+    runner = GuiAgentRunner(
+        computer_loop=ComputerLoop(backend=backend, screen=FakeScreen()),
+        max_steps=4,
+    )
+    task = GuiAgentTaskSpec(
+        task_id="workflow",
+        instruction="Run workflow.",
+        metadata={"input_path": str(text_file)},
+    )
+    saw_guard = False
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal saw_guard
+        if not saw_guard:
+            if any(
+                "必须先调用 read_text_file" in str(part.get("text", ""))
+                for message in conversation
+                if isinstance(message, dict)
+                for part in message.get("content", [])
+                if isinstance(part, dict)
+            ):
+                saw_guard = True
+                assert backend.calls == []
+                return {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "name": "read_text_file",
+                            "call_id": "read_1",
+                            "arguments": {"path": str(text_file), "max_chars": 32},
+                        }
+                    ]
+                }
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "computer_use",
+                        "call_id": "click_1",
+                        "arguments": {
+                            "coordinate_space": "qwen_normalized_1000",
+                            "actions": [{"type": "click", "x": 500, "y": 900}],
+                        },
+                    }
+                ]
+            }
+        if conversation[-1]["type"] == "function_call_output":
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Done"}],
+                    }
+                ]
+            }
+        raise AssertionError("unexpected conversation state")
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert saw_guard
+    assert backend.calls == []
+    assert any(
+        event.kind == "workflow_input_read_required"
+        for event in runner.trace_store.events
+    )
+
+
 def test_runner_records_final_message_json_as_workflow_result(tmp_path: Path):
     input_file = tmp_path / "items.jsonl"
     input_file.write_text(
@@ -243,7 +432,22 @@ def test_runner_records_final_message_json_as_workflow_result(tmp_path: Path):
         metadata={"input_path": str(input_file)},
     )
 
-    def agent(_conversation: list[dict[str, Any]]) -> dict[str, Any]:
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        if (
+            conversation
+            and conversation[-1].get("type") == "function_call_output"
+            and str(conversation[-1].get("call_id", "")).startswith(
+                "call_recovered_record_"
+            )
+        ):
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Done"}],
+                    }
+                ]
+            }
         return {
             "output": [
                 {
@@ -273,3 +477,260 @@ def test_runner_records_final_message_json_as_workflow_result(tmp_path: Path):
     assert workflow_events[0]["input_text"] == "What is 2+2?"
     assert workflow_events[0]["expected_output"] == "4"
     assert workflow_events[0]["source"] == "final_message_json"
+
+
+def test_runner_recovers_workflow_result_intent_from_text_with_wrong_tool(
+    tmp_path: Path,
+):
+    input_file = tmp_path / "items.jsonl"
+    input_file.write_text(
+        '{"item_id":"q1","input_text":"How many albums?","expected_output":"4"}',
+        encoding="utf-8",
+    )
+    runner = GuiAgentRunner(
+        computer_loop=ComputerLoop(backend=FakeBackend(), screen=FakeScreen()),
+        max_steps=2,
+    )
+    task = GuiAgentTaskSpec(
+        task_id="workflow_recover",
+        instruction="Run workflow.",
+        metadata={"input_path": str(input_file)},
+    )
+    calls = 0
+
+    def agent(_conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": (
+                                    "上一步状态：已获取答案“4 studio albums”。"
+                                    "下一步动作：调用 record_workflow_result 记录结果。"
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "computer_use",
+                        "call_id": "bad_click",
+                        "arguments": {
+                            "coordinate_space": "qwen_normalized_1000",
+                            "actions": [{"type": "click", "x": 700, "y": 930}],
+                        },
+                    },
+                ]
+            }
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    workflow_events = [
+        event.payload
+        for event in runner.trace_store.events
+        if event.kind == "workflow_result"
+    ]
+    assert result.status == "completed"
+    assert workflow_events[0]["item_id"] == "q1"
+    assert workflow_events[0]["output_text"] == "4"
+    assert not [
+        event
+        for event in runner.trace_store.events
+        if event.kind == "step" and "computer_use" in event.payload.get("tags", ())
+    ]
+
+
+def test_runner_recovers_workflow_result_from_natural_language_intent(
+    tmp_path: Path,
+):
+    input_file = tmp_path / "items.jsonl"
+    input_file.write_text(
+        '{"item_id":"q1","input_text":"How many albums?","expected_output":"4"}',
+        encoding="utf-8",
+    )
+    runner = GuiAgentRunner(
+        computer_loop=ComputerLoop(backend=FakeBackend(), screen=FakeScreen()),
+        max_steps=2,
+    )
+    task = GuiAgentTaskSpec(
+        task_id="workflow_recover_natural_language",
+        instruction="Run workflow.",
+        metadata={"input_path": str(input_file)},
+    )
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        if (
+            conversation
+            and conversation[-1].get("type") == "function_call_output"
+            and str(conversation[-1].get("call_id", "")).startswith(
+                "call_recovered_record_"
+            )
+        ):
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Done"}],
+                    }
+                ]
+            }
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                "上一步状态：第一个问题已得到回答，显示发布了4张专辑。"
+                                "下一步动作：记录第一个任务结果，然后开始处理第二个问题。"
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "name": "computer_use",
+                    "call_id": "bad_click",
+                    "arguments": {
+                        "coordinate_space": "qwen_normalized_1000",
+                        "actions": [{"type": "click", "x": 500, "y": 925}],
+                    },
+                },
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    workflow_events = [
+        event.payload
+        for event in runner.trace_store.events
+        if event.kind == "workflow_result"
+    ]
+    assert result.status == "completed"
+    assert workflow_events[0]["item_id"] == "q1"
+    assert workflow_events[0]["output_text"] == "4"
+
+
+def test_runner_recovers_failed_workflow_status_for_next_unrecorded_item(
+    tmp_path: Path,
+):
+    input_file = tmp_path / "items.jsonl"
+    input_file.write_text(
+        "\n".join(
+            [
+                '{"item_id":"q1","input_text":"first","expected_output":"1"}',
+                '{"item_id":"q2","input_text":"video","expected_output":"2"}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    runner = GuiAgentRunner(
+        computer_loop=ComputerLoop(backend=FakeBackend(), screen=FakeScreen()),
+        max_steps=3,
+    )
+    task = GuiAgentTaskSpec(
+        task_id="workflow_recover_failed_status",
+        instruction="Run workflow.",
+        metadata={"input_path": str(input_file)},
+    )
+    calls = 0
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal calls
+        if (
+            conversation
+            and conversation[-1].get("type") == "function_call_output"
+            and str(conversation[-1].get("call_id", "")).startswith(
+                "call_recovered_record_"
+            )
+        ):
+            calls += 1
+            if calls == 1:
+                return {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": (
+                                        "The second item failed because YouTube "
+                                        "cannot be accessed in this region. "
+                                        "Next action: record the second item "
+                                        "failed status."
+                                    ),
+                                }
+                            ],
+                        },
+                        {
+                            "type": "function_call",
+                            "name": "computer_use",
+                            "call_id": "bad_click_2",
+                            "arguments": {
+                                "coordinate_space": "qwen_normalized_1000",
+                                "actions": [{"type": "click", "x": 550, "y": 915}],
+                            },
+                        },
+                    ]
+                }
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Done"}],
+                    }
+                ]
+            }
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                "The first item has been answered; answer is 1. "
+                                "Next action: record the first item result."
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "name": "computer_use",
+                    "call_id": "bad_click_1",
+                    "arguments": {
+                        "coordinate_space": "qwen_normalized_1000",
+                        "actions": [{"type": "click", "x": 500, "y": 925}],
+                    },
+                },
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    workflow_events = [
+        event.payload
+        for event in runner.trace_store.events
+        if event.kind == "workflow_result"
+    ]
+    assert result.status == "completed"
+    assert [event["item_id"] for event in workflow_events] == ["q1", "q2"]
+    assert workflow_events[0]["output_text"] == "1"
+    assert workflow_events[0]["status"] == "passed"
+    assert workflow_events[1]["status"] == "failed"
+    assert "cannot be accessed" in workflow_events[1]["output_text"]
