@@ -102,26 +102,32 @@ def test_openai_responses_agent_posts_flat_tool_schema_and_normalizes_outputs():
         server.server_close()
 
     assert response["output"][0]["name"] == "append_trace_note"
+    assert "_cfie_request_debug" in response
     payload = CaptureHandler.captured_payload
     assert payload is not None
     assert payload["model"] == "qwen35-vl"
     assert payload["input"][0]["role"] == "system"
     assert payload["input"][2]["output"] == '{"status": "accepted"}'
-    assert payload["input"][3]["role"] == "user"
-    assert payload["input"][3]["content"][1]["type"] == "input_image"
-    assert payload["input"][3]["content"][1]["image_url"] == "file:///tmp/screen.jpg"
-    assert payload["input"][4]["content"][1]["image_url"] == (
-        "file:///tmp/screen_after.jpg"
-    )
+    assert payload["input"][3]["type"] == "computer_call_output"
+    assert payload["input"][3]["output"]["image_url"] == "file:///tmp/screen.jpg"
+    assert payload["input"][4]["type"] == "computer_call_output"
+    assert payload["input"][4]["output"]["image_url"] == "file:///tmp/screen_after.jpg"
     tool_names = {tool["name"] for tool in payload["tools"]}
     assert "set_app_viewport" in tool_names
     assert payload["tools"][0]["type"] == "function"
     assert "name" in payload["tools"][0]
     assert "function" not in payload["tools"][0]
     assert payload["tool_choice"] == "auto"
+    assert payload["parallel_tool_calls"] is False
     assert payload["store"] is False
     assert payload["reasoning"] == {"effort": "none"}
     assert payload["chat_template_kwargs"]["enable_thinking"] is False
+    debug_input = response["_cfie_request_debug"]["input"]
+    assert debug_input[3]["output"]["image_url"] == {
+        "placeholder": "[图片]",
+        "source_type": "reference",
+        "ref": "file:///tmp/screen.jpg",
+    }
 
 
 def test_openai_responses_agent_splits_qwen_text_tool_call_output():
@@ -183,3 +189,214 @@ def test_openai_responses_agent_splits_qwen_text_tool_call_output():
         "coordinate_space": "qwen_normalized_1000",
         "actions": [{"type": "click", "x": 570, "y": 470}],
     }
+
+
+def test_openai_responses_agent_splits_bare_qwen_function_block():
+    CaptureHandler.captured_payload = None
+    CaptureHandler.response_payload = {
+        "id": "resp_bare_function_tool",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "<function=computer_use>"
+                            "<parameter=coordinate_space>"
+                            "qwen_normalized_1000"
+                            "</parameter>"
+                            "<parameter=actions>"
+                            '[{"type":"click","x":500,"y":900}]'
+                            "</parameter>"
+                            "</function>"
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        agent = OpenAIResponsesAgent(
+            model="qwen35-vl",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+            max_output_tokens=64,
+        )
+        response = agent(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "click send"}],
+                }
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert response["output"] == [
+        {
+            "type": "function_call",
+            "name": "computer_use",
+            "call_id": "text_tool_call_1",
+            "arguments": (
+                '{"coordinate_space": "qwen_normalized_1000", '
+                '"actions": [{"type": "click", "x": 500, "y": 900}]}'
+            ),
+        }
+    ]
+
+
+def test_openai_responses_agent_strips_inline_media_from_tool_outputs():
+    CaptureHandler.captured_payload = None
+    CaptureHandler.response_payload = {"id": "resp_ok", "output": []}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        agent = OpenAIResponsesAgent(
+            model="qwen35-vl",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+            max_output_tokens=64,
+        )
+        agent(
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": "tool_with_image",
+                    "output": {
+                        "status": "accepted",
+                        "screenshot_image_url": (
+                            "data:image/jpeg;base64,"
+                            + ("A" * 4096)
+                        ),
+                        "nested": [
+                            {
+                                "after_ref": (
+                                    "prefix data:image/png;base64,"
+                                    + ("B" * 4096)
+                                )
+                            }
+                        ],
+                    },
+                }
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    payload = CaptureHandler.captured_payload
+    assert payload is not None
+    output_text = payload["input"][0]["output"]
+    assert "data:image" not in output_text
+    assert "AAAA" not in output_text
+    assert "BBBB" not in output_text
+    assert "inline media data omitted" in output_text
+
+
+def test_openai_responses_agent_strips_inline_media_from_runtime_text_only():
+    CaptureHandler.captured_payload = None
+    CaptureHandler.response_payload = {"id": "resp_ok", "output": []}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    image_url = "data:image/jpeg;base64," + ("C" * 4096)
+    try:
+        agent = OpenAIResponsesAgent(
+            model="qwen35-vl",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+            max_output_tokens=64,
+        )
+        agent(
+            [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                '{"current_frame":"'
+                                + image_url
+                                + '","note":"image is also sent separately"}'
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "inspect screenshot"},
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": "low",
+                        },
+                    ],
+                },
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    payload = CaptureHandler.captured_payload
+    assert payload is not None
+    developer_text = payload["input"][0]["content"][0]["text"]
+    assert "data:image" not in developer_text
+    assert "CCCC" not in developer_text
+    assert "inline media data omitted" in developer_text
+    assert payload["input"][1]["content"][1]["image_url"] == image_url
+
+
+def test_openai_responses_agent_request_debug_redacts_typed_media():
+    CaptureHandler.captured_payload = None
+    CaptureHandler.response_payload = {"id": "resp_ok", "output": []}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    image_url = "data:image/jpeg;base64," + ("D" * 4096)
+    try:
+        agent = OpenAIResponsesAgent(
+            model="qwen35-vl",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+            max_output_tokens=64,
+        )
+        response = agent(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "inspect screenshot"},
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": "low",
+                        },
+                    ],
+                }
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    payload = CaptureHandler.captured_payload
+    assert payload is not None
+    assert payload["input"][0]["content"][1]["image_url"] == image_url
+    debug = response["_cfie_request_debug"]
+    debug_json = json.dumps(debug, ensure_ascii=False)
+    assert "data:image" not in debug_json
+    assert "DDDD" not in debug_json
+    image_debug = debug["input"][0]["content"][1]["image_url"]
+    assert image_debug["placeholder"] == "[图片]"
+    assert image_debug["source_type"] == "data_url"
+    assert image_debug["mime_type"] == "image/jpeg"

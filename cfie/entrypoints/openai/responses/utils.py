@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from typing import Any
 
 from openai.types.chat import (
@@ -23,6 +24,9 @@ from openai.types.responses.tool import Tool
 from cfie import envs
 from cfie.entrypoints.constants import MCP_PREFIX
 from cfie.entrypoints.openai.chat_completion.protocol import ChatCompletionMessageParam
+from cfie.entrypoints.openai.responses.input_sanitizer import (
+    strip_inline_media_from_text,
+)
 from cfie.entrypoints.openai.responses.protocol import ResponseInputOutputItem
 from cfie.logger import init_logger
 
@@ -88,7 +92,7 @@ def construct_input_messages(
         messages.append(
             {
                 "role": "system",
-                "content": request_instructions,
+                "content": strip_inline_media_from_text(request_instructions),
             }
         )
 
@@ -112,7 +116,9 @@ def construct_input_messages(
     # Append the new input.
     # Responses API supports simple text inputs without chat format.
     if isinstance(request_input, str):
-        messages.append({"role": "user", "content": request_input})
+        messages.append(
+            {"role": "user", "content": strip_inline_media_from_text(request_input)}
+        )
     else:
         input_messages = construct_chat_messages_with_tool_call(request_input)
         messages.extend(input_messages)
@@ -163,6 +169,9 @@ def construct_chat_messages_with_tool_call(
     """
     messages: list[ChatCompletionMessageParam] = []
     for item in input_messages:
+        if _response_item_type(item) == "computer_call_output":
+            messages.extend(_construct_computer_call_output_messages(item))
+            continue
         maybe_combined_message = _maybe_combine_reasoning_and_tool_call(item, messages)
         if maybe_combined_message is not None:
             messages[-1] = maybe_combined_message
@@ -185,6 +194,47 @@ def _construct_single_message_from_response_item(
                     function=FunctionCallTool(
                         name=item.name,
                         arguments=item.arguments,
+                    ),
+                    type="function",
+                )
+            ],
+        )
+    elif isinstance(item, dict) and item.get("type") in {
+        "function_call",
+        "tool_call",
+    }:
+        arguments = item.get("arguments", "")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        return ChatCompletionAssistantMessageParam(
+            role="assistant",
+            tool_calls=[
+                ChatCompletionMessageToolCallParam(
+                    id=str(item.get("call_id") or item.get("id") or item.get("name")),
+                    function=FunctionCallTool(
+                        name=str(item.get("name") or ""),
+                        arguments=arguments,
+                    ),
+                    type="function",
+                )
+            ],
+        )
+    elif isinstance(item, dict) and item.get("type") == "computer_call":
+        arguments = {
+            key: value
+            for key, value in item.items()
+            if key not in {"type", "id", "call_id", "status"}
+        }
+        return ChatCompletionAssistantMessageParam(
+            role="assistant",
+            tool_calls=[
+                ChatCompletionMessageToolCallParam(
+                    id=str(item.get("call_id") or item.get("id") or "computer_use"),
+                    function=FunctionCallTool(
+                        name="computer_use",
+                        arguments=strip_inline_media_from_text(
+                            json.dumps(arguments, ensure_ascii=False)
+                        ),
                     ),
                     type="function",
                 )
@@ -216,17 +266,90 @@ def _construct_single_message_from_response_item(
     elif isinstance(item, ResponseFunctionToolCallOutputItem):
         return ChatCompletionToolMessageParam(
             role="tool",
-            content=item.output,
+            content=strip_inline_media_from_text(item.output),
             tool_call_id=item.call_id,
         )
     elif isinstance(item, dict) and item.get("type") == "function_call_output":
         # Append the function call output as a tool message.
+        output = item.get("output")
+        if isinstance(output, str):
+            output = strip_inline_media_from_text(output)
         return ChatCompletionToolMessageParam(
             role="tool",
-            content=item.get("output"),
+            content=output,
             tool_call_id=item.get("call_id"),
         )
     return item  # type: ignore
+
+
+def _construct_computer_call_output_messages(
+    item: ResponseInputOutputItem,
+) -> list[ChatCompletionMessageParam]:
+    call_id = str(_response_item_field(item, "call_id", "computer_use"))
+    output = _response_item_field(item, "output", {}) or {}
+    if not isinstance(output, dict):
+        return [
+            ChatCompletionToolMessageParam(
+                role="tool",
+                content="computer_use returned no screenshot output.",
+                tool_call_id=call_id,
+            )
+        ]
+
+    detail = output.get("detail", "low")
+    image_url = output.get("image_url")
+    summary = str(output.get("summary") or "").strip()
+    content = (
+        f"computer_use completed. {summary} Screenshot observation is provided "
+        "as the following image message."
+        if summary
+        else (
+            "computer_use completed. Screenshot observation is provided "
+            "as the following image message."
+        )
+    )
+    messages: list[ChatCompletionMessageParam] = [
+        ChatCompletionToolMessageParam(
+            role="tool",
+            content=content,
+            tool_call_id=call_id,
+        )
+    ]
+    if image_url:
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Screenshot observation after computer_use "
+                            f"call_id={call_id}."
+                        ),
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": image_url,
+                        "detail": detail,
+                    },
+                ],
+            }
+        )
+    return messages
+
+
+def _response_item_type(item: ResponseInputOutputItem) -> str | None:
+    return _response_item_field(item, "type", None)
+
+
+def _response_item_field(
+    item: ResponseInputOutputItem,
+    field_name: str,
+    default: Any = None,
+) -> Any:
+    if isinstance(item, dict):
+        return item.get(field_name, default)
+    return getattr(item, field_name, default)
 
 
 def extract_tool_types(tools: list[Tool]) -> set[str]:

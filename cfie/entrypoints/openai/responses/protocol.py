@@ -70,6 +70,9 @@ from cfie.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
 )
 from cfie.entrypoints.openai.engine.protocol import OpenAIBaseModel
+from cfie.entrypoints.openai.responses.input_sanitizer import (
+    sanitize_responses_input_data,
+)
 from cfie.entrypoints.openai.reasoning_template import (
     build_reasoning_chat_template_kwargs,
 )
@@ -480,6 +483,16 @@ class ResponsesRequest(OpenAIBaseModel):
                 "Parameter 'cache_salt' must be a non-empty string if provided.",
                 parameter="cache_salt",
             )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_inline_media_in_text_fields(cls, data):
+        if not isinstance(data, dict):
+            return data
+        if "input" in data:
+            data = dict(data)
+            data["input"] = sanitize_responses_input_data(data["input"])
         return data
 
     @model_validator(mode="before")

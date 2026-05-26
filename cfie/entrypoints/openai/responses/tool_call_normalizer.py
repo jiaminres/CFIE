@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from typing import Any
@@ -32,6 +33,22 @@ _PARAMETER_RE = re.compile(
     r"<parameter=([A-Za-z_][A-Za-z0-9_]*)>(.*?)</parameter>",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_DIRECT_AGENT_TOOL_ACTION_TYPES = {
+    "append_trace_note",
+    "ask_replan",
+    "finish_subtask",
+    "navigate_to_target",
+    "query_memory",
+    "read_image",
+    "read_text_file",
+    "read_video_clip",
+    "record_workflow_result",
+    "report_blocked",
+    "request_human_help",
+    "run_action_macro",
+    "set_app_viewport",
+    "update_constraints",
+}
 
 
 def normalize_text_tool_calls_in_response_outputs(
@@ -52,6 +69,7 @@ def normalize_text_tool_calls_in_response_outputs(
         if stripped_item is not None:
             normalized.append(stripped_item)
         generated_calls.extend(calls)
+    generated_calls = _normalize_generated_function_calls(generated_calls)
 
     if not generated_calls:
         return output
@@ -73,6 +91,8 @@ def normalize_text_tool_calls_in_response_outputs(
 def _normalize_output_item(
     item: ResponseOutputItem,
 ) -> tuple[ResponseOutputItem | None, list[ResponseFunctionToolCall]]:
+    if _item_type(item) == "function_call":
+        return _normalize_function_call_item(item)
     if _item_type(item) != "message":
         return item, []
     content = getattr(item, "content", None)
@@ -89,7 +109,7 @@ def _normalize_output_item(
             normalized_parts.append(part)
             continue
 
-        parsed_calls = _parse_qwen_xml_tool_calls(text)
+        parsed_calls = _parse_qwen_text_tool_calls(text)
         cleaned = _strip_qwen_tool_call_blocks(text)
         if parsed_calls:
             calls.extend(parsed_calls)
@@ -124,22 +144,186 @@ def _normalize_output_item(
     )
 
 
+def _normalize_function_call_item(
+    item: ResponseOutputItem,
+) -> tuple[ResponseOutputItem | None, list[ResponseFunctionToolCall]]:
+    if _item_name(item) != "computer_use":
+        return item, []
+    arguments = _parse_arguments_value(_item_arguments(item))
+    if not isinstance(arguments, dict):
+        return item, []
+    actions = arguments.get("actions")
+    if isinstance(actions, str):
+        parsed_actions = _parse_parameter_value(actions)
+        actions = parsed_actions
+    if isinstance(actions, dict):
+        actions = [actions]
+    if not isinstance(actions, list):
+        return item, []
+
+    kept_actions: list[Any] = []
+    nested_calls: list[ResponseFunctionToolCall] = []
+    for index, action in enumerate(actions):
+        nested = _nested_agent_tool_call_from_action(action, offset=index)
+        if nested is None:
+            kept_actions.append(action)
+        else:
+            nested_calls.append(nested)
+
+    if not nested_calls:
+        return item, []
+    if not kept_actions:
+        return None, nested_calls
+
+    updated_arguments = dict(arguments)
+    updated_arguments["actions"] = kept_actions
+    return (
+        _make_function_call(
+            name="computer_use",
+            arguments=updated_arguments,
+            id_value=_item_id(item),
+            call_id=_item_call_id(item),
+            status=_item_status(item),
+        ),
+        nested_calls,
+    )
+
+
+def _normalize_generated_function_calls(
+    calls: list[ResponseFunctionToolCall],
+) -> list[ResponseFunctionToolCall]:
+    normalized: list[ResponseFunctionToolCall] = []
+    for call in calls:
+        item, nested_calls = _normalize_function_call_item(call)
+        if item is not None:
+            normalized.append(item)  # type: ignore[arg-type]
+        normalized.extend(nested_calls)
+    return normalized
+
+
+def _parse_qwen_text_tool_calls(text: str) -> list[ResponseFunctionToolCall]:
+    calls = _parse_qwen_xml_tool_calls(text)
+    calls.extend(_parse_qwen_bare_function_calls(text, offset=len(calls)))
+    calls.extend(_parse_qwen_tool_code_calls(text, offset=len(calls)))
+    return calls
+
+
 def _parse_qwen_xml_tool_calls(text: str) -> list[ResponseFunctionToolCall]:
     calls: list[ResponseFunctionToolCall] = []
     for block in _TOOL_BLOCK_RE.findall(text):
         for name, body in _FUNCTION_RE.findall(block):
             arguments = _parse_qwen_xml_arguments(body)
-            calls.append(
-                ResponseFunctionToolCall(
-                    id=f"fc_{random_uuid()}",
-                    call_id=f"call_{random_uuid()}",
-                    type="function_call",
-                    status="completed",
-                    name=name.strip(),
-                    arguments=json.dumps(arguments, ensure_ascii=False),
-                )
-            )
+            calls.append(_make_function_call(name=name.strip(), arguments=arguments))
     return calls
+
+
+def _parse_qwen_bare_function_calls(
+    text: str,
+    *,
+    offset: int = 0,
+) -> list[ResponseFunctionToolCall]:
+    text_without_wrapped_calls = _TOOL_BLOCK_RE.sub("", text)
+    text_without_wrapped_calls = _TOOL_CODE_BLOCK_RE.sub("", text_without_wrapped_calls)
+    calls: list[ResponseFunctionToolCall] = []
+    for name, body in _FUNCTION_RE.findall(text_without_wrapped_calls):
+        arguments = _parse_qwen_xml_arguments(body)
+        calls.append(
+            _make_function_call(
+                name=name.strip(),
+                arguments=arguments,
+                call_id=f"call_text_function_{offset + len(calls) + 1}",
+            )
+        )
+    return calls
+
+
+def _parse_qwen_tool_code_calls(
+    text: str,
+    *,
+    offset: int = 0,
+) -> list[ResponseFunctionToolCall]:
+    calls: list[ResponseFunctionToolCall] = []
+    for block in _TOOL_CODE_BLOCK_RE.findall(text):
+        calls.extend(_parse_python_tool_code(block, offset=offset + len(calls)))
+    return calls
+
+
+def _parse_python_tool_code(
+    code: str,
+    *,
+    offset: int = 0,
+) -> list[ResponseFunctionToolCall]:
+    stripped = code.strip()
+    if not stripped:
+        return []
+    try:
+        tree = ast.parse(stripped, mode="exec")
+    except SyntaxError:
+        return []
+
+    calls: list[ResponseFunctionToolCall] = []
+    for statement in tree.body:
+        value = statement.value if isinstance(statement, ast.Expr) else statement
+        if not isinstance(value, ast.Call):
+            continue
+        call = _unwrap_print_tool_call(value)
+        name = _call_name(call)
+        if not name or name == "print":
+            continue
+        calls.append(
+            _make_function_call(
+                name=name,
+                arguments=_python_call_arguments(name, call),
+                call_id=f"call_tool_code_{offset + len(calls) + 1}",
+            )
+        )
+    return calls
+
+
+def _unwrap_print_tool_call(call: ast.Call) -> ast.Call:
+    if (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "print"
+        and len(call.args) == 1
+        and isinstance(call.args[0], ast.Call)
+    ):
+        return call.args[0]
+    return call
+
+
+def _call_name(call: ast.Call) -> str:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return ""
+
+
+def _python_call_arguments(tool_name: str, call: ast.Call) -> dict[str, Any]:
+    arguments: dict[str, Any] = {}
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            continue
+        arguments[keyword.arg] = _literal_ast_value(keyword.value)
+    if call.args:
+        values = [_literal_ast_value(arg) for arg in call.args]
+        if len(values) == 1 and isinstance(values[0], dict):
+            arguments.update(values[0])
+        elif len(values) == 1 and tool_name == "computer_use":
+            arguments.setdefault("actions", values[0])
+        else:
+            arguments.setdefault("_args", values)
+    return arguments
+
+
+def _literal_ast_value(node: ast.AST) -> Any:
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, SyntaxError):
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return ""
 
 
 def _parse_qwen_xml_arguments(body: str) -> dict[str, Any]:
@@ -161,7 +345,102 @@ def _parse_parameter_value(raw_value: str) -> Any:
                 return json.loads(candidate)
             except json.JSONDecodeError:
                 pass
+        if stripped[0] == "{":
+            try:
+                return ast.literal_eval(stripped)
+            except (ValueError, SyntaxError):
+                pass
+    if stripped[0] in {"'", '"'}:
+        try:
+            return json.loads(stripped) if stripped[0] == '"' else ast.literal_eval(stripped)
+        except (json.JSONDecodeError, ValueError, SyntaxError):
+            return stripped
     return stripped
+
+
+def _parse_arguments_value(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return {}
+        parsed = _parse_parameter_value(stripped)
+        return parsed
+    return value
+
+
+def _nested_agent_tool_call_from_action(
+    action: Any,
+    *,
+    offset: int,
+) -> ResponseFunctionToolCall | None:
+    if not isinstance(action, dict):
+        return None
+    action_type = str(action.get("type") or "").strip()
+    if action_type in _DIRECT_AGENT_TOOL_ACTION_TYPES:
+        parameters = (
+            action.get("parameters")
+            if "parameters" in action
+            else action.get("arguments")
+        )
+        if isinstance(parameters, str):
+            parameters = _parse_parameter_value(parameters)
+        if isinstance(parameters, dict):
+            arguments = dict(parameters)
+        elif parameters is not None:
+            arguments = {"parameters": parameters}
+        else:
+            arguments = {
+                key: value
+                for key, value in action.items()
+                if key not in {"type", "call_id"}
+            }
+        return _make_function_call(
+            name=action_type,
+            arguments=arguments,
+            call_id=str(action.get("call_id") or f"call_nested_{offset + 1}"),
+        )
+    if action_type not in {"call_function", "call_tool"}:
+        return None
+
+    function_spec = action.get("function")
+    if isinstance(function_spec, dict):
+        name = str(
+            function_spec.get("name")
+            or action.get("function_name")
+            or action.get("tool_name")
+            or action.get("name")
+            or ""
+        ).strip()
+        parameters = (
+            function_spec.get("parameters")
+            if "parameters" in function_spec
+            else function_spec.get("arguments")
+        )
+    else:
+        name = str(
+            action.get("function_name")
+            or action.get("tool_name")
+            or action.get("name")
+            or ""
+        ).strip()
+        parameters = (
+            action.get("parameters")
+            if "parameters" in action
+            else action.get("arguments")
+        )
+    if not name:
+        return None
+    if isinstance(parameters, str):
+        parsed_parameters = _parse_parameter_value(parameters)
+        parameters = parsed_parameters
+    arguments = dict(parameters) if isinstance(parameters, dict) else {}
+    if parameters is not None and not isinstance(parameters, dict):
+        arguments["parameters"] = parameters
+    return _make_function_call(
+        name=name,
+        arguments=arguments,
+        call_id=str(action.get("call_id") or f"call_nested_{offset + 1}"),
+    )
 
 
 def _repair_missing_y_coordinate(value: str) -> str:
@@ -175,6 +454,7 @@ def _repair_missing_y_coordinate(value: str) -> str:
 def _strip_qwen_tool_call_blocks(text: str) -> str:
     text = _TOOL_BLOCK_RE.sub("", text)
     text = _TOOL_CODE_BLOCK_RE.sub("", text)
+    text = _FUNCTION_RE.sub("", text)
     return text.strip()
 
 
@@ -182,6 +462,60 @@ def _item_type(item: Any) -> str:
     if isinstance(item, dict):
         return str(item.get("type") or "")
     return str(getattr(item, "type", "") or "")
+
+
+def _item_name(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("name") or "")
+    return str(getattr(item, "name", "") or "")
+
+
+def _item_id(item: Any) -> str | None:
+    if isinstance(item, dict):
+        value = item.get("id")
+    else:
+        value = getattr(item, "id", None)
+    return str(value) if value else None
+
+
+def _item_call_id(item: Any) -> str | None:
+    if isinstance(item, dict):
+        value = item.get("call_id")
+    else:
+        value = getattr(item, "call_id", None)
+    return str(value) if value else None
+
+
+def _item_status(item: Any) -> str:
+    if isinstance(item, dict):
+        value = item.get("status")
+    else:
+        value = getattr(item, "status", None)
+    return str(value or "completed")
+
+
+def _item_arguments(item: Any) -> Any:
+    if isinstance(item, dict):
+        return item.get("arguments")
+    return getattr(item, "arguments", None)
+
+
+def _make_function_call(
+    *,
+    name: str,
+    arguments: dict[str, Any],
+    id_value: str | None = None,
+    call_id: str | None = None,
+    status: str = "completed",
+) -> ResponseFunctionToolCall:
+    return ResponseFunctionToolCall(
+        id=id_value or f"fc_{random_uuid()}",
+        call_id=call_id or f"call_{random_uuid()}",
+        type="function_call",
+        status=status,
+        name=name,
+        arguments=json.dumps(arguments, ensure_ascii=False),
+    )
 
 
 def _function_call_signature(item: Any) -> tuple[str, str]:

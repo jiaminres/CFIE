@@ -33,6 +33,99 @@ def test_responses_request_accepts_input_video_content_part():
     assert messages == payload["input"]
 
 
+def test_responses_request_strips_inline_media_from_text_only():
+    image_url = "data:image/jpeg;base64," + ("A" * 4096)
+    payload = {
+        "model": "qwen3.5-vl",
+        "input": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            '{"current_frame":"' + image_url + '",'
+                            '"note":"the image is sent separately"}'
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Inspect the screenshot."},
+                    {
+                        "type": "input_image",
+                        "image_url": image_url,
+                        "detail": "high",
+                    },
+                ],
+            },
+        ],
+    }
+
+    request = ResponsesRequest.model_validate(payload)
+    messages = construct_input_messages(request_input=request.input)
+
+    developer_text = messages[0]["content"][0]["text"]
+    assert "data:image" not in developer_text
+    assert "AAAA" not in developer_text
+    assert "inline media data omitted" in developer_text
+    assert messages[1]["content"][1]["image_url"] == image_url
+
+
+def test_construct_input_messages_strips_inline_media_from_tool_output():
+    output = "data:image/png;base64," + ("B" * 4096)
+
+    messages = construct_input_messages(
+        request_input=[
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": output,
+            }
+        ]
+    )
+
+    assert "data:image" not in messages[0]["content"]
+    assert "BBBB" not in messages[0]["content"]
+    assert "inline media data omitted" in messages[0]["content"]
+
+
+def test_construct_input_messages_maps_computer_output_to_tool_observation():
+    messages = construct_input_messages(
+        request_input=[
+            {
+                "type": "function_call",
+                "name": "computer_use",
+                "call_id": "call_screen",
+                "arguments": '{"actions":[{"type":"click","x":500,"y":900}]}',
+            },
+            {
+                "type": "computer_call_output",
+                "call_id": "call_screen",
+                "output": {
+                    "type": "computer_screenshot",
+                    "image_url": "file:///tmp/screen.jpg",
+                    "detail": "low",
+                    "summary": "Executed actions: click(500,900)",
+                },
+            },
+        ]
+    )
+
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["tool_calls"][0]["function"]["name"] == "computer_use"
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "call_screen"
+    assert "click(500,900)" in messages[1]["content"]
+    assert messages[2]["role"] == "user"
+    assert messages[2]["content"][1]["type"] == "input_image"
+    assert messages[2]["content"][1]["image_url"] == "file:///tmp/screen.jpg"
+
+
 def test_chat_parser_maps_input_video_to_video_url_content():
     part_type, content = _parse_chat_message_content_mm_part(
         {
