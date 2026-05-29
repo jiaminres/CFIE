@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -208,6 +209,16 @@ if TYPE_CHECKING:
     from cfie.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
+
+
+def _cfie_mtp_timing_enabled() -> bool:
+    return os.getenv("CFIE_MTP_TIMING", "") == "1"
+
+
+def _cfie_cuda_sync(device: torch.device) -> None:
+    if torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -4011,6 +4022,10 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        _timing = _cfie_mtp_timing_enabled()
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _target_t0 = time.perf_counter()
         with (
             set_forward_context(
                 attn_metadata,
@@ -4038,6 +4053,17 @@ class GPUModelRunner(
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
+            )
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING target_forward seconds=%.6f tokens=%d "
+                "num_reqs=%d spec=%s cudagraph_mode=%s",
+                time.perf_counter() - _target_t0,
+                int(num_tokens_padded),
+                int(num_reqs),
+                self.speculative_config is not None,
+                cudagraph_mode,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
@@ -4177,12 +4203,34 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        _timing = _cfie_mtp_timing_enabled()
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _sample_t0 = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING sample seconds=%.6f scheduled_tokens=%d "
+                "num_reqs=%d",
+                time.perf_counter() - _sample_t0,
+                int(scheduler_output.total_num_scheduled_tokens),
+                len(self.input_batch.req_ids),
+            )
 
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _update_t0 = time.perf_counter()
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING update_states seconds=%.6f",
+                time.perf_counter() - _update_t0,
+            )
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4199,6 +4247,9 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            if _timing:
+                _cfie_cuda_sync(self.device)
+                _draft_t0 = time.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4211,11 +4262,51 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
-                self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if _timing:
+                _cfie_cuda_sync(self.device)
+                logger.info(
+                    "CFIE_MTP_TIMING propose_draft seconds=%.6f "
+                    "scheduled_tokens=%d max_query_len=%d max_seq_len=%d "
+                    "draft_shape=%s",
+                    time.perf_counter() - _draft_t0,
+                    int(scheduler_output.total_num_scheduled_tokens),
+                    int(getattr(spec_decode_common_attn_metadata, "max_query_len", -1)),
+                    int(getattr(spec_decode_common_attn_metadata, "max_seq_len", -1)),
+                    tuple(self._draft_token_ids.shape)
+                    if self._draft_token_ids is not None
+                    else None,
+                )
+            self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
+        max_scheduled_tokens_this_step = max(
+            (
+                int(scheduler_output.num_scheduled_tokens.get(req_id, 0))
+                for req_id in self.input_batch.req_ids
+            ),
+            default=0,
+        )
+        allow_draft_proposal = (
+            max_scheduled_tokens_this_step <= int(self.uniform_decode_query_len)
+        )
+        if spec_config is not None and not allow_draft_proposal:
+            logger.debug(
+                "Skipping speculative drafter for prefill/chunked-prefill step: "
+                "max_scheduled_tokens=%d uniform_decode_query_len=%d",
+                max_scheduled_tokens_this_step,
+                int(self.uniform_decode_query_len),
+            )
+            if _timing:
+                logger.info(
+                    "CFIE_MTP_TIMING propose_draft skipped=true "
+                    "scheduled_tokens=%d max_scheduled_tokens=%d "
+                    "uniform_decode_query_len=%d",
+                    int(scheduler_output.total_num_scheduled_tokens),
+                    max_scheduled_tokens_this_step,
+                    int(self.uniform_decode_query_len),
+                )
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
+        if spec_config is not None and allow_draft_proposal:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
@@ -4281,6 +4372,9 @@ class GPUModelRunner(
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _bookkeep_t0 = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4298,6 +4392,12 @@ class GPUModelRunner(
                 aux_hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
+            )
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING bookkeeping seconds=%.6f",
+                time.perf_counter() - _bookkeep_t0,
             )
 
         if propose_drafts_after_bookkeeping:

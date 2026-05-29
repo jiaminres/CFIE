@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from typing import Any
 
 import torch
@@ -27,6 +29,15 @@ from cfie.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from cfie.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _cfie_mtp_timing_enabled() -> bool:
+    return os.getenv("CFIE_MTP_TIMING", "") == "1"
+
+
+def _cfie_cuda_sync(device: torch.device) -> None:
+    if torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 class EagleSpeculator:
@@ -231,6 +242,10 @@ class EagleSpeculator:
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
     ) -> torch.Tensor:
+        _timing = _cfie_mtp_timing_enabled()
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _total_t0 = time.perf_counter()
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of eagle's input_ids and
         # hidden_states the same as the target model's. This means, we pad each
@@ -248,6 +263,9 @@ class EagleSpeculator:
         self.hidden_states[:num_tokens] = hidden_states
 
         # Get the input ids and last token indices for the speculator.
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _prepare_t0 = time.perf_counter()
         last_token_indices = prepare_eagle_inputs(
             self.input_buffers,
             input_batch,
@@ -256,17 +274,49 @@ class EagleSpeculator:
             last_sampled,
             next_prefill_tokens,
         )
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING spec_prepare_inputs seconds=%.6f "
+                "tokens=%d num_reqs=%d",
+                time.perf_counter() - _prepare_t0,
+                int(num_tokens),
+                int(input_batch.num_reqs),
+            )
 
         # Prefill: Run the eagle speculator with eager mode.
         # TODO(woosuk): Support CUDA graph for prefill.
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _run_model_t0 = time.perf_counter()
         last_hidden_states, hidden_states = self.run_model(
             num_tokens,
             attn_metadata,
             slot_mappings,
             num_tokens_across_dp=num_tokens_across_dp,
         )
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING spec_run_model_prefill seconds=%.6f "
+                "tokens=%d num_reqs=%d",
+                time.perf_counter() - _run_model_t0,
+                int(num_tokens),
+                int(input_batch.num_reqs),
+            )
         sample_hidden_states = last_hidden_states[last_token_indices]
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _logits_t0 = time.perf_counter()
         logits = self.model.compute_logits(sample_hidden_states)
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING spec_compute_logits seconds=%.6f "
+                "num_reqs=%d",
+                time.perf_counter() - _logits_t0,
+                int(input_batch.num_reqs),
+            )
 
         num_reqs = input_batch.num_reqs
         num_reqs_padded = input_batch.num_reqs_after_padding
@@ -285,6 +335,9 @@ class EagleSpeculator:
         torch.gather(input_batch.positions, 0, last_token_indices, out=pos)
         # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
         # used for draft and target sampling.
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _sample_t0 = time.perf_counter()
         draft_tokens = gumbel_sample(
             logits,
             idx_mapping,
@@ -296,9 +349,26 @@ class EagleSpeculator:
             if draft_logits_out is not None
             else None,
         )
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING spec_gumbel_sample seconds=%.6f "
+                "num_reqs=%d",
+                time.perf_counter() - _sample_t0,
+                int(input_batch.num_reqs),
+            )
 
         if self.num_speculative_steps == 1:
             # Early exit.
+            if _timing:
+                _cfie_cuda_sync(self.device)
+                logger.info(
+                    "CFIE_MTP_TIMING spec_total seconds=%.6f tokens=%d "
+                    "num_reqs=%d early_exit=1",
+                    time.perf_counter() - _total_t0,
+                    int(num_tokens),
+                    int(input_batch.num_reqs),
+                )
             return draft_tokens.view(-1, 1)
 
         # Save the draft tokens for the first step.

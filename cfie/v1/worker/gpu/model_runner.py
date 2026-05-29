@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -97,6 +98,15 @@ from cfie.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from cfie.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 logger = init_logger(__name__)
+
+
+def _cfie_mtp_timing_enabled() -> bool:
+    return os.getenv("CFIE_MTP_TIMING", "") == "1"
+
+
+def _cfie_cuda_sync(device: torch.device) -> None:
+    if torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1004,6 +1014,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert intermediate_tensors is not None
 
         # Run model.
+        _timing = _cfie_mtp_timing_enabled()
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _target_t0 = time.perf_counter()
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1039,6 +1053,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     hidden_states = model_output
                     aux_hidden_states = None
+
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING target_forward seconds=%.6f tokens=%d "
+                "num_reqs=%d spec=%s cg_mode=%s",
+                time.perf_counter() - _target_t0,
+                int(input_batch.num_tokens_after_padding),
+                int(input_batch.num_reqs),
+                self.speculator is not None,
+                batch_desc.cg_mode,
+            )
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
         self.execute_model_state = ExecuteModelState(
@@ -1088,15 +1114,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None
 
         # Last rank: sample tokens
+        _timing = _cfie_mtp_timing_enabled()
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _sample_t0 = time.perf_counter()
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING sample seconds=%.6f tokens=%d num_reqs=%d "
+                "num_draft_tokens=%d",
+                time.perf_counter() - _sample_t0,
+                int(input_batch.num_tokens_after_padding),
+                int(input_batch.num_reqs),
+                int(input_batch.num_draft_tokens),
+            )
 
         if self.use_pp:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
             pp_broadcast(sampler_output.sampled_token_ids, num_sampled, num_rejected)
 
         assert self.prompt_logprobs_worker is not None
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _prompt_logprobs_t0 = time.perf_counter()
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
             hidden_states,
@@ -1107,6 +1150,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.prefill_len.np,
             self.req_states.num_computed_prefill_tokens,
         )
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING prompt_logprobs seconds=%.6f tokens=%d",
+                time.perf_counter() - _prompt_logprobs_t0,
+                int(input_batch.num_tokens_after_padding),
+            )
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
@@ -1132,11 +1182,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            _post_t0 = time.perf_counter()
         self.postprocess(
             input_batch, sampler_output.sampled_token_ids, num_sampled, num_rejected
         )
-        if self.speculator is not None:
+        if _timing:
+            _cfie_cuda_sync(self.device)
+            logger.info(
+                "CFIE_MTP_TIMING postprocess seconds=%.6f tokens=%d",
+                time.perf_counter() - _post_t0,
+                int(input_batch.num_tokens_after_padding),
+            )
+        allow_speculator_propose = True
+        if self.speculator is not None and input_batch.num_scheduled_tokens.size:
+            max_scheduled_tokens = int(input_batch.num_scheduled_tokens.max())
+            allow_speculator_propose = max_scheduled_tokens <= int(self.decode_query_len)
+            if not allow_speculator_propose:
+                logger.debug(
+                    "Skipping speculative drafter for prefill/chunked-prefill step: "
+                    "max_scheduled_tokens=%d decode_query_len=%d",
+                    max_scheduled_tokens,
+                    int(self.decode_query_len),
+                )
+                if _timing:
+                    logger.info(
+                        "CFIE_MTP_TIMING speculator_propose skipped=true "
+                        "tokens=%d max_scheduled_tokens=%d decode_query_len=%d",
+                        int(input_batch.num_tokens_after_padding),
+                        max_scheduled_tokens,
+                        int(self.decode_query_len),
+                    )
+
+        if self.speculator is not None and allow_speculator_propose:
             assert self.sampler is not None
+            if _timing:
+                _cfie_cuda_sync(self.device)
+                _spec_t0 = time.perf_counter()
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1152,6 +1235,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.draft_logits,
                 num_tokens_across_dp=num_tokens_across_dp,
             )
+            if _timing:
+                _cfie_cuda_sync(self.device)
+                try:
+                    _num_sampled_sum = int(num_sampled.sum().item())
+                    _num_rejected_sum = int(num_rejected.sum().item())
+                except Exception:
+                    _num_sampled_sum = -1
+                    _num_rejected_sum = -1
+                logger.info(
+                    "CFIE_MTP_TIMING speculator_propose seconds=%.6f "
+                    "tokens=%d num_reqs=%d num_sampled_sum=%d "
+                    "num_rejected_sum=%d draft_shape=%s",
+                    time.perf_counter() - _spec_t0,
+                    int(input_batch.num_tokens_after_padding),
+                    int(input_batch.num_reqs),
+                    _num_sampled_sum,
+                    _num_rejected_sum,
+                    tuple(draft_tokens.shape),
+                )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
 

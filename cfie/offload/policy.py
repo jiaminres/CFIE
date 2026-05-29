@@ -236,6 +236,13 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
     cpu_static_pinned_layers_raw = str(
         getattr(offload_config, "cpu_static_pinned_layers", "") or ""
     )
+    # The target model owns the pinned static mirror budget. The MTP drafter is
+    # auxiliary and much smaller, but inheriting the target pinned budget makes
+    # Windows runs fail or enter a slow memory-pressure path after the target
+    # already pinned tens of GiB of experts.
+    if planning_mode == "mtp":
+        cpu_static_pinned_gb = 0.0
+        cpu_static_pinned_layers_raw = ""
     if (cpu_static_pinned_gb > 0.0 or cpu_static_pinned_layers_raw) and (
         not is_pin_memory_available()
     ):
@@ -422,8 +429,13 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
         )
 
     # reserve-only 的 mtp 临时计划必须保留 base_8 语义，不能在递归预估阶段直接扩成全量常驻。
-    # 除此之外，target 和真正的 draft 计划只要预算足够，都可以直接走 full residency。
-    if raw_gpu_expert_budget_bytes >= expert_bytes_total and not mtp_reserve_mode:
+    # 真实 MTP drafter 也不能贪心扩成 full residency；否则 122B target + drafter
+    # 会把 32GB Windows 显存推入压力慢路径，导致 target prefill kernel 整体变慢。
+    if (
+            raw_gpu_expert_budget_bytes >= expert_bytes_total
+            and not mtp_reserve_mode
+            and planning_mode != "mtp"
+    ):
         return MoeTieredCachePlan(
             enabled=False,
             reason="full_gpu_residency_already_possible",
@@ -468,9 +480,15 @@ def build_moe_tiered_cache_plan(cfie_config: Any) -> MoeTieredCachePlan:
             raw_gpu_slots_per_layer,
             fixed_gpu_slots_per_layer,
         )
-        # 固定常驻模式下不启用 prefill burst。
-        prefill_burst_slots = min(num_experts, max(0, explicit_prefill_burst_slots))
-        # 对应的 burst 临时池显存也为 0。
+        # MTP drafter 不继承 target 的 prefill burst pool。target 负责长 prefill；
+        # drafter 只需要给 speculative decode 保留小规模 resident experts。
+        if planning_mode == "mtp":
+            prefill_burst_slots = 0
+        else:
+            prefill_burst_slots = min(
+                num_experts, max(0, explicit_prefill_burst_slots)
+            )
+        # 对应的 burst 临时池显存。
         prefill_burst_bytes = prefill_burst_slots * expert_bytes_per_expert
         # GPU 专家预算收缩为“常驻 slot 数 * 每 slot 跨层总字节”。
         gpu_expert_budget_bytes = (

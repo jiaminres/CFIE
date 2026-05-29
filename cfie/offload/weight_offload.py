@@ -4733,7 +4733,11 @@ class LayerTieredExpertCacheController:
         )
 
     def _assemble_unquantized_weights(
-            self, bundle: ExpertBundle
+            self,
+            bundle: ExpertBundle,
+            *,
+            raw: _RawUnquantizedExpertWeights | None = None,
+            expert_index: int = 0,
     ) -> _RawUnquantizedExpertWeights:
         # ----------------- 閻犱緤绱曢悾濠氭閻愬搫娅ら柛?w13 闁汇劌瀚€氶箖骞掗妷銉︽閻?-----------------
         tensors = bundle.tensors
@@ -4745,11 +4749,19 @@ class LayerTieredExpertCacheController:
         )
         half_dim = self.layer.intermediate_size_per_partition
         # 闂傚牏鍋ら崳娲礌閺嶎剛鐔呯€垫澘瀚幃鎾诲冀閻ゎ垼娲ｆ慨鐟板€块。鈺呭礆閸℃稑甯?CPU raw buffer闁?
-        if self._cpu_unquantized_raw_buffer is None:
+        if raw is None and self._cpu_unquantized_raw_buffer is None:
             raise RuntimeError(
                 f"{self.layer_key}: unquantized CPU raw buffer is missing"
             )
-        raw = self._cpu_unquantized_raw_buffer
+        if raw is None:
+            raw = self._cpu_unquantized_raw_buffer
+        assert raw is not None
+        expert_index = int(expert_index)
+        if expert_index < 0 or expert_index >= int(raw.w13_weight.shape[0]):
+            raise IndexError(
+                f"{self.layer_key}: unquantized raw expert_index={expert_index} "
+                f"out of range for buffer with {raw.w13_weight.shape[0]} slots"
+            )
         seen_fields: set[tuple[str, str]] = set()
 
         # ----------------- 闁?gate/up/down 闁哄鍟撮崳鎼佸箯閸忕厧鐏?runtime 闁圭鍋撻梻鍥ｅ亾闁?w13/w2 -----------------
@@ -4762,17 +4774,19 @@ class LayerTieredExpertCacheController:
             cpu_tensor = tensor if tensor.device.type == "cpu" else tensor.to(device="cpu")
             # gate_proj 闁告劖鐟ラ崣?w13 闁告挸绉村畷鎰版焾閵娿儱鐎婚柕?
             if proj_name == "gate_proj":
-                raw.w13_weight[0, :half_dim].copy_(cpu_tensor)
+                raw.w13_weight[expert_index, :half_dim].copy_(cpu_tensor)
                 seen_fields.add((proj_name, field_name))
             # up_proj 闁告劖鐟ラ崣?w13 闁告艾楠稿畷鎰版焾閵娿儱鐎婚柕?
             elif proj_name == "up_proj":
-                raw.w13_weight[0, half_dim: half_dim + cpu_tensor.shape[0]].copy_(
+                raw.w13_weight[
+                    expert_index, half_dim: half_dim + cpu_tensor.shape[0]
+                ].copy_(
                     cpu_tensor
                 )
                 seen_fields.add((proj_name, field_name))
             # down_proj 闁烩晛鐡ㄧ敮鎾礃濞嗗繐寮?w2闁?
             elif proj_name == "down_proj":
-                raw.w2_weight[0].copy_(cpu_tensor)
+                raw.w2_weight[expert_index].copy_(cpu_tensor)
                 seen_fields.add((proj_name, field_name))
 
         # 缂傚倽妗ㄩ幑銏ゅ箛韫囧海顏遍柛褎顨嗗鍫ユ煂瀹ュ鍘村☉鎾崇Х閸忔鈧懓鏈崹姘跺礉閵婏腹鍋撴担绋款潱閺夌偛顫曢埀?
