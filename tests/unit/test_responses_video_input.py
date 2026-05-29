@@ -120,10 +120,44 @@ def test_construct_input_messages_maps_computer_output_to_tool_observation():
     assert messages[0]["tool_calls"][0]["function"]["name"] == "computer_use"
     assert messages[1]["role"] == "tool"
     assert messages[1]["tool_call_id"] == "call_screen"
-    assert "click(500,900)" in messages[1]["content"]
-    assert messages[2]["role"] == "user"
-    assert messages[2]["content"][1]["type"] == "input_image"
-    assert messages[2]["content"][1]["image_url"] == "file:///tmp/screen.jpg"
+    assert "click(500,900)" in messages[1]["content"][0]["text"]
+    assert messages[1]["content"][1]["type"] == "input_image"
+    assert messages[1]["content"][1]["image_url"] == "file:///tmp/screen.jpg"
+    assert len(messages) == 2
+
+
+def test_construct_input_messages_keeps_click_refinement_images_in_tool_observation():
+    messages = construct_input_messages(
+        request_input=[
+            {
+                "type": "computer_call_output",
+                "call_id": "call_screen",
+                "output": {
+                    "type": "computer_screenshot",
+                    "image_url": "file:///tmp/screen.jpg",
+                    "detail": "low",
+                    "summary": "Executed actions: click(500,900)",
+                    "local_refinements": [
+                        {
+                            "type": "computer_screenshot",
+                            "image_url": "file:///tmp/local.jpg",
+                            "detail": "high",
+                            "summary": "Click-local refinement image.",
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "tool"
+    assert messages[0]["tool_call_id"] == "call_screen"
+    assert messages[0]["content"][0]["type"] == "input_text"
+    assert "click-local refinement" in messages[0]["content"][0]["text"]
+    assert messages[0]["content"][1]["image_url"] == "file:///tmp/screen.jpg"
+    assert messages[0]["content"][2]["text"] == "Click-local refinement image."
+    assert messages[0]["content"][3]["image_url"] == "file:///tmp/local.jpg"
 
 
 def test_chat_parser_maps_input_video_to_video_url_content():

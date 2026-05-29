@@ -6,6 +6,7 @@ from cfie.entrypoints.openai.reasoning_template import (
     QWEN_REASONING_PREAMBLE_KWARG,
 )
 from cfie.entrypoints.openai.responses.protocol import ResponsesRequest
+from cfie.entrypoints.openai.responses.serving import OpenAIServingResponses
 from cfie.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
 from cfie.renderers.hf import _apply_cfie_reasoning_preamble
 
@@ -58,15 +59,17 @@ def test_chat_completion_reasoning_effort_uses_same_template_mapping() -> None:
 
     assert params.chat_template_kwargs["reasoning_effort"] == "low"
     assert params.chat_template_kwargs["enable_thinking"] is True
-    assert "Think fast" in params.chat_template_kwargs[QWEN_REASONING_PREAMBLE_KWARG]
+    assert "当前状态" in params.chat_template_kwargs[
+        QWEN_REASONING_PREAMBLE_KWARG
+    ]
 
 
 def test_qwen_preamble_is_inserted_inside_generation_think_block() -> None:
     prompt = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
 
-    rendered = _apply_cfie_reasoning_preamble(prompt, "Current think mode: low.")
+    rendered = _apply_cfie_reasoning_preamble(prompt, "当前思考模式：low。\n当前状态：")
 
-    assert rendered.endswith("<think>\nCurrent think mode: low.\n")
+    assert rendered.endswith("<think>\n当前思考模式：low。\n当前状态：\n")
 
 
 def test_qwen_preamble_does_not_modify_disabled_thinking_prompt() -> None:
@@ -75,7 +78,7 @@ def test_qwen_preamble_does_not_modify_disabled_thinking_prompt() -> None:
         "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
 
-    rendered = _apply_cfie_reasoning_preamble(prompt, "Current think mode: low.")
+    rendered = _apply_cfie_reasoning_preamble(prompt, "当前思考模式：low。")
 
     assert rendered == prompt
 
@@ -120,3 +123,65 @@ def test_qwen_parser_effort_overrides_template_kwargs_for_enabled_thinking() -> 
 
     assert reasoning == "unfinished reasoning"
     assert content is None
+
+
+def test_responses_build_chat_params_persists_reasoning_preamble_for_parser() -> None:
+    request = ResponsesRequest(input="hello", reasoning={"effort": "low"})
+
+    params = request.build_chat_params(None, "auto")
+
+    assert request.chat_template_kwargs == params.chat_template_kwargs
+    assert QWEN_REASONING_PREAMBLE_KWARG in request.chat_template_kwargs
+
+
+def test_qwen_parser_includes_preamble_with_empty_model_reasoning() -> None:
+    parser = Qwen3ReasoningParser(_FakeTokenizer())
+    request = ResponsesRequest(input="hello", reasoning={"effort": "low"})
+    request.build_chat_params(None, "auto")
+
+    reasoning, content = parser.extract_reasoning("</think>final answer", request)
+
+    assert "当前思考模式：low" in reasoning
+    assert "final answer" == content
+
+
+def test_qwen_parser_prefixes_preamble_to_generated_reasoning() -> None:
+    parser = Qwen3ReasoningParser(_FakeTokenizer())
+    request = ResponsesRequest(input="hello", reasoning={"effort": "medium"})
+    request.build_chat_params(None, "auto")
+
+    reasoning, content = parser.extract_reasoning(
+        "checked state</think>call tool", request
+    )
+
+    assert reasoning.startswith("当前思考模式：medium")
+    assert reasoning.endswith("checked state")
+    assert content == "call tool"
+
+
+def test_responses_reasoning_enabled_requires_parser() -> None:
+    request = ResponsesRequest(input="hello", reasoning={"effort": "low"})
+    serving = object.__new__(OpenAIServingResponses)
+    serving.use_harmony = False
+    serving.enable_store = False
+    serving.parser = None
+    serving.default_chat_template_kwargs = {"enable_thinking": False}
+
+    error = OpenAIServingResponses._validate_create_responses_input(serving, request)
+
+    assert error is not None
+    assert error.error.param == "reasoning"
+    assert "--reasoning-parser qwen3" in error.error.message
+
+
+def test_responses_reasoning_disabled_does_not_require_parser() -> None:
+    request = ResponsesRequest(input="hello", reasoning={"effort": "none"})
+    serving = object.__new__(OpenAIServingResponses)
+    serving.use_harmony = False
+    serving.enable_store = False
+    serving.parser = None
+    serving.default_chat_template_kwargs = {"enable_thinking": False}
+
+    error = OpenAIServingResponses._validate_create_responses_input(serving, request)
+
+    assert error is None

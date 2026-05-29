@@ -299,6 +299,9 @@ def _construct_computer_call_output_messages(
     detail = output.get("detail", "low")
     image_url = output.get("image_url")
     summary = str(output.get("summary") or "").strip()
+    local_refinements = output.get("local_refinements")
+    if not isinstance(local_refinements, list):
+        local_refinements = []
     content = (
         f"computer_use completed. {summary} Screenshot observation is provided "
         "as the following image message."
@@ -308,34 +311,52 @@ def _construct_computer_call_output_messages(
             "as the following image message."
         )
     )
-    messages: list[ChatCompletionMessageParam] = [
+    if local_refinements:
+        content += (
+            f" {len(local_refinements)} click-local refinement image(s) are "
+            "included in the same observation."
+        )
+    tool_content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": content,
+        }
+    ]
+    if image_url:
+        tool_content.append(
+            {
+                "type": "input_image",
+                "image_url": image_url,
+                "detail": detail,
+            }
+        )
+        for index, refinement in enumerate(local_refinements, start=1):
+            if not isinstance(refinement, dict):
+                continue
+            refinement_image_url = refinement.get("image_url")
+            if not refinement_image_url:
+                continue
+            refinement_summary = str(refinement.get("summary") or "").strip()
+            if not refinement_summary:
+                refinement_summary = (
+                    f"Click-local refinement image {index} after computer_use "
+                    f"call_id={call_id}."
+                )
+            tool_content.append({"type": "input_text", "text": refinement_summary})
+            tool_content.append(
+                {
+                    "type": "input_image",
+                    "image_url": refinement_image_url,
+                    "detail": refinement.get("detail", detail),
+                }
+            )
+    return [
         ChatCompletionToolMessageParam(
             role="tool",
-            content=content,
+            content=tool_content,  # type: ignore[typeddict-item]
             tool_call_id=call_id,
         )
     ]
-    if image_url:
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Screenshot observation after computer_use "
-                            f"call_id={call_id}."
-                        ),
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_url,
-                        "detail": detail,
-                    },
-                ],
-            }
-        )
-    return messages
 
 
 def _response_item_type(item: ResponseInputOutputItem) -> str | None:

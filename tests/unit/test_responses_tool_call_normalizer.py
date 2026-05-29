@@ -252,11 +252,11 @@ def test_responses_output_normalizer_splits_nested_call_tool_from_computer_use()
                         {"type": "click", "x": 500, "y": 900},
                         {
                             "type": "call_tool",
-                            "name": "record_workflow_result",
+                            "name": "append_trace_note",
                             "parameters": {
-                                "item_id": "q1",
-                                "output_text": "3",
-                                "status": "passed",
+                                "title": "q1",
+                                "summary": "3",
+                                "status": "recorded",
                             },
                         },
                     ],
@@ -278,11 +278,11 @@ def test_responses_output_normalizer_splits_nested_call_tool_from_computer_use()
     }
     agent_call = normalized[1]
     assert agent_call.type == "function_call"
-    assert agent_call.name == "record_workflow_result"
+    assert agent_call.name == "append_trace_note"
     assert json.loads(agent_call.arguments) == {
-        "item_id": "q1",
-        "output_text": "3",
-        "status": "passed",
+        "title": "q1",
+        "summary": "3",
+        "status": "recorded",
     }
 
 
@@ -300,10 +300,10 @@ def test_responses_output_normalizer_splits_direct_agent_tool_action():
                     "actions": [
                         {"type": "click", "x": 500, "y": 900},
                         {
-                            "type": "record_workflow_result",
-                            "item_id": "q1",
-                            "output_text": "4",
-                            "status": "passed",
+                            "type": "append_trace_note",
+                            "title": "q1",
+                            "summary": "4",
+                            "status": "recorded",
                         },
                     ],
                 },
@@ -324,11 +324,11 @@ def test_responses_output_normalizer_splits_direct_agent_tool_action():
     }
     agent_call = normalized[1]
     assert agent_call.type == "function_call"
-    assert agent_call.name == "record_workflow_result"
+    assert agent_call.name == "append_trace_note"
     assert json.loads(agent_call.arguments) == {
-        "item_id": "q1",
-        "output_text": "4",
-        "status": "passed",
+        "title": "q1",
+        "summary": "4",
+        "status": "recorded",
     }
 
 
@@ -364,6 +364,58 @@ def test_responses_output_normalizer_replaces_direct_agent_tool_action_only():
     assert json.loads(call.arguments) == {
         "completion_reason": "done",
     }
+
+
+def test_responses_output_normalizer_deduplicates_nested_call_ids():
+    output = [
+        ResponseFunctionToolCall(
+            id="fc_1",
+            call_id="call_1",
+            type="function_call",
+            status="completed",
+            name="computer_use",
+            arguments=json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "append_trace_note",
+                            "title": "first",
+                            "summary": "one",
+                            "status": "passed",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        ),
+        ResponseFunctionToolCall(
+            id="fc_2",
+            call_id="call_2",
+            type="function_call",
+            status="completed",
+            name="computer_use",
+            arguments=json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "finish_subtask",
+                            "completion_reason": "done",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        ),
+    ]
+
+    normalized = normalize_text_tool_calls_in_response_outputs(output)
+
+    assert [call.name for call in normalized] == [
+        "append_trace_note",
+        "finish_subtask",
+    ]
+    call_ids = [call.call_id for call in normalized]
+    assert len(call_ids) == len(set(call_ids))
 
 
 def test_responses_output_normalizer_replaces_computer_use_nested_function_only():

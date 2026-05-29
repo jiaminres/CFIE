@@ -108,6 +108,7 @@ from cfie.entrypoints.openai.responses.utils import (
     construct_tool_dicts,
     extract_tool_types,
 )
+from cfie.entrypoints.openai.reasoning_template import normalize_reasoning_effort
 from cfie.entrypoints.utils import get_max_tokens
 from cfie.exceptions import VLLMValidationError
 from cfie.inputs.data import ProcessorInputs, token_inputs
@@ -273,6 +274,25 @@ class OpenAIServingResponses(OpenAIServing):
 
         self.tool_server = tool_server
 
+    def _request_enables_reasoning(self, request: ResponsesRequest) -> bool:
+        reasoning = request.reasoning
+        normalized_effort = normalize_reasoning_effort(
+            reasoning.effort if reasoning is not None else None
+        )
+        if normalized_effort == "none":
+            return False
+        if normalized_effort is not None:
+            return True
+
+        request_kwargs = request.chat_template_kwargs or {}
+        if request_kwargs.get("enable_thinking") is not None:
+            return bool(request_kwargs.get("enable_thinking"))
+
+        if self.default_chat_template_kwargs.get("enable_thinking") is not None:
+            return bool(self.default_chat_template_kwargs.get("enable_thinking"))
+
+        return False
+
     def _validate_generator_input(
         self,
         engine_prompt: ProcessorInputs,
@@ -326,6 +346,23 @@ class OpenAIServingResponses(OpenAIServing):
                 "`previous_response_id` can be set.",
                 status_code=HTTPStatus.BAD_REQUEST,
                 param="previous_response_id",
+            )
+        if (
+            self._request_enables_reasoning(request)
+            and (
+                self.parser is None
+                or self.parser.reasoning_parser_cls is None
+            )
+        ):
+            return self.create_error_response(
+                err_type="invalid_request_error",
+                message=(
+                    "Responses reasoning is enabled but no reasoning parser is "
+                    "configured. Launch the server with "
+                    "`--reasoning-parser qwen3` for Qwen3/Qwen3.5 models."
+                ),
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="reasoning",
             )
         return None
 

@@ -77,7 +77,12 @@ def _sanitize_message_content(content: Any) -> Any:
             )
             continue
         part_type = part.get("type")
-        if part_type in {"input_image", "input_video"}:
+        if part_type == "input_image":
+            sanitized_part = dict(part)
+            sanitized_part.setdefault("detail", "auto")
+            sanitized.append(sanitized_part)
+            continue
+        if part_type == "input_video":
             sanitized.append(part)
             continue
         sanitized_part = dict(part)

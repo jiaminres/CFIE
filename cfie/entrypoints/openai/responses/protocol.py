@@ -344,6 +344,7 @@ class ResponsesRequest(OpenAIBaseModel):
             chat_template_kwargs,
             build_reasoning_chat_template_kwargs(reasoning_effort),
         )
+        self.chat_template_kwargs = chat_template_kwargs
 
         return ChatParams(
             chat_template=default_template,

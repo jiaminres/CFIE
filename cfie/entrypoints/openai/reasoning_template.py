@@ -7,24 +7,26 @@ QWEN_REASONING_PREAMBLE_KWARG = "cfie_reasoning_preamble"
 
 _REASONING_PREAMBLES = {
     "minimal": (
-        "Current think mode: minimal. Think only if essential, keep internal "
-        "reasoning to one very short note, then answer immediately."
+        "当前思考模式：minimal。只在思考区写一句极短状态判断，工具调用前"
+        "不要输出可见状态文字。\n当前状态："
     ),
     "low": (
-        "Current think mode: low. Think fast, check only the key facts needed "
-        "for correctness, and keep internal reasoning brief."
+        "当前思考模式：low。只在思考区写两行：当前状态和下一步；不要描述"
+        "无关画面，工具调用前不要输出可见状态文字。\n当前状态："
     ),
     "medium": (
-        "Current think mode: medium. Reason through the essential steps, avoid "
-        "exhaustive exploration, then answer clearly."
+        "当前思考模式：medium。只在思考区写三到四行：当前状态、不确定性、"
+        "下一步和风险；每行很短，不枚举界面细节，工具调用前不要输出"
+        "可见状态文字。\n当前状态："
     ),
     "high": (
-        "Current think mode: high. Spend more internal reasoning on important "
-        "edge cases and verification before answering."
+        "当前思考模式：high。只在思考区核对当前状态、目标、失败风险和"
+        "兜底动作；保持边界，不做长篇探索，工具调用前不要输出可见"
+        "状态文字。\n当前状态："
     ),
     "xhigh": (
-        "Current think mode: xhigh. Use deep internal reasoning, verify edge "
-        "cases carefully, and only then answer."
+        "当前思考模式：xhigh。只在思考区做较深检查，覆盖边界情况后再"
+        "行动；可见输出保持简短。\n当前状态："
     ),
 }
 

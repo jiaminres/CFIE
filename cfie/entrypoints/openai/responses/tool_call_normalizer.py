@@ -39,15 +39,18 @@ _DIRECT_AGENT_TOOL_ACTION_TYPES = {
     "finish_subtask",
     "navigate_to_target",
     "query_memory",
+    "append_text_file",
+    "launch_app",
+    "open_url",
     "read_image",
     "read_text_file",
     "read_video_clip",
-    "record_workflow_result",
     "report_blocked",
     "request_human_help",
     "run_action_macro",
-    "set_app_viewport",
+    "run_shell",
     "update_constraints",
+    "write_text_file",
 }
 
 
@@ -198,7 +201,42 @@ def _normalize_generated_function_calls(
         if item is not None:
             normalized.append(item)  # type: ignore[arg-type]
         normalized.extend(nested_calls)
+    return _ensure_unique_function_call_ids(normalized)
+
+
+def _ensure_unique_function_call_ids(
+    calls: list[ResponseFunctionToolCall],
+) -> list[ResponseFunctionToolCall]:
+    seen: dict[str, int] = {}
+    normalized: list[ResponseFunctionToolCall] = []
+    for call in calls:
+        call_id = _item_call_id(call) or f"call_{random_uuid()}"
+        count = seen.get(call_id, 0)
+        seen[call_id] = count + 1
+        if count:
+            call_id = f"{call_id}_{count + 1}"
+        if call_id != _item_call_id(call):
+            call = _replace_function_call_id(call, call_id=call_id)
+        normalized.append(call)
     return normalized
+
+
+def _replace_function_call_id(
+    call: ResponseFunctionToolCall,
+    *,
+    call_id: str,
+) -> ResponseFunctionToolCall:
+    arguments = _item_arguments(call)
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments or {}, ensure_ascii=False)
+    return ResponseFunctionToolCall(
+        id=_item_id(call) or f"fc_{random_uuid()}",
+        call_id=call_id,
+        type="function_call",
+        status=_item_status(call),
+        name=_item_name(call),
+        arguments=arguments,
+    )
 
 
 def _parse_qwen_text_tool_calls(text: str) -> list[ResponseFunctionToolCall]:

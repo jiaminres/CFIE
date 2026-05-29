@@ -105,6 +105,7 @@ def _normalize_path(value: Any) -> tuple[tuple[int, int], ...]:
 @dataclass(slots=True, frozen=True)
 class ComputerAction:
     type: str
+    index: int | None = None
     x: int | None = None
     y: int | None = None
     button: str | None = None
@@ -122,6 +123,12 @@ class ComputerAction:
         action_type = str(_read_field(value, "type", "")).strip()
         if action_type not in ACTION_TYPES:
             raise ProtocolError(f"unsupported computer action type: {action_type!r}")
+
+        action_index = _read_field(value, "index", None)
+        if action_index is not None:
+            action_index = _require_int(action_index, "index")
+            if action_index < 1:
+                raise ProtocolError("index must be a positive integer")
 
         x = _read_field(value, "x")
         y = _read_field(value, "y")
@@ -175,6 +182,7 @@ class ComputerAction:
 
         return cls(
             type=action_type,
+            index=action_index,
             x=x,
             y=y,
             button=button,
@@ -189,6 +197,8 @@ class ComputerAction:
 
     def to_openai_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"type": self.type}
+        if self.index is not None:
+            payload["index"] = self.index
         if self.x is not None:
             payload["x"] = self.x
         if self.y is not None:
@@ -275,6 +285,7 @@ class ComputerCall:
     actions: tuple[ComputerAction, ...]
     status: str | None = None
     coordinate_space: str | None = None
+    index: int | None = None
     pending_safety_checks: tuple[dict[str, Any], ...] = ()
     id: str | None = None
 
@@ -288,6 +299,12 @@ class ComputerCall:
         if not call_id:
             raise ProtocolError("computer_call.call_id is required")
 
+        call_index = _read_field(value, "index", None)
+        if call_index is not None:
+            call_index = _require_int(call_index, "index")
+            if call_index < 1:
+                raise ProtocolError("index must be a positive integer")
+
         actions_raw = _read_field(value, "actions")
         if actions_raw is None:
             action_raw = _read_field(value, "action")
@@ -296,6 +313,7 @@ class ComputerCall:
             actions_raw = [actions_raw]
 
         actions = tuple(ComputerAction.from_openai(action) for action in actions_raw)
+        actions = sort_actions_by_explicit_index(actions)
         coordinate_space = _read_field(value, "coordinate_space")
         if coordinate_space is not None:
             coordinate_space = _normalize_coordinate_space(coordinate_space)
@@ -314,6 +332,7 @@ class ComputerCall:
             actions=actions,
             status=_read_field(value, "status"),
             coordinate_space=coordinate_space,
+            index=call_index,
             pending_safety_checks=pending,
             id=_read_field(value, "id"),
         )
@@ -324,6 +343,8 @@ class ComputerCall:
             "call_id": self.call_id,
             "actions": [action.to_openai_dict() for action in self.actions],
         }
+        if self.index is not None:
+            payload["index"] = self.index
         if self.coordinate_space is not None:
             payload["coordinate_space"] = self.coordinate_space
         if self.status is not None:
@@ -333,6 +354,22 @@ class ComputerCall:
         if self.id is not None:
             payload["id"] = self.id
         return payload
+
+
+def sort_actions_by_explicit_index(
+    actions: tuple[ComputerAction, ...],
+) -> tuple[ComputerAction, ...]:
+    if len(actions) < 2:
+        return actions
+    if not all(action.index is not None for action in actions):
+        return actions
+    return tuple(
+        action
+        for _, action in sorted(
+            enumerate(actions),
+            key=lambda item: (item[1].index, item[0]),
+        )
+    )
 
 
 def _normalize_coordinate_space(value: Any) -> str:

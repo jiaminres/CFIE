@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from cfie.entrypoints.openai.engine.protocol import DeltaMessage
+from cfie.entrypoints.openai.reasoning_template import QWEN_REASONING_PREAMBLE_KWARG
 from cfie.reasoning.basic_parsers import BaseThinkingReasoningParser
 
 if TYPE_CHECKING:
@@ -66,6 +67,29 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         chat_kwargs = getattr(request, "chat_template_kwargs", None) or {}
         return chat_kwargs.get("enable_thinking") is False
 
+    @staticmethod
+    def _request_reasoning_preamble(
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> str:
+        chat_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+        value = chat_kwargs.get(QWEN_REASONING_PREAMBLE_KWARG)
+        return str(value).strip() if value else ""
+
+    def _prepend_request_preamble(
+        self,
+        reasoning: str,
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> str:
+        preamble = self._request_reasoning_preamble(request)
+        if not preamble:
+            return reasoning
+        reasoning = reasoning.strip()
+        if not reasoning:
+            return preamble
+        if reasoning.startswith(preamble):
+            return reasoning
+        return f"{preamble}\n\n{reasoning}"
+
     def extract_reasoning(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> tuple[str | None, str | None]:
@@ -103,10 +127,12 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
                 return None, model_output
             # Thinking enabled but no </think>: output was truncated.
             # Everything generated so far is reasoning.
-            return model_output, None
+            return self._prepend_request_preamble(model_output, request), None
 
         # Extract reasoning content from the model output.
         reasoning, _, content = model_output.partition(self.end_token)
+        if thinking_enabled:
+            reasoning = self._prepend_request_preamble(reasoning, request)
 
         final_content = content or None
         return reasoning, final_content
