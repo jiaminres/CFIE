@@ -8,8 +8,13 @@ from typing import Any
 from uuid import uuid4
 
 from cfie_gui_agent.human_loop import HumanLoopManager, InMemoryHumanChannel
-from cfie_gui_agent.jobs import JobBoard
-from cfie_gui_agent.macros import ActionMacro, ActionMacroRegistry, ActionMacroStep
+from cfie_gui_agent.jobs import JobBoard, JobState
+from cfie_gui_agent.macros import (
+    ActionMacro,
+    ActionMacroRegistry,
+    ActionMacroStep,
+    action_macro_from_proposal,
+)
 from cfie_gui_agent.trace import AgentTraceStore
 
 DIRECT_COMMAND_NONE = "none"
@@ -32,6 +37,8 @@ DIRECT_COMMAND_LABELS = {
 
 DEFAULT_RESPONSES_BASE_URL = "http://127.0.0.1:8000/v1"
 DEFAULT_RESPONSES_MODEL = "qwen35-vl"
+DEFAULT_CLIENT_STATE_PATH = Path("runs") / "gui_agent" / "state.json"
+DEFAULT_TRACE_DIR = Path("runs") / "gui_agent" / "traces"
 
 
 @dataclass(slots=True, frozen=True)
@@ -112,12 +119,16 @@ class DesktopClientState:
     trace_store: AgentTraceStore = field(default_factory=AgentTraceStore)
     action_macros: ActionMacroRegistry = field(default_factory=ActionMacroRegistry)
     target_apps: dict[str, TargetAppConfig] = field(default_factory=dict)
-    workflow_runs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    selected_app_id: str = ""
+    settings: dict[str, Any] = field(default_factory=dict)
+    macro_configs: dict[str, MacroConfig] = field(default_factory=dict)
 
     def add_target_app(self, config: TargetAppConfig) -> None:
         if not config.app_id:
             raise ValueError("app_id is required")
         self.target_apps[config.app_id] = config
+        if not self.selected_app_id:
+            self.selected_app_id = config.app_id
 
     def update_target_description(self, app_id: str, text: str) -> None:
         config = self.target_apps[app_id]
@@ -189,119 +200,94 @@ class DesktopClientState:
             },
         )
         self.action_macros.register(macro)
+        self.macro_configs[macro.name] = macro_config
         return macro
 
-    def configure_workflow(
+    def approve_macro_request(self, request_id: str) -> ActionMacro:
+        state = self.human_loop.states.get(request_id)
+        if state is None:
+            state = self.human_loop.completed.get(request_id)
+        if state is None:
+            raise KeyError(f"unknown human request: {request_id}")
+        proposal = state.request.metadata.get("macro_proposal")
+        if not isinstance(proposal, dict):
+            raise ValueError("human request does not contain a macro proposal")
+        macro = action_macro_from_proposal(
+            proposal,
+            metadata={
+                "request_id": request_id,
+                "app_id": self.selected_app_id or None,
+            },
+        )
+        self.action_macros.upsert(macro)
+        return macro
+
+    def configure_app_session(
         self,
         *,
         app_name: str,
-        target_url: str,
-        input_path: str,
-        trace_path: str,
-        process_name: str = "chrome.exe",
-        executable_path: str = r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        window_title_pattern: str = ".*",
-        limit: int | None = None,
+        task_description: str = "",
+        trace_path: str | None = None,
+        process_name: str = "",
+        executable_path: str = "",
+        window_title_pattern: str = "",
+        base_url: str = DEFAULT_RESPONSES_BASE_URL,
+        model: str = DEFAULT_RESPONSES_MODEL,
+        reasoning_mode: str = "guided",
         reasoning_effort: str = "none",
         max_output_tokens: int | None = None,
+        tool_profile: str = "core",
         record_trace: bool = True,
     ) -> dict[str, Any]:
-        from cfie_gui_agent.workflow import (
-            WorkflowRun,
-            build_workflow_target_config,
-            load_workflow_items,
-            make_operation_event,
-            write_run_manifest,
-        )
-
-        items = load_workflow_items(input_path, limit=limit)
-        if not items:
-            raise ValueError("workflow input file does not contain usable rows")
-        config = build_workflow_target_config(
+        app_name = app_name.strip()
+        if not app_name:
+            raise ValueError("app_name is required")
+        app_id = unique_app_id(app_name, self.target_apps)
+        job_id = f"job:{app_id}"
+        metadata = {
+            "trace_path": str(trace_path or ""),
+            "process_name": process_name,
+            "executable_path": executable_path,
+            "window_title_pattern": normalize_window_title_pattern(window_title_pattern),
+            "base_url": base_url,
+            "model": model,
+            "reasoning_mode": reasoning_mode,
+            "reasoning_effort": reasoning_effort,
+            "max_output_tokens": max_output_tokens,
+            "tool_profile": tool_profile,
+        }
+        config = TargetAppConfig(
+            app_id=app_id,
             app_name=app_name,
-            target_url=target_url,
-            input_path=input_path,
-            trace_path=trace_path,
-            item_count=len(items),
-            process_name=process_name,
-            executable_path=executable_path,
-            window_title_pattern=window_title_pattern,
-        )
-        config = replace(
-            config,
-            metadata={
-                **config.metadata,
-                "reasoning_effort": reasoning_effort,
-                "max_output_tokens": max_output_tokens,
-            },
+            job_id=job_id,
+            task_description=task_description.strip(),
+            metadata=metadata,
         )
         self.add_target_app(config)
-        if config.job_id not in self.job_board.jobs:
-            from cfie_gui_agent.jobs import JobState
-
+        self.selected_app_id = app_id
+        if job_id not in self.job_board.jobs:
             self.job_board.add_job(
                 JobState(
-                    job_id=config.job_id,
-                    target_app=config.app_name,
-                    goal=f"Run workflow with {len(items)} items",
+                    job_id=job_id,
+                    target_app=app_name,
+                    goal=task_description.strip() or app_name,
                 )
             )
-        run = WorkflowRun(
-            run_id=f"workflow_{uuid4().hex[:8]}",
-            app_id=config.app_id,
-            job_id=config.job_id,
-            app_name=config.app_name,
-            target_url=target_url,
-            input_path=input_path,
-            trace_path=trace_path,
-            item_count=len(items),
-            metadata={
-                "process_name": process_name,
-                "executable_path": executable_path,
-                "window_title_pattern": window_title_pattern,
-                "first_item_id": items[0].item_id,
-                "reasoning_effort": reasoning_effort,
-                "max_output_tokens": max_output_tokens,
-            },
-        )
-        manifest_path = write_run_manifest(run, items=items)
-        self.workflow_runs[run.run_id] = {
-            **run.to_dict(),
-            "manifest_path": str(manifest_path),
-        }
-        self.trace_store.path = Path(trace_path)
+        if trace_path:
+            self.trace_store.path = Path(trace_path)
         if record_trace:
             self.trace_store.record(
-                "workflow_configured",
+                "app_configured",
                 {
-                    **run.to_dict(),
-                    "manifest_path": str(manifest_path),
-                    "sample_items": [item.to_dict() for item in items[:3]],
+                    "app_id": app_id,
+                    "app_name": app_name,
+                    "job_id": job_id,
+                    "task_description": task_description.strip(),
+                    "trace_path": str(trace_path or ""),
+                    "metadata": metadata,
                 },
             )
-            self.trace_store.record(
-                "operation",
-                make_operation_event(
-                    app_id=config.app_id,
-                    kind="workflow",
-                    title="任务流已配置",
-                    summary=(
-                        f"{config.app_name} / {len(items)} items / "
-                        f"trace: {trace_path}"
-                    ),
-                    status="configured",
-                    payload={
-                        "run_id": run.run_id,
-                        "manifest_path": str(manifest_path),
-                    },
-                ),
-            )
-        return {
-            "run": run.to_dict(),
-            "app": config.to_dict(),
-            "manifest_path": str(manifest_path),
-            "item_count": len(items),
-        }
+        return {"app": config.to_dict(), "job_id": job_id}
 
     def record_operation_summary(
         self,
@@ -314,17 +300,15 @@ class DesktopClientState:
         artifact_refs: tuple[str, ...] = (),
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        from cfie_gui_agent.workflow import make_operation_event
-
-        event_payload = make_operation_event(
-            app_id=app_id,
-            kind=kind,
-            title=title,
-            summary=summary,
-            status=status,
-            artifact_refs=artifact_refs,
-            payload=payload,
-        )
+        event_payload = {
+            "app_id": app_id,
+            "kind": kind,
+            "title": title,
+            "summary": summary,
+            "status": status,
+            "artifact_refs": list(artifact_refs),
+            "payload": payload or {},
+        }
         self.trace_store.record("operation", event_payload)
         return event_payload
 
@@ -357,7 +341,7 @@ class DesktopClientState:
             text_parts.append(f"你的输入：{manager_input.strip()}")
         if constraints.strip():
             text_parts.append(f"新增约束：{constraints.strip()}")
-        return self.human_loop.submit_reply(
+        task = self.human_loop.submit_reply(
             request_id=request_id,
             text="\n".join(text_parts).strip() or DIRECT_COMMAND_LABELS[direct_command],
             source="client",
@@ -366,9 +350,15 @@ class DesktopClientState:
                 "structured_payload": payload,
             },
         )
+        try:
+            self.job_board.enqueue_manager_reply(task)
+        except Exception:
+            pass
+        return task
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "selected_app_id": self.selected_app_id,
             "target_apps": {
                 key: config.to_dict() for key, config in self.target_apps.items()
             },
@@ -379,114 +369,12 @@ class DesktopClientState:
                 self.human_loop.list_requests(include_completed=True)
             ),
             "macros": self.action_macros.to_context_payload(),
+            "macro_configs": [
+                config.to_dict() for config in self.macro_configs.values()
+            ],
+            "settings": self.settings,
             "trace": self.trace_store.to_dict(),
-            "workflow_runs": self.workflow_runs,
         }
-
-
-def build_workflow_run_command(
-    config: TargetAppConfig,
-    *,
-    python_executable: str,
-    result_json: str | Path | None = None,
-    base_url: str = DEFAULT_RESPONSES_BASE_URL,
-    model: str = DEFAULT_RESPONSES_MODEL,
-    max_steps: int = 8,
-    max_output_tokens: int = 512,
-    item_limit: int | None = None,
-) -> list[str]:
-    metadata = config.metadata or {}
-    target_url = str(metadata.get("target_url") or metadata.get("browser_url_pattern") or "")
-    input_path = str(metadata.get("input_path") or "")
-    trace_path = str(metadata.get("trace_path") or "")
-    if not target_url or not input_path or not trace_path:
-        raise ValueError("当前 APP 缺少 target_url/input_path/trace_path，无法启动工作流。")
-
-    trace_dir = Path(trace_path).expanduser().parent
-    artifact_dir = str(metadata.get("artifact_dir") or trace_dir / "artifacts")
-    executable_path = str(
-        metadata.get("executable_path")
-        or r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    )
-    window_title_pattern = normalize_window_title_pattern(
-        str(metadata.get("window_title_pattern") or "").strip()
-    )
-    resolved_limit = item_limit
-    if resolved_limit is None:
-        raw_limit = metadata.get("expected_item_count")
-        if isinstance(raw_limit, int):
-            resolved_limit = raw_limit
-    effective_max_steps = max_steps
-    if resolved_limit is not None:
-        effective_max_steps = max(effective_max_steps, int(resolved_limit) * 8 + 4)
-
-    command = [
-        python_executable,
-        "benchmarks/run_gui_agent_workflow_responses.py",
-        "--base-url",
-        base_url,
-        "--model",
-        model,
-        "--app-name",
-        config.app_name,
-        "--target-url",
-        target_url,
-        "--input-path",
-        input_path,
-        "--trace-path",
-        trace_path,
-        "--artifact-dir",
-        artifact_dir,
-        "--chrome-path",
-        executable_path,
-        "--max-steps",
-        str(effective_max_steps),
-        "--max-output-tokens",
-        str(max_output_tokens),
-        "--tool-profile",
-        "workflow",
-        "--reasoning-effort",
-        str(metadata.get("reasoning_effort") or "none"),
-        "--screenshot-max-width",
-            str(metadata.get("screenshot_max_width") or 1920),
-        "--screenshot-max-height",
-            str(metadata.get("screenshot_max_height") or 1080),
-        "--screenshot-jpeg-quality",
-        str(metadata.get("screenshot_jpeg_quality") or 90),
-        "--screenshot-url-mode",
-        str(metadata.get("screenshot_url_mode") or "file"),
-        "--screenshot-grid",
-        str(metadata.get("screenshot_grid") or "off"),
-        "--image-detail",
-        str(metadata.get("image_detail") or "high"),
-    ]
-    if resolved_limit is not None:
-        command.extend(["--item-limit", str(max(1, int(resolved_limit)))])
-    manual_viewport = metadata.get("manual_viewport")
-    if isinstance(manual_viewport, dict):
-        try:
-            crop = (
-                int(manual_viewport["x"]),
-                int(manual_viewport["y"]),
-                int(manual_viewport["width"]),
-                int(manual_viewport["height"]),
-            )
-        except (KeyError, TypeError, ValueError):
-            crop = None
-        if crop is not None and crop[2] > 0 and crop[3] > 0:
-            command.extend(["--screenshot-crop", ",".join(str(value) for value in crop)])
-    elif window_title_pattern:
-        command.extend(
-            [
-                "--focus-window-title-pattern",
-                window_title_pattern,
-                "--crop-focused-window",
-                "--maximize-focused-window",
-            ]
-        )
-    if result_json is not None:
-        command.extend(["--result-json", str(result_json)])
-    return command
 
 
 def normalize_window_title_pattern(pattern: str) -> str:
@@ -512,6 +400,17 @@ def normalize_window_title_pattern(pattern: str) -> str:
     return "|".join(safe_parts)
 
 
+def unique_app_id(app_name: str, existing: dict[str, TargetAppConfig]) -> str:
+    base = re.sub(r"[^a-zA-Z0-9]+", "_", app_name.strip().lower()).strip("_")
+    base = f"app_{base or 'app'}"
+    candidate = base
+    index = 2
+    while candidate in existing:
+        candidate = f"{base}_{index}"
+        index += 1
+    return candidate
+
+
 def parse_macro_sequence(sequence: str) -> tuple[tuple[str, ...], ...]:
     groups: list[tuple[str, ...]] = []
     for raw_step in sequence.split(","):
@@ -534,13 +433,16 @@ def run_desktop_client(
     *,
     state: DesktopClientState | None = None,
     auto_start: bool = False,
+    state_path: str | Path | None = None,
 ) -> None:
     from cfie_gui_agent.desktop_client_ui import GuiAgentDesktopClient
+    from cfie_gui_agent.state_store import load_desktop_state
 
-    app_state = state if state is not None else DesktopClientState()
-    app = GuiAgentDesktopClient(app_state)
+    resolved_state_path = Path(state_path) if state_path else DEFAULT_CLIENT_STATE_PATH
+    app_state = state if state is not None else load_desktop_state(resolved_state_path)
+    app = GuiAgentDesktopClient(app_state, state_path=resolved_state_path)
     if auto_start:
-        app.after(800, app._start_selected_workflow_run)
+        app.after(800, app._start_selected_agent_run)
     app.mainloop()
 
 
@@ -549,8 +451,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Launch the CFIE GUI Agent desktop client."
     )
     parser.add_argument("--app-name", default=None)
-    parser.add_argument("--target-url", default=None)
-    parser.add_argument("--input-path", default=None)
+    parser.add_argument(
+        "--state-path",
+        default=None,
+        help="Desktop client state file. Defaults to runs/gui_agent/state.json.",
+    )
+    parser.add_argument("--task-description", default="")
+    parser.add_argument(
+        "--task-description-file",
+        default=None,
+        help="Read the selected app task description from a UTF-8 text file.",
+    )
     parser.add_argument("--trace-path", default=None)
     parser.add_argument("--process-name", default="chrome.exe")
     parser.add_argument(
@@ -558,13 +469,40 @@ def build_parser() -> argparse.ArgumentParser:
         default=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     )
     parser.add_argument("--window-title-pattern", default=".*")
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--base-url", default=DEFAULT_RESPONSES_BASE_URL)
+    parser.add_argument("--model", default=DEFAULT_RESPONSES_MODEL)
+    parser.add_argument("--image-detail", default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--screenshot-max-width", type=int, default=None)
+    parser.add_argument("--screenshot-max-height", type=int, default=None)
+    parser.add_argument(
+        "--max-visual-frames",
+        type=int,
+        default=None,
+        help="Maximum screenshots/video frames to keep in one model request.",
+    )
     parser.add_argument(
         "--reasoning-effort",
         choices=("none", "low", "medium", "high"),
         default="none",
     )
+    parser.add_argument(
+        "--reasoning-mode",
+        choices=("guided", "default", "off"),
+        default="guided",
+        help=(
+            "guided sends reasoning.effort and CFIE's Qwen think preamble; "
+            "default enables Qwen thinking without the preamble; off disables "
+            "thinking."
+        ),
+    )
     parser.add_argument("--max-output-tokens", type=int, default=None)
+    parser.add_argument(
+        "--tool-profile",
+        choices=("minimal", "core", "full"),
+        default="core",
+        help="Model-callable tool set. core is faster; full exposes every generic tool.",
+    )
     parser.add_argument(
         "--load-trace",
         action=argparse.BooleanOptionalAction,
@@ -574,49 +512,63 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--auto-start",
         action="store_true",
-        help="Start the selected configured workflow after the client opens.",
+        help="Start the selected Agent session after the client opens.",
     )
     return parser
 
 
 def build_initial_state(args: argparse.Namespace) -> DesktopClientState:
-    state = DesktopClientState()
-    has_workflow = any(
+    if args.state_path:
+        from cfie_gui_agent.state_store import load_desktop_state
+
+        state = load_desktop_state(args.state_path)
+    else:
+        state = DesktopClientState()
+    has_session = any(
         getattr(args, name) is not None
-        for name in ("app_name", "target_url", "input_path", "trace_path")
+        for name in ("app_name", "trace_path")
     )
-    if not has_workflow:
+    if not has_session:
         return state
-    missing = [
-        option
-        for option, value in {
-            "--app-name": args.app_name,
-            "--target-url": args.target_url,
-            "--input-path": args.input_path,
-            "--trace-path": args.trace_path,
-        }.items()
-        if not value
-    ]
-    if missing:
-        raise SystemExit(
-            "workflow launch requires "
-            + ", ".join(missing)
-        )
-    trace_exists = Path(args.trace_path).exists()
+    if not args.app_name:
+        raise SystemExit("session launch requires --app-name")
+    trace_exists = bool(args.trace_path) and Path(args.trace_path).exists()
     record_trace = not (args.load_trace and trace_exists)
-    state.configure_workflow(
+    task_description = args.task_description
+    if args.task_description_file:
+        task_description = Path(args.task_description_file).read_text(
+            encoding="utf-8"
+        )
+
+    state.configure_app_session(
         app_name=args.app_name,
-        target_url=args.target_url,
-        input_path=args.input_path,
+        task_description=task_description,
         trace_path=args.trace_path,
         process_name=args.process_name,
         executable_path=args.executable_path,
         window_title_pattern=args.window_title_pattern,
-        limit=args.limit,
+        base_url=args.base_url,
+        model=args.model,
+        reasoning_mode=args.reasoning_mode,
         reasoning_effort=args.reasoning_effort,
         max_output_tokens=args.max_output_tokens,
+        tool_profile=args.tool_profile,
         record_trace=record_trace,
     )
+    config = state.target_apps[state.selected_app_id]
+    metadata = dict(config.metadata or {})
+    if args.image_detail:
+        metadata["image_detail"] = args.image_detail
+    if args.max_steps is not None:
+        metadata["max_steps"] = args.max_steps
+    if args.screenshot_max_width is not None:
+        metadata["screenshot_max_width"] = args.screenshot_max_width
+    if args.screenshot_max_height is not None:
+        metadata["screenshot_max_height"] = args.screenshot_max_height
+    if args.max_visual_frames is not None:
+        metadata["max_visual_frames"] = args.max_visual_frames
+    if metadata != config.metadata:
+        state.target_apps[state.selected_app_id] = replace(config, metadata=metadata)
     if args.load_trace and trace_exists:
         state.trace_store.load_existing(args.trace_path)
     return state
@@ -624,7 +576,12 @@ def build_initial_state(args: argparse.Namespace) -> DesktopClientState:
 
 def main() -> None:
     args = build_parser().parse_args()
-    run_desktop_client(state=build_initial_state(args), auto_start=args.auto_start)
+    state = build_initial_state(args) if args.app_name or args.trace_path else None
+    run_desktop_client(
+        state=state,
+        auto_start=args.auto_start,
+        state_path=args.state_path,
+    )
 
 
 if __name__ == "__main__":

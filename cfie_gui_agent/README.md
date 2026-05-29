@@ -4,7 +4,7 @@
 top of `cfie_client` and the CFIE local inference service.
 
 It is not limited to test automation. It is intended for desktop application
-automation, browser workflows, e-commerce operations, future mobile/remote
+automation, browser automation, e-commerce operations, future mobile/remote
 device control, and GUI Agent orchestration.
 
 ## Boundary
@@ -95,6 +95,19 @@ The recommended local client is the Windows desktop client:
 ```powershell
 ..\.venv\Scripts\python.exe -m cfie_gui_agent.desktop_client
 ```
+
+Current GUI Agent request default candidate:
+
+```text
+reasoning_mode = guided
+reasoning_effort = medium
+max_output_tokens = 1024
+max_visual_frames = 24
+screenshot_size = 900
+```
+
+This default keeps Qwen thinking short and visible while avoiding the instability
+seen in no-thinking and unguided-thinking runs.
 
 It provides:
 

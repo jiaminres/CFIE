@@ -14,11 +14,41 @@ MODEL_CALLABLE_TOOLS = (
     "ask_replan",
     "query_memory",
     "run_action_macro",
+    "propose_action_macro",
     "navigate_to_target",
     "read_text_file",
+    "write_text_file",
+    "append_text_file",
+    "open_url",
+    "launch_app",
+    "run_shell",
+)
+
+CORE_MODEL_CALLABLE_TOOLS = (
+    "computer_use",
+    "request_human_help",
+    "finish_subtask",
+    "report_blocked",
+    "run_action_macro",
+    "propose_action_macro",
+    "read_text_file",
+    "write_text_file",
+    "append_text_file",
+    "open_url",
+    "launch_app",
+    "run_shell",
+)
+
+LEGACY_AGENT_TOOL_NAMES = (
     "append_trace_note",
-    "set_app_viewport",
-    "record_workflow_result",
+)
+
+MINIMAL_MODEL_CALLABLE_TOOLS = (
+    "computer_use",
+    "request_human_help",
+    "finish_subtask",
+    "open_url",
+    "run_action_macro",
 )
 
 HARNESS_INTERNAL_TOOLS = (
@@ -45,6 +75,12 @@ HARNESS_INTERNAL_TOOLS = (
     "check_human_reply",
     "run_shell_command",
 )
+
+MODEL_TOOL_PROFILES = {
+    "minimal": MINIMAL_MODEL_CALLABLE_TOOLS,
+    "core": CORE_MODEL_CALLABLE_TOOLS,
+    "full": MODEL_CALLABLE_TOOLS,
+}
 
 
 class ToolRegistryError(ValueError):
@@ -121,13 +157,23 @@ class ModelToolRegistry:
         return [spec.to_openai_tool() for spec in self.model_tools()]
 
 
+def model_tool_names_for_profile(profile: str | None) -> tuple[str, ...]:
+    key = (profile or "core").strip().lower()
+    if key not in MODEL_TOOL_PROFILES:
+        raise ToolRegistryError(f"unknown model tool profile: {profile!r}")
+    return MODEL_TOOL_PROFILES[key]
+
+
 def _default_description(tool_name: str) -> str:
     descriptions = {
         "computer_use": (
             "Perform validated desktop computer actions. For Qwen VL grounding, "
             "set coordinate_space to qwen_normalized_1000 and express mouse "
             "coordinates on a 0..1000 image grid. Use local_refinement_1000 "
-            "only after the harness provides a local refinement crop."
+            "only after the harness provides a local refinement crop. When one "
+            "model response returns multiple tool calls, give each tool call a "
+            "positive integer index starting at 1. When one computer_use call "
+            "contains multiple actions, give every action its own index too."
         ),
         "read_image": "Read a referenced image artifact into model context.",
         "read_video_clip": "Read a bounded video clip or selected frame set.",
@@ -138,21 +184,22 @@ def _default_description(tool_name: str) -> str:
         "ask_replan": "Ask TaskManager to consider a task transition.",
         "query_memory": "Query workspace or business memory.",
         "run_action_macro": "Execute a registered low-latency action macro.",
+        "propose_action_macro": (
+            "Suggest a reusable operation macro for human approval. Use this "
+            "for repeated multi-step UI actions that should later run with one "
+            "macro call plus dynamic parameters."
+        ),
         "navigate_to_target": (
             "Ask the harness to move a source element toward a target while "
             "avoiding model-identified obstacles."
         ),
         "read_text_file": "Read a bounded UTF-8 text file that the harness has allowed.",
+        "write_text_file": "Write UTF-8 text to a local file for the current task.",
+        "append_text_file": "Append UTF-8 text to a local file for the current task.",
+        "open_url": "Open a URL in the local desktop browser.",
+        "launch_app": "Launch a local desktop application.",
+        "run_shell": "Run a bounded local shell command and return stdout/stderr.",
         "append_trace_note": "Append a structured note to the current trace.",
-        "set_app_viewport": (
-            "Set the APP viewport crop box so later screenshots include only "
-            "the useful application region."
-        ),
-        "record_workflow_result": (
-            "Persist one workflow item result. Keep arguments short; when item_id "
-            "is available, omit input_text and expected_output because the harness "
-            "can recover them from the workflow input file."
-        ),
     }
     return descriptions.get(tool_name, tool_name)
 
@@ -183,6 +230,14 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                     "items": {
                         "type": "object",
                         "properties": {
+                            "index": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": (
+                                    "Optional execution order. Required when "
+                                    "returning multiple actions; use 1, 2, 3..."
+                                ),
+                            },
                             "type": {"type": "string"},
                             "x": {"type": "integer"},
                             "y": {"type": "integer"},
@@ -253,6 +308,16 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                 "risk_reason": {"type": "string"},
                 "proposed_action": {"type": "string"},
                 "allowed_reply_format": {"type": "string"},
+                "blocking": {
+                    "type": "boolean",
+                    "description": (
+                        "true when the current subtask cannot continue until "
+                        "a human replies, such as captcha or account-risk "
+                        "confirmation. false when other work can continue "
+                        "while waiting, such as a buyer requesting manual "
+                        "customer-service wording."
+                    ),
+                },
             },
             required=("question",),
         ),
@@ -317,10 +382,40 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
             {
                 "macro_name": {"type": "string", "minLength": 1},
                 "repeat": {"type": "integer", "minimum": 1},
+                "parameters": {"type": "object"},
                 "objective": {"type": "string"},
                 "stop_condition": {"type": "string"},
             },
             required=("macro_name",),
+        ),
+        "propose_action_macro": _object_schema(
+            {
+                "macro_name": {"type": "string", "minLength": 1},
+                "description": {"type": "string"},
+                "reason": {"type": "string"},
+                "scope": {
+                    "type": "string",
+                    "enum": ["current_app", "global"],
+                },
+                "dynamic_parameters": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": _object_schema(
+                        {
+                            "index": {"type": "integer", "minimum": 1},
+                            "purpose": {"type": "string", "minLength": 1},
+                            "action": {"type": "object"},
+                        },
+                        required=("index", "purpose", "action"),
+                        allow_index=False,
+                    ),
+                },
+            },
+            required=("macro_name", "steps"),
         ),
         "navigate_to_target": _object_schema(
             {
@@ -348,6 +443,56 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
             },
             required=("path",),
         ),
+        "write_text_file": _object_schema(
+            {
+                "path": {"type": "string", "minLength": 1},
+                "text": {"type": "string"},
+                "encoding": {"type": "string"},
+                "create_parent": {"type": "boolean"},
+                "purpose": {"type": "string"},
+            },
+            required=("path", "text"),
+        ),
+        "append_text_file": _object_schema(
+            {
+                "path": {"type": "string", "minLength": 1},
+                "text": {"type": "string"},
+                "encoding": {"type": "string"},
+                "create_parent": {"type": "boolean"},
+                "purpose": {"type": "string"},
+            },
+            required=("path", "text"),
+        ),
+        "open_url": _object_schema(
+            {
+                "url": {"type": "string", "minLength": 1},
+                "browser_path": {"type": "string"},
+                "new_window": {"type": "boolean"},
+                "purpose": {"type": "string"},
+            },
+            required=("url",),
+        ),
+        "launch_app": _object_schema(
+            {
+                "executable_path": {"type": "string", "minLength": 1},
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "cwd": {"type": "string"},
+                "purpose": {"type": "string"},
+            },
+            required=("executable_path",),
+        ),
+        "run_shell": _object_schema(
+            {
+                "command": {"type": "string", "minLength": 1},
+                "cwd": {"type": "string"},
+                "timeout_seconds": {"type": "number", "minimum": 0.1},
+                "purpose": {"type": "string"},
+            },
+            required=("command",),
+        ),
         "append_trace_note": _object_schema(
             {
                 "title": {"type": "string", "minLength": 1},
@@ -360,49 +505,6 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                 "metadata": {"type": "object"},
             },
             required=("title",),
-        ),
-        "set_app_viewport": _object_schema(
-            {
-                "x": {"type": "integer", "minimum": 0},
-                "y": {"type": "integer", "minimum": 0},
-                "width": {"type": "integer", "minimum": 1},
-                "height": {"type": "integer", "minimum": 1},
-                "coordinate_space": {
-                    "type": "string",
-                    "enum": ["screenshot", "physical"],
-                    "description": (
-                        "Use 'screenshot' when coordinates refer to the image "
-                        "shown to the model; use 'physical' for full desktop pixels."
-                    ),
-                },
-                "reason": {"type": "string"},
-            },
-            required=("x", "y", "width", "height"),
-        ),
-        "record_workflow_result": _object_schema(
-            {
-                "item_id": {"type": "string", "minLength": 1},
-                "input_text": {
-                    "type": "string",
-                    "description": "Optional. Prefer omitting this to keep tool output short.",
-                },
-                "expected_output": {
-                    "type": "string",
-                    "description": "Optional. Prefer omitting this to keep tool output short.",
-                },
-                "output_text": {"type": "string"},
-                "status": {
-                    "type": "string",
-                    "enum": ["passed", "failed", "uncertain", "skipped", "error"],
-                },
-                "latency_seconds": {"type": "number"},
-                "artifact_refs": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "reason": {"type": "string"},
-            },
-            required=("item_id", "output_text", "status"),
         ),
     }
     return schemas.get(tool_name, _object_schema({}))
@@ -431,7 +533,21 @@ def _object_schema(
     properties: dict[str, Any],
     *,
     required: tuple[str, ...] = (),
+    allow_index: bool = True,
 ) -> dict[str, Any]:
+    if allow_index and "index" not in properties:
+        properties = {
+            "index": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Optional order of this tool call within the current "
+                    "model response. Use 1, 2, 3... when returning multiple "
+                    "tool calls."
+                ),
+            },
+            **properties,
+        }
     return {
         "type": "object",
         "properties": properties,

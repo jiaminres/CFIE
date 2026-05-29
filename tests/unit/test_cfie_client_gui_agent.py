@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from urllib.request import url2pathname
 import pytest
 from PIL import Image
 
+import cfie_client.executor.keyboard as keyboard_mod
 import cfie_client.screen as screen_mod
 from cfie_client import (
     ComputerLoop,
@@ -26,6 +28,8 @@ from cfie_gui_agent import (
     GuiAgentTaskSpec,
     WorkspaceProfile,
 )
+from cfie_gui_agent.context import ContextManager, VisionContextPolicy
+from cfie_gui_agent.runner import _normalize_agent_tool_arguments
 
 
 @dataclass
@@ -61,6 +65,53 @@ class FakeBackend(ComputerBackend):
 
     def wait(self, seconds: float) -> None:
         self.calls.append(("wait", (seconds,)))
+
+
+def test_keyboard_type_text_uses_clipboard_paste(monkeypatch):
+    calls: list[tuple[str, Any]] = []
+
+    monkeypatch.setattr(keyboard_mod, "_get_clipboard_text", lambda: (True, "old"))
+    monkeypatch.setattr(
+        keyboard_mod,
+        "_set_clipboard_text",
+        lambda text: calls.append(("set", text)),
+    )
+    monkeypatch.setattr(
+        keyboard_mod,
+        "press_keys",
+        lambda keys: calls.append(("press", keys)),
+    )
+    monkeypatch.setattr(keyboard_mod.time, "sleep", lambda _seconds: None)
+
+    keyboard_mod.type_text("请只回答数字：71 + 27 等于几？")
+
+    assert calls == [
+        ("set", "请只回答数字：71 + 27 等于几？"),
+        ("press", ("ctrl", "v")),
+        ("set", "old"),
+    ]
+
+
+def test_file_tool_text_argument_accepts_json_object_payload():
+    normalized = _normalize_agent_tool_arguments(
+        "append_text_file",
+        {
+            "path": "trace.jsonl",
+            "text": {"item_id": "q1", "status": "success"},
+        },
+    )
+
+    assert normalized["text"] == '{"item_id": "q1", "status": "success"}\n'
+
+    write_normalized = _normalize_agent_tool_arguments(
+        "write_text_file",
+        {
+            "path": "trace.jsonl",
+            "text": {"item_id": "q1", "status": "success"},
+        },
+    )
+
+    assert write_normalized["text"] == '{"item_id": "q1", "status": "success"}'
 
 
 class FakeScreen:
@@ -167,6 +218,38 @@ def test_protocol_accepts_single_action_dict_wait_and_key_chord():
     assert key_press_alias_action.keys == ("Enter",)
     assert keys_alias_action.type == "keypress"
     assert keys_alias_action.keys == ("ctrl", "a")
+
+
+def test_protocol_sorts_fully_indexed_computer_actions_and_preserves_index():
+    call = ComputerCall.from_openai(
+        {
+            "type": "computer_call",
+            "call_id": "call_ordered",
+            "actions": [
+                {"index": 2, "type": "type", "text": "hello"},
+                {"index": 1, "type": "click", "x": 10, "y": 20},
+            ],
+        }
+    )
+
+    assert [action.index for action in call.actions] == [1, 2]
+    assert [action.type for action in call.actions] == ["click", "type"]
+    assert call.to_openai_dict()["actions"][0]["index"] == 1
+
+
+def test_protocol_keeps_original_action_order_when_index_is_partial():
+    call = ComputerCall.from_openai(
+        {
+            "type": "computer_call",
+            "call_id": "call_mixed_order",
+            "actions": [
+                {"type": "click", "x": 10, "y": 20},
+                {"index": 1, "type": "type", "text": "hello"},
+            ],
+        }
+    )
+
+    assert [action.type for action in call.actions] == ["click", "type"]
 
 
 def test_protocol_unquotes_coordinate_space_from_qwen_text_tool_output():
@@ -493,13 +576,11 @@ def test_gui_agent_runner_executes_computer_call_until_final_message():
                 ]
             }
 
-        assert conversation[-3]["type"] == "computer_call"
-        assert conversation[-3]["call_id"] == "call_1"
-        assert conversation[-2]["type"] == "computer_call_output"
-        assert conversation[-2]["output"]["detail"] == "low"
-        assert "click(10,20)" in conversation[-2]["output"]["summary"]
-        assert conversation[-1]["role"] == "user"
-        assert "坐标提醒" in conversation[-1]["content"][0]["text"]
+        assert conversation[-2]["type"] == "computer_call"
+        assert conversation[-2]["call_id"] == "call_1"
+        assert conversation[-1]["type"] == "computer_call_output"
+        assert conversation[-1]["output"]["detail"] == "low"
+        assert "click(10,20)" in conversation[-1]["output"]["summary"]
         return {
             "output": [
                 {
@@ -531,6 +612,55 @@ def test_gui_agent_runner_executes_computer_call_until_final_message():
     assert "computer_use" in result.metadata["model_tools"]
     assert ("click", (10, 20, "left")) in backend.calls
     assert ("wait", (0.1,)) in backend.calls
+
+
+def test_gui_agent_runner_writes_reasoning_back_before_tool_result():
+    backend = FakeBackend()
+    loop = ComputerLoop(backend=backend, screen=FakeScreen())
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=3)
+    task = GuiAgentTaskSpec(task_id="task_reasoning", instruction="Click once.")
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(conversation) == 2:
+            return {
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [],
+                        "content": [
+                            {
+                                "type": "reasoning_text",
+                                "text": "当前思考模式：low。\n当前状态：click target",
+                            }
+                        ],
+                    },
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_reasoned_click",
+                        "actions": [{"type": "click", "x": 10, "y": 20}],
+                    },
+                ]
+            }
+
+        assert conversation[-3]["type"] == "reasoning"
+        assert "当前思考模式：low" in conversation[-3]["content"][0]["text"]
+        assert conversation[-2]["type"] == "computer_call"
+        assert conversation[-2]["call_id"] == "call_reasoned_click"
+        assert conversation[-1]["type"] == "computer_call_output"
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert ("click", (10, 20, "left")) in backend.calls
 
 
 def test_gui_agent_runner_adds_local_crop_after_click_only_action():
@@ -575,17 +705,14 @@ def test_gui_agent_runner_adds_local_crop_after_click_only_action():
                 ]
             }
         saw_local_refinement = any(
-            any(
-                isinstance(part, dict)
-                and (
-                    "局部定位兜底"
-                    in str(part.get("text", ""))
-                    or part.get("image_url") == "data:image/png;base64,LOCAL"
-                )
-                for part in message.get("content", [])
+            isinstance(message.get("output"), dict)
+            and any(
+                isinstance(item, dict)
+                and item.get("image_url") == "data:image/png;base64,LOCAL"
+                for item in message["output"].get("local_refinements", [])
             )
             for message in conversation
-            if isinstance(message, dict)
+            if isinstance(message, dict) and message.get("type") == "computer_call_output"
         )
         return {
             "output": [
@@ -606,6 +733,127 @@ def test_gui_agent_runner_adds_local_crop_after_click_only_action():
     ]
     assert local_refinement["coordinate_space"] == "local_refinement_1000"
     assert local_refinement["local_refinement_box"] == [0, 0, 800, 600]
+
+
+def test_gui_agent_runner_adds_local_crop_for_every_click_in_compound_action():
+    class LocalCropScreen(FakeScreen):
+        def __init__(self) -> None:
+            self.local_requests: list[tuple[int, int, int]] = []
+
+        def screenshot_region_around(
+            self,
+            *,
+            x: int,
+            y: int,
+            radius: int = 180,
+            max_width: int = 720,
+            max_height: int = 720,
+        ) -> ScreenshotResult:
+            self.local_requests.append((x, y, radius))
+            index = len(self.local_requests)
+            return ScreenshotResult(
+                image_url=f"data:image/png;base64,LOCAL{index}",
+                width=320,
+                height=240,
+            )
+
+    backend = FakeBackend()
+    screen = LocalCropScreen()
+    loop = ComputerLoop(backend=backend, screen=screen)
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=2)
+    task = GuiAgentTaskSpec(task_id="task_refine_each_click", instruction="Click twice.")
+    observed_local_images: list[str] = []
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(conversation) == 2:
+            return {
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_refine_multi",
+                        "coordinate_space": "qwen_normalized_1000",
+                        "actions": [
+                            {"type": "click", "x": 100, "y": 200},
+                            {"type": "type", "text": "hello"},
+                            {"type": "click", "x": 900, "y": 800},
+                        ],
+                    }
+                ]
+            }
+        for item in conversation:
+            if not isinstance(item, dict):
+                continue
+            output = item.get("output")
+            if item.get("type") != "computer_call_output" or not isinstance(output, dict):
+                continue
+            for part in output.get("local_refinements", []):
+                if isinstance(part, dict) and str(part.get("image_url", "")).startswith(
+                    "data:image/png;base64,LOCAL"
+                ):
+                    observed_local_images.append(str(part["image_url"]))
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert screen.local_requests == [(80, 120, 520), (720, 480, 520)]
+    assert observed_local_images == [
+        "data:image/png;base64,LOCAL1",
+        "data:image/png;base64,LOCAL2",
+    ]
+    local_refinements = result.metadata["step_records"][0]["metadata"][
+        "local_refinements"
+    ]
+    assert len(local_refinements) == 2
+    assert local_refinements[0]["is_active_local_refinement"] is False
+    assert local_refinements[1]["is_active_local_refinement"] is True
+
+
+def test_gui_agent_runner_compacts_response_object_for_trace():
+    loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=1)
+    task = GuiAgentTaskSpec(task_id="task_trace_compact", instruction="Say done.")
+
+    def agent(_conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "computer_use",
+                    "description": "x" * 1000,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"actions": {"type": "array"}},
+                    },
+                }
+            ],
+            "prompt": "data:image/png;base64," + ("A" * 4096),
+        }
+
+    result = runner.run_task(task, agent)
+
+    response_object = result.metadata["model_response_metrics"][0]["response_object"]
+    assert response_object["tools"] == [
+        {"type": "function", "name": "computer_use"}
+    ]
+    assert response_object["tool_schema_count"] == 1
+    assert response_object["prompt"] == "<omitted; see request_context>"
+    response_json = json.dumps(response_object)
+    assert "properties" not in response_json
+    assert "data:image" not in response_json
 
 
 def test_gui_agent_runner_does_not_complete_on_truncated_text_tool_call():
@@ -824,6 +1072,114 @@ def test_gui_agent_runner_handles_finish_subtask_tool_call():
     assert result.metadata["step_records"][0]["action"]["name"] == "finish_subtask"
 
 
+def test_gui_agent_runner_accepts_indexed_agent_tool_arguments():
+    loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=3)
+    task = GuiAgentTaskSpec(task_id="task_indexed_note", instruction="Record result.")
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(conversation) == 2:
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "append_trace_note",
+                        "call_id": "note_1",
+                        "arguments": {
+                            "index": 1,
+                            "title": "effort_probe",
+                            "summary": "connected",
+                            "status": "passed",
+                        },
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "finish_subtask",
+                        "call_id": "finish_1",
+                        "arguments": {"index": 2},
+                    },
+                ]
+            }
+        return {"output": []}
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert [record["action"]["name"] for record in result.metadata["step_records"]] == [
+        "append_trace_note",
+        "finish_subtask",
+    ]
+    assert result.metadata["step_records"][0]["result"] == "accepted"
+    operation = next(
+        event.payload
+        for event in runner.trace_store.events
+        if event.kind == "operation" and event.payload.get("title") == "effort_probe"
+    )
+    assert operation["metadata"]["model_response_step"] == 1
+    assert operation["metadata"]["tool_call_id"] == "note_1"
+
+
+def test_gui_agent_runner_executes_mixed_tool_calls_by_index():
+    backend = FakeBackend()
+    loop = ComputerLoop(backend=backend, screen=FakeScreen())
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=5)
+    task = GuiAgentTaskSpec(
+        task_id="task_mixed_index",
+        instruction="Execute indexed tools in order.",
+    )
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(conversation) == 2:
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "computer_use",
+                        "call_id": "click_1",
+                        "arguments": {
+                            "index": 2,
+                            "coordinate_space": "qwen_normalized_1000",
+                            "actions": [
+                                {
+                                    "index": 1,
+                                    "type": "click",
+                                    "x": 500,
+                                    "y": 500,
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "append_trace_note",
+                        "call_id": "note_1",
+                        "arguments": {
+                            "index": 1,
+                            "title": "before_click",
+                            "summary": "record first",
+                            "status": "passed",
+                        },
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "finish_subtask",
+                        "call_id": "finish_1",
+                        "arguments": {"index": 3},
+                    },
+                ]
+            }
+        return {"output": []}
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert backend.calls == [("click", (400, 300, "left"))]
+    assert [
+        record["action"].get("name") or record["action"].get("type")
+        for record in result.metadata["step_records"]
+    ] == ["append_trace_note", "computer_call", "finish_subtask"]
+
+
 def test_gui_agent_runner_handles_human_help_tool_call():
     loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
     runner = GuiAgentRunner(computer_loop=loop, max_steps=3)
@@ -867,6 +1223,56 @@ def test_gui_agent_runner_handles_human_help_tool_call():
     assert waiting[request_id]["human_request_id"] == request_id
     assert runner.human_loop.pending[request_id].question == "Should I refund this order?"
     assert runner.human_loop.pending[request_id].evidence_refs == ("screen.png",)
+    assert runner.human_loop.pending[request_id].blocking is True
+
+
+def test_gui_agent_runner_queues_non_blocking_human_help_without_stopping_task():
+    loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=4)
+    task = GuiAgentTaskSpec(task_id="task_non_blocking_human", instruction="Continue work.")
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        outputs = [
+            item
+            for item in conversation
+            if item.get("type") == "function_call_output"
+        ]
+        if not outputs:
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "request_human_help",
+                        "call_id": "human_async_1",
+                        "arguments": {
+                            "question": "Buyer asks for manager wording.",
+                            "blocking": False,
+                            "urgency": "normal",
+                        },
+                    }
+                ]
+            }
+        assert outputs[-1]["output"]["status"] == "human_request_queued"
+        assert outputs[-1]["output"]["blocking"] is False
+        return {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "finish_subtask",
+                    "call_id": "finish_1",
+                    "arguments": {"completion_reason": "Queued human request and continued."},
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert not result.metadata["jobs"]["job:task_non_blocking_human"]["subtasks"]["waiting_human"]
+    request = next(iter(runner.human_loop.pending.values()))
+    assert request.blocking is False
+    assert request.metadata["intervention_kind"] == "non_blocking"
+    assert request.metadata["resume_context"]["active_job_id"] == "job:task_non_blocking_human"
 
 
 def test_gui_agent_runner_reports_malformed_tool_arguments_for_retry():
@@ -880,9 +1286,9 @@ def test_gui_agent_runner_reports_malformed_tool_arguments_for_retry():
                 "output": [
                     {
                         "type": "function_call",
-                        "name": "record_workflow_result",
+                        "name": "append_trace_note",
                         "call_id": "result_bad",
-                        "arguments": '{"item_id":"a","output_text":"unfinished',
+                        "arguments": '{"title":"a","summary":"unfinished',
                     }
                 ]
             }
@@ -954,6 +1360,63 @@ def test_gui_agent_runner_rejects_invalid_agent_tool_arguments():
     assert "request_human_help.question" in (
         result.metadata["step_records"][0]["metadata"]["output"]["reason"]
     )
+
+
+def test_gui_agent_runner_stops_after_max_executed_steps():
+    backend = FakeBackend()
+    loop = ComputerLoop(backend=backend, screen=FakeScreen())
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=1)
+    task = GuiAgentTaskSpec(task_id="task_cap", instruction="Click once.")
+    calls = 0
+
+    def agent(_conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {
+            "output": [
+                {
+                    "type": "computer_call",
+                    "call_id": f"click_{calls}",
+                    "actions": [{"type": "click", "x": 10, "y": 20}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "max_steps_exceeded"
+    assert result.steps == 1
+    assert calls == 1
+    assert len(backend.calls) == 1
+
+
+def test_gui_agent_runner_honors_stop_request_after_model_response():
+    backend = FakeBackend()
+    loop = ComputerLoop(backend=backend, screen=FakeScreen())
+    stop = {"value": False}
+    runner = GuiAgentRunner(
+        computer_loop=loop,
+        max_steps=3,
+        stop_requested=lambda: stop["value"],
+    )
+    task = GuiAgentTaskSpec(task_id="task_cancel", instruction="Click once.")
+
+    def agent(_conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        stop["value"] = True
+        return {
+            "output": [
+                {
+                    "type": "computer_call",
+                    "call_id": "click_cancelled",
+                    "actions": [{"type": "click", "x": 10, "y": 20}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "cancelled"
+    assert backend.calls == []
 
 
 def test_gui_agent_runner_persists_update_constraints_tool_call():
@@ -1055,6 +1518,77 @@ def test_gui_agent_runner_handles_action_macro_tool_call():
     assert result.metadata["step_records"][0]["action"]["name"] == "run_action_macro"
 
 
+def test_gui_agent_runner_records_action_macro_proposal_for_human_approval():
+    loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
+    runner = GuiAgentRunner(computer_loop=loop, max_steps=4)
+    task = GuiAgentTaskSpec(task_id="task_macro_proposal", instruction="Suggest macro.")
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        outputs = [
+            item
+            for item in conversation
+            if item.get("type") == "function_call_output"
+        ]
+        if not outputs:
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "propose_action_macro",
+                        "call_id": "macro_proposal_1",
+                        "arguments": {
+                            "macro_name": "submit_current_question",
+                            "description": "Submit one current question.",
+                            "dynamic_parameters": ["question_text"],
+                            "steps": [
+                                {
+                                    "index": 1,
+                                    "purpose": "Focus the input box.",
+                                    "action": {
+                                        "type": "click",
+                                        "x": 500,
+                                        "y": 900,
+                                        "coordinate_space": "qwen_normalized_1000",
+                                    },
+                                },
+                                {
+                                    "index": 2,
+                                    "purpose": "Type the dynamic question.",
+                                    "action": {
+                                        "type": "type",
+                                        "text": "{{question_text}}",
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                ]
+            }
+        assert outputs[-1]["output"]["status"] == "macro_approval_requested"
+        assert outputs[-1]["output"]["blocking"] is False
+        return {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "finish_subtask",
+                    "call_id": "finish_1",
+                    "arguments": {"completion_reason": "Macro proposed."},
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    request = next(iter(runner.human_loop.pending.values()))
+    assert request.blocking is False
+    assert request.metadata["intervention_kind"] == "macro_approval"
+    proposal = request.metadata["macro_proposal"]
+    assert proposal["macro_name"] == "submit_current_question"
+    assert proposal["dynamic_parameters"] == ["question_text"]
+    assert proposal["steps"][0]["click_preview"]["available"] is False
+
+
 def test_gui_agent_runner_handles_navigation_tool_call():
     loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
     runner = GuiAgentRunner(computer_loop=loop, max_steps=3)
@@ -1096,57 +1630,6 @@ def test_gui_agent_runner_handles_navigation_tool_call():
     assert len(plan["waypoints"]) >= 2
 
 
-def test_gui_agent_runner_accepts_app_viewport_crop_tool_call():
-    screen = FakeScaledScreen(
-        logical_size=(1000, 500),
-        physical_size=(2000, 1000),
-        physical_origin=(0, 0),
-    )
-    loop = ComputerLoop(backend=FakeBackend(), screen=screen)
-    runner = GuiAgentRunner(computer_loop=loop, max_steps=3)
-    task = GuiAgentTaskSpec(task_id="task_viewport", instruction="Crop the APP.")
-
-    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
-        if len(conversation) == 2:
-            assert "set_app_viewport" in conversation[0]["content"][0]["text"]
-            return {
-                "output": [
-                    {
-                        "type": "function_call",
-                        "name": "set_app_viewport",
-                        "call_id": "viewport_1",
-                        "arguments": {
-                            "x": "100",
-                            "y": "50",
-                            "width": "400",
-                            "height": "200",
-                            "coordinate_space": "screenshot",
-                            "reason": "Only the browser area is useful.",
-                        },
-                    }
-                ]
-            }
-        assert conversation[-2]["type"] == "function_call_output"
-        assert conversation[-2]["output"]["status"] == "accepted"
-        assert conversation[-1]["content"][1]["type"] == "input_image"
-        return {
-            "output": [
-                {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "Viewport set."}],
-                }
-            ]
-        }
-
-    result = runner.run_task(task, agent)
-
-    assert result.status == "completed"
-    assert screen.crop_box == (200, 100, 800, 400)
-    viewport_record = result.metadata["step_records"][0]["metadata"]["output"]
-    assert viewport_record["tool"] == "set_app_viewport"
-    assert viewport_record["screen_viewport"]["crop_width"] == 800
-
-
 def test_gui_agent_runner_keeps_stable_history_prefix_between_steps():
     backend = FakeBackend()
     loop = ComputerLoop(backend=backend, screen=FakeScreen())
@@ -1172,11 +1655,10 @@ def test_gui_agent_runner_keeps_stable_history_prefix_between_steps():
                     }
                 ]
             }
-        if len(conversation) == 5:
+        if len(conversation) == 4:
             assert conversation[1]["content"][1]["type"] == "input_image"
             assert conversation[2]["type"] == "computer_call"
             assert conversation[3]["type"] == "computer_call_output"
-            assert "坐标提醒" in conversation[4]["content"][0]["text"]
             return {
                 "output": [
                     {
@@ -1198,10 +1680,63 @@ def test_gui_agent_runner_keeps_stable_history_prefix_between_steps():
     result = runner.run_task(task, agent)
 
     assert result.status == "completed"
-    assert conversation_lengths == [2, 5, 8]
+    assert conversation_lengths == [2, 4, 6]
     assert screenshot_output_counts == [0, 1, 2]
     assert developer_texts[0] == developer_texts[1] == developer_texts[2]
     assert result.metadata["prompt_context"]["selected_frame_count"] >= 3
+
+
+def test_gui_agent_runner_prunes_old_execution_screenshots_after_visual_limit():
+    loop = ComputerLoop(backend=FakeBackend(), screen=FakeScreen())
+    runner = GuiAgentRunner(
+        computer_loop=loop,
+        context_manager=ContextManager(
+            policy=VisionContextPolicy.agility(max_visual_frames=3)
+        ),
+        max_steps=5,
+        recent_execution_image_frames=1,
+        auto_human_repeated_action_threshold=0,
+    )
+    task = GuiAgentTaskSpec(task_id="task_prune_images", instruction="Click several times.")
+    captured: list[list[dict[str, Any]]] = []
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        captured.append(json.loads(json.dumps(conversation)))
+        if len(captured) <= 4:
+            return {
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": f"click_{len(captured)}",
+                        "actions": [{"type": "click", "x": 10, "y": 20}],
+                    }
+                ]
+            }
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    final_conversation = captured[-1]
+    assert final_conversation[1]["content"][1]["type"] == "input_image"
+    active_execution_images = [
+        item for item in final_conversation if item.get("type") == "computer_call_output"
+    ]
+    pruned_outputs = [
+        item
+        for item in final_conversation
+        if item.get("type") == "function_call_output"
+        and "cfie_execution_image_pruned" in str(item.get("output"))
+    ]
+    assert len(active_execution_images) == 1
+    assert len(pruned_outputs) == 3
 
 
 def test_gui_agent_runner_omits_inline_media_from_runtime_text_context():
@@ -1233,68 +1768,6 @@ def test_gui_agent_runner_omits_inline_media_from_runtime_text_context():
     assert "图片已作为 input_image 提供" in runtime_text
     assert image_part["type"] == "input_image"
     assert image_part["image_url"].startswith("data:image")
-
-
-def test_gui_agent_runner_clicks_inside_cropped_app_viewport():
-    backend = FakeBackend()
-    screen = FakeScaledScreen(
-        logical_size=(1000, 500),
-        physical_size=(2000, 1000),
-        physical_origin=(0, 0),
-    )
-    loop = ComputerLoop(backend=backend, screen=screen)
-    runner = GuiAgentRunner(computer_loop=loop, max_steps=4)
-    task = GuiAgentTaskSpec(
-        task_id="task_cropped_click",
-        instruction="Crop to APP and click its center.",
-    )
-
-    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
-        if len(conversation) == 2:
-            return {
-                "output": [
-                    {
-                        "type": "function_call",
-                        "name": "set_app_viewport",
-                        "call_id": "viewport_1",
-                        "arguments": {
-                            "x": 100,
-                            "y": 50,
-                            "width": 400,
-                            "height": 200,
-                            "coordinate_space": "screenshot",
-                        },
-                    }
-                ]
-            }
-        if conversation[-2]["type"] == "function_call_output":
-            assert conversation[-1]["content"][1]["type"] == "input_image"
-            assert screen.size() == (800, 400)
-            return {
-                "output": [
-                    {
-                        "type": "computer_call",
-                        "call_id": "cropped_click",
-                        "actions": [{"type": "click", "x": 400, "y": 200}],
-                    }
-                ]
-            }
-        assert conversation[-2]["type"] == "computer_call_output"
-        assert "坐标提醒" in conversation[-1]["content"][0]["text"]
-        return {
-            "output": [
-                {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "Clicked."}],
-                }
-            ]
-        }
-
-    result = runner.run_task(task, agent)
-
-    assert result.status == "completed"
-    assert screen.crop_box == (200, 100, 800, 400)
-    assert ("click", (600, 300, "left")) in backend.calls
 
 
 def test_gui_agent_runner_reports_rejected_computer_action_without_crashing():

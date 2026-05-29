@@ -6,13 +6,13 @@ import urllib.request
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 from cfie_client.responses_adapter import (
     sanitize_responses_input_item,
     strip_inline_media_from_text,
     strip_inline_media_from_tool_output,
 )
-from cfie_gui_agent.agent_tools import normalize_response_tool_calls
 from cfie_gui_agent.tools import ModelToolRegistry
 
 
@@ -35,7 +35,6 @@ class OpenAIResponsesAgent:
     store: bool = False
     tool_choice: str = "auto"
     include_tools: bool = True
-    normalize_tool_calls: bool = True
     parallel_tool_calls: bool = False
     reasoning_effort: str | None = "none"
     chat_template_kwargs: dict[str, Any] = field(
@@ -69,7 +68,7 @@ class OpenAIResponsesAgent:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(
-            self.base_url.rstrip("/") + "/responses",
+            _responses_endpoint(self.base_url),
             data=body,
             headers=headers,
             method="POST",
@@ -78,8 +77,6 @@ class OpenAIResponsesAgent:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 raw = response.read().decode("utf-8")
                 data = json.loads(raw)
-                if self.normalize_tool_calls:
-                    data = normalize_response_tool_calls(data)
                 if isinstance(data, dict):
                     data[REQUEST_DEBUG_KEY] = request_debug
                 return data
@@ -100,6 +97,19 @@ class OpenAIResponsesAgent:
             raise OpenAIResponsesAgentError(
                 "Responses API returned non-JSON response"
             ) from exc
+
+
+def _responses_endpoint(base_url: str) -> str:
+    root = base_url.rstrip("/")
+    if not root:
+        return "/v1/responses"
+    parsed = urlparse(root)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/responses"):
+        return root
+    if path.endswith("/v1"):
+        return root + "/responses"
+    return root + "/v1/responses"
 
 
 def _to_responses_tool(tool: Any) -> dict[str, Any]:

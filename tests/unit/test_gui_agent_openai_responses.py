@@ -10,6 +10,7 @@ from cfie_gui_agent import OpenAIResponsesAgent
 
 class CaptureHandler(BaseHTTPRequestHandler):
     captured_payload: dict[str, Any] | None = None
+    captured_path: str | None = None
     response_payload: dict[str, Any] = {
         "id": "resp_test",
         "output": [
@@ -23,6 +24,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
     }
 
     def do_POST(self) -> None:
+        CaptureHandler.captured_path = self.path
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length).decode("utf-8")
         CaptureHandler.captured_payload = json.loads(raw)
@@ -36,6 +38,68 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args: Any) -> None:
         return
+
+
+def test_openai_responses_agent_accepts_root_base_url():
+    CaptureHandler.captured_payload = None
+    CaptureHandler.captured_path = None
+    CaptureHandler.response_payload = {"id": "resp_ok", "output": []}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        agent = OpenAIResponsesAgent(
+            model="qwen35-vl",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}",
+            include_tools=False,
+            max_output_tokens=64,
+        )
+        agent(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert CaptureHandler.captured_path == "/v1/responses"
+    assert CaptureHandler.captured_payload is not None
+
+
+def test_openai_responses_agent_accepts_responses_endpoint_base_url():
+    CaptureHandler.captured_payload = None
+    CaptureHandler.captured_path = None
+    CaptureHandler.response_payload = {"id": "resp_ok", "output": []}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        agent = OpenAIResponsesAgent(
+            model="qwen35-vl",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1/responses",
+            include_tools=False,
+            max_output_tokens=64,
+        )
+        agent(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert CaptureHandler.captured_path == "/v1/responses"
+    assert CaptureHandler.captured_payload is not None
 
 
 def test_openai_responses_agent_posts_flat_tool_schema_and_normalizes_outputs():
@@ -113,7 +177,8 @@ def test_openai_responses_agent_posts_flat_tool_schema_and_normalizes_outputs():
     assert payload["input"][4]["type"] == "computer_call_output"
     assert payload["input"][4]["output"]["image_url"] == "file:///tmp/screen_after.jpg"
     tool_names = {tool["name"] for tool in payload["tools"]}
-    assert "set_app_viewport" in tool_names
+    assert "open_url" in tool_names
+    assert "append_trace_note" not in tool_names
     assert payload["tools"][0]["type"] == "function"
     assert "name" in payload["tools"][0]
     assert "function" not in payload["tools"][0]
@@ -130,7 +195,53 @@ def test_openai_responses_agent_posts_flat_tool_schema_and_normalizes_outputs():
     }
 
 
-def test_openai_responses_agent_splits_qwen_text_tool_call_output():
+def test_openai_responses_agent_adds_default_image_detail():
+    CaptureHandler.captured_payload = None
+    CaptureHandler.response_payload = {
+        "id": "resp_image_detail",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}],
+            }
+        ],
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        agent = OpenAIResponsesAgent(
+            model="qwen35-vl",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+            include_tools=False,
+            max_output_tokens=64,
+        )
+        agent(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "describe"},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AAAA",
+                        },
+                    ],
+                }
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    payload = CaptureHandler.captured_payload
+    assert payload is not None
+    assert payload["input"][0]["content"][1]["detail"] == "auto"
+
+
+def test_openai_responses_agent_does_not_rewrite_qwen_text_tool_call_output():
     CaptureHandler.captured_payload = None
     CaptureHandler.response_payload = {
         "id": "resp_text_tool",
@@ -181,17 +292,11 @@ def test_openai_responses_agent_splits_qwen_text_tool_call_output():
         server.shutdown()
         server.server_close()
 
-    assert response["output"][0]["content"][0]["text"] == "Next I will click send."
-    call = response["output"][1]
-    assert call["type"] == "function_call"
-    assert call["name"] == "computer_use"
-    assert json.loads(call["arguments"]) == {
-        "coordinate_space": "qwen_normalized_1000",
-        "actions": [{"type": "click", "x": 570, "y": 470}],
-    }
+    assert response["output"] == CaptureHandler.response_payload["output"]
+    assert "<tool_call>" in response["output"][0]["content"][0]["text"]
 
 
-def test_openai_responses_agent_splits_bare_qwen_function_block():
+def test_openai_responses_agent_does_not_rewrite_bare_qwen_function_block():
     CaptureHandler.captured_payload = None
     CaptureHandler.response_payload = {
         "id": "resp_bare_function_tool",
@@ -239,17 +344,8 @@ def test_openai_responses_agent_splits_bare_qwen_function_block():
         server.shutdown()
         server.server_close()
 
-    assert response["output"] == [
-        {
-            "type": "function_call",
-            "name": "computer_use",
-            "call_id": "text_tool_call_1",
-            "arguments": (
-                '{"coordinate_space": "qwen_normalized_1000", '
-                '"actions": [{"type": "click", "x": 500, "y": 900}]}'
-            ),
-        }
-    ]
+    assert response["output"] == CaptureHandler.response_payload["output"]
+    assert "<function=computer_use>" in response["output"][0]["content"][0]["text"]
 
 
 def test_openai_responses_agent_strips_inline_media_from_tool_outputs():

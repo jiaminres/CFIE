@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -9,13 +11,13 @@ from time import perf_counter
 from typing import Any, Protocol
 
 from cfie_client import ComputerCall, ComputerLoop, find_computer_calls
+from cfie.entrypoints.openai.reasoning_template import QWEN_REASONING_PREAMBLE_KWARG
 
 from cfie_gui_agent.agent_tools import (
     AgentToolError,
     AgentToolCall,
     find_agent_tool_calls,
     find_computer_tool_calls,
-    normalize_response_tool_calls,
 )
 from cfie_gui_agent.context import ContextManager, StepRecord, VisionContextPolicy
 from cfie_gui_agent.human_loop import HumanLoopManager, InMemoryHumanChannel
@@ -37,6 +39,9 @@ from cfie_gui_agent.verifier import (
     VERIFICATION_NO_SCREEN_CHANGE,
     VERIFICATION_REPEATED_ACTION,
 )
+
+
+DEFAULT_AGENT_MAX_STEPS = 48
 
 
 class ResponseAgent(Protocol):
@@ -64,10 +69,13 @@ class GuiAgentRunner:
     response_latency_warning_seconds: float = 10.0
     refresh_runtime_context_each_step: bool = False
     max_repair_turns: int = 4
+    require_finish_tool_for_completion: bool = False
+    recent_execution_image_frames: int = 4
+    stop_requested: Callable[[], bool] | None = None
     human_loop: HumanLoopManager = field(
         default_factory=lambda: HumanLoopManager(channel=InMemoryHumanChannel())
     )
-    max_steps: int = 8
+    max_steps: int = DEFAULT_AGENT_MAX_STEPS
 
     def run_task(
         self,
@@ -93,6 +101,19 @@ class GuiAgentRunner:
 
         max_model_turns = self.max_steps + max(0, self.max_repair_turns)
         for step in range(1, max_model_turns + 1):
+            if self.stop_requested is not None and self.stop_requested():
+                return GuiAgentResult(
+                    task_id=task.task_id,
+                    status="cancelled",
+                    reason="User requested stop.",
+                    steps=max(0, step - 1),
+                    metadata=self._build_result_metadata(
+                        job_board=job_board,
+                        context_store=context_store,
+                        active_job_id=active_job_id,
+                        model_response_metrics=model_response_metrics,
+                    ),
+                )
             if self.include_runtime_context and self.refresh_runtime_context_each_step:
                 conversation[0] = self._runtime_context_message(
                     job_board=job_board,
@@ -100,9 +121,29 @@ class GuiAgentRunner:
                     active_job_id=active_job_id,
                     current_frame_ref=current_frame_ref,
                 )
+            prune_stats = _prune_execution_image_history(
+                conversation,
+                max_visual_frames=self.context_manager.policy.max_visual_frames,
+                keep_recent=self.recent_execution_image_frames,
+            )
+            if prune_stats["pruned_now"]:
+                self.trace_store.record("visual_history_pruned", prune_stats)
             response_started = perf_counter()
-            response = normalize_response_tool_calls(agent(conversation))
+            response = agent(conversation)
             response_latency = perf_counter() - response_started
+            if self.stop_requested is not None and self.stop_requested():
+                return GuiAgentResult(
+                    task_id=task.task_id,
+                    status="cancelled",
+                    reason="User requested stop.",
+                    steps=max(0, step - 1),
+                    metadata=self._build_result_metadata(
+                        job_board=job_board,
+                        context_store=context_store,
+                        active_job_id=active_job_id,
+                        model_response_metrics=model_response_metrics,
+                    ),
+                )
             response_metrics = _build_model_response_metrics(
                 response,
                 step=step,
@@ -112,6 +153,10 @@ class GuiAgentRunner:
                 latency_warning_seconds=self.response_latency_warning_seconds,
                 input_text_preview=_conversation_text_preview(conversation),
             )
+            response_metrics["task_id"] = task.task_id
+            app_id = str(task.metadata.get("app_id") or "").strip()
+            if app_id:
+                response_metrics["app_id"] = app_id
             model_response_metrics.append(response_metrics)
             self.trace_store.record("model_response", response_metrics)
             try:
@@ -146,122 +191,65 @@ class GuiAgentRunner:
                     }
                 )
                 continue
-            human_help_override = _human_help_call_from_text(
-                step=step,
-                text=_extract_response_text(response) or "",
-                current_frame_ref=current_frame_ref,
-            )
-            if human_help_override is not None and computer_calls:
+            response_text = _extract_response_text(response)
+            if (
+                computer_calls or _mentions_computer_use(response_text)
+            ) and _should_escalate_computer_use_to_human(response_text):
+                running = job_board.jobs[active_job_id].queues.running
+                request = self.human_loop.request_help(
+                    question=(
+                        "当前界面可能涉及登录、授权、验证码或账号风险，"
+                        "需要人工确认后再继续。"
+                    ),
+                    task_id=running.subtask_id if running is not None else None,
+                    evidence_refs=(current_frame_ref,) if current_frame_ref else (),
+                    risk_reason="auth_or_account_sensitive_computer_use",
+                    proposed_action="请人工完成或确认登录/授权相关操作。",
+                    urgency="normal",
+                    metadata={"job_id": active_job_id, "step": step},
+                )
+                if job_board.jobs[active_job_id].queues.running is not None:
+                    job_board.jobs[active_job_id].queues.move_running_to(
+                        "waiting_human",
+                        human_request_id=request.request_id,
+                    )
                 self.trace_store.record(
                     "tool_call_safety_override",
                     {
                         "step": step,
-                        "reason": "human_help_intent_with_computer_action",
-                        "preview": (_extract_response_text(response) or "")[:500],
+                        "reason": "auth_or_account_sensitive_computer_use",
+                        "preview": (response_text or "")[:500],
                     },
                 )
-                computer_calls = ()
-                agent_tool_calls = (human_help_override, *agent_tool_calls)
-            conflicting_tools = _mentioned_agent_tools_in_text(
-                _extract_response_text(response) or "",
-                self.tool_registry.allowed_tool_names,
-            )
-            if conflicting_tools and computer_calls and not agent_tool_calls:
-                recovered_agent_calls = _recover_agent_tool_calls_from_text_intent(
-                    step=step,
-                    text=_extract_response_text(response) or "",
-                    tool_names=conflicting_tools,
-                    job=job_board.jobs[active_job_id],
-                    trace_store=self.trace_store,
+                return GuiAgentResult(
+                    task_id=task.task_id,
+                    status="waiting_human",
+                    reason=(
+                        "Harness converted a sensitive computer action into "
+                        "a human-help request."
+                    ),
+                    steps=step,
+                    metadata=self._build_result_metadata(
+                        job_board=job_board,
+                        context_store=context_store,
+                        active_job_id=active_job_id,
+                        model_response_metrics=model_response_metrics,
+                    ),
                 )
-                if recovered_agent_calls:
-                    self.trace_store.record(
-                        "tool_call_safety_override",
-                        {
-                            "step": step,
-                            "reason": "recovered_agent_tool_intent",
-                            "recovered_tools": [
-                                call.name for call in recovered_agent_calls
-                            ],
-                            "preview": (_extract_response_text(response) or "")[:500],
-                        },
-                    )
-                    computer_calls = ()
-                    agent_tool_calls = (*recovered_agent_calls, *agent_tool_calls)
-                else:
-                    self.trace_store.record(
-                        "tool_call_parse_retry",
-                        {
-                            "step": step,
-                            "reason": "agent_tool_intent_with_computer_action",
-                            "mentioned_tools": list(conflicting_tools),
-                            "preview": (_extract_response_text(response) or "")[:500],
-                        },
-                    )
-                    conversation.append(
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": (
-                                        "Your text said the next step requires the "
-                                        f"Agent tool {', '.join(conflicting_tools)}, "
-                                        "but the returned structured call was "
-                                        "computer_use. Do not use mouse clicks or "
-                                        "keyboard actions as a substitute for Agent "
-                                        "tools. Return exactly one function_call now. "
-                                        "The function_call name must be one of: "
-                                        f"{', '.join(conflicting_tools)}. Put all "
-                                        "parameters in that tool's arguments. Do not "
-                                        "return computer_use in this repair turn."
-                                    ),
-                                }
-                            ],
-                        }
-                    )
-                    continue
-
-            computer_calls, agent_tool_calls = _select_single_tool_turn(
+            ordered_tool_calls = _order_tool_turn(
                 step=step,
                 computer_calls=computer_calls,
                 agent_tool_calls=agent_tool_calls,
                 trace_store=self.trace_store,
             )
-            if _workflow_input_read_is_required(
-                job_board.jobs[active_job_id],
-                conversation=conversation,
-            ) and computer_calls:
-                input_path = job_board.jobs[active_job_id].metadata.get("input_path")
-                self.trace_store.record(
-                    "workflow_input_read_required",
-                    {
-                        "step": step,
-                        "input_path": str(input_path or ""),
-                        "blocked_computer_calls": len(computer_calls),
-                        "blocked_agent_tools": [call.name for call in agent_tool_calls],
-                    },
-                )
-                conversation.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": (
-                                    "当前任务配置了输入清单，但你还没有读取清单正文。"
-                                    "在执行任何电脑操作或记录结果之前，必须先调用 "
-                                    f"read_text_file 读取：{input_path}。"
-                                    "只返回这一个工具调用，不要调用 computer_use。"
-                                ),
-                            }
-                        ],
-                    }
-                )
-                continue
-
+            computer_calls = tuple(
+                call for kind, call in ordered_tool_calls if kind == "computer_use"
+            )
+            agent_tool_calls = tuple(
+                call for kind, call in ordered_tool_calls if kind == "agent_tool"
+            )
             if not computer_calls and not agent_tool_calls:
-                final_text = _extract_response_text(response)
+                final_text = response_text
                 running = job_board.jobs[active_job_id].queues.running
                 if running is not None and not (final_text or "").strip():
                     self.trace_store.record(
@@ -349,12 +337,35 @@ class GuiAgentRunner:
                         }
                     )
                     continue
-                _maybe_record_final_workflow_result(
-                    final_text,
-                    job=job_board.jobs[active_job_id],
-                    trace_store=self.trace_store,
-                )
                 running = job_board.jobs[active_job_id].queues.running
+                if running is not None and self.require_finish_tool_for_completion:
+                    self.trace_store.record(
+                        "tool_call_parse_retry",
+                        {
+                            "step": step,
+                            "reason": "plain_text_without_tool_call_for_active_task",
+                            "preview": (final_text or "")[:500],
+                        },
+                    )
+                    conversation.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "The task is still active. Plain text "
+                                        "does not complete this GUI Agent task. "
+                                        "Return exactly one executable tool call "
+                                        "now, or call finish_subtask only after "
+                                        "the required results have actually been "
+                                        "written."
+                                    ),
+                                }
+                            ],
+                        }
+                    )
+                    continue
                 if running is not None:
                     job_board.jobs[active_job_id].queues.move_running_to("completed")
                 return GuiAgentResult(
@@ -377,139 +388,171 @@ class GuiAgentRunner:
                 agent_tool_calls=agent_tool_calls,
             )
 
-            for call in computer_calls:
-                self.tool_registry.validate_model_tool("computer_use")
-                try:
-                    output = self.computer_loop.handle_call(call)
-                except Exception as exc:
-                    before_ref = current_frame_ref
-                    screenshot_ref = current_frame_ref
+            for call_kind, call in ordered_tool_calls:
+                if call_kind == "computer_use":
+                    assert isinstance(call, ComputerCall)
+                    self.tool_registry.validate_model_tool("computer_use")
                     try:
-                        screenshot = self.computer_loop.screen.screenshot()
-                        screenshot_ref = screenshot.image_url
-                        current_frame_ref = screenshot.image_url
-                    except Exception:
-                        screenshot = None
-                    error_text = (
-                        "computer_use was rejected by the local harness: "
-                        f"{type(exc).__name__}: {exc}. Use coordinates inside "
-                        f"the current screenshot ({_screen_bounds_text(self.computer_loop.screen)}), "
-                        "or call request_human_help if "
-                        "the UI cannot be operated safely."
-                    )
-                    conversation.append(
-                        _screen_observation_message(
-                            text=error_text,
-                            image_url=(
-                                screenshot.image_url
-                                if screenshot is not None
-                                else None
-                            ),
-                            image_detail=self.image_detail,
+                        output = self.computer_loop.handle_call(call)
+                    except Exception as exc:
+                        before_ref = current_frame_ref
+                        screenshot_ref = current_frame_ref
+                        try:
+                            screenshot = self.computer_loop.screen.screenshot()
+                            screenshot_ref = screenshot.image_url
+                            current_frame_ref = screenshot.image_url
+                        except Exception:
+                            screenshot = None
+                        error_text = (
+                            "computer_use was rejected by the local harness: "
+                            f"{type(exc).__name__}: {exc}. Use coordinates inside "
+                            f"the current screenshot ({_screen_bounds_text(self.computer_loop.screen)}), "
+                            "or call request_human_help if "
+                            "the UI cannot be operated safely."
                         )
-                    )
+                        conversation.append(
+                            _screen_observation_message(
+                                text=error_text,
+                                image_url=(
+                                    screenshot.image_url
+                                    if screenshot is not None
+                                    else None
+                                ),
+                                image_detail=self.image_detail,
+                            )
+                        )
+                        running = job_board.jobs[active_job_id].queues.running
+                        record = StepRecord(
+                            step_id=len(step_records) + 1,
+                            task_id=active_job_id,
+                            subtask_id=(
+                                running.subtask_id if running is not None else None
+                            ),
+                            action=call.to_openai_dict(),
+                            result="rejected",
+                            before_ref=before_ref,
+                            after_ref=screenshot_ref,
+                            summary=error_text,
+                            tags=("computer_use", "rejected"),
+                            metadata={
+                                "model_response_step": step,
+                                **_task_trace_metadata(task),
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                            },
+                        )
+                        step_records.append(record)
+                        context_store.append_step(active_job_id, record)
+                        self.trace_store.record_step(record)
+                        continue
                     running = job_board.jobs[active_job_id].queues.running
                     record = StepRecord(
                         step_id=len(step_records) + 1,
                         task_id=active_job_id,
-                        subtask_id=(
-                            running.subtask_id if running is not None else None
-                        ),
+                        subtask_id=running.subtask_id if running is not None else None,
                         action=call.to_openai_dict(),
-                        result="rejected",
-                        before_ref=before_ref,
-                        after_ref=screenshot_ref,
-                        summary=error_text,
-                        tags=("computer_use", "rejected"),
+                        result="computer_call_output",
+                        before_ref=current_frame_ref,
+                        after_ref=output.output.image_url,
+                        summary=f"Executed {len(call.actions)} computer action(s).",
+                        tags=("computer_use",),
                         metadata={
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
+                            "model_response_step": step,
+                            **_task_trace_metadata(task),
                         },
                     )
+                    verification = self.step_verifier.verify(record)
+                    record.metadata["verification"] = verification.to_dict()
+                    local_refinements = _local_click_refinement_messages(
+                        computer_loop=self.computer_loop,
+                        call=call,
+                        verification_status=verification.status,
+                        image_detail=self.image_detail,
+                    )
+                    if local_refinements:
+                        record.metadata["local_refinements"] = [
+                            item["metadata"] for item in local_refinements
+                        ]
+                        record.metadata["local_refinement"] = local_refinements[-1][
+                            "metadata"
+                        ]
+                    conversation.append(
+                        _computer_call_output_context_item(
+                            output,
+                            call=call,
+                            local_refinements=local_refinements,
+                        )
+                    )
+                    if not verification.is_ok:
+                        record = replace(
+                            record,
+                            tags=tuple(
+                                dict.fromkeys((*record.tags, verification.status))
+                            ),
+                        )
                     step_records.append(record)
                     context_store.append_step(active_job_id, record)
                     self.trace_store.record_step(record)
-                    continue
-                conversation.append(
-                    _computer_call_output_context_item(output, call=call)
-                )
-                conversation.append(_coordinate_bounds_message(self.computer_loop.screen))
-                running = job_board.jobs[active_job_id].queues.running
-                record = StepRecord(
-                    step_id=len(step_records) + 1,
-                    task_id=active_job_id,
-                    subtask_id=running.subtask_id if running is not None else None,
-                    action=call.to_openai_dict(),
-                    result="computer_call_output",
-                    before_ref=current_frame_ref,
-                    after_ref=output.output.image_url,
-                    summary=f"Executed {len(call.actions)} computer action(s).",
-                    tags=("computer_use",),
-                )
-                verification = self.step_verifier.verify(record)
-                record.metadata["verification"] = verification.to_dict()
-                local_refinement = _local_click_refinement_message(
-                    computer_loop=self.computer_loop,
-                    call=call,
-                    verification_status=verification.status,
-                    image_detail=self.image_detail,
-                )
-                if local_refinement is not None:
-                    conversation.append(local_refinement["message"])
-                    record.metadata["local_refinement"] = local_refinement["metadata"]
-                if not verification.is_ok:
-                    record = replace(
-                        record,
-                        tags=tuple(
-                            dict.fromkeys((*record.tags, verification.status))
-                        ),
-                    )
-                step_records.append(record)
-                context_store.append_step(active_job_id, record)
-                self.trace_store.record_step(record)
-                current_frame_ref = output.output.image_url
-                if self._should_auto_request_human_on_verification(verification):
-                    request = self.human_loop.request_help(
-                        question=(
-                            "The same computer action repeated without useful "
-                            "progress. Please inspect the current screen and "
-                            "decide how the Agent should continue."
-                        ),
-                        task_id=running.subtask_id if running is not None else None,
-                        evidence_refs=(current_frame_ref,),
-                        risk_reason=verification.status,
-                        proposed_action="Human should unblock the current UI state.",
-                        urgency="normal",
-                        metadata={
-                            "job_id": active_job_id,
-                            "step_id": record.step_id,
-                            "verification": verification.to_dict(),
-                        },
-                    )
-                    if job_board.jobs[active_job_id].queues.running is not None:
-                        job_board.jobs[active_job_id].queues.move_running_to(
-                            "waiting_human",
-                            human_request_id=request.request_id,
+                    current_frame_ref = output.output.image_url
+                    if self._should_auto_request_human_on_verification(verification):
+                        request = self.human_loop.request_help(
+                            question=(
+                                "The same computer action repeated without useful "
+                                "progress. Please inspect the current screen and "
+                                "decide how the Agent should continue."
+                            ),
+                            task_id=running.subtask_id if running is not None else None,
+                            evidence_refs=(current_frame_ref,),
+                            risk_reason=verification.status,
+                            proposed_action="Human should unblock the current UI state.",
+                            urgency="normal",
+                            metadata={
+                                "job_id": active_job_id,
+                                "step_id": record.step_id,
+                                "verification": verification.to_dict(),
+                            },
                         )
-                    return GuiAgentResult(
-                        task_id=task.task_id,
-                        status="waiting_human",
-                        reason=(
-                            "Harness requested human input after repeated "
-                            "computer actions."
-                        ),
-                        steps=step,
-                        metadata=self._build_result_metadata(
+                        if job_board.jobs[active_job_id].queues.running is not None:
+                            job_board.jobs[active_job_id].queues.move_running_to(
+                                "waiting_human",
+                                human_request_id=request.request_id,
+                            )
+                        return GuiAgentResult(
+                            task_id=task.task_id,
+                            status="waiting_human",
+                            reason=(
+                                "Harness requested human input after repeated "
+                                "computer actions."
+                            ),
+                            steps=step,
+                            metadata=self._build_result_metadata(
+                                job_board=job_board,
+                                context_store=context_store,
+                                active_job_id=active_job_id,
+                                model_response_metrics=model_response_metrics,
+                            ),
+                        )
+                    if len(step_records) >= self.max_steps:
+                        return self._max_steps_result(
+                            task=task,
                             job_board=job_board,
                             context_store=context_store,
                             active_job_id=active_job_id,
+                            step_records=step_records,
                             model_response_metrics=model_response_metrics,
-                        ),
-                    )
+                        )
+                    continue
 
-            for call in agent_tool_calls:
+                assert isinstance(call, AgentToolCall)
                 running_before = job_board.jobs[active_job_id].queues.running
-                output = self._handle_agent_tool_call(call, job_board=job_board)
+                output = self._handle_agent_tool_call(
+                    call,
+                    job_board=job_board,
+                    context_store=context_store,
+                    conversation=conversation,
+                    current_frame_ref=current_frame_ref,
+                    model_response_step=step,
+                )
                 running = job_board.jobs[active_job_id].queues.running
                 subtask_id = (
                     output.get("subtask_id")
@@ -529,34 +572,17 @@ class GuiAgentRunner:
                     result=str(output.get("status", "tool_output")),
                     summary=f"Handled agent tool {call.name}.",
                     tags=("agent_tool", call.name),
-                    metadata={"output": output},
+                    metadata={
+                        "model_response_step": step,
+                        **_task_trace_metadata(task),
+                        "output": output,
+                    },
                 )
                 step_records.append(record)
                 context_store.append_step(active_job_id, record)
                 self.trace_store.record_step(record)
                 if call.name == "update_constraints":
                     self.trace_store.record_policy_update(output)
-                if (
-                    call.name == "set_app_viewport"
-                    and output.get("status") == "accepted"
-                ):
-                    try:
-                        screenshot = self.computer_loop.screen.screenshot()
-                    except Exception:
-                        screenshot = None
-                    if screenshot is not None:
-                        current_frame_ref = screenshot.image_url
-                        conversation.append(
-                            _screen_observation_message(
-                                text=(
-                                    "Viewport updated. The next image is the "
-                                    "current cropped APP screenshot. Use this "
-                                    "image coordinate space for computer_use."
-                                ),
-                                image_url=screenshot.image_url,
-                                image_detail=self.image_detail,
-                            )
-                        )
                 if (
                     call.name == "finish_subtask"
                     and output.get("status") == "accepted"
@@ -605,7 +631,37 @@ class GuiAgentRunner:
                             model_response_metrics=model_response_metrics,
                         ),
                     )
+                if len(step_records) >= self.max_steps:
+                    return self._max_steps_result(
+                        task=task,
+                        job_board=job_board,
+                        context_store=context_store,
+                        active_job_id=active_job_id,
+                        step_records=step_records,
+                        model_response_metrics=model_response_metrics,
+                    )
 
+        if job_board.jobs[active_job_id].queues.running is not None:
+            job_board.jobs[active_job_id].queues.move_running_to("failed")
+        return self._max_steps_result(
+            task=task,
+            job_board=job_board,
+            context_store=context_store,
+            active_job_id=active_job_id,
+            step_records=step_records,
+            model_response_metrics=model_response_metrics,
+        )
+
+    def _max_steps_result(
+        self,
+        *,
+        task: GuiAgentTaskSpec,
+        job_board: JobBoard,
+        context_store: PerJobContextStore,
+        active_job_id: str,
+        step_records: list[StepRecord],
+        model_response_metrics: list[dict[str, Any]],
+    ) -> GuiAgentResult:
         if job_board.jobs[active_job_id].queues.running is not None:
             job_board.jobs[active_job_id].queues.move_running_to("failed")
         return GuiAgentResult(
@@ -629,6 +685,10 @@ class GuiAgentRunner:
         call: AgentToolCall,
         *,
         job_board: JobBoard,
+        context_store: PerJobContextStore,
+        conversation: list[dict[str, Any]],
+        current_frame_ref: str | None,
+        model_response_step: int | None = None,
     ) -> dict[str, Any]:
         arguments = _normalize_agent_tool_arguments(call.name, call.arguments)
         if "_parse_error" in arguments:
@@ -639,14 +699,15 @@ class GuiAgentRunner:
                 "raw_arguments": arguments.get("_raw_arguments"),
                 "tool": call.name,
             }
-        try:
-            self.tool_registry.validate_model_tool_call(call.name, arguments)
-        except ToolRegistryError as exc:
-            return {
-                "status": "rejected",
-                "reason": str(exc),
-                "tool": call.name,
-            }
+        if call.name != "append_trace_note":
+            try:
+                self.tool_registry.validate_model_tool_call(call.name, arguments)
+            except ToolRegistryError as exc:
+                return {
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "tool": call.name,
+                }
         active_job_id = job_board.active_job_id
         if active_job_id is None:
             return {"status": "rejected", "reason": "no active job"}
@@ -677,10 +738,19 @@ class GuiAgentRunner:
             }
 
         if call.name == "request_human_help":
+            blocking = bool(arguments.get("blocking", True))
+            context_snapshot = _human_resume_context_snapshot(
+                job_board=job_board,
+                context_store=context_store,
+                active_job_id=active_job_id,
+                conversation=conversation,
+                current_frame_ref=current_frame_ref,
+            )
             request = self.human_loop.request_help(
                 question=str(arguments.get("question", "")).strip()
                 or "Human help requested.",
                 task_id=job.queues.running.subtask_id if job.queues.running else None,
+                blocking=blocking,
                 evidence_refs=tuple(arguments.get("evidence_refs", ()) or ()),
                 risk_reason=arguments.get("risk_reason"),
                 proposed_action=arguments.get("proposed_action"),
@@ -689,17 +759,21 @@ class GuiAgentRunner:
                 metadata={
                     "job_id": active_job_id,
                     "tool_call_id": call.call_id,
+                    "blocking": blocking,
+                    "intervention_kind": "blocking" if blocking else "non_blocking",
+                    "resume_context": context_snapshot,
                 },
             )
-            if job.queues.running is not None:
+            if blocking and job.queues.running is not None:
                 job.queues.move_running_to(
                     "waiting_human",
                     human_request_id=request.request_id,
                 )
             return {
-                "status": "waiting_human",
+                "status": "waiting_human" if blocking else "human_request_queued",
                 "request_id": request.request_id,
                 "job_id": active_job_id,
+                "blocking": blocking,
             }
 
         if call.name == "ask_replan":
@@ -745,53 +819,137 @@ class GuiAgentRunner:
                 "text": text,
             }
 
+        if call.name in {"write_text_file", "append_text_file"}:
+            path = Path(str(arguments.get("path", ""))).expanduser()
+            encoding = str(arguments.get("encoding") or "utf-8")
+            text = str(arguments.get("text", ""))
+            if bool(arguments.get("create_parent", True)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if call.name == "append_text_file" else "w"
+            try:
+                with path.open(mode, encoding=encoding, errors="replace") as handle:
+                    handle.write(text)
+            except OSError as exc:
+                return {
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "path": str(path),
+                    "tool": call.name,
+                }
+            return {
+                "status": "accepted",
+                "path": str(path),
+                "chars": len(text),
+                "mode": mode,
+                "tool": call.name,
+            }
+
+        if call.name == "open_url":
+            url = str(arguments.get("url", "")).strip()
+            browser_path = str(arguments.get("browser_path") or "").strip()
+            try:
+                if browser_path:
+                    command = [browser_path]
+                    if bool(arguments.get("new_window", False)):
+                        command.append("--new-window")
+                    command.append(url)
+                    process = subprocess.Popen(command)
+                    return {
+                        "status": "accepted",
+                        "url": url,
+                        "pid": process.pid,
+                        "tool": call.name,
+                    }
+                webbrowser.open(url, new=1 if arguments.get("new_window") else 0)
+            except Exception as exc:
+                return {
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "url": url,
+                    "tool": call.name,
+                }
+            return {"status": "accepted", "url": url, "tool": call.name}
+
+        if call.name == "launch_app":
+            executable_path = str(arguments.get("executable_path", "")).strip()
+            args = arguments.get("args", []) or []
+            if not isinstance(args, list):
+                args = [str(args)]
+            cwd = str(arguments.get("cwd") or "").strip() or None
+            try:
+                process = subprocess.Popen(
+                    [executable_path, *(str(arg) for arg in args)],
+                    cwd=cwd,
+                )
+            except Exception as exc:
+                return {
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "tool": call.name,
+                }
+            return {
+                "status": "accepted",
+                "pid": process.pid,
+                "tool": call.name,
+            }
+
+        if call.name == "run_shell":
+            command = str(arguments.get("command", "")).strip()
+            cwd = str(arguments.get("cwd") or "").strip() or None
+            timeout_seconds = float(arguments.get("timeout_seconds") or 30.0)
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=cwd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=max(0.1, timeout_seconds),
+                )
+            except subprocess.TimeoutExpired as exc:
+                return {
+                    "status": "rejected",
+                    "reason": "timeout",
+                    "stdout": _short_text(exc.stdout or "", 4000),
+                    "stderr": _short_text(exc.stderr or "", 4000),
+                    "tool": call.name,
+                }
+            except Exception as exc:
+                return {
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "tool": call.name,
+                }
+            return {
+                "status": "accepted" if completed.returncode == 0 else "failed",
+                "returncode": completed.returncode,
+                "stdout": _short_text(completed.stdout, 8000),
+                "stderr": _short_text(completed.stderr, 8000),
+                "tool": call.name,
+            }
+
         if call.name == "append_trace_note":
+            metadata = arguments.get("metadata", {}) or {}
+            if not isinstance(metadata, dict):
+                metadata = {"value": metadata}
+            if model_response_step is not None:
+                metadata = {
+                    **metadata,
+                    "model_response_step": model_response_step,
+                    "tool_call_id": call.call_id,
+                }
             payload = {
                 "job_id": active_job_id,
                 "title": arguments.get("title"),
                 "summary": arguments.get("summary", ""),
                 "status": arguments.get("status", "recorded"),
                 "artifact_refs": arguments.get("artifact_refs", []) or [],
-                "metadata": arguments.get("metadata", {}) or {},
+                "metadata": metadata,
             }
             self.trace_store.record("operation", payload)
             return {"status": "accepted", "trace_event": payload}
-
-        if call.name == "set_app_viewport":
-            result = _set_screen_viewport(
-                self.computer_loop.screen,
-                x=int(arguments.get("x", 0)),
-                y=int(arguments.get("y", 0)),
-                width=int(arguments.get("width", 1)),
-                height=int(arguments.get("height", 1)),
-                coordinate_space=str(arguments.get("coordinate_space", "screenshot")),
-            )
-            payload = {
-                "job_id": active_job_id,
-                "reason": arguments.get("reason", ""),
-                **result,
-            }
-            self.trace_store.record("viewport", payload)
-            return payload
-
-        if call.name == "record_workflow_result":
-            item_id = arguments.get("item_id")
-            item_defaults = _workflow_item_defaults(job, str(item_id or ""))
-            payload = {
-                "job_id": active_job_id,
-                "item_id": item_id,
-                "input_text": arguments.get("input_text")
-                or item_defaults.get("input_text", ""),
-                "expected_output": arguments.get("expected_output")
-                or item_defaults.get("expected_output", ""),
-                "output_text": arguments.get("output_text", ""),
-                "status": arguments.get("status"),
-                "latency_seconds": arguments.get("latency_seconds"),
-                "artifact_refs": arguments.get("artifact_refs", []) or [],
-                "reason": arguments.get("reason", ""),
-            }
-            self.trace_store.record("workflow_result", payload)
-            return {"status": "accepted", "workflow_result": payload}
 
         if call.name == "read_image":
             return {
@@ -815,8 +973,15 @@ class GuiAgentRunner:
         if call.name == "run_action_macro":
             macro_name = str(arguments.get("macro_name", ""))
             repeat = int(arguments.get("repeat", 1))
+            parameters = arguments.get("parameters")
+            if not isinstance(parameters, dict):
+                parameters = {}
             try:
-                actions = self.action_macros.expand(macro_name, repeat=repeat)
+                actions = self.action_macros.expand(
+                    macro_name,
+                    repeat=repeat,
+                    parameters=parameters,
+                )
             except ActionMacroError as exc:
                 return {
                     "status": "rejected",
@@ -827,9 +992,56 @@ class GuiAgentRunner:
                 "status": "accepted",
                 "macro_name": macro_name,
                 "repeat": repeat,
+                "parameters": parameters,
+                "coordinate_space": self.action_macros.require(macro_name).metadata.get(
+                    "coordinate_space"
+                ),
                 "expanded_actions": [
                     action.to_openai_dict() for action in actions
                 ],
+            }
+
+        if call.name == "propose_action_macro":
+            proposal = _macro_proposal_payload(
+                arguments,
+                screen=self.computer_loop.screen,
+            )
+            context_snapshot = _human_resume_context_snapshot(
+                job_board=job_board,
+                context_store=context_store,
+                active_job_id=active_job_id,
+                conversation=conversation,
+                current_frame_ref=current_frame_ref,
+            )
+            request = self.human_loop.request_help(
+                question=(
+                    "请确认是否批准这个操作宏："
+                    f"{proposal.get('macro_name') or '未命名宏'}"
+                ),
+                task_id=job.queues.running.subtask_id if job.queues.running else None,
+                blocking=False,
+                evidence_refs=(current_frame_ref,) if current_frame_ref else (),
+                risk_reason="model_proposed_action_macro",
+                proposed_action=str(proposal.get("description") or ""),
+                allowed_reply_format=(
+                    "批准、拒绝，或提出修改建议；修改建议会恢复宏提案时的上下文后重新生成。"
+                ),
+                urgency="normal",
+                metadata={
+                    "job_id": active_job_id,
+                    "tool_call_id": call.call_id,
+                    "blocking": False,
+                    "intervention_kind": "macro_approval",
+                    "macro_proposal": proposal,
+                    "resume_context": context_snapshot,
+                },
+            )
+            return {
+                "status": "macro_approval_requested",
+                "request_id": request.request_id,
+                "job_id": active_job_id,
+                "blocking": False,
+                "macro_proposal": proposal,
             }
 
         if call.name == "navigate_to_target":
@@ -934,11 +1146,8 @@ class GuiAgentRunner:
                 f"{json.dumps(viewport, ensure_ascii=False, sort_keys=True)}"
             )
         viewport_guidance = (
-            "如果有效应用区域只占截图的一部分，先调用 "
-            "set_app_viewport 写入应用轮廓；后续截图和点击坐标"
-            "都会使用裁剪后的应用视口。"
-            if self.tool_registry.is_model_callable("set_app_viewport")
-            else "应用视口由客户端和 harness 维护；不要调用或假设存在视口裁剪工具。"
+            "应用视口由客户端和 harness 维护；不要调用或假设存在视口裁剪工具。"
+            "如需打开网页、启动程序、读取或写入本地文件，应调用对应通用工具。"
         )
         content: list[dict[str, Any]] = [
             {
@@ -953,6 +1162,9 @@ class GuiAgentRunner:
                     'coordinate_space="qwen_normalized_1000"，并使用 0..1000 '
                     "归一化图像坐标；左上角是 (0,0)，右下角是 "
                     "(1000,1000)。不要使用物理屏幕坐标。"
+                    "如果一轮响应包含多个工具调用，每个工具调用都必须写 "
+                    "index: 1, 2, 3... 表示执行顺序；如果一次 computer_use "
+                    "包含多个动作，每个 action 也必须写 index。"
                     f"{viewport_guidance}"
                     f"{viewport_note}"
                 ),
@@ -988,11 +1200,8 @@ class GuiAgentRunner:
             sort_keys=True,
         )
         viewport_rule = (
-            "当 APP 区域清晰后，尽早调用 set_app_viewport，后续截图会裁剪到"
-            "活动应用区域，使每轮新增 prefill 尽量接近 2096/4192 token 预算。"
-            if self.tool_registry.is_model_callable("set_app_viewport")
-            else "应用视口由客户端或 harness 负责裁剪；当前工具列表没有 "
-            "set_app_viewport 时，不要在输出中计划或调用它。"
+            "应用视口由客户端或 harness 负责裁剪；不要在输出中计划或调用视口裁剪工具。"
+            "需要读写文件、打开 URL、启动应用或记录轨迹时，调用通用 Agent 工具。"
         )
         return {
             "type": "message",
@@ -1005,12 +1214,13 @@ class GuiAgentRunner:
                         "你必须以该状态为准，不要自行编造任务队列或工具状态。\n"
                         "效率要求：回复保持简短。除非截图或视频描述本身就是任务结果，"
                         "否则不要复述画面内容。需要行动时优先调用工具，不要在工具调用前"
-                        "输出可见的“上一步状态”或“下一步计划”。不要输出长篇思考；"
-                        "如果启用思考，只保留两个短句：上一步状态和下一步动作。"
-                        "调用 record_workflow_result 时，除非确有必要，只传 item_id、"
-                        "output_text、status、reason、artifact_refs。每轮新增文本要尽量少，"
+                        "输出可见的“上一步状态”或“下一步计划”。如果启用思考，"
+                        "把当前状态、下一步和风险写入 <think> 思考区；普通可见文本"
+                        "只用于最终结果或极短说明，不能承载状态分析。不要输出长篇思考。"
+                        "需要记录阶段性结果时，调用写文件或 shell 类通用工具。每轮新增文本要尽量少，"
                         "让 prefix cache 复用稳定历史；历史截图已经在对话中，不要重复描述。"
                         "每一步只新增必要的操作结果关键帧和简短工具结果。"
+                        "如果当前截图已经满足当前子任务，立即调用 finish_subtask；不要为了保险再点击、输入或打开页面。"
                         f"{viewport_rule}"
                     ),
                 },
@@ -1046,6 +1256,7 @@ class GuiAgentRunner:
                         running.success_condition or "",
                         240,
                     ),
+                    "metadata": _subtask_runtime_metadata(running.metadata),
                 }
                 if running is not None
                 else None
@@ -1072,6 +1283,11 @@ class GuiAgentRunner:
                 self.action_macros.to_context_payload()
                 if self.action_macros is not None
                 else {"macros": []}
+            ),
+            "macro_policy": (
+                "如果当前任务出现稳定、重复的多步界面操作，例如连续提交多条同类输入，"
+                "应该调用 propose_action_macro 非阻塞地建议一次操作宏，然后继续当前任务。"
+                "宏必须包含步骤目的、动作顺序、动态参数和可能的点击位置；批准前不要假设宏已经可用。"
             ),
         }
 
@@ -1125,20 +1341,48 @@ def _normalize_agent_tool_arguments(
         "finish_subtask": ("evidence_refs",),
         "report_blocked": ("evidence_refs",),
         "append_trace_note": ("artifact_refs",),
-        "record_workflow_result": ("artifact_refs",),
     }
     for field_name in list_fields_by_tool.get(tool_name, ()):
         if field_name in normalized:
             normalized[field_name] = _as_string_list(normalized[field_name])
     int_fields_by_tool = {
-        "set_app_viewport": ("x", "y", "width", "height"),
         "read_text_file": ("max_chars",),
         "run_action_macro": ("repeat",),
     }
     for field_name in int_fields_by_tool.get(tool_name, ()):
         if field_name in normalized:
             normalized[field_name] = _as_int_or_original(normalized[field_name])
+    if tool_name in {"write_text_file", "append_text_file"} and "text" in normalized:
+        normalized["text"] = _normalize_text_tool_payload(
+            tool_name=tool_name,
+            path=normalized.get("path"),
+            text=normalized["text"],
+        )
     return normalized
+
+
+def _normalize_text_tool_payload(
+    *,
+    tool_name: str,
+    path: Any,
+    text: Any,
+) -> str:
+    payload = _as_text_payload(text)
+    if tool_name != "append_text_file":
+        return payload
+    if not str(path or "").lower().endswith(".jsonl"):
+        return payload
+    if payload.endswith("\n"):
+        return payload
+    return payload + "\n"
+
+
+def _as_text_payload(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _as_int_or_original(value: Any) -> Any:
@@ -1188,6 +1432,22 @@ def _short_text(value: str, limit: int) -> str:
     return text[: max(0, limit - 3)].rstrip() + "..."
 
 
+def _subtask_runtime_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    if not metadata:
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("source", "manager_reply", "human_request"):
+        value = metadata.get(key)
+        if value not in (None, "", {}, []):
+            result[key] = value
+    request = result.get("human_request")
+    if isinstance(request, dict):
+        request_metadata = request.get("metadata")
+        if isinstance(request_metadata, dict) and "resume_context" in request_metadata:
+            result["resume_context"] = request_metadata["resume_context"]
+    return result
+
+
 def _screen_viewport_context(screen: Any) -> dict[str, Any]:
     viewport_fn = getattr(screen, "viewport_context", None)
     if callable(viewport_fn):
@@ -1218,24 +1478,6 @@ def _screen_bounds_text(screen: Any) -> str:
     )
 
 
-def _coordinate_bounds_message(screen: Any) -> dict[str, Any]:
-    return {
-        "type": "message",
-        "role": "user",
-        "content": [
-            {
-                "type": "input_text",
-                "text": (
-                    "坐标提醒：下一次 computer_use 的当前截图范围是 "
-                    f"{_screen_bounds_text(screen)}。Qwen VL 必须设置 "
-                    'coordinate_space="qwen_normalized_1000"，并使用 0..1000 '
-                    "归一化图像坐标；不要使用物理屏幕坐标。"
-                ),
-            }
-        ],
-    }
-
-
 def _screen_observation_message(
     *,
     text: str,
@@ -1252,6 +1494,116 @@ def _screen_observation_message(
             image_part["detail"] = image_detail
         content.append(image_part)
     return {"type": "message", "role": "user", "content": content}
+
+
+def _local_click_refinement_messages(
+    *,
+    computer_loop: ComputerLoop,
+    call: Any,
+    verification_status: str,
+    image_detail: str | None,
+) -> list[dict[str, Any]]:
+    screen = computer_loop.screen
+    screenshot_region_around = getattr(screen, "screenshot_region_around", None)
+    if not callable(screenshot_region_around):
+        return []
+    click_points = _click_logical_points(call, screen)
+    if not click_points:
+        return []
+
+    refinements: list[dict[str, Any]] = []
+    total_clicks = len(click_points)
+    for local_index, item in enumerate(click_points, start=1):
+        point = item["point"]
+        local_box = _local_refinement_logical_box(point, screen, radius=520)
+        try:
+            crop = screenshot_region_around(x=point[0], y=point[1], radius=520)
+        except Exception:
+            continue
+        is_last = local_index == total_clicks
+        text = (
+            "点击局部截图：这是刚才 computer_use 中"
+            f"第 {local_index}/{total_clicks} 个点击动作后的局部高清截图，"
+            f"以该点击点 x={point[0]}, y={point[1]} 为中心。请用这张图确认"
+            "点击是否落在目标控件上。"
+        )
+        if is_last:
+            text += (
+                "如果下一步需要基于这张局部图修正点击，必须设置 "
+                'coordinate_space="local_refinement_1000"；harness 会把局部 '
+                "0..1000 坐标转换回完整截图坐标。"
+            )
+        else:
+            text += (
+                "这张图用于诊断前序点击；如果要继续基于完整截图操作，"
+                '继续使用 coordinate_space="qwen_normalized_1000"。'
+            )
+        metadata = {
+            "click_index": local_index,
+            "action_index": item["action_index"],
+            "action_type": item["action_type"],
+            "attempted_click": {"x": point[0], "y": point[1]},
+            "local_refinement_box": list(local_box),
+            "coordinate_space": "local_refinement_1000",
+            "image_ref": crop.image_url,
+            "crop_width": crop.width,
+            "crop_height": crop.height,
+            "reason": verification_status,
+            "is_active_local_refinement": is_last,
+        }
+        output_payload = {
+            "type": "computer_screenshot",
+            "image_url": crop.image_url,
+            "detail": image_detail or "auto",
+            "summary": text,
+            "click_index": local_index,
+            "action_index": item["action_index"],
+            "attempted_click": {"x": point[0], "y": point[1]},
+            "local_refinement_box": list(local_box),
+            "coordinate_space": "local_refinement_1000",
+            "is_active_local_refinement": is_last,
+        }
+        refinements.append(
+            {
+                "output": output_payload,
+                "metadata": metadata,
+            }
+        )
+
+    if refinements:
+        active_box = refinements[-1]["metadata"]["local_refinement_box"]
+        set_local_refinement_box = getattr(computer_loop, "set_local_refinement_box", None)
+        if callable(set_local_refinement_box):
+            set_local_refinement_box(tuple(int(value) for value in active_box))
+    return refinements
+
+
+def _click_logical_points(call: Any, screen: Any) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+    actions = list(getattr(call, "actions", ()) or ())
+    for action_index, action in enumerate(actions, start=1):
+        action_type = getattr(action, "type", "")
+        if action_type not in {"click", "double_click"}:
+            continue
+        x = getattr(action, "x", None)
+        y = getattr(action, "y", None)
+        if x is None or y is None:
+            continue
+        points.append(
+            {
+                "action_index": action_index,
+                "action_type": action_type,
+                "point": _map_model_point_to_logical_screen(
+                    int(x),
+                    int(y),
+                    coordinate_space=str(
+                        getattr(call, "coordinate_space", "") or "screenshot"
+                    ),
+                    screen=screen,
+                ),
+            }
+        )
+    return points
 
 
 def _local_click_refinement_message(
@@ -1378,170 +1730,6 @@ def _local_refinement_logical_box(
     return (left, top, max(1, right - left), max(1, bottom - top))
 
 
-def _set_screen_viewport(
-    screen: Any,
-    *,
-    x: int,
-    y: int,
-    width: int,
-    height: int,
-    coordinate_space: str,
-) -> dict[str, Any]:
-    if width <= 0 or height <= 0:
-        return {
-            "status": "rejected",
-            "reason": "viewport width and height must be positive",
-        }
-    if coordinate_space not in {"screenshot", "physical"}:
-        return {
-            "status": "rejected",
-            "reason": "coordinate_space must be screenshot or physical",
-        }
-    crop_box = (int(x), int(y), int(width), int(height))
-    if coordinate_space == "screenshot":
-        crop_box = _viewport_screenshot_to_physical(screen, crop_box)
-    set_crop_box = getattr(screen, "set_crop_box", None)
-    if callable(set_crop_box):
-        set_crop_box(crop_box)
-    elif hasattr(screen, "crop_box"):
-        setattr(screen, "crop_box", crop_box)
-    else:
-        return {
-            "status": "rejected",
-            "reason": "screen capture backend does not support viewport cropping",
-        }
-    return {
-        "status": "accepted",
-        "tool": "set_app_viewport",
-        "coordinate_space": coordinate_space,
-        "crop_box": list(crop_box),
-        "screen_viewport": _screen_viewport_context(screen),
-    }
-
-
-def _viewport_screenshot_to_physical(
-    screen: Any,
-    crop_box: tuple[int, int, int, int],
-) -> tuple[int, int, int, int]:
-    x, y, width, height = crop_box
-    size_fn = getattr(screen, "size", None)
-    physical_size_fn = getattr(screen, "physical_size", None)
-    physical_origin_fn = getattr(screen, "physical_origin", None)
-    if not callable(size_fn) or not callable(physical_size_fn):
-        return crop_box
-    logical_width, logical_height = size_fn()
-    physical_width, physical_height = physical_size_fn()
-    origin_x, origin_y = (
-        physical_origin_fn()
-        if callable(physical_origin_fn)
-        else (0, 0)
-    )
-    if logical_width <= 0 or logical_height <= 0:
-        return crop_box
-    x = max(0, min(x, logical_width - 1))
-    y = max(0, min(y, logical_height - 1))
-    width = max(1, min(width, logical_width - x))
-    height = max(1, min(height, logical_height - y))
-    return (
-        origin_x + int(round(x * physical_width / logical_width)),
-        origin_y + int(round(y * physical_height / logical_height)),
-        max(1, int(round(width * physical_width / logical_width))),
-        max(1, int(round(height * physical_height / logical_height))),
-    )
-
-
-def _workflow_item_defaults(job: JobState, item_id: str) -> dict[str, str]:
-    item = _current_workflow_item(job, item_id=item_id)
-    if item is None:
-        return {}
-    return {
-        "input_text": item.input_text,
-        "expected_output": item.expected_output,
-    }
-
-
-def _current_workflow_item(job: JobState, item_id: str = "") -> Any | None:
-    input_path = job.metadata.get("input_path")
-    if not input_path:
-        return None
-    try:
-        from cfie_gui_agent.workflow import load_workflow_items
-
-        items = load_workflow_items(str(input_path))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    if item_id:
-        for item in items:
-            if item.item_id == item_id:
-                return item
-        return None
-    for item in items:
-        return item
-    return None
-
-
-def _next_unrecorded_workflow_item(
-    job: JobState,
-    *,
-    trace_store: AgentTraceStore,
-) -> Any | None:
-    input_path = job.metadata.get("input_path")
-    if not input_path:
-        return None
-    try:
-        from cfie_gui_agent.workflow import load_workflow_items
-
-        items = load_workflow_items(str(input_path))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    recorded = {
-        str(event.payload.get("item_id") or "")
-        for event in trace_store.events
-        if event.kind == "workflow_result"
-    }
-    for item in items:
-        if item.item_id not in recorded:
-            return item
-    return items[-1] if items else None
-
-
-def _maybe_record_final_workflow_result(
-    final_text: str | None,
-    *,
-    job: JobState,
-    trace_store: AgentTraceStore,
-) -> dict[str, Any] | None:
-    if not final_text:
-        return None
-    stripped = final_text.strip()
-    if not stripped.startswith("{"):
-        return None
-    try:
-        value = json.loads(stripped)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(value, dict):
-        return None
-    if not {"item_id", "output_text", "status"}.issubset(value):
-        return None
-    defaults = _workflow_item_defaults(job, str(value.get("item_id") or ""))
-    payload = {
-        "job_id": job.job_id,
-        "item_id": value.get("item_id"),
-        "input_text": value.get("input_text") or defaults.get("input_text", ""),
-        "expected_output": value.get("expected_output")
-        or defaults.get("expected_output", ""),
-        "output_text": value.get("output_text", ""),
-        "status": value.get("status"),
-        "latency_seconds": value.get("latency_seconds"),
-        "artifact_refs": _as_string_list(value.get("artifact_refs", [])),
-        "reason": value.get("reason", ""),
-        "source": "final_message_json",
-    }
-    trace_store.record("workflow_result", payload)
-    return payload
-
-
 def _append_assistant_tool_context(
     conversation: list[dict[str, Any]],
     *,
@@ -1576,6 +1764,10 @@ def _assistant_tool_context_items(
     included_call_ids: set[str] = set()
 
     for item in output_items:
+        if _read_field(item, "type") == "reasoning":
+            context_items.append(_plain_response_item(item))
+
+    for item in output_items:
         item_type = _read_field(item, "type")
         if item_type not in {"function_call", "tool_call", "computer_call"}:
             continue
@@ -1596,80 +1788,68 @@ def _assistant_tool_context_items(
     return context_items
 
 
-def _select_single_tool_turn(
+def _order_tool_turn(
     *,
     step: int,
     computer_calls: tuple[ComputerCall, ...],
     agent_tool_calls: tuple[AgentToolCall, ...],
     trace_store: AgentTraceStore,
-) -> tuple[tuple[ComputerCall, ...], tuple[AgentToolCall, ...]]:
+) -> tuple[tuple[str, ComputerCall | AgentToolCall], ...]:
     total_calls = len(computer_calls) + len(agent_tool_calls)
-    if total_calls <= 1:
-        return computer_calls, agent_tool_calls
-
-    if agent_tool_calls:
-        kept_computer_calls: tuple[ComputerCall, ...] = ()
-        kept_agent_tool_calls = (agent_tool_calls[0],)
-        kept = {
-            "kind": "agent_tool",
-            "name": kept_agent_tool_calls[0].name,
-            "call_id": kept_agent_tool_calls[0].call_id,
-        }
-    else:
-        kept_computer_calls = (computer_calls[0],)
-        kept_agent_tool_calls = ()
-        kept = {
-            "kind": "computer_use",
-            "name": "computer_use",
-            "call_id": kept_computer_calls[0].call_id,
-        }
-
-    dropped = [
-        {"kind": "computer_use", "name": "computer_use", "call_id": call.call_id}
-        for call in computer_calls
-        if call not in kept_computer_calls
-    ]
-    dropped.extend(
-        {"kind": "agent_tool", "name": call.name, "call_id": call.call_id}
-        for call in agent_tool_calls
-        if call not in kept_agent_tool_calls
+    ordered_calls = _sort_tool_calls_across_kinds(
+        (
+            *((("computer_use", call) for call in computer_calls)),
+            *((("agent_tool", call) for call in agent_tool_calls)),
+        )
     )
+    if total_calls <= 1:
+        return ordered_calls
+
     trace_store.record(
-        "parallel_tool_call_pruned",
+        "parallel_tool_call_ordered",
         {
             "step": step,
-            "kept": kept,
-            "dropped": dropped,
+            "tool_calls": [
+                {
+                    "kind": kind,
+                    "name": "computer_use" if kind == "computer_use" else call.name,
+                    "call_id": call.call_id,
+                    "index": _tool_call_index(call),
+                }
+                for kind, call in ordered_calls
+            ],
         },
     )
-    return kept_computer_calls, kept_agent_tool_calls
+    return ordered_calls
 
 
-def _workflow_input_read_is_required(
-    job: JobState,
-    *,
-    conversation: list[dict[str, Any]],
-) -> bool:
-    if not job.metadata.get("input_path"):
-        return False
-    return not _workflow_input_has_been_read(conversation)
+def _sort_tool_calls_across_kinds(
+    calls: tuple[tuple[str, ComputerCall | AgentToolCall], ...],
+) -> tuple[tuple[str, ComputerCall | AgentToolCall], ...]:
+    if len(calls) < 2:
+        return calls
+    if not all(_tool_call_index(call) is not None for _, call in calls):
+        return calls
+    return tuple(
+        item
+        for _, item in sorted(
+            enumerate(calls),
+            key=lambda item: (_tool_call_index(item[1][1]), item[0]),
+        )
+    )
 
 
-def _workflow_input_has_been_read(conversation: list[dict[str, Any]]) -> bool:
-    read_call_ids: set[str] = set()
-    for item in conversation:
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        if item_type in {"function_call", "tool_call"} and item.get("name") == "read_text_file":
-            call_id = str(item.get("call_id") or item.get("id") or "")
-            if call_id:
-                read_call_ids.add(call_id)
-        elif item_type == "function_call_output":
-            call_id = str(item.get("call_id") or "")
-            if call_id in read_call_ids:
-                return True
-    return False
+def _tool_call_index(call: Any) -> int | None:
+    value = getattr(call, "index", None)
+    if value is None and isinstance(getattr(call, "arguments", None), dict):
+        value = call.arguments.get("index")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return None
+    return index if index > 0 else None
 
 
 def _plain_response_item(item: Any) -> dict[str, Any]:
@@ -1694,6 +1874,8 @@ def _computer_call_as_function_call_item(call: ComputerCall) -> dict[str, Any]:
     arguments: dict[str, Any] = {
         "actions": [action.to_openai_dict() for action in call.actions],
     }
+    if call.index is not None:
+        arguments["index"] = call.index
     if call.coordinate_space is not None:
         arguments["coordinate_space"] = call.coordinate_space
     return {
@@ -1708,11 +1890,19 @@ def _computer_call_output_context_item(
     output: Any,
     *,
     call: ComputerCall,
+    local_refinements: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     item = output.to_openai_dict()
     output_payload = item.get("output")
     if isinstance(output_payload, dict):
         output_payload["summary"] = _computer_action_summary(call)
+        refinement_outputs = [
+            dict(refinement["output"])
+            for refinement in (local_refinements or ())
+            if isinstance(refinement, dict) and isinstance(refinement.get("output"), dict)
+        ]
+        if refinement_outputs:
+            output_payload["local_refinements"] = refinement_outputs
     return item
 
 
@@ -1738,6 +1928,99 @@ def _computer_action_summary(call: ComputerCall) -> str:
         else:
             parts.append(action_type)
     return "Executed actions: " + "; ".join(parts)
+
+
+def _prune_execution_image_history(
+    conversation: list[dict[str, Any]],
+    *,
+    max_visual_frames: int,
+    keep_recent: int,
+) -> dict[str, Any]:
+    max_visual_frames = max(1, int(max_visual_frames or 1))
+    keep_recent = max(1, min(int(keep_recent or 1), max_visual_frames))
+    execution_indexes: list[int] = []
+    active_image_indexes: list[int] = []
+    for index, item in enumerate(conversation):
+        if _is_pruned_execution_output(item):
+            execution_indexes.append(index)
+            continue
+        if _is_execution_screenshot_output(item):
+            execution_indexes.append(index)
+            active_image_indexes.append(index)
+
+    if len(execution_indexes) <= max_visual_frames:
+        return {
+            "total_execution_outputs": len(execution_indexes),
+            "active_execution_images_before": len(active_image_indexes),
+            "active_execution_images_after": len(active_image_indexes),
+            "max_visual_frames": max_visual_frames,
+            "keep_recent_execution_images": keep_recent,
+            "pruned_now": 0,
+        }
+
+    keep_indexes = set(active_image_indexes[-keep_recent:])
+    pruned_now = 0
+    for index in active_image_indexes:
+        if index in keep_indexes:
+            continue
+        conversation[index] = _execution_screenshot_to_text_output(conversation[index])
+        pruned_now += 1
+
+    return {
+        "total_execution_outputs": len(execution_indexes),
+        "active_execution_images_before": len(active_image_indexes),
+        "active_execution_images_after": len(active_image_indexes) - pruned_now,
+        "max_visual_frames": max_visual_frames,
+        "keep_recent_execution_images": keep_recent,
+        "pruned_now": pruned_now,
+    }
+
+
+def _is_execution_screenshot_output(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") != "computer_call_output":
+        return False
+    output = item.get("output")
+    if not isinstance(output, dict):
+        return False
+    return output.get("type") == "computer_screenshot" and bool(output.get("image_url"))
+
+
+def _is_pruned_execution_output(item: Any) -> bool:
+    if not isinstance(item, dict) or item.get("type") != "function_call_output":
+        return False
+    output = item.get("output")
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except json.JSONDecodeError:
+            return False
+    return isinstance(output, dict) and bool(output.get("cfie_execution_image_pruned"))
+
+
+def _execution_screenshot_to_text_output(item: dict[str, Any]) -> dict[str, Any]:
+    output = item.get("output") if isinstance(item.get("output"), dict) else {}
+    summary = ""
+    if isinstance(output, dict):
+        summary = str(output.get("summary") or "").strip()
+    if not summary:
+        summary = "computer_use completed; old execution screenshot omitted."
+    payload = {
+        "status": "computer_call_output_summary",
+        "summary": summary,
+        "screenshot_omitted": True,
+        "cfie_execution_image_pruned": True,
+        "reason": (
+            "Older execution screenshots were replaced by text summaries so "
+            "stable APP/task reference images and prefix cache remain stable."
+        ),
+    }
+    return {
+        "type": "function_call_output",
+        "call_id": str(item.get("call_id") or ""),
+        "output": json.dumps(payload, ensure_ascii=False),
+    }
 
 
 def _agent_call_as_function_call_item(call: AgentToolCall) -> dict[str, Any]:
@@ -1790,7 +2073,9 @@ def _build_model_response_metrics(
     function_call_count += text_tool_call_count
     try:
         request_debug = _read_field(response, "_cfie_request_debug", None)
-        response_for_json = _response_without_private_debug(response)
+        response_for_json = _compact_response_for_trace(
+            _response_without_private_debug(response)
+        )
         response_json = json.dumps(
             response_for_json,
             ensure_ascii=False,
@@ -1801,6 +2086,11 @@ def _build_model_response_metrics(
         request_debug = None
         response_json = str(response)
         response_object = {"repr": response_json[:4000]}
+    reasoning_preamble = _extract_request_reasoning_preamble(request_debug)
+    reasoning_generated_text = _strip_reasoning_preamble(
+        reasoning_text,
+        reasoning_preamble,
+    )
     warnings: list[str] = []
     if len(output_text) > text_warning_chars:
         warnings.append("long_output_text")
@@ -1823,6 +2113,10 @@ def _build_model_response_metrics(
         "reasoning_text_chars": len(reasoning_text),
         "reasoning_text": reasoning_text,
         "reasoning_text_preview": reasoning_text[:240],
+        "reasoning_preamble": reasoning_preamble,
+        "reasoning_generated_text_chars": len(reasoning_generated_text),
+        "reasoning_generated_text": reasoning_generated_text,
+        "reasoning_generated_text_preview": reasoning_generated_text[:240],
         "tool_argument_chars": tool_argument_chars,
         "text_tool_call_count": text_tool_call_count,
         "message_count": message_count,
@@ -1839,6 +2133,14 @@ def _build_model_response_metrics(
     }
 
 
+def _task_trace_metadata(task: GuiAgentTaskSpec) -> dict[str, str]:
+    metadata: dict[str, str] = {"task_spec_id": task.task_id}
+    app_id = str(task.metadata.get("app_id") or "").strip()
+    if app_id:
+        metadata["app_id"] = app_id
+    return metadata
+
+
 def _response_without_private_debug(response: Any) -> Any:
     if isinstance(response, dict):
         return {
@@ -1847,6 +2149,80 @@ def _response_without_private_debug(response: Any) -> Any:
             if not str(key).startswith("_cfie_")
         }
     return response
+
+
+def _extract_request_reasoning_preamble(request_debug: Any) -> str:
+    if not isinstance(request_debug, dict):
+        return ""
+    chat_kwargs = request_debug.get("chat_template_kwargs")
+    if not isinstance(chat_kwargs, dict):
+        return ""
+    value = chat_kwargs.get(QWEN_REASONING_PREAMBLE_KWARG)
+    return str(value).strip() if value else ""
+
+
+def _strip_reasoning_preamble(reasoning_text: str, preamble: str) -> str:
+    reasoning_text = str(reasoning_text or "").strip()
+    preamble = str(preamble or "").strip()
+    if not reasoning_text or not preamble:
+        return reasoning_text
+    if reasoning_text.startswith(preamble):
+        generated = reasoning_text[len(preamble) :].strip()
+        if generated and preamble.endswith("当前状态："):
+            return f"当前状态：{generated}"
+        return generated
+    return reasoning_text
+
+
+def _compact_response_for_trace(value: Any) -> Any:
+    if isinstance(value, dict):
+        compacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text == "tools" and isinstance(item, list):
+                compacted[key_text] = [_compact_tool_schema_for_trace(tool) for tool in item]
+                compacted["tool_schema_count"] = len(item)
+                continue
+            if key_text in {"input_messages", "prompt"} and item:
+                compacted[key_text] = "<omitted; see request_context>"
+                continue
+            compacted[key_text] = _compact_response_for_trace(item)
+        return compacted
+    if isinstance(value, list):
+        return [_compact_response_for_trace(item) for item in value]
+    if isinstance(value, tuple):
+        return [_compact_response_for_trace(item) for item in value]
+    if isinstance(value, str):
+        return _compact_media_text_for_trace(value)
+    return value
+
+
+def _compact_tool_schema_for_trace(tool: Any) -> dict[str, Any]:
+    if not isinstance(tool, dict):
+        return {"repr": _short_text(str(tool), 120)}
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    name = str(tool.get("name") or function.get("name") or "").strip()
+    tool_type = str(tool.get("type") or "function")
+    result: dict[str, Any] = {"type": tool_type}
+    if name:
+        result["name"] = name
+    return result
+
+
+def _compact_media_text_for_trace(text: str) -> str:
+    if text.startswith("data:image/"):
+        header = text.split(",", 1)[0]
+        return f"<image data omitted; {header}; chars={len(text)}>"
+    if text.startswith("data:video/"):
+        header = text.split(",", 1)[0]
+        return f"<video data omitted; {header}; chars={len(text)}>"
+    if "data:image/" not in text and "data:video/" not in text:
+        return text
+    return re.sub(
+        r"data:(image|video)/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\r\n]+",
+        lambda match: f"<{match.group(1)} data omitted; chars={len(match.group(0))}>",
+        text,
+    )
 
 
 def _extract_response_usage(response: Any) -> dict[str, int]:
@@ -1893,6 +2269,114 @@ def _conversation_text_preview(conversation: list[dict[str, Any]]) -> str:
     return _short_text("\n\n".join(texts), 1600)
 
 
+def _human_resume_context_snapshot(
+    *,
+    job_board: JobBoard,
+    context_store: PerJobContextStore,
+    active_job_id: str,
+    conversation: list[dict[str, Any]],
+    current_frame_ref: str | None,
+) -> dict[str, Any]:
+    job = job_board.require_job(active_job_id)
+    running = job.queues.running
+    recent_steps = context_store.get_steps(active_job_id)[-5:]
+    return {
+        "active_job_id": active_job_id,
+        "active_app": job.target_app,
+        "active_subtask": running.to_dict() if running is not None else None,
+        "queue_counts": job.queues.counts(),
+        "current_frame_ref": current_frame_ref,
+        "current_frame_text_ref": _model_context_ref(current_frame_ref),
+        "conversation_text_preview": _conversation_text_preview(conversation),
+        "recent_steps": [step.to_summary_dict() for step in recent_steps],
+        "restore_instruction": (
+            "恢复该请求产生时的文字和截图上下文，把用户回复作为新的人工反馈处理；"
+            "处理完该人工反馈后，再切回请求到来前的当前任务上下文。"
+        ),
+    }
+
+
+def _macro_proposal_payload(
+    arguments: dict[str, Any],
+    *,
+    screen: Any,
+) -> dict[str, Any]:
+    steps: list[dict[str, Any]] = []
+    for raw_step in arguments.get("steps", ()) or ():
+        if not isinstance(raw_step, dict):
+            continue
+        action = dict(raw_step.get("action") or {})
+        step_payload = {
+            "index": raw_step.get("index"),
+            "purpose": str(raw_step.get("purpose") or "").strip(),
+            "action": action,
+        }
+        preview = _macro_click_preview(action, screen=screen)
+        if preview is not None:
+            step_payload["click_preview"] = preview
+        steps.append(step_payload)
+    return {
+        "macro_name": str(arguments.get("macro_name") or "").strip(),
+        "description": str(arguments.get("description") or "").strip(),
+        "reason": str(arguments.get("reason") or "").strip(),
+        "scope": str(arguments.get("scope") or "current_app"),
+        "dynamic_parameters": [
+            str(item)
+            for item in (arguments.get("dynamic_parameters") or ())
+            if item not in (None, "")
+        ],
+        "steps": sorted(
+            steps,
+            key=lambda item: (
+                int(item.get("index") or 10**9)
+                if str(item.get("index") or "").isdigit()
+                else 10**9
+            ),
+        ),
+    }
+
+
+def _macro_click_preview(action: dict[str, Any], *, screen: Any) -> dict[str, Any] | None:
+    action_type = str(action.get("type") or action.get("action") or "").strip()
+    if action_type not in {"click", "double_click", "move"}:
+        return None
+    try:
+        x = int(action.get("x"))
+        y = int(action.get("y"))
+    except (TypeError, ValueError):
+        return None
+    coordinate_space = str(action.get("coordinate_space") or "qwen_normalized_1000")
+    point = _map_model_point_to_logical_screen(
+        x,
+        y,
+        coordinate_space=coordinate_space,
+        screen=screen,
+    )
+    screenshot_region_around = getattr(screen, "screenshot_region_around", None)
+    if not callable(screenshot_region_around):
+        return {
+            "center": {"x": point[0], "y": point[1]},
+            "coordinate_space": coordinate_space,
+            "available": False,
+        }
+    try:
+        crop = screenshot_region_around(x=point[0], y=point[1], radius=80)
+    except Exception:
+        return {
+            "center": {"x": point[0], "y": point[1]},
+            "coordinate_space": coordinate_space,
+            "available": False,
+        }
+    return {
+        "center": {"x": point[0], "y": point[1]},
+        "coordinate_space": coordinate_space,
+        "available": True,
+        "image_url": crop.image_url,
+        "width": crop.width,
+        "height": crop.height,
+    }
+
+
 def _model_context_ref(ref: str | None) -> str | None:
     if not ref:
         return ref
@@ -1930,6 +2414,43 @@ def _looks_like_incomplete_tool_call(text: str | None) -> bool:
     if "<parameter=" in lower and "</parameter>" not in lower:
         return True
     return False
+
+
+def _should_escalate_computer_use_to_human(text: str | None) -> bool:
+    lower = (text or "").lower()
+    if not lower:
+        return False
+    human_markers = (
+        "request_human_help",
+        "human",
+        "人工",
+        "用户",
+        "管理员",
+    )
+    sensitive_markers = (
+        "login",
+        "sign in",
+        "auth",
+        "authorize",
+        "captcha",
+        "password",
+        "account",
+        "登录",
+        "授权",
+        "验证码",
+        "密码",
+        "账号",
+        "账户",
+    )
+    return (
+        any(marker in lower for marker in human_markers)
+        and any(marker in lower for marker in sensitive_markers)
+    )
+
+
+def _mentions_computer_use(text: str | None) -> bool:
+    lower = (text or "").lower()
+    return "computer_use" in lower or "computer call" in lower
 
 
 def _looks_like_unexecuted_tool_plan(
@@ -1974,207 +2495,6 @@ def _looks_like_unexecuted_tool_plan(
         "工具",
     )
     return any(marker in lower for marker in call_markers)
-
-
-def _mentioned_agent_tools_in_text(
-    text: str | None,
-    tool_names: tuple[str, ...],
-) -> tuple[str, ...]:
-    stripped = (text or "").strip()
-    if not stripped:
-        return ()
-    lower = stripped.lower()
-    mentioned = [
-        tool_name
-        for tool_name in tool_names
-        if tool_name
-        and tool_name != "computer_use"
-        and tool_name.lower() in lower
-    ]
-    if (
-        "record_workflow_result" in tool_names
-        and _has_workflow_result_evidence(stripped)
-        and (
-            re.search(r"(记录|保存).{0,20}(结果|答案|任务|状态)", stripped)
-            or re.search(
-                r"\b(record|save).{0,30}(result|answer|status)\b",
-                lower,
-            )
-        )
-    ):
-        mentioned.append("record_workflow_result")
-    if "finish_subtask" in tool_names and re.search(
-        r"(结束|完成).{0,12}(任务|子任务|流程)",
-        stripped,
-    ):
-        mentioned.append("finish_subtask")
-    if not mentioned and not _looks_like_unexecuted_tool_plan(stripped, tool_names):
-        return ()
-    return tuple(dict.fromkeys(mentioned))
-
-
-def _recover_agent_tool_calls_from_text_intent(
-    *,
-    step: int,
-    text: str,
-    tool_names: tuple[str, ...],
-    job: JobState,
-    trace_store: AgentTraceStore,
-) -> tuple[AgentToolCall, ...]:
-    """Recover obvious Agent tool calls when Qwen wraps intent as computer_use.
-
-    This is intentionally conservative: it only reconstructs workflow bookkeeping
-    tools from explicit text intent. UI actions still require a real computer_use
-    call from the model.
-    """
-
-    requested = set(tool_names)
-    calls: list[AgentToolCall] = []
-    if "record_workflow_result" in requested:
-        if not _has_workflow_result_evidence(text):
-            return ()
-        item = _next_unrecorded_workflow_item(job, trace_store=trace_store)
-        item_id = str(getattr(item, "item_id", "") or "").strip()
-        output_text = _extract_workflow_output_from_text(text)
-        if item_id and output_text:
-            status = "failed" if _looks_like_failed_workflow_result(text) else "passed"
-            calls.append(
-                AgentToolCall(
-                    name="record_workflow_result",
-                    call_id=f"call_recovered_record_{step}",
-                    arguments={
-                        "item_id": item_id,
-                        "output_text": output_text,
-                        "status": status,
-                        "reason": _short_text(text, 320),
-                    },
-                )
-            )
-    if "finish_subtask" in requested:
-        calls.append(
-            AgentToolCall(
-                name="finish_subtask",
-                call_id=f"call_recovered_finish_{step}",
-                arguments={"completion_reason": _short_text(text, 240)},
-            )
-        )
-    return tuple(calls)
-
-
-def _has_workflow_result_evidence(text: str) -> bool:
-    stripped = (text or "").strip()
-    if not stripped:
-        return False
-    if re.search(r"等待.{0,12}(输出|回答|结果).{0,12}(后|再)?记录", stripped):
-        return False
-    return bool(
-        re.search(
-            r"(已得到|已获取|已收到|得到|收到|显示|回复|回答|答案|失败|无法|不能)",
-            stripped,
-        )
-        or re.search(
-            r"\b(got|received|showed|shows|answered|answer|result|failed|unable|cannot)\b",
-            stripped,
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def _looks_like_failed_workflow_result(text: str) -> bool:
-    return bool(
-        re.search(
-            r"(failed|失败|无法访问|不能访问|区域限制|不可用|无法观看|无法完成)",
-            text or "",
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def _extract_workflow_output_from_text(text: str) -> str:
-    stripped = (text or "").strip()
-    if not stripped:
-        return ""
-    if _looks_like_failed_workflow_result(stripped):
-        return _short_text(stripped, 180)
-    patterns = (
-        r"答案[是为：:\s]*[“\"']([^”\"'，。；;\n]+)[”\"']?",
-        r"\banswer\s*(?:is|=|:)\s*[“\"']?([^”\"'，。；;\n]+)[”\"']?",
-        r"output_text[\"']?\s*[:=]\s*[\"']([^\"']+)[\"']",
-        r"(\d+(?:\.\d+)?)\s*(?:studio albums?|albums?|张专辑|张录音室专辑|首|本|次)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, stripped, flags=re.IGNORECASE)
-        if not match:
-            continue
-        value = match.group(1).strip()
-        sentence_number = re.match(
-            r"^(\d+(?:\.\d+)?)(?:\.\s+(?:next|then|record|call)\b|$)",
-            value,
-            flags=re.IGNORECASE,
-        )
-        if sentence_number:
-            return sentence_number.group(1)
-        number_match = re.fullmatch(r"(\d+(?:\.\d+)?)(?:\s+\S.*)?", value)
-        if number_match and re.search(r"\d", value):
-            return number_match.group(1)
-        return _short_text(value, 120)
-    return ""
-
-
-def _human_help_call_from_text(
-    *,
-    step: int,
-    text: str,
-    current_frame_ref: str | None,
-) -> AgentToolCall | None:
-    stripped = (text or "").strip()
-    if not stripped:
-        return None
-    lower = stripped.lower()
-    mentions_human_help = (
-        "request_human_help" in lower
-        or "human help" in lower
-        or "人工" in stripped
-        and any(marker in stripped for marker in ("求助", "介入", "确认", "处理"))
-    )
-    blocked_state = any(
-        marker in lower
-        for marker in (
-            "login",
-            "captcha",
-            "verify",
-            "verification",
-            "authorize",
-            "authorization",
-        )
-    ) or any(
-        marker in stripped
-        for marker in (
-            "登录",
-            "验证码",
-            "验证",
-            "授权",
-            "弹窗",
-            "无法继续",
-            "需要用户",
-        )
-    )
-    if not mentions_human_help or not blocked_state:
-        return None
-    evidence_refs = []
-    if current_frame_ref and not current_frame_ref.startswith("data:"):
-        evidence_refs.append(current_frame_ref)
-    return AgentToolCall(
-        name="request_human_help",
-        call_id=f"safety_human_help_{step}",
-        arguments={
-            "question": "当前界面需要人工处理，是否继续执行？",
-            "risk_reason": _short_text(_strip_tool_markup(stripped), 300),
-            "proposed_action": "请处理登录、验证码、授权或给出下一步操作约束。",
-            "evidence_refs": evidence_refs,
-            "urgency": "normal",
-        },
-    )
 
 
 def _strip_tool_markup(text: str) -> str:

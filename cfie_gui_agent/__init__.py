@@ -3,7 +3,6 @@ from cfie_gui_agent.agent_tools import (
     AgentToolError,
     find_agent_tool_calls,
     find_computer_tool_calls,
-    normalize_response_tool_calls,
 )
 from cfie_gui_agent.context import (
     CompactionApplication,
@@ -39,6 +38,7 @@ from cfie_gui_agent.macros import (
     ActionMacroError,
     ActionMacroRegistry,
     ActionMacroStep,
+    action_macro_from_proposal,
 )
 from cfie_gui_agent.monitor import (
     MonitorController,
@@ -84,10 +84,13 @@ from cfie_gui_agent.task import (
     TaskTransition,
 )
 from cfie_gui_agent.tools import (
+    CORE_MODEL_CALLABLE_TOOLS,
+    MINIMAL_MODEL_CALLABLE_TOOLS,
     MODEL_CALLABLE_TOOLS,
     ModelToolRegistry,
     ModelToolSpec,
     ToolRegistryError,
+    model_tool_names_for_profile,
 )
 from cfie_gui_agent.trace import AgentTraceEvent, AgentTraceStore
 from cfie_gui_agent.verifier import (
@@ -97,14 +100,6 @@ from cfie_gui_agent.verifier import (
     VERIFICATION_OK,
     VERIFICATION_REPEATED_ACTION,
 )
-from cfie_gui_agent.workflow import (
-    WorkflowInputItem,
-    WorkflowRun,
-    build_workflow_target_config,
-    build_workflow_task_description,
-    load_workflow_items,
-    make_operation_event,
-)
 
 __all__ = [
     "AgentToolCall",
@@ -113,6 +108,7 @@ __all__ = [
     "ActionMacroError",
     "ActionMacroRegistry",
     "ActionMacroStep",
+    "action_macro_from_proposal",
     "ContextManager",
     "CompactionApplication",
     "GuiAgentRunner",
@@ -132,6 +128,8 @@ __all__ = [
     "JobSelection",
     "JobState",
     "LongHistorySummary",
+    "CORE_MODEL_CALLABLE_TOOLS",
+    "MINIMAL_MODEL_CALLABLE_TOOLS",
     "MODEL_CALLABLE_TOOLS",
     "ModelToolRegistry",
     "ModelToolSpec",
@@ -186,15 +184,22 @@ __all__ = [
     "VERIFICATION_REPEATED_ACTION",
     "VisionContextPolicy",
     "WorkspaceProfile",
-    "WorkflowInputItem",
-    "WorkflowRun",
     "assign_subtask_completion_credit",
-    "build_workflow_target_config",
-    "build_workflow_task_description",
     "find_agent_tool_calls",
     "find_computer_tool_calls",
-    "normalize_response_tool_calls",
-    "load_workflow_items",
-    "make_operation_event",
+    "load_desktop_state",
+    "model_tool_names_for_profile",
+    "save_desktop_state",
     "transition_reward_event",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"load_desktop_state", "save_desktop_state"}:
+        from cfie_gui_agent.state_store import load_desktop_state, save_desktop_state
+
+        return {
+            "load_desktop_state": load_desktop_state,
+            "save_desktop_state": save_desktop_state,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,7 +65,10 @@ class StepVerifier:
             semantic_repeated = self._count_repeated_semantic(semantic_signature)
             if (
                 semantic_signature == "computer_click_only"
-                and "computer_text_submit" in self.recent_semantic_signatures
+                and any(
+                    item.startswith("computer_text_submit:")
+                    for item in self.recent_semantic_signatures
+                )
             ):
                 semantic_threshold = self.max_repeated_click_only_actions
             self.recent_semantic_signatures.append(semantic_signature)
@@ -157,11 +161,13 @@ def _semantic_action_signature(action: dict[str, Any]) -> str | None:
     ):
         return "computer_click_only"
     has_text = False
+    submitted_texts: list[str] = []
     has_submit = False
     for item in normalized_actions:
         action_type = str(item.get("type") or "").lower()
         if action_type == "type" and str(item.get("text") or "").strip():
             has_text = True
+            submitted_texts.append(str(item.get("text") or ""))
         if action_type in {"keypress", "key"}:
             keys = item.get("keys") or item.get("key") or ()
             if isinstance(keys, str):
@@ -169,7 +175,9 @@ def _semantic_action_signature(action: dict[str, Any]) -> str | None:
             if any(str(key).lower() in {"enter", "return"} for key in keys):
                 has_submit = True
     if has_text and has_submit:
-        return "computer_text_submit"
+        normalized_text = " ".join(" ".join(submitted_texts).split())
+        digest = hashlib.sha1(normalized_text.encode("utf-8")).hexdigest()[:12]
+        return f"computer_text_submit:{digest}"
     return None
 
 

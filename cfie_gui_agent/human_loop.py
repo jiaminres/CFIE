@@ -16,6 +16,7 @@ class HumanRequest:
     request_id: str
     task_id: str | None
     question: str
+    blocking: bool = True
     evidence_refs: tuple[str, ...] = ()
     risk_reason: str | None = None
     proposed_action: str | None = None
@@ -29,6 +30,7 @@ class HumanRequest:
         *,
         question: str,
         task_id: str | None = None,
+        blocking: bool = True,
         evidence_refs: tuple[str, ...] = (),
         risk_reason: str | None = None,
         proposed_action: str | None = None,
@@ -40,6 +42,7 @@ class HumanRequest:
             request_id=f"human_{uuid4().hex}",
             task_id=task_id,
             question=question,
+            blocking=bool(blocking),
             evidence_refs=evidence_refs,
             risk_reason=risk_reason,
             proposed_action=proposed_action,
@@ -53,6 +56,7 @@ class HumanRequest:
             "request_id": self.request_id,
             "task_id": self.task_id,
             "question": self.question,
+            "blocking": self.blocking,
             "evidence_refs": list(self.evidence_refs),
             "risk_reason": self.risk_reason,
             "proposed_action": self.proposed_action,
@@ -141,6 +145,7 @@ class HumanLoopManager:
         *,
         question: str,
         task_id: str | None = None,
+        blocking: bool = True,
         evidence_refs: tuple[str, ...] = (),
         risk_reason: str | None = None,
         proposed_action: str | None = None,
@@ -151,6 +156,7 @@ class HumanLoopManager:
         request = HumanRequest.create(
             question=question,
             task_id=task_id,
+            blocking=blocking,
             evidence_refs=evidence_refs,
             risk_reason=risk_reason,
             proposed_action=proposed_action,
@@ -252,6 +258,7 @@ class HumanLoopManager:
         return {
             "type": "manager_reply",
             "priority": "urgent",
+            "blocking": request.blocking,
             "request": request.to_task_payload(),
             "reply": {
                 "request_id": reply.request_id,
