@@ -22,6 +22,7 @@ pip-wheel-metadata/
 .tmp/
 logs/
 .bench_logs/
+runs/
 .claude/
 .cmake/
 .wsl-venv/
