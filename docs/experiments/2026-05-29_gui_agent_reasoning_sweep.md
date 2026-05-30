@@ -137,3 +137,94 @@ Validation:
 ```text
 71 passed
 ```
+
+## Desktop UI Refresh And Macro Smoke
+
+Scope:
+
+- Smooth the desktop client refresh path so focus changes and polling do not
+  rebuild the full app list, timeline, and inspector when the underlying data
+  has not changed.
+- Keep terminal sessions visually stable: completed sessions do not show a
+  runnable play icon, and app status no longer changes between focused and
+  unfocused states.
+- Verify the generic macro proposal path in the Doubao Web 5-question workflow.
+
+Code changes:
+
+- `cfie_gui_agent.desktop_client_ui`
+  - Added app/timeline/inspector content signatures.
+  - Debounced focus refresh.
+  - Added session deletion from the app context menu.
+  - Prevented stale loaded `running` traces from overriding persisted terminal
+    app status.
+- `cfie_gui_agent.runner`
+  - Added a generic macro reminder after two repeated successful submit/record
+    cycles.
+  - Added a stricter rule that active tasks must end each model turn with an
+    executable tool call, not reasoning-only empty output.
+- `cfie_gui_agent.tools`
+  - Tightened `propose_action_macro` so macro steps are computer-use actions
+    only. File writes, shell calls, memory, and trace records stay outside the
+    low-latency macro.
+- `cfie.entrypoints.openai.reasoning_template`
+  - Added the same "reasoning must be followed by an action" hint to the Qwen
+    reasoning preamble. This requires service restart before it affects the
+    running OpenAI server.
+
+Validation:
+
+```text
+124 passed
+```
+
+Doubao Web 5-question run after UI refresh:
+
+```text
+trace: runs/gui_agent/traces/doubao_5q_smooth_20260529_201336.jsonl
+result: .bench_logs/gui_agent_client_doubao/doubao_5q_ui_verify_results.jsonl
+outcome: completed
+questions: 5/5 pass
+client stderr: empty
+macro proposal: not requested in this run
+empty-response retry: 5
+```
+
+Doubao Web 5-question macro run:
+
+```text
+trace: runs/gui_agent/traces/doubao_5q_macro2_20260529_205428.jsonl
+outcome: completed
+questions: 5/5 pass
+macro_proposal_reminder: 1
+propose_action_macro: 1, non-blocking, macro_approval_requested
+empty-response retry: 3
+```
+
+Doubao Web macro schema tightening run:
+
+```text
+trace: runs/gui_agent/traces/doubao_5q_macro3_20260529_211151.jsonl
+outcome: completed
+questions: 5/5 pass
+macro_proposal_reminder: 1
+propose_action_macro: 1, non-blocking, macro_approval_requested
+empty-response retry: 4
+client stderr: empty
+```
+
+Macro proposal in the tightened run used only computer-use steps:
+
+```text
+macro_name: doubao_submit_and_record
+steps:
+  1. submit_text(text="{{input_text}}")
+  2. wait(seconds=3)
+```
+
+Remaining issue:
+
+- The currently running OpenAI server had already loaded the older Qwen
+  reasoning preamble, so the server-side "reasoning must be followed by action"
+  hint was not active during these runs. The next engine restart should retest
+  whether `empty_response_without_tool_call` retries drop.

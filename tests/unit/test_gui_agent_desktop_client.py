@@ -165,6 +165,55 @@ def test_desktop_state_persists_apps_macros_trace_and_human_requests(tmp_path):
     assert restored_requests[0]["request"]["request_id"] == request.request_id
 
 
+def test_desktop_state_removes_app_without_deleting_trace_file(tmp_path):
+    trace_path = tmp_path / "app_shop.jsonl"
+    trace_path.write_text("kept on disk\n", encoding="utf-8")
+    state = DesktopClientState()
+    state.add_target_app(
+        TargetAppConfig(
+            app_id="app_shop",
+            app_name="Shop",
+            job_id="job_shop",
+            metadata={"trace_path": str(trace_path)},
+        )
+    )
+    state.add_target_app(
+        TargetAppConfig(app_id="app_other", app_name="Other", job_id="job_other")
+    )
+    state.selected_app_id = "app_shop"
+    state.job_board.add_job(JobState(job_id="job_shop", target_app="Shop", goal="Shop"))
+    state.register_macro(
+        MacroConfig(
+            name="shop_macro",
+            description="Shop only",
+            sequence="CTRL+A",
+            app_id="app_shop",
+        )
+    )
+    request = state.human_loop.request_help(
+        question="Need help?",
+        metadata={"app_id": "app_shop", "job_id": "job_shop"},
+    )
+    state.trace_store.path = trace_path
+    state.record_operation_summary(
+        app_id="app_shop",
+        kind="agent_run",
+        title="started",
+        status="running",
+    )
+
+    removed = state.remove_target_app("app_shop")
+
+    assert removed.app_name == "Shop"
+    assert "app_shop" not in state.target_apps
+    assert "job_shop" not in state.job_board.jobs
+    assert "shop_macro" not in state.action_macros.macros
+    assert request.request_id not in state.human_loop.pending
+    assert state.trace_store.events == []
+    assert state.selected_app_id == "app_other"
+    assert trace_path.exists()
+
+
 def test_desktop_state_loads_legacy_control_character_json(tmp_path):
     state_path = tmp_path / "state.json"
     state_path.write_text(
@@ -360,6 +409,46 @@ def test_desktop_status_marks_loaded_running_trace_as_paused():
 
     assert GuiAgentDesktopClient._latest_agent_run_status(ui, "app_web") == "paused"
     assert GuiAgentDesktopClient._agent_status_label("paused") == "已暂停"
+
+
+def test_desktop_status_uses_persisted_app_status_before_loaded_trace():
+    class Event:
+        def __init__(self, kind, payload):
+            self.kind = kind
+            self.payload = payload
+
+    class Flag:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    state = DesktopClientState()
+    state.add_target_app(
+        TargetAppConfig(
+            app_id="app_web",
+            app_name="Web",
+            job_id="job_web",
+            metadata={"last_run_status": "completed"},
+        )
+    )
+    ui = object.__new__(GuiAgentDesktopClient)
+    ui.state = state
+    ui.selected_app_id = Flag("app_web")
+    ui.agent_running = Flag(False)
+    ui._events_for_selected_app = lambda _app_id: [
+        Event(
+            "operation",
+            {
+                "app_id": "app_web",
+                "kind": "agent_run",
+                "status": "running",
+            },
+        )
+    ]
+
+    assert GuiAgentDesktopClient._latest_agent_run_status(ui, "app_web") == "completed"
 
 
 def test_trace_detail_does_not_attach_model_context_to_operation():

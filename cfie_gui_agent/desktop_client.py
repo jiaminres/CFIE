@@ -130,6 +130,48 @@ class DesktopClientState:
         if not self.selected_app_id:
             self.selected_app_id = config.app_id
 
+    def remove_target_app(self, app_id: str) -> TargetAppConfig:
+        config = self.target_apps.pop(app_id)
+        self.job_board.jobs.pop(config.job_id, None)
+        self.macro_configs = {
+            name: macro_config
+            for name, macro_config in self.macro_configs.items()
+            if macro_config.app_id != app_id
+        }
+        self.action_macros.macros = {
+            name: macro
+            for name, macro in self.action_macros.macros.items()
+            if macro.metadata.get("app_id") != app_id
+        }
+        for bucket in (
+            self.human_loop.pending,
+            self.human_loop.states,
+            self.human_loop.completed,
+        ):
+            for request_id, item in list(bucket.items()):
+                request = item.request if hasattr(item, "request") else item
+                metadata = getattr(request, "metadata", {}) or {}
+                if metadata.get("app_id") == app_id or metadata.get("job_id") == config.job_id:
+                    bucket.pop(request_id, None)
+        channel = self.human_loop.channel
+        if hasattr(channel, "sent_requests"):
+            channel.sent_requests = [
+                request
+                for request in channel.sent_requests
+                if (request.metadata or {}).get("app_id") != app_id
+                and (request.metadata or {}).get("job_id") != config.job_id
+            ]
+        self.trace_store.events = [
+            event
+            for event in self.trace_store.events
+            if _trace_event_app_id(event.payload) != app_id
+        ]
+        if self.trace_store.path == Path(config.metadata.get("trace_path", "")):
+            self.trace_store.path = None
+        if self.selected_app_id == app_id:
+            self.selected_app_id = next(iter(self.target_apps), "")
+        return config
+
     def update_target_description(self, app_id: str, text: str) -> None:
         config = self.target_apps[app_id]
         self.target_apps[app_id] = config.with_description(text)
@@ -429,6 +471,23 @@ def parse_macro_sequence(sequence: str) -> tuple[tuple[str, ...], ...]:
     return tuple(groups)
 
 
+def _trace_event_app_id(payload: dict[str, Any]) -> str:
+    app_id = str(payload.get("app_id") or "").strip()
+    if app_id:
+        return app_id
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        app_id = str(metadata.get("app_id") or "").strip()
+        if app_id:
+            return app_id
+    nested = payload.get("payload")
+    if isinstance(nested, dict):
+        app_id = str(nested.get("app_id") or "").strip()
+        if app_id:
+            return app_id
+    return ""
+
+
 def run_desktop_client(
     *,
     state: DesktopClientState | None = None,
@@ -483,7 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reasoning-effort",
-        choices=("none", "low", "medium", "high"),
+        choices=("none", "origin", "low", "medium", "high"),
         default="none",
     )
     parser.add_argument(

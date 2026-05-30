@@ -139,7 +139,7 @@ $env:MAX_JOBS = "8"
 ```text
 --max-model-len 128000
 --max-num-seqs 1
---max-num-batched-tokens 2096
+--max-num-batched-tokens 6288
 --kv-cache-memory-bytes 4000000000
 --gpu-slots-per-layer 16
 --prefill-burst-slots 256
@@ -158,7 +158,7 @@ $env:MAX_JOBS = "8"
 | --- | ---: | --- |
 | `--max-model-len` | `128000` | 当前实测更稳的长上下文档位。 |
 | `--max-num-seqs` | `1` | GUI Agent 单会话优先，避免为多并发序列放大 KV 预算。 |
-| `--max-num-batched-tokens` | `2096` | GUI Agent 交互式默认档位，和 Qwen3.5 Mamba cache 对齐，降低单轮新增视觉/文本上下文延迟。 |
+| `--max-num-batched-tokens` | `6288` | GUI Agent 交互式默认档位，约为低延迟 2096 档的 3 倍；在当前显存盈余较大的配置下，减少多图/长文本单轮输入被切分的概率。 |
 | `--kv-cache-memory-bytes` | `4000000000` | 手动预留约 3.73 GiB KV，适配 128K 上下文。 |
 | `--gpu-slots-per-layer` | `16` | 每层 GPU resident expert slots。 |
 | `--prefill-burst-slots` | `256` | 长 prefill 的临时 expert 执行池。 |
@@ -169,7 +169,7 @@ $env:MAX_JOBS = "8"
 | `--reasoning-parser` | `qwen3` | Qwen3/Qwen3.5 的 `<think>...</think>` 解析器；开启思考模式时必须配置。 |
 | `--enforce-eager` | 开启 | 当前默认不启用 CUDA graph。 |
 
-长文档批处理可以单独测试 `--max-num-batched-tokens 4192/8192`，但 GUI Agent 的默认目标是让每轮新增截图和文本尽量落在 `2096` 或 `4192` token 内，复用 prefix cache 中的历史上下文。
+长文档批处理可以单独测试 `--max-num-batched-tokens 8192` 或更高档位；GUI Agent 的默认目标是让每轮新增截图和文本尽量落在 `6288` token 内，复用 prefix cache 中的历史上下文。
 
 ### 思考模式
 
@@ -201,7 +201,7 @@ screenshot_size = 900
   --port 8000 `
   --max-model-len 128000 `
   --max-num-seqs 1 `
-  --max-num-batched-tokens 2096 `
+  --max-num-batched-tokens 6288 `
   --kv-cache-memory-bytes 4000000000 `
   --gpu-slots-per-layer 16 `
   --prefill-burst-slots 256 `
@@ -226,7 +226,7 @@ screenshot_size = 900
   --port 8000 `
   --max-model-len 128000 `
   --max-num-seqs 1 `
-  --max-num-batched-tokens 2096 `
+  --max-num-batched-tokens 6288 `
   --kv-cache-memory-bytes 4000000000 `
   --gpu-slots-per-layer 16 `
   --prefill-burst-slots 256 `

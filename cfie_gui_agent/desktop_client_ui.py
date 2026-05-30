@@ -609,11 +609,16 @@ class GuiAgentDesktopClient(tk.Tk):
         self._inspector_max_width = 980
         self._inspector_resize_origin_x = 0
         self._inspector_resize_origin_width = self._inspector_width
+        self._app_list_signature: tuple[Any, ...] | None = None
+        self._message_signature: tuple[Any, ...] | None = None
+        self._inspector_signature: tuple[Any, ...] | None = None
+        self._focus_refresh_after_id: str | None = None
 
         self._setup_style()
         self._build_layout()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.refresh_all()
+        self.bind("<FocusIn>", self._on_focus_refresh, add="+")
+        self.refresh_all(force=True)
         self.after(2000, self._periodic_refresh)
 
     def _configure_initial_window(self) -> None:
@@ -1181,12 +1186,12 @@ class GuiAgentDesktopClient(tk.Tk):
         header = ttk.Frame(self.inspector, style="Surface.TFrame")
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="记录", style="Title.TLabel").grid(
+        ttk.Label(header, text="详情", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
             self.inspector,
-            text="最近的模型意图、工具调用、验证结果与人工介入。",
+            text="选中主窗口中的执行记录后，查看输入、输出、工具调用和截图。",
             style="Hint.TLabel",
             wraplength=self._detail_wraplength(90),
         ).grid(row=1, column=0, sticky="w", pady=(4, 12))
@@ -1329,18 +1334,36 @@ class GuiAgentDesktopClient(tk.Tk):
             width = self._inspector_width
         return max(240, width - reserved)
 
-    def refresh_all(self) -> None:
-        self.refresh_apps()
+    def refresh_all(self, *, force: bool = False) -> None:
+        self.refresh_apps(force=force)
         self.refresh_header()
-        self.refresh_messages()
-        self.refresh_inspector()
+        self.refresh_messages(force=force)
+        self.refresh_inspector(force=force)
         self.refresh_composer()
 
-    def refresh_apps(self) -> None:
+    def refresh_apps(self, *, force: bool = False) -> None:
         current = self.selected_app_id.get()
+        app_ids = list(self.state.target_apps)
+        signature = (
+            current,
+            tuple(
+                (
+                    app_id,
+                    config.app_name,
+                    config.job_id,
+                    self._app_status_text(app_id, config.job_id),
+                    bool((config.metadata or {}).get("manual_viewport")),
+                    len(config.reference_assets),
+                    len(self._macros_for_app(app_id)),
+                )
+                for app_id, config in self.state.target_apps.items()
+            ),
+        )
+        if not force and signature == self._app_list_signature:
+            return
+        self._app_list_signature = signature
         for child in self.app_list_frame.winfo_children():
             child.destroy()
-        app_ids = list(self.state.target_apps)
         for app_id in app_ids:
             config = self.state.target_apps[app_id]
             subtitle = self._app_status_text(app_id, config.job_id)
@@ -1348,6 +1371,7 @@ class GuiAgentDesktopClient(tk.Tk):
         if current not in self.state.target_apps and app_ids:
             current = app_ids[0]
             self.selected_app_id.set(current)
+            self.state.selected_app_id = current
 
     def refresh_header(self) -> None:
         config = self._selected_config()
@@ -1369,15 +1393,12 @@ class GuiAgentDesktopClient(tk.Tk):
         if self.agent_running.get():
             parts.append("运行中")
             self.run_button_text.set("\u25a0")
-        elif self.agent_run_status.get():
-            parts.append(self.agent_run_status.get())
-            self.run_button_text.set("\u25b6")
         else:
             status_text = self._app_status_text(config.app_id, config.job_id)
             if status_text != "就绪":
                 parts.append(status_text)
             self.run_button_text.set(
-                "\u2713"
+                "\u2298"
                 if self._is_terminal_agent_status(
                     self._latest_agent_run_status(config.app_id)
                 )
@@ -1385,25 +1406,41 @@ class GuiAgentDesktopClient(tk.Tk):
             )
         self.app_subtitle.configure(text=" · ".join(parts) if parts else "就绪")
 
-    def refresh_messages(self) -> None:
-        for child in self.messages_frame.winfo_children():
-            child.destroy()
-        self._timeline_images.clear()
+    def refresh_messages(self, *, force: bool = False) -> None:
         config = self._selected_config()
         if config is None:
+            signature = ("empty",)
+            if not force and signature == self._message_signature:
+                return
+            self._message_signature = signature
+            for child in self.messages_frame.winfo_children():
+                child.destroy()
+            self._timeline_images.clear()
             self._add_empty_message()
             return
         has_visible_content = False
         events = self._events_for_selected_app(config.app_id)
         self._ensure_pending_human_request_from_waiting_agent_run(config, events)
+        human_items = [
+            item
+            for item in self.state.human_loop.list_requests(include_completed=True)
+            if (item["request"].get("metadata") or {}).get("job_id") == config.job_id
+        ]
+        signature = (
+            config.app_id,
+            tuple(self._trace_event_signature(event) for event in events),
+            tuple(self._human_item_signature(item) for item in human_items),
+        )
+        if not force and signature == self._message_signature:
+            return
+        self._message_signature = signature
+        for child in self.messages_frame.winfo_children():
+            child.destroy()
+        self._timeline_images.clear()
         for event in events:
             if self._add_operation_card(event):
                 has_visible_content = True
-        for item in self.state.human_loop.list_requests(include_completed=True):
-            request = item["request"]
-            metadata = request.get("metadata") or {}
-            if metadata.get("job_id") != config.job_id:
-                continue
+        for item in human_items:
             self._add_human_request_card(item)
             has_visible_content = True
         if not has_visible_content:
@@ -1472,39 +1509,22 @@ class GuiAgentDesktopClient(tk.Tk):
         self.composer_toolbar.grid()
         self.direct_command_combo.configure(state="readonly")
 
-    def refresh_inspector(self) -> None:
+    def refresh_inspector(self, *, force: bool = False) -> None:
+        signature = (
+            self.selected_app_id.get(),
+            self._trace_event_signature(self._selected_trace_event)
+            if self._selected_trace_event is not None
+            else None,
+        )
+        if not force and signature == self._inspector_signature:
+            return
+        self._inspector_signature = signature
         for child in self.inspector_list_frame.winfo_children():
             child.destroy()
         self._inspector_images.clear()
         if self._selected_trace_event is not None:
             self._render_trace_event_detail(self._selected_trace_event)
             return
-        config = self._selected_config()
-        for index, item in enumerate(
-            self.state.human_loop.list_requests(include_completed=True)
-        ):
-            request = item["request"]
-            self._add_inspector_card(
-                item_id=f"human:{index}",
-                kind=self._status_label(item["status"]),
-                title="人工介入",
-                summary=request.get("question") or "",
-            )
-        if config is not None:
-            self._add_inspector_card(
-                item_id="task_definition",
-                kind="任务",
-                title="任务",
-                summary=self._task_brief(config.task_description),
-            )
-            visible_events = self._events_for_selected_app(config.app_id)
-            for index, event in enumerate(visible_events):
-                self._add_inspector_card(
-                    item_id=f"trace:{index}",
-                    kind=self._trace_kind_label(event.kind),
-                    title=self._operation_title(event.kind, event.payload),
-                    summary=self._operation_summary(event.kind, event.payload),
-                )
         self.inspector_detail_shell.grid_remove()
         self._set_text(self.inspector_detail, "")
 
@@ -1512,7 +1532,72 @@ class GuiAgentDesktopClient(tk.Tk):
         self.refresh_apps()
         self.refresh_header()
         self.refresh_composer()
+        if self.focus_displayof() is not None:
+            self.refresh_messages()
+            self.refresh_inspector()
         self.after(2000, self._periodic_refresh)
+
+    def _on_focus_refresh(self, _event: tk.Event[Any]) -> None:
+        if self.focus_displayof() is None:
+            return
+        if self._focus_refresh_after_id is not None:
+            try:
+                self.after_cancel(self._focus_refresh_after_id)
+            except tk.TclError:
+                pass
+        self._focus_refresh_after_id = self.after(120, self._run_focus_refresh)
+
+    def _run_focus_refresh(self) -> None:
+        self._focus_refresh_after_id = None
+        self.refresh_all()
+
+    @staticmethod
+    def _trace_event_signature(event: Any | None) -> tuple[Any, ...]:
+        if event is None:
+            return ("none",)
+        payload = event.payload if isinstance(getattr(event, "payload", None), dict) else {}
+        action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        image_refs = payload.get("image_refs") if isinstance(payload.get("image_refs"), list) else []
+        return (
+            getattr(event, "kind", ""),
+            getattr(event, "time_unix_nano", 0),
+            payload.get("step"),
+            payload.get("step_id"),
+            payload.get("kind"),
+            payload.get("status"),
+            payload.get("title"),
+            payload.get("summary"),
+            payload.get("app_id"),
+            action.get("type"),
+            action.get("name"),
+            metadata.get("model_response_step"),
+            payload.get("latency_seconds"),
+            payload.get("input_tokens"),
+            payload.get("output_tokens"),
+            payload.get("reasoning_tokens"),
+            payload.get("response_json_chars"),
+            tuple(str(ref) for ref in image_refs),
+        )
+
+    @staticmethod
+    def _human_item_signature(item: dict[str, Any]) -> tuple[Any, ...]:
+        request = item.get("request") if isinstance(item.get("request"), dict) else {}
+        metadata = request.get("metadata") if isinstance(request.get("metadata"), dict) else {}
+        reply = item.get("reply") if isinstance(item.get("reply"), dict) else {}
+        return (
+            request.get("request_id"),
+            item.get("status"),
+            request.get("task_id"),
+            request.get("question"),
+            request.get("risk_reason"),
+            request.get("proposed_action"),
+            metadata.get("job_id"),
+            metadata.get("app_id"),
+            metadata.get("agent_waiting_key"),
+            reply.get("text"),
+            reply.get("decision_type"),
+        )
 
     def _save_state(self) -> None:
         if self.state_path is None:
@@ -1528,7 +1613,8 @@ class GuiAgentDesktopClient(tk.Tk):
         self.destroy()
 
     def _load_selected_trace_if_available(self, app_id: str) -> None:
-        config = self.state.target_apps.get(app_id)
+        state = getattr(self, "state", None)
+        config = state.target_apps.get(app_id) if state is not None else None
         if config is None:
             return
         trace_path = str((config.metadata or {}).get("trace_path") or "").strip()
@@ -1720,13 +1806,18 @@ class GuiAgentDesktopClient(tk.Tk):
                 rendered += 1
 
         def redraw(_event: tk.Event[Any] | None = None) -> None:
-            card_width = max(shell.winfo_width(), width)
-            content_width = max(120, card_width - 36)
-            shell.itemconfigure(content_window, width=content_width)
-            content.update_idletasks()
-            height = max(88, content.winfo_reqheight() + 32)
-            shell.configure(height=height)
-            shell.delete("bg")
+            try:
+                if not shell.winfo_exists() or not content.winfo_exists():
+                    return
+                card_width = max(shell.winfo_width(), width)
+                content_width = max(120, card_width - 36)
+                shell.itemconfigure(content_window, width=content_width)
+                content.update_idletasks()
+                height = max(88, content.winfo_reqheight() + 32)
+                shell.configure(height=height)
+                shell.delete("bg")
+            except tk.TclError:
+                return
             draw_rounded_rect(
                 shell,
                 2,
@@ -2295,6 +2386,8 @@ class GuiAgentDesktopClient(tk.Tk):
             title = "点击"
         elif "type" in types and ("click" in types or "move" in types):
             title = "定位并输入"
+        elif "submit_text" in types:
+            title = "提交文本"
         elif types == {"type"}:
             title = "输入文本"
         elif "keypress" in types:
@@ -2321,6 +2414,7 @@ class GuiAgentDesktopClient(tk.Tk):
             "launch_app": "启动应用",
             "run_shell": "执行命令",
             "run_action_macro": "执行快捷操作",
+            "propose_action_macro": "建议操作宏",
             "navigate_to_target": "移动到目标",
             "read_image": "查看图片",
             "read_video_clip": "查看视频",
@@ -2361,6 +2455,16 @@ class GuiAgentDesktopClient(tk.Tk):
             if returncode is not None:
                 return f"命令已结束，退出码 {returncode}。"
             return "命令已执行。"
+        if name == "propose_action_macro":
+            proposal = output.get("macro_proposal")
+            if not isinstance(proposal, dict):
+                proposal = {}
+            macro_name = str(proposal.get("macro_name") or "").strip()
+            description = str(proposal.get("description") or "").strip()
+            suffix = f"：{macro_name}" if macro_name else ""
+            if description:
+                return f"宏建议已提交，等待人工批准{suffix}。\n{description}"
+            return f"宏建议已提交，等待人工批准{suffix}。"
         if name == "request_human_help":
             return "Agent 需要人工确认后再继续。"
         return self._step_summary(payload)
@@ -2453,7 +2557,7 @@ class GuiAgentDesktopClient(tk.Tk):
             refs: list[tuple[str, str]] = []
             after = str(payload.get("after_ref") or "").strip()
             if after:
-                refs.append(("操作后观察截图", after))
+                refs.append(("上一轮工具执行后观察截图", after))
             metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
             local_refinements = metadata.get("local_refinements")
             if isinstance(local_refinements, list):
@@ -2588,6 +2692,7 @@ class GuiAgentDesktopClient(tk.Tk):
             return
         self.status_text.set(f"已启用操作宏：{macro.name}")
         self.refresh_all()
+        self._save_state()
 
     def _submit_human_card_reply(self, item: dict[str, Any], widget: tk.Text) -> None:
         text = widget.get("1.0", tk.END).strip()
@@ -2777,7 +2882,12 @@ class GuiAgentDesktopClient(tk.Tk):
     def _operation_accent(self, *, status: str, kind: str) -> tuple[str, str]:
         if status in {"failed", "error", "rejected"} or kind == "failure":
             return ("#b42318", "#fff0ed")
-        if status in {"waiting", "waiting_human", "pending"} or kind == "human":
+        if status in {
+            "waiting",
+            "waiting_human",
+            "pending",
+            "macro_approval_requested",
+        } or kind == "human":
             return ("#b45f06", "#fff6e5")
         if status in {"verified", "completed", "passed", "accepted"}:
             return ("#067647", "#eaf7ef")
@@ -2790,6 +2900,7 @@ class GuiAgentDesktopClient(tk.Tk):
             "recorded": "已记录",
             "planned": "已计划",
             "accepted": "已接受",
+            "macro_approval_requested": "待批准",
             "rejected": "已退回",
             "executed": "已执行",
             "computer_call_output": "已执行",
@@ -3132,6 +3243,8 @@ class GuiAgentDesktopClient(tk.Tk):
         menu.add_command(label="打开轨迹文件目录", command=self._open_selected_trace_folder)
         menu.add_command(label="复制 APP ID", command=self._copy_selected_app_id)
         menu.add_separator()
+        menu.add_command(label="删除会话", command=self._delete_selected_app)
+        menu.add_separator()
         menu.add_command(label="打开设置", command=self._open_settings)
         menu.tk_popup(event.x_root, event.y_root)
 
@@ -3195,6 +3308,25 @@ class GuiAgentDesktopClient(tk.Tk):
                 )
             )
         self.status_text.set("应用设定已更新")
+        self.refresh_all()
+        self._save_state()
+
+    def _delete_selected_app(self) -> None:
+        config = self._selected_config()
+        if config is None:
+            return
+        if self.agent_running.get() and config.app_id == self.selected_app_id.get():
+            messagebox.showinfo("正在运行", "当前会话正在执行，请先停止后再删除。")
+            return
+        if not messagebox.askyesno(
+            "删除会话",
+            f"删除“{config.app_name}”？\n\n这只会移除客户端里的会话配置和内存记录，不会删除磁盘上的轨迹文件。",
+        ):
+            return
+        removed = self.state.remove_target_app(config.app_id)
+        self.selected_app_id.set(self.state.selected_app_id)
+        self._selected_trace_event = None
+        self.status_text.set(f"已删除：{removed.app_name}")
         self.refresh_all()
         self._save_state()
 
@@ -3508,6 +3640,10 @@ class GuiAgentDesktopClient(tk.Tk):
                 max_steps=int(metadata.get("max_steps") or DEFAULT_AGENT_MAX_STEPS),
                 image_detail=str(metadata.get("image_detail") or "high"),
                 require_finish_tool_for_completion=True,
+                guard_untrusted_clicks=(
+                    str(metadata.get("guard_untrusted_clicks", "true")).lower()
+                    not in {"0", "false", "no", "off"}
+                ),
                 stop_requested=self._agent_stop_event.is_set,
             )
             task = GuiAgentTaskSpec(
@@ -3750,6 +3886,10 @@ class GuiAgentDesktopClient(tk.Tk):
         self._selected_trace_event = event
         if not self.inspector_visible.get():
             self._toggle_inspector()
+        self._inspector_signature = (
+            self.selected_app_id.get(),
+            self._trace_event_signature(event),
+        )
         self._render_trace_event_detail(event)
 
     def _render_trace_event_detail(self, event: Any) -> None:
@@ -3814,10 +3954,10 @@ class GuiAgentDesktopClient(tk.Tk):
 
         model_image_refs = self._model_request_image_ref_pairs(event)
         if model_image_refs:
-            self._add_detail_image_section("本轮模型输入截图", model_image_refs)
+            self._add_detail_image_section("本轮输入中的历史观察截图", model_image_refs)
         screenshot_refs = self._detail_screenshot_refs(event)
         if screenshot_refs:
-            self._add_detail_image_section("本次工具执行结果截图", screenshot_refs)
+            self._add_detail_image_section("本轮工具执行后的新观察截图", screenshot_refs)
 
         if model_payload:
             reasoning = str(
@@ -4197,53 +4337,10 @@ class GuiAgentDesktopClient(tk.Tk):
             if item_type == "computer_call_output":
                 output = item.get("output")
                 if isinstance(output, dict):
-                    call_id = str(item.get("call_id") or "").strip()
-                    if call_id:
-                        self._add_nested_text_block(body, "工具结果", f"call_id={call_id}")
-                    ref_index = 1
-                    image_url = output.get("image_url")
-                    if image_url:
-                        self._add_nested_text_block(
-                            body,
-                            f"图片内容（引用 {ref_index}）",
-                            self._format_media_placeholder(
-                                image_url,
-                                reference_label=f"引用 {ref_index}",
-                            ),
-                        )
-                        ref_index += 1
-                    local_refinements = output.get("local_refinements")
-                    if isinstance(local_refinements, list):
-                        for local in local_refinements:
-                            if not isinstance(local, dict):
-                                continue
-                            local_image = local.get("image_url")
-                            if not local_image:
-                                continue
-                            click_index = local.get("click_index") or ref_index
-                            self._add_nested_text_block(
-                                body,
-                                f"点击局部图 {click_index}（引用 {ref_index}）",
-                                self._format_media_placeholder(
-                                    local_image,
-                                    reference_label=f"引用 {ref_index}",
-                                ),
-                            )
-                            ref_index += 1
-                    for index, (label, ref) in enumerate(
-                        self._computer_call_output_image_ref_pairs(call_id),
-                        start=1,
-                    ):
-                        self._add_inline_image_ref(
-                            body,
-                            f"引用 {index} · {label}",
-                            ref,
-                        )
-                    self._add_detail_json_section(
-                        "原始 output",
-                        output,
-                        parent=body,
-                        collapsed=True,
+                    self._add_computer_observation_detail(
+                        body,
+                        call_id=str(item.get("call_id") or "").strip(),
+                        output=output,
                     )
                     return
             self._add_detail_json_section("原始 item", item, parent=body, collapsed=True)
@@ -4255,6 +4352,96 @@ class GuiAgentDesktopClient(tk.Tk):
             subtitle=subtitle,
             collapsed=True,
         )
+
+    def _add_computer_observation_detail(
+        self,
+        parent: tk.Widget,
+        *,
+        call_id: str,
+        output: dict[str, Any],
+    ) -> None:
+        if call_id:
+            self._add_nested_text_block(parent, "工具调用", f"call_id={call_id}")
+
+        observation_text = str(
+            output.get("observation_text") or output.get("summary") or ""
+        ).strip()
+        if observation_text:
+            self._add_nested_text_block(parent, "观察说明", observation_text)
+
+        image_ref_index = 1
+        image_ref_index = self._add_observation_image_or_placeholder(
+            parent,
+            title=f"观察截图（引用 {image_ref_index}）",
+            value=output.get("image_url"),
+            reference_label=f"引用 {image_ref_index}",
+            next_index=image_ref_index,
+        )
+
+        structured_data = output.get("structured_data")
+        if structured_data is not None:
+            self._add_detail_json_section(
+                "结构化观察数据",
+                structured_data,
+                parent=parent,
+                collapsed=True,
+            )
+
+        local_refinements = output.get("local_refinements")
+        if isinstance(local_refinements, list):
+            for local in local_refinements:
+                if not isinstance(local, dict):
+                    continue
+                click_index = local.get("click_index") or image_ref_index
+                local_text = str(
+                    local.get("observation_text") or local.get("summary") or ""
+                ).strip()
+                if local_text:
+                    self._add_nested_text_block(
+                        parent,
+                        f"点击局部观察 {click_index}",
+                        local_text,
+                    )
+                image_ref_index = self._add_observation_image_or_placeholder(
+                    parent,
+                    title=f"点击局部截图 {click_index}（引用 {image_ref_index}）",
+                    value=local.get("image_url"),
+                    reference_label=f"引用 {image_ref_index}",
+                    next_index=image_ref_index,
+                )
+                local_structured_data = local.get("structured_data")
+                if local_structured_data is not None:
+                    self._add_detail_json_section(
+                        f"点击局部结构化数据 {click_index}",
+                        local_structured_data,
+                        parent=parent,
+                        collapsed=True,
+                    )
+
+    def _add_observation_image_or_placeholder(
+        self,
+        parent: tk.Widget,
+        *,
+        title: str,
+        value: Any,
+        reference_label: str,
+        next_index: int,
+    ) -> int:
+        if not value:
+            return next_index
+        actual_ref = self._actual_image_ref_from_value(value)
+        if actual_ref:
+            self._add_inline_image_ref(parent, title, actual_ref)
+        else:
+            self._add_nested_text_block(
+                parent,
+                title,
+                self._format_media_placeholder(
+                    value,
+                    reference_label=reference_label,
+                ),
+            )
+        return next_index + 1
 
     def _add_request_content_part(
         self,
@@ -4607,7 +4794,7 @@ class GuiAgentDesktopClient(tk.Tk):
         refs: list[tuple[str, str]] = []
         after = str(payload.get("after_ref") or "").strip()
         if after:
-            refs.append(("操作后观察截图", after))
+            refs.append(("本轮工具执行后观察截图", after))
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         local_refinements = metadata.get("local_refinements")
         if isinstance(local_refinements, list):
@@ -5068,6 +5255,17 @@ class GuiAgentDesktopClient(tk.Tk):
         return "就绪"
 
     def _latest_agent_run_status(self, app_id: str) -> str:
+        live_flag = self.__dict__.get("agent_running")
+        selected = self.__dict__.get("selected_app_id")
+        selected_app_id = selected.get() if selected is not None else ""
+        if app_id == selected_app_id and live_flag is not None and live_flag.get():
+            return "running"
+        state = self.__dict__.get("state")
+        config = state.target_apps.get(app_id) if state is not None else None
+        metadata = config.metadata if config is not None else {}
+        metadata_status = str((metadata or {}).get("last_run_status") or "")
+        if metadata_status:
+            return metadata_status
         for event in reversed(self._events_for_selected_app(app_id)):
             payload = event.payload
             if event.kind != "operation" or payload.get("kind") != "agent_run":
@@ -5075,13 +5273,9 @@ class GuiAgentDesktopClient(tk.Tk):
             status = str(payload.get("status") or "")
             if status and status != "configured":
                 if status == "running":
-                    live_flag = getattr(self, "agent_running", None)
-                    is_live_running = bool(live_flag.get()) if live_flag is not None else False
-                    return "running" if is_live_running else "paused"
+                    return "paused"
                 return status
-        config = self.state.target_apps.get(app_id)
-        metadata = config.metadata if config is not None else {}
-        return str((metadata or {}).get("last_run_status") or "")
+        return ""
 
     @staticmethod
     def _is_terminal_agent_status(status: str) -> bool:
@@ -5626,14 +5820,16 @@ class SettingsDialog(tk.Toplevel):
         )
         self.macro_tree = ttk.Treeview(
             left,
-            columns=("scope", "sequence", "description"),
+            columns=("status", "scope", "steps", "description"),
             show="headings",
         )
+        self.macro_tree.heading("status", text="状态")
         self.macro_tree.heading("scope", text="范围")
-        self.macro_tree.heading("sequence", text="按键")
+        self.macro_tree.heading("steps", text="动作")
         self.macro_tree.heading("description", text="说明")
+        self.macro_tree.column("status", width=80, anchor="center")
         self.macro_tree.column("scope", width=80, anchor="center")
-        self.macro_tree.column("sequence", width=120)
+        self.macro_tree.column("steps", width=140)
         self.macro_tree.column("description", width=260, stretch=True)
         self.macro_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
 
@@ -5710,22 +5906,100 @@ class SettingsDialog(tk.Toplevel):
         self.sequence_entry.delete(0, tk.END)
         self.description_text.delete("1.0", tk.END)
         self._refresh_macros()
+        if self.master is not None and hasattr(self.master, "_save_state"):
+            self.master._save_state()
 
     def _refresh_macros(self) -> None:
         for item in self.macro_tree.get_children():
             self.macro_tree.delete(item)
         for macro in self.state.action_macros.macros.values():
-            scope = "全局" if macro.metadata.get("scope") == "global" else "当前 APP"
+            scope = _macro_scope_label(macro.metadata, current_app_id=self.current_app_id)
             self.macro_tree.insert(
                 "",
                 tk.END,
                 iid=macro.name,
                 values=(
+                    "已启用",
                     scope,
-                    macro.metadata.get("sequence", ""),
+                    _macro_steps_summary(macro.to_dict()),
                     macro.description,
                 ),
             )
+        for item in self.state.human_loop.list_requests():
+            request = item.get("request") if isinstance(item, dict) else {}
+            metadata = request.get("metadata") if isinstance(request, dict) else {}
+            proposal = metadata.get("macro_proposal") if isinstance(metadata, dict) else None
+            if not isinstance(proposal, dict):
+                continue
+            job_id = str(metadata.get("job_id") or "")
+            if self.current_app_id:
+                app = self.state.target_apps.get(self.current_app_id)
+                if app is not None and job_id and job_id != app.job_id:
+                    continue
+            request_id = str(request.get("request_id") or id(item))
+            macro_name = str(proposal.get("macro_name") or "未命名宏")
+            self.macro_tree.insert(
+                "",
+                tk.END,
+                iid=f"pending:{request_id}",
+                values=(
+                    "待批准",
+                    _macro_scope_label(proposal, current_app_id=self.current_app_id),
+                    _macro_steps_summary(proposal),
+                    f"{macro_name}：{proposal.get('description') or ''}".strip("："),
+                ),
+            )
+
+
+def _macro_scope_label(data: dict[str, Any], *, current_app_id: str | None = None) -> str:
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    scope = str(data.get("scope") or metadata.get("scope") or "").strip()
+    app_id = str(data.get("app_id") or metadata.get("app_id") or "").strip()
+    if scope == "global":
+        return "全局"
+    if scope in {"app", "current_app"} or app_id:
+        if current_app_id and app_id and app_id != current_app_id:
+            return "其他 APP"
+        return "当前 APP"
+    return "当前 APP"
+
+
+def _macro_steps_summary(data: dict[str, Any]) -> str:
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    sequence = str(data.get("sequence") or metadata.get("sequence") or "").strip()
+    if sequence:
+        return sequence
+    steps = data.get("steps")
+    if not isinstance(steps, list):
+        return ""
+    labels: list[str] = []
+    for index, step in enumerate(steps[:4], start=1):
+        if not isinstance(step, dict):
+            continue
+        action = step.get("action") if isinstance(step.get("action"), dict) else step
+        action_type = str(action.get("type") or step.get("type") or "动作")
+        purpose = str(step.get("purpose") or "").strip()
+        label = purpose or _macro_action_label(action_type)
+        labels.append(f"{index}. {label}")
+    if len(steps) > 4:
+        labels.append(f"另有 {len(steps) - 4} 步")
+    return "；".join(labels)
+
+
+def _macro_action_label(action_type: str) -> str:
+    return {
+        "click": "点击",
+        "double_click": "双击",
+        "submit_text": "输入并提交",
+        "type": "输入文本",
+        "wait": "等待",
+        "keypress": "按键",
+        "scroll": "滚动",
+        "drag": "拖拽",
+        "move": "移动鼠标",
+        "screenshot": "截图",
+        "computer": "电脑操作",
+    }.get(action_type, action_type)
 
 
 def format_payload(payload: dict[str, Any], *, indent: int = 0) -> str:
@@ -5770,16 +6044,30 @@ def format_computer_action(action: dict[str, Any]) -> str:
     prefix = ""
     if action.get("index") is not None:
         prefix = f"{action.get('index')}. "
+    intent = str(action.get("intent") or "").strip()
+    intent_suffix = f"（{intent}）" if intent else ""
     if action_type == "click":
         button = action.get("button") or "left"
-        return f"{prefix}鼠标点击 ({action.get('x')}, {action.get('y')}) / {button}"
+        return (
+            f"{prefix}鼠标点击 ({action.get('x')}, {action.get('y')})"
+            f" / {button}{intent_suffix}"
+        )
     if action_type == "type":
         text = str(action.get("text") or "")
         preview = text[:80] + ("..." if len(text) > 80 else "")
-        return f"{prefix}输入文本：{preview}"
+        return f"{prefix}输入文本{intent_suffix}：{preview}"
+    if action_type == "submit_text":
+        text = str(action.get("text") or "")
+        preview = text[:80] + ("..." if len(text) > 80 else "")
+        target = (
+            f" ({action.get('x')}, {action.get('y')})"
+            if action.get("x") is not None and action.get("y") is not None
+            else ""
+        )
+        return f"{prefix}提交文本{target}{intent_suffix}: {preview}"
     if action_type in {"keypress", "key"}:
         keys = action.get("keys") or action.get("key") or ""
-        return f"{prefix}按键：{keys}"
+        return f"{prefix}按键{intent_suffix}：{keys}"
     if action_type == "wait":
         return f"{prefix}等待 {action.get('seconds', '')} 秒"
     if action_type == "move":

@@ -718,10 +718,18 @@ def test_model_tool_registry_exports_non_empty_openai_schemas():
         computer_schema["properties"]["coordinate_space"]["enum"]
         == ["qwen_normalized_1000", "local_refinement_1000", "screenshot"]
     )
+    coordinate_description = computer_schema["properties"]["coordinate_space"][
+        "description"
+    ]
+    assert "0..1000" in coordinate_description
+    assert "not to the full screenshot" in coordinate_description
     assert "index" in computer_schema["properties"]
     action_schema = computer_schema["properties"]["actions"]["items"]
     assert "index" in action_schema["properties"]
     assert action_schema["properties"]["index"]["minimum"] == 1
+    assert "0..1000" in action_schema["properties"]["x"]["description"]
+    assert "0..1000" in action_schema["properties"]["y"]["description"]
+    assert "submit_text" in action_schema["properties"]["type"]["enum"]
     assert "open_url" in by_name
     assert "write_text_file" in by_name
     assert "run_shell" in by_name
