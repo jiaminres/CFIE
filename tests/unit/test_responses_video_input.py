@@ -160,6 +160,72 @@ def test_construct_input_messages_keeps_click_refinement_images_in_tool_observat
     assert messages[0]["content"][3]["image_url"] == "file:///tmp/local.jpg"
 
 
+def test_construct_input_messages_splits_observation_text_image_and_structured_data():
+    messages = construct_input_messages(
+        request_input=[
+            {
+                "type": "computer_call_output",
+                "call_id": "call_precise_click",
+                "output": {
+                    "type": "computer_screenshot",
+                    "image_url": "file:///tmp/local.jpg",
+                    "detail": "high",
+                    "summary": "fallback summary",
+                    "observation_text": "点击保护：本次 click 尚未执行。",
+                    "structured_data": {
+                        "mode": "pre_click_refinement",
+                        "executed": False,
+                        "local_refinement_box": [251, 200, 240, 240],
+                    },
+                },
+            },
+        ]
+    )
+
+    content = messages[0]["content"]
+    assert content[0]["type"] == "input_text"
+    assert content[0]["text"] == "点击保护：本次 click 尚未执行。"
+    assert content[1]["type"] == "input_image"
+    assert content[1]["image_url"] == "file:///tmp/local.jpg"
+    assert content[2]["type"] == "input_text"
+    assert "Structured observation data JSON" in content[2]["text"]
+    assert '"mode": "pre_click_refinement"' in content[2]["text"]
+
+
+def test_construct_input_messages_keeps_local_observation_without_main_image():
+    messages = construct_input_messages(
+        request_input=[
+            {
+                "type": "computer_call_output",
+                "call_id": "call_precise_click",
+                "output": {
+                    "type": "computer_screenshot",
+                    "observation_text": "主观察文本。",
+                    "local_refinements": [
+                        {
+                            "image_url": "file:///tmp/local.jpg",
+                            "detail": "high",
+                            "observation_text": "局部观察文本。",
+                            "structured_data": {
+                                "mode": "pre_click_refinement",
+                                "executed": False,
+                            },
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+
+    content = messages[0]["content"]
+    assert content[0]["text"] == "主观察文本。 1 click-local refinement image(s) are included in the same observation."
+    assert content[1]["text"] == "局部观察文本。"
+    assert content[2]["type"] == "input_image"
+    assert content[2]["image_url"] == "file:///tmp/local.jpg"
+    assert content[3]["type"] == "input_text"
+    assert '"mode": "pre_click_refinement"' in content[3]["text"]
+
+
 def test_chat_parser_maps_input_video_to_video_url_content():
     part_type, content = _parse_chat_message_content_mm_part(
         {

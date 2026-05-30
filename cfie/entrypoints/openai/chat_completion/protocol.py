@@ -33,7 +33,9 @@ from cfie.entrypoints.openai.engine.protocol import (
     UsageInfo,
 )
 from cfie.entrypoints.openai.reasoning_template import (
+    QWEN_REASONING_PREAMBLE_KWARG,
     build_reasoning_chat_template_kwargs,
+    normalize_reasoning_effort,
 )
 from cfie.exceptions import VLLMValidationError
 from cfie.logger import init_logger
@@ -182,7 +184,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | ChatCompletionNamedToolChoiceParam
         | None
     ) = "none"
-    reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
+    reasoning_effort: Literal["none", "origin", "low", "medium", "high"] | None = None
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -364,8 +366,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_template: str | None,
         default_template_content_format: ChatTemplateContentFormatOption,
     ) -> ChatParams:
+        requested_template_kwargs = self.chat_template_kwargs
+        requested_reasoning_preamble = (
+            requested_template_kwargs.get(QWEN_REASONING_PREAMBLE_KWARG)
+            if isinstance(requested_template_kwargs, dict)
+            else None
+        )
         chat_template_kwargs = merge_kwargs(
-            self.chat_template_kwargs,
+            requested_template_kwargs,
             dict(
                 add_generation_prompt=self.add_generation_prompt,
                 continue_final_message=self.continue_final_message,
@@ -376,6 +384,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
             chat_template_kwargs,
             build_reasoning_chat_template_kwargs(self.reasoning_effort),
         )
+        normalized_reasoning_effort = normalize_reasoning_effort(
+            self.reasoning_effort
+        )
+        if (
+            requested_reasoning_preamble
+            and normalized_reasoning_effort is not None
+            and normalized_reasoning_effort not in {"none", "origin"}
+        ):
+            chat_template_kwargs[QWEN_REASONING_PREAMBLE_KWARG] = (
+                requested_reasoning_preamble
+            )
 
         return ChatParams(
             chat_template=self.chat_template or default_template,

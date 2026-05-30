@@ -74,7 +74,9 @@ from cfie.entrypoints.openai.responses.input_sanitizer import (
     sanitize_responses_input_data,
 )
 from cfie.entrypoints.openai.reasoning_template import (
+    QWEN_REASONING_PREAMBLE_KWARG,
     build_reasoning_chat_template_kwargs,
+    normalize_reasoning_effort,
 )
 from cfie.exceptions import VLLMValidationError
 from cfie.logger import init_logger
@@ -190,6 +192,20 @@ ResponseInputOutputItem: TypeAlias = (
 )
 
 
+class CFIERequestReasoning(OpenAIBaseModel):
+    effort: Literal[
+        "none",
+        "origin",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ] | None = None
+    generate_summary: Literal["auto", "concise", "detailed"] | None = None
+    summary: Literal["auto", "concise", "detailed"] | None = None
+
+
 class ResponsesRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
@@ -217,7 +233,7 @@ class ResponsesRequest(OpenAIBaseModel):
     parallel_tool_calls: bool | None = True
     previous_response_id: str | None = None
     prompt: ResponsePrompt | None = None
-    reasoning: Reasoning | None = None
+    reasoning: CFIERequestReasoning | None = None
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] = "auto"
     store: bool | None = True
     stream: bool | None = False
@@ -333,8 +349,14 @@ class ResponsesRequest(OpenAIBaseModel):
 
         reasoning = self.reasoning
         reasoning_effort = None if reasoning is None else reasoning.effort
+        requested_template_kwargs = self.chat_template_kwargs
+        requested_reasoning_preamble = (
+            requested_template_kwargs.get(QWEN_REASONING_PREAMBLE_KWARG)
+            if isinstance(requested_template_kwargs, dict)
+            else None
+        )
         chat_template_kwargs = merge_kwargs(
-            self.chat_template_kwargs,
+            requested_template_kwargs,
             dict(
                 add_generation_prompt=not continue_final,
                 continue_final_message=continue_final,
@@ -344,6 +366,15 @@ class ResponsesRequest(OpenAIBaseModel):
             chat_template_kwargs,
             build_reasoning_chat_template_kwargs(reasoning_effort),
         )
+        normalized_reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+        if (
+            requested_reasoning_preamble
+            and normalized_reasoning_effort is not None
+            and normalized_reasoning_effort not in {"none", "origin"}
+        ):
+            chat_template_kwargs[QWEN_REASONING_PREAMBLE_KWARG] = (
+                requested_reasoning_preamble
+            )
         self.chat_template_kwargs = chat_template_kwargs
 
         return ChatParams(
@@ -560,7 +591,7 @@ class ResponsesResponse(OpenAIBaseModel):
     max_tool_calls: int | None = None
     previous_response_id: str | None = None
     prompt: ResponsePrompt | None = None
-    reasoning: Reasoning | None = None
+    reasoning: CFIERequestReasoning | Reasoning | None = None
     service_tier: Literal["auto", "default", "flex", "scale", "priority"]
     status: ResponseStatus
     text: ResponseTextConfig | None = None

@@ -299,10 +299,12 @@ def _construct_computer_call_output_messages(
     detail = output.get("detail", "low")
     image_url = output.get("image_url")
     summary = str(output.get("summary") or "").strip()
+    observation_text = str(output.get("observation_text") or "").strip()
+    structured_data = output.get("structured_data")
     local_refinements = output.get("local_refinements")
     if not isinstance(local_refinements, list):
         local_refinements = []
-    content = (
+    content = observation_text or (
         f"computer_use completed. {summary} Screenshot observation is provided "
         "as the following image message."
         if summary
@@ -330,24 +332,46 @@ def _construct_computer_call_output_messages(
                 "detail": detail,
             }
         )
-        for index, refinement in enumerate(local_refinements, start=1):
-            if not isinstance(refinement, dict):
-                continue
-            refinement_image_url = refinement.get("image_url")
-            if not refinement_image_url:
-                continue
-            refinement_summary = str(refinement.get("summary") or "").strip()
-            if not refinement_summary:
-                refinement_summary = (
-                    f"Click-local refinement image {index} after computer_use "
-                    f"call_id={call_id}."
-                )
+    structured_text = _computer_observation_structured_text(structured_data)
+    if structured_text:
+        tool_content.append({"type": "input_text", "text": structured_text})
+    for index, refinement in enumerate(local_refinements, start=1):
+        if not isinstance(refinement, dict):
+            continue
+        refinement_image_url = refinement.get("image_url")
+        refinement_summary = str(
+            refinement.get("observation_text")
+            or refinement.get("summary")
+            or ""
+        ).strip()
+        if refinement_summary:
             tool_content.append({"type": "input_text", "text": refinement_summary})
+        elif refinement_image_url:
+            tool_content.append(
+                {
+                    "type": "input_text",
+                    "text": (
+                        f"Click-local refinement image {index} after computer_use "
+                        f"call_id={call_id}."
+                    ),
+                }
+            )
+        if refinement_image_url:
             tool_content.append(
                 {
                     "type": "input_image",
                     "image_url": refinement_image_url,
                     "detail": refinement.get("detail", detail),
+                }
+            )
+        refinement_structured_text = _computer_observation_structured_text(
+            refinement.get("structured_data")
+        )
+        if refinement_structured_text:
+            tool_content.append(
+                {
+                    "type": "input_text",
+                    "text": refinement_structured_text,
                 }
             )
     return [
@@ -357,6 +381,16 @@ def _construct_computer_call_output_messages(
             tool_call_id=call_id,
         )
     ]
+
+
+def _computer_observation_structured_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        payload = json.dumps(str(value), ensure_ascii=False)
+    return f"结构化观察数据 JSON / Structured observation data JSON:\n{payload}"
 
 
 def _response_item_type(item: ResponseInputOutputItem) -> str | None:

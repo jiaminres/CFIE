@@ -3,6 +3,7 @@
 
 from cfie.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from cfie.entrypoints.openai.reasoning_template import (
+    QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE,
     QWEN_REASONING_PREAMBLE_KWARG,
 )
 from cfie.entrypoints.openai.responses.protocol import ResponsesRequest
@@ -21,6 +22,16 @@ def test_responses_reasoning_none_disables_qwen_thinking() -> None:
     assert QWEN_REASONING_PREAMBLE_KWARG not in params.chat_template_kwargs
 
 
+def test_responses_reasoning_origin_enables_qwen_thinking_without_preamble() -> None:
+    request = ResponsesRequest(input="hello", reasoning={"effort": "origin"})
+
+    params = request.build_chat_params(None, "auto")
+
+    assert params.chat_template_kwargs["reasoning_effort"] == "origin"
+    assert params.chat_template_kwargs["enable_thinking"] is True
+    assert QWEN_REASONING_PREAMBLE_KWARG not in params.chat_template_kwargs
+
+
 def test_responses_reasoning_efforts_build_distinct_qwen_preambles() -> None:
     prompts = {}
     for effort in ("minimal", "low", "medium", "high", "xhigh"):
@@ -34,6 +45,44 @@ def test_responses_reasoning_efforts_build_distinct_qwen_preambles() -> None:
     assert len(set(prompts.values())) == len(prompts)
     assert "minimal" in prompts["minimal"]
     assert "xhigh" in prompts["xhigh"]
+
+
+def test_responses_reasoning_preserves_request_specific_preamble() -> None:
+    request = ResponsesRequest(
+        input="hello",
+        reasoning={"effort": "low"},
+        chat_template_kwargs={
+            QWEN_REASONING_PREAMBLE_KWARG: QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE,
+        },
+    )
+
+    params = request.build_chat_params(None, "auto")
+
+    assert (
+        params.chat_template_kwargs[QWEN_REASONING_PREAMBLE_KWARG]
+        == QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE
+    )
+    assert "局部图重新选点" in QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE
+    assert "思考最多两行" in QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE
+    assert "recommended_click_1000" not in QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE
+    assert "1000 归一化坐标 x=" in QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE
+
+
+def test_chat_completion_reasoning_preserves_request_specific_preamble() -> None:
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning_effort="medium",
+        chat_template_kwargs={
+            QWEN_REASONING_PREAMBLE_KWARG: QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE,
+        },
+    )
+
+    params = request.build_chat_params(None, "auto")
+
+    assert (
+        params.chat_template_kwargs[QWEN_REASONING_PREAMBLE_KWARG]
+        == QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE
+    )
 
 
 def test_responses_reasoning_effort_overrides_default_thinking_disabled() -> None:
@@ -62,6 +111,19 @@ def test_chat_completion_reasoning_effort_uses_same_template_mapping() -> None:
     assert "当前状态" in params.chat_template_kwargs[
         QWEN_REASONING_PREAMBLE_KWARG
     ]
+
+
+def test_chat_completion_reasoning_origin_has_no_preamble() -> None:
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning_effort="origin",
+    )
+
+    params = request.build_chat_params(None, "auto")
+
+    assert params.chat_template_kwargs["reasoning_effort"] == "origin"
+    assert params.chat_template_kwargs["enable_thinking"] is True
+    assert QWEN_REASONING_PREAMBLE_KWARG not in params.chat_template_kwargs
 
 
 def test_qwen_preamble_is_inserted_inside_generation_think_block() -> None:

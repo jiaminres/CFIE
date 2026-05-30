@@ -5,6 +5,24 @@ from typing import Any
 
 QWEN_REASONING_PREAMBLE_KWARG = "cfie_reasoning_preamble"
 
+QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE = (
+    "当前思考任务：局部图重新选点。只看本轮局部高清截图。"
+    "不要使用全屏坐标、物理像素坐标或历史坐标；不要默认点击图像中心。"
+    "如果目标很小，点击彩色圆点、按钮或可点击区域的中心，不要点文字标签、边缘或旧坐标。"
+    "思考最多两行：目标是否可见、目标中心坐标；随后立即调用 computer_use，"
+    'coordinate_space="local_refinement_1000"。'
+    "当前局部图中，目标中心的 1000 归一化坐标 x="
+)
+
+
+def click_local_refinement_preamble(_mode: str | None = None) -> str:
+    return QWEN_CLICK_LOCAL_REFINEMENT_PREAMBLE
+
+_ACTION_AFTER_THINK_HINT = (
+    "如果任务尚未完成，思考后必须立即返回一个可执行工具调用；"
+    "不要只输出思考内容、空白文本或普通说明。"
+)
+
 _REASONING_PREAMBLES = {
     "minimal": (
         "当前思考模式：minimal。只在思考区写一句极短状态判断，工具调用前"
@@ -30,7 +48,7 @@ _REASONING_PREAMBLES = {
     ),
 }
 
-_VALID_EFFORTS = frozenset({"none", *_REASONING_PREAMBLES.keys()})
+_VALID_EFFORTS = frozenset({"none", "origin", *_REASONING_PREAMBLES.keys()})
 
 
 def normalize_reasoning_effort(effort: Any) -> str | None:
@@ -62,7 +80,13 @@ def build_reasoning_chat_template_kwargs(effort: Any) -> dict[str, Any]:
     if normalized == "none":
         kwargs["enable_thinking"] = False
         return kwargs
+    if normalized == "origin":
+        kwargs["enable_thinking"] = True
+        return kwargs
 
     kwargs["enable_thinking"] = True
-    kwargs[QWEN_REASONING_PREAMBLE_KWARG] = _REASONING_PREAMBLES[normalized]
+    kwargs[QWEN_REASONING_PREAMBLE_KWARG] = (
+        _REASONING_PREAMBLES[normalized]
+        + _ACTION_AFTER_THINK_HINT
+    )
     return kwargs
