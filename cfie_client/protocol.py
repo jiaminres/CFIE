@@ -8,6 +8,7 @@ ACTION_TYPES = (
     "click",
     "double_click",
     "scroll",
+    "submit_text",
     "type",
     "wait",
     "keypress",
@@ -106,6 +107,7 @@ def _normalize_path(value: Any) -> tuple[tuple[int, int], ...]:
 class ComputerAction:
     type: str
     index: int | None = None
+    intent: str | None = None
     x: int | None = None
     y: int | None = None
     button: str | None = None
@@ -129,6 +131,14 @@ class ComputerAction:
             action_index = _require_int(action_index, "index")
             if action_index < 1:
                 raise ProtocolError("index must be a positive integer")
+
+        intent = _read_field(
+            value,
+            "intent",
+            _read_field(value, "operation_intent", _read_field(value, "purpose", None)),
+        )
+        if intent is not None:
+            intent = str(intent).strip() or None
 
         x = _read_field(value, "x")
         y = _read_field(value, "y")
@@ -168,9 +178,9 @@ class ComputerAction:
         if action_type == "keypress" and not keys:
             raise ProtocolError("keypress requires at least one key")
 
-        if action_type == "type":
+        if action_type in {"type", "submit_text"}:
             if text is None:
-                raise ProtocolError("type action requires text")
+                raise ProtocolError(f"{action_type} action requires text")
             text = str(text)
 
         if action_type == "wait" and duration is not None:
@@ -183,6 +193,7 @@ class ComputerAction:
         return cls(
             type=action_type,
             index=action_index,
+            intent=intent,
             x=x,
             y=y,
             button=button,
@@ -199,6 +210,8 @@ class ComputerAction:
         payload: dict[str, Any] = {"type": self.type}
         if self.index is not None:
             payload["index"] = self.index
+        if self.intent is not None:
+            payload["intent"] = self.intent
         if self.x is not None:
             payload["x"] = self.x
         if self.y is not None:
@@ -238,6 +251,10 @@ def _normalize_action_payload(value: Any) -> Any:
         "left_click": "click",
         "right_click": "click",
         "mouse_click": "click",
+        "paste_submit": "submit_text",
+        "replace_and_submit": "submit_text",
+        "send_text": "submit_text",
+        "submit": "submit_text",
         "input": "type",
         "input_text": "type",
         "text": "type",
@@ -264,7 +281,7 @@ def _normalize_action_payload(value: Any) -> Any:
             raise ProtocolError("coordinate must be a pair [x, y]") from exc
         action["x"] = x
         action["y"] = y
-    if action.get("type") == "type" and "text" not in action:
+    if action.get("type") in {"type", "submit_text"} and "text" not in action:
         text = action.get("content", action.get("value"))
         if text is not None:
             action["text"] = text

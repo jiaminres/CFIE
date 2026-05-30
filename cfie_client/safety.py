@@ -34,9 +34,11 @@ class SafetyGate:
             if action.type not in allowed:
                 raise SafetyViolation(f"blocked computer action: {action.type}")
 
-            if action.type == "type" and action.text is not None:
+            if action.type in {"submit_text", "type"} and action.text is not None:
                 if len(action.text) > self.max_typed_chars:
-                    raise SafetyViolation("type action text exceeds local limit")
+                    raise SafetyViolation(
+                        f"{action.type} action text exceeds local limit"
+                    )
 
             if action.type == "scroll":
                 if (

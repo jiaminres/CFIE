@@ -5,6 +5,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from cfie.entrypoints.openai.reasoning_template import (
+    QWEN_REASONING_PREAMBLE_KWARG,
+    click_local_refinement_preamble,
+)
 from cfie_gui_agent import OpenAIResponsesAgent
 
 
@@ -239,6 +243,121 @@ def test_openai_responses_agent_adds_default_image_detail():
     payload = CaptureHandler.captured_payload
     assert payload is not None
     assert payload["input"][0]["content"][1]["detail"] == "auto"
+
+
+def test_openai_responses_agent_uses_local_click_reasoning_preamble():
+    CaptureHandler.captured_payload = None
+    CaptureHandler.response_payload = {"id": "resp_ok", "output": []}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        agent = OpenAIResponsesAgent(
+            model="qwen35-vl",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+            include_tools=False,
+            max_output_tokens=64,
+            reasoning_effort="none",
+        )
+        agent(
+            [
+                {
+                    "type": "computer_call_output",
+                    "call_id": "call_click_guard",
+                    "output": {
+                        "type": "computer_screenshot",
+                        "image_url": "data:image/png;base64,LOCAL",
+                        "precision_mode": "pre_click_refinement",
+                        "structured_data": {
+                            "mode": "pre_click_refinement",
+                            "next_coordinate_space": "local_refinement_1000",
+                        },
+                    },
+                }
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    payload = CaptureHandler.captured_payload
+    assert payload is not None
+    assert payload["reasoning"] == {"effort": "minimal"}
+    assert payload["chat_template_kwargs"]["enable_thinking"] is True
+    assert (
+        payload["chat_template_kwargs"][QWEN_REASONING_PREAMBLE_KWARG]
+        == click_local_refinement_preamble("none")
+    )
+    assert "recommended_click_1000" not in payload["chat_template_kwargs"][
+        QWEN_REASONING_PREAMBLE_KWARG
+    ]
+
+
+def test_openai_responses_agent_can_use_isolated_local_click_context():
+    CaptureHandler.captured_payload = None
+    CaptureHandler.response_payload = {"id": "resp_ok", "output": []}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        agent = OpenAIResponsesAgent(
+            model="qwen35-vl",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+            include_tools=False,
+            max_output_tokens=64,
+            reasoning_effort="origin",
+            click_local_refinement_reasoning=False,
+        )
+        agent(
+            [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "system rules"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old full history"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_click",
+                    "name": "computer_use",
+                    "arguments": json.dumps({"actions": [{"type": "click"}]}),
+                },
+                {
+                    "type": "computer_call_output",
+                    "call_id": "call_click",
+                    "output": {
+                        "type": "computer_screenshot",
+                        "image_url": "data:image/png;base64,LOCAL",
+                        "detail": "high",
+                        "intent": "点击目标 A 的红色小圆点",
+                        "structured_data": {
+                            "mode": "pre_click_refinement",
+                            "next_coordinate_space": "local_refinement_1000",
+                        },
+                    },
+                },
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    payload = CaptureHandler.captured_payload
+    assert payload is not None
+    text = json.dumps(payload["input"], ensure_ascii=False)
+    assert len(payload["input"]) == 1
+    assert "system rules" not in text
+    assert "old full history" not in text
+    assert "call_click" not in text
+    assert "点击目标 A 的红色小圆点" in text
+    assert "local_refinement_1000" in text
+    assert payload["input"][0]["content"][1]["image_url"] == (
+        "data:image/png;base64,LOCAL"
+    )
 
 
 def test_openai_responses_agent_does_not_rewrite_qwen_text_tool_call_output():

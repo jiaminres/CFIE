@@ -169,17 +169,31 @@ def _default_description(tool_name: str) -> str:
         "computer_use": (
             "Perform validated desktop computer actions. For Qwen VL grounding, "
             "set coordinate_space to qwen_normalized_1000 and express mouse "
-            "coordinates on a 0..1000 image grid. Use local_refinement_1000 "
-            "only after the harness provides a local refinement crop. When one "
+            "coordinates on a 0..1000 image grid. x=500,y=500 means the center "
+            "of the current full screenshot. Use local_refinement_1000 only "
+            "after the harness provides a local refinement crop; then x/y are "
+            "0..1000 coordinates inside that crop, not full-screen pixels. "
+            "Never return x/y outside 0..1000 for qwen_normalized_1000 or "
+            "local_refinement_1000. When the crop is present, choose the "
+            "target center inside the crop from the visible image only. "
+            "Prefer a submit_text action for chat boxes, search boxes, "
+            "and form fields: the harness will focus, replace text, paste, and "
+            "press Enter. When one "
             "model response returns multiple tool calls, give each tool call a "
             "positive integer index starting at 1. When one computer_use call "
-            "contains multiple actions, give every action its own index too."
+            "contains multiple actions, give every action its own index too. "
+            "Do not call computer_use to report task completion; when the "
+            "current subtask is complete, call finish_subtask instead."
         ),
         "read_image": "Read a referenced image artifact into model context.",
         "read_video_clip": "Read a bounded video clip or selected frame set.",
         "request_human_help": "Ask a manager for human intervention.",
         "update_constraints": "Propose a structured policy update.",
-        "finish_subtask": "Report that the current subtask appears complete.",
+        "finish_subtask": (
+            "Report that the current subtask appears complete. Use this tool, "
+            "not computer_use, when the visible state already satisfies the "
+            "subtask goal."
+        ),
         "report_blocked": "Report that the current task is blocked.",
         "ask_replan": "Ask TaskManager to consider a task transition.",
         "query_memory": "Query workspace or business memory.",
@@ -187,7 +201,11 @@ def _default_description(tool_name: str) -> str:
         "propose_action_macro": (
             "Suggest a reusable operation macro for human approval. Use this "
             "for repeated multi-step UI actions that should later run with one "
-            "macro call plus dynamic parameters."
+            "macro call plus dynamic parameters. If the same workflow succeeds "
+            "twice in a row, propose the macro once without waiting for approval. "
+            "Macro steps must be computer_use actions only; the macro covers UI "
+            "operation, while file writing, shell commands, memory, and trace "
+            "recording must remain separate normal tool calls."
         ),
         "navigate_to_target": (
             "Ask the harness to move a source element toward a target while "
@@ -220,8 +238,10 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                         "(0,0) is the current image top-left and "
                         "(1000,1000) is bottom-right. Use "
                         "local_refinement_1000 only when the harness has just "
-                        "provided a local refinement crop. Use screenshot only "
-                        "when actions are already in screenshot pixel coordinates."
+                        "provided a local refinement crop; in that mode, x/y "
+                        "refer to the crop, not to the full screenshot, and must "
+                        "still be in 0..1000. Use screenshot only when actions "
+                        "are already in screenshot pixel coordinates."
                     ),
                 },
                 "actions": {
@@ -238,9 +258,54 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                                     "returning multiple actions; use 1, 2, 3..."
                                 ),
                             },
-                            "type": {"type": "string"},
-                            "x": {"type": "integer"},
-                            "y": {"type": "integer"},
+                            "intent": {
+                                "type": "string",
+                                "description": (
+                                    "Required. A short natural-language purpose "
+                                    "for this exact action, e.g. 'click the blue "
+                                    "send button', 'focus the question input', or "
+                                    "'press Enter to submit'. This must describe "
+                                    "a real UI operation, not a task completion "
+                                    "claim. If the task is complete, call "
+                                    "finish_subtask instead of computer_use. The "
+                                    "harness uses this intent to verify local "
+                                    "click refinements."
+                                ),
+                            },
+                            "type": {
+                                "type": "string",
+                                "enum": [
+                                    "click",
+                                    "double_click",
+                                    "scroll",
+                                    "submit_text",
+                                    "type",
+                                    "wait",
+                                    "keypress",
+                                    "drag",
+                                    "move",
+                                    "screenshot",
+                                ],
+                                "description": (
+                                    "Use submit_text for entering text into a "
+                                    "focused or focusable text field and "
+                                    "submitting it with Enter."
+                                ),
+                            },
+                            "x": {
+                                "type": "integer",
+                                "description": (
+                                    "Mouse x coordinate. For qwen_normalized_1000 "
+                                    "or local_refinement_1000, this must be 0..1000."
+                                ),
+                            },
+                            "y": {
+                                "type": "integer",
+                                "description": (
+                                    "Mouse y coordinate. For qwen_normalized_1000 "
+                                    "or local_refinement_1000, this must be 0..1000."
+                                ),
+                            },
                             "button": {"type": "string"},
                             "keys": {
                                 "anyOf": [
@@ -257,7 +322,7 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                             "scroll_y": {"type": "integer"},
                             "seconds": {"type": "number"},
                         },
-                        "required": ["type"],
+                        "required": ["type", "intent"],
                     },
                 }
             },
@@ -408,7 +473,57 @@ def _default_parameters(tool_name: str) -> dict[str, Any]:
                         {
                             "index": {"type": "integer", "minimum": 1},
                             "purpose": {"type": "string", "minLength": 1},
-                            "action": {"type": "object"},
+                            "action": {
+                                "type": "object",
+                                "properties": {
+                                    "index": {"type": "integer", "minimum": 1},
+                                    "type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "click",
+                                            "double_click",
+                                            "scroll",
+                                            "submit_text",
+                                            "type",
+                                            "wait",
+                                            "keypress",
+                                            "drag",
+                                            "move",
+                                            "screenshot",
+                                        ],
+                                        "description": (
+                                            "Only computer_use action types are "
+                                            "valid inside a macro."
+                                        ),
+                                    },
+                                    "x": {"type": "integer"},
+                                    "y": {"type": "integer"},
+                                    "button": {"type": "string"},
+                                    "keys": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                        ]
+                                    },
+                                    "text": {"type": "string"},
+                                    "path": {"type": "array"},
+                                    "scroll_x": {"type": "integer"},
+                                    "scroll_y": {"type": "integer"},
+                                    "seconds": {"type": "number"},
+                                    "coordinate_space": {
+                                        "type": "string",
+                                        "enum": [
+                                            "qwen_normalized_1000",
+                                            "local_refinement_1000",
+                                            "screenshot",
+                                        ],
+                                    },
+                                },
+                                "required": ["type"],
+                            },
                         },
                         required=("index", "purpose", "action"),
                         allow_index=False,

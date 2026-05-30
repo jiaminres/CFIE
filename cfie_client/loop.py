@@ -199,7 +199,7 @@ def _map_action_from_qwen_normalized_1000(
         return replace(action, path=tuple(map_xy(x, y) for x, y in action.path))
     if action.x is None or action.y is None:
         return action
-    if action.type not in {"click", "double_click", "move", "scroll"}:
+    if action.type not in {"click", "double_click", "move", "scroll", "submit_text"}:
         return action
     x, y = map_xy(action.x, action.y)
     return replace(action, x=x, y=y)
@@ -233,13 +233,26 @@ def _map_action_from_local_refinement_1000(
         )
 
     if action.path:
+        for x, y in action.path:
+            _validate_local_refinement_coordinate(x, y)
         return replace(action, path=tuple(map_xy(x, y) for x, y in action.path))
     if action.x is None or action.y is None:
         return action
-    if action.type not in {"click", "double_click", "move", "scroll"}:
+    if action.type not in {"click", "double_click", "move", "scroll", "submit_text"}:
         return action
+    _validate_local_refinement_coordinate(action.x, action.y)
     x, y = map_xy(action.x, action.y)
     return replace(action, x=x, y=y)
+
+
+def _validate_local_refinement_coordinate(x: int, y: int) -> None:
+    if 0 <= int(x) <= 1000 and 0 <= int(y) <= 1000:
+        return
+    raise ValueError(
+        "local_refinement_1000 coordinates must stay within 0..1000. "
+        f"Got x={x}, y={y}. Use qwen_normalized_1000 for full-screen "
+        "coordinates, or provide corrected coordinates inside the local crop."
+    )
 
 
 def _map_call_to_physical_screen(
@@ -303,7 +316,7 @@ def _map_action_to_physical_screen(
         )
     if action.x is None or action.y is None:
         return action
-    if action.type not in {"click", "double_click", "move", "scroll"}:
+    if action.type not in {"click", "double_click", "move", "scroll", "submit_text"}:
         return action
     x, y = map_xy(action.x, action.y)
     return replace(action, x=x, y=y)

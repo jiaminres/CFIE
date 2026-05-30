@@ -218,6 +218,24 @@ class ComputerExecutor:
             self.backend.type_text(action.text or "")
             return
 
+        if action.type == "submit_text":
+            if action.x is not None and action.y is not None:
+                self._with_modifiers(
+                    action.keys,
+                    lambda: self.backend.click(
+                        int(action.x),
+                        int(action.y),
+                        action.button or "left",
+                    ),
+                )
+                self._sleep_between_subactions()
+            self.backend.press_keys(("ctrl", "a"))
+            self._sleep_between_subactions()
+            self.backend.type_text(action.text or "")
+            self._sleep_between_subactions()
+            self.backend.press_keys(("enter",))
+            return
+
         if action.type == "wait":
             self.backend.wait(action.duration if action.duration is not None else 1.0)
             return
@@ -237,3 +255,7 @@ class ComputerExecutor:
         finally:
             for key in reversed(pressed):
                 self.backend.key_up(key)
+
+    def _sleep_between_subactions(self) -> None:
+        if self.action_delay_seconds:
+            time.sleep(self.action_delay_seconds)

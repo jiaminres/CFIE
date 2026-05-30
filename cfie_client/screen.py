@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
-from PIL import ImageDraw, ImageGrab
+from PIL import Image, ImageDraw, ImageGrab
 
 
 @dataclass(slots=True, frozen=True)
@@ -155,6 +155,12 @@ class ScaledPillowScreenCapture:
         radius: int = 180,
         max_width: int = 720,
         max_height: int = 720,
+        draw_cursor: bool | None = None,
+        draw_center_marker: bool = False,
+        upscale: bool = False,
+        resample: str = "nearest",
+        image_format: str | None = None,
+        jpeg_quality: int | None = None,
     ) -> ScreenshotResult:
         logical_width, logical_height = self.size()
         physical_width, physical_height = self.physical_size()
@@ -174,16 +180,21 @@ class ScaledPillowScreenCapture:
             raise ValueError("local screenshot crop is empty")
         image = ImageGrab.grab(bbox=(left, top, right, bottom))
         crop_physical_width, crop_physical_height = image.size
+        max_scale = float("inf") if upscale else 1.0
         scale = min(
             max(1, int(max_width)) / crop_physical_width,
             max(1, int(max_height)) / crop_physical_height,
-            1.0,
+            max_scale,
         )
         width = max(1, int(crop_physical_width * scale))
         height = max(1, int(crop_physical_height * scale))
         if (width, height) != (crop_physical_width, crop_physical_height):
-            image = image.resize((width, height))
-        if self.draw_cursor:
+            image = image.resize(
+                (width, height),
+                resample=_resolve_resample_filter(resample, scale=scale),
+            )
+        should_draw_cursor = self.draw_cursor if draw_cursor is None else draw_cursor
+        if should_draw_cursor:
             image = _draw_cursor_overlay(
                 image,
                 cursor_position=_resolve_cursor_position(
@@ -193,10 +204,32 @@ class ScaledPillowScreenCapture:
                 physical_size=(crop_physical_width, crop_physical_height),
                 logical_size=(width, height),
             )
-        return self._encode_image(image, width=width, height=height)
+        if draw_center_marker:
+            image = _draw_center_marker_overlay(image)
+        return self._encode_image(
+            image,
+            width=width,
+            height=height,
+            image_format=image_format,
+            jpeg_quality=jpeg_quality,
+        )
 
-    def _encode_image(self, image, *, width: int, height: int) -> ScreenshotResult:
-        if self.image_format == "JPEG":
+    def _encode_image(
+        self,
+        image,
+        *,
+        width: int,
+        height: int,
+        image_format: str | None = None,
+        jpeg_quality: int | None = None,
+    ) -> ScreenshotResult:
+        resolved_format = (image_format or self.image_format).upper()
+        resolved_quality = (
+            self.jpeg_quality
+            if jpeg_quality is None
+            else max(1, min(100, int(jpeg_quality)))
+        )
+        if resolved_format == "JPEG":
             image = image.convert("RGB")
             suffix = "jpg"
             mime = "image/jpeg"
@@ -208,8 +241,8 @@ class ScaledPillowScreenCapture:
                 raise ValueError("output_dir is required when url_mode='file'")
             self.output_dir.mkdir(parents=True, exist_ok=True)
             path = self.output_dir / f"{self.filename_prefix}_{uuid4().hex}.{suffix}"
-            if self.image_format == "JPEG":
-                image.save(path, format="JPEG", quality=self.jpeg_quality, optimize=True)
+            if resolved_format == "JPEG":
+                image.save(path, format="JPEG", quality=resolved_quality, optimize=True)
             else:
                 image.save(path, format="PNG", optimize=True)
             return ScreenshotResult(
@@ -218,8 +251,8 @@ class ScaledPillowScreenCapture:
                 height=height,
             )
         buffer = BytesIO()
-        if self.image_format == "JPEG":
-            image.save(buffer, format="JPEG", quality=self.jpeg_quality, optimize=True)
+        if resolved_format == "JPEG":
+            image.save(buffer, format="JPEG", quality=resolved_quality, optimize=True)
         else:
             image.save(buffer, format="PNG", optimize=True)
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -258,6 +291,19 @@ class ScaledPillowScreenCapture:
             return None
         x, y, width, height = self.crop_box
         return (x, y, x + width, y + height)
+
+
+def _resolve_resample_filter(value: str, *, scale: float):
+    normalized = str(value or "").strip().lower()
+    if normalized in {"nearest", "pixel", "sharp"}:
+        return Image.Resampling.NEAREST
+    if normalized in {"bicubic", "cubic"}:
+        return Image.Resampling.BICUBIC
+    if normalized in {"bilinear", "linear"}:
+        return Image.Resampling.BILINEAR
+    if normalized in {"lanczos", "lanczos4"}:
+        return Image.Resampling.LANCZOS
+    return Image.Resampling.NEAREST if scale > 1.0 else Image.Resampling.LANCZOS
 
 
 def _normalize_crop_box(
@@ -356,4 +402,32 @@ def _draw_cursor_overlay(
     ]
     draw.polygon(pointer, fill="white", outline="black")
     draw.line((x + 1, y + 1, x + 1, y + 20), fill="black", width=1)
+    return result
+
+
+def _draw_center_marker_overlay(image):
+    result = image.convert("RGB")
+    draw = ImageDraw.Draw(result)
+    width, height = result.size
+    x = width // 2
+    y = height // 2
+    primary = "#ff00ff"
+    halo = "white"
+    # Corner brackets keep the exact center unobscured for tiny targets.
+    bracket_outer = 30
+    bracket_inner = 18
+    brackets = (
+        ((x - bracket_outer, y - bracket_outer), (x - bracket_inner, y - bracket_outer)),
+        ((x - bracket_outer, y - bracket_outer), (x - bracket_outer, y - bracket_inner)),
+        ((x + bracket_inner, y - bracket_outer), (x + bracket_outer, y - bracket_outer)),
+        ((x + bracket_outer, y - bracket_outer), (x + bracket_outer, y - bracket_inner)),
+        ((x - bracket_outer, y + bracket_outer), (x - bracket_inner, y + bracket_outer)),
+        ((x - bracket_outer, y + bracket_inner), (x - bracket_outer, y + bracket_outer)),
+        ((x + bracket_inner, y + bracket_outer), (x + bracket_outer, y + bracket_outer)),
+        ((x + bracket_outer, y + bracket_inner), (x + bracket_outer, y + bracket_outer)),
+    )
+    for start, end in brackets:
+        draw.line((*start, *end), fill=halo, width=5)
+    for start, end in brackets:
+        draw.line((*start, *end), fill=primary, width=3)
     return result

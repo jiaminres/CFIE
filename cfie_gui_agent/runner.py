@@ -36,7 +36,6 @@ from cfie_gui_agent.tools import ModelToolRegistry, ToolRegistryError
 from cfie_gui_agent.trace import AgentTraceStore
 from cfie_gui_agent.verifier import (
     StepVerifier,
-    VERIFICATION_NO_SCREEN_CHANGE,
     VERIFICATION_REPEATED_ACTION,
 )
 
@@ -68,6 +67,14 @@ class GuiAgentRunner:
     response_json_warning_chars: int = 12000
     response_latency_warning_seconds: float = 10.0
     refresh_runtime_context_each_step: bool = False
+    local_click_refinement_radius: int = 120
+    local_click_refinement_upscale: bool = True
+    local_click_refinement_max_size: int = 1080
+    local_click_refinement_resample: str = "nearest"
+    local_click_refinement_image_format: str = "PNG"
+    local_click_refinement_draw_center_marker: bool = False
+    guard_untrusted_clicks: bool = False
+    trusted_click_success_threshold: int = 2
     max_repair_turns: int = 4
     require_finish_tool_for_completion: bool = False
     recent_execution_image_frames: int = 4
@@ -88,6 +95,9 @@ class GuiAgentRunner:
         step_records: list[StepRecord] = []
         model_response_metrics: list[dict[str, Any]] = []
         conversation, current_frame_ref = self._initial_conversation(task)
+        macro_proposal_reminder_sent = False
+        pending_click_guard: dict[str, Any] | None = None
+        trusted_click_counts: dict[str, int] = {}
         if self.include_runtime_context:
             conversation.insert(
                 0,
@@ -392,8 +402,74 @@ class GuiAgentRunner:
                 if call_kind == "computer_use":
                     assert isinstance(call, ComputerCall)
                     self.tool_registry.validate_model_tool("computer_use")
+                    click_guard = _pre_click_guard_decision(
+                        call=call,
+                        computer_loop=self.computer_loop,
+                        pending_guard=pending_click_guard,
+                        trusted_click_counts=trusted_click_counts,
+                        trusted_success_threshold=self.trusted_click_success_threshold,
+                    )
+                    if self.guard_untrusted_clicks and click_guard["status"] == "guard":
+                        refinements = _pre_click_refinement_messages(
+                            computer_loop=self.computer_loop,
+                            call=call,
+                            image_detail=self.image_detail,
+                            radius=self.local_click_refinement_radius,
+                            upscale=self.local_click_refinement_upscale,
+                            max_size=self.local_click_refinement_max_size,
+                            resample=self.local_click_refinement_resample,
+                            image_format=self.local_click_refinement_image_format,
+                            draw_center_marker=(
+                                self.local_click_refinement_draw_center_marker
+                            ),
+                        )
+                        if refinements:
+                            pending_click_guard = {
+                                "signatures": click_guard["signatures"],
+                                "created_step": step,
+                            }
+                            guard_item = _pre_click_guard_context_item(
+                                call=call,
+                                refinements=refinements,
+                                image_detail=self.image_detail,
+                            )
+                            conversation.append(guard_item)
+                            running = job_board.jobs[active_job_id].queues.running
+                            active_refinement = refinements[-1]["metadata"]
+                            record = StepRecord(
+                                step_id=len(step_records) + 1,
+                                task_id=active_job_id,
+                                subtask_id=(
+                                    running.subtask_id if running is not None else None
+                                ),
+                                action=call.to_openai_dict(),
+                                result="click_refinement_required",
+                                before_ref=current_frame_ref,
+                                after_ref=str(active_refinement.get("image_ref") or ""),
+                                summary=(
+                                    "Click was not executed; local refinement "
+                                    "confirmation is required."
+                                ),
+                                tags=("computer_use", "click_refinement_required"),
+                                metadata={
+                                    "model_response_step": step,
+                                    **_task_trace_metadata(task),
+                                    "click_guard": click_guard,
+                                    "local_refinements": [
+                                        item["metadata"] for item in refinements
+                                    ],
+                                    "local_refinement": active_refinement,
+                                },
+                            )
+                            step_records.append(record)
+                            context_store.append_step(active_job_id, record)
+                            self.trace_store.record_step(record)
+                            continue
                     try:
+                        executed_click_signatures = click_guard.get("signatures", ())
                         output = self.computer_loop.handle_call(call)
+                        if click_guard.get("status") in {"confirmed", "trusted"}:
+                            pending_click_guard = None
                     except Exception as exc:
                         before_ref = current_frame_ref
                         screenshot_ref = current_frame_ref
@@ -463,12 +539,27 @@ class GuiAgentRunner:
                     )
                     verification = self.step_verifier.verify(record)
                     record.metadata["verification"] = verification.to_dict()
-                    local_refinements = _local_click_refinement_messages(
-                        computer_loop=self.computer_loop,
-                        call=call,
-                        verification_status=verification.status,
-                        image_detail=self.image_detail,
-                    )
+                    if verification.is_ok:
+                        for signature in executed_click_signatures:
+                            trusted_click_counts[signature] = (
+                                trusted_click_counts.get(signature, 0) + 1
+                            )
+                    local_refinements = []
+                    if not self.guard_untrusted_clicks:
+                        local_refinements = _local_click_refinement_messages(
+                            computer_loop=self.computer_loop,
+                            call=call,
+                            verification_status=verification.status,
+                            image_detail=self.image_detail,
+                            radius=self.local_click_refinement_radius,
+                            upscale=self.local_click_refinement_upscale,
+                            max_size=self.local_click_refinement_max_size,
+                            resample=self.local_click_refinement_resample,
+                            image_format=self.local_click_refinement_image_format,
+                            draw_center_marker=(
+                                self.local_click_refinement_draw_center_marker
+                            ),
+                        )
                     if local_refinements:
                         record.metadata["local_refinements"] = [
                             item["metadata"] for item in local_refinements
@@ -494,6 +585,23 @@ class GuiAgentRunner:
                     context_store.append_step(active_job_id, record)
                     self.trace_store.record_step(record)
                     current_frame_ref = output.output.image_url
+                    if (
+                        not macro_proposal_reminder_sent
+                        and _should_inject_macro_proposal_reminder(
+                            step_records,
+                            self.tool_registry,
+                        )
+                    ):
+                        conversation.append(_macro_proposal_reminder_message())
+                        self.trace_store.record(
+                            "macro_proposal_reminder",
+                            {
+                                "step": step,
+                                "reason": "repeated_successful_ui_workflow",
+                                "step_count": len(step_records),
+                            },
+                        )
+                        macro_proposal_reminder_sent = True
                     if self._should_auto_request_human_on_verification(verification):
                         request = self.human_loop.request_help(
                             question=(
@@ -581,6 +689,23 @@ class GuiAgentRunner:
                 step_records.append(record)
                 context_store.append_step(active_job_id, record)
                 self.trace_store.record_step(record)
+                if (
+                    not macro_proposal_reminder_sent
+                    and _should_inject_macro_proposal_reminder(
+                        step_records,
+                        self.tool_registry,
+                    )
+                ):
+                    conversation.append(_macro_proposal_reminder_message())
+                    self.trace_store.record(
+                        "macro_proposal_reminder",
+                        {
+                            "step": step,
+                            "reason": "repeated_successful_ui_workflow",
+                            "step_count": len(step_records),
+                        },
+                    )
+                    macro_proposal_reminder_sent = True
                 if call.name == "update_constraints":
                     self.trace_store.record_policy_update(output)
                 if (
@@ -1165,6 +1290,10 @@ class GuiAgentRunner:
                     "如果一轮响应包含多个工具调用，每个工具调用都必须写 "
                     "index: 1, 2, 3... 表示执行顺序；如果一次 computer_use "
                     "包含多个动作，每个 action 也必须写 index。"
+                    "向聊天框、搜索框或表单输入并提交文本时，优先使用 "
+                    "computer_use 的 submit_text 动作；harness 会负责聚焦、"
+                    "替换现有文本、输入并按 Enter，避免把提交拆成点击、输入、"
+                    "点击发送按钮导致坐标误差。"
                     f"{viewport_guidance}"
                     f"{viewport_note}"
                 ),
@@ -1215,8 +1344,12 @@ class GuiAgentRunner:
                         "效率要求：回复保持简短。除非截图或视频描述本身就是任务结果，"
                         "否则不要复述画面内容。需要行动时优先调用工具，不要在工具调用前"
                         "输出可见的“上一步状态”或“下一步计划”。如果启用思考，"
+                        "向聊天框、搜索框或表单输入并提交文本时优先使用 submit_text；"
+                        "只有需要精确点选按钮、菜单或控件时才拆成鼠标点击。"
                         "把当前状态、下一步和风险写入 <think> 思考区；普通可见文本"
                         "只用于最终结果或极短说明，不能承载状态分析。不要输出长篇思考。"
+                        "只要任务尚未完成，本轮必须以一个可执行工具调用结束；"
+                        "不要只输出思考、空白文本或普通说明。"
                         "需要记录阶段性结果时，调用写文件或 shell 类通用工具。每轮新增文本要尽量少，"
                         "让 prefix cache 复用稳定历史；历史截图已经在对话中，不要重复描述。"
                         "每一步只新增必要的操作结果关键帧和简短工具结果。"
@@ -1278,7 +1411,6 @@ class GuiAgentRunner:
                 _short_text(rule.get("summary") or rule.get("text") or str(rule), 180)
                 for rule in self.policy_store.to_context_payload().get("rules", [])[-5:]
             ],
-            "model_tools": list(self.tool_registry.allowed_tool_names),
             "action_macros": (
                 self.action_macros.to_context_payload()
                 if self.action_macros is not None
@@ -1286,7 +1418,8 @@ class GuiAgentRunner:
             ),
             "macro_policy": (
                 "如果当前任务出现稳定、重复的多步界面操作，例如连续提交多条同类输入，"
-                "应该调用 propose_action_macro 非阻塞地建议一次操作宏，然后继续当前任务。"
+                "在同类流程连续成功两次后必须调用 propose_action_macro 非阻塞地建议一次操作宏，"
+                "然后继续当前任务，不要等待人工批准。"
                 "宏必须包含步骤目的、动作顺序、动态参数和可能的点击位置；批准前不要假设宏已经可用。"
             ),
         }
@@ -1496,12 +1629,69 @@ def _screen_observation_message(
     return {"type": "message", "role": "user", "content": content}
 
 
-def _local_click_refinement_messages(
+def _pre_click_guard_decision(
+    *,
+    call: ComputerCall,
+    computer_loop: ComputerLoop,
+    pending_guard: dict[str, Any] | None,
+    trusted_click_counts: dict[str, int],
+    trusted_success_threshold: int,
+) -> dict[str, Any]:
+    signatures = _click_guard_signatures(call, computer_loop.screen)
+    if not signatures:
+        return {"status": "none", "signatures": ()}
+    if pending_guard is not None:
+        pending_signatures = tuple(pending_guard.get("signatures") or ())
+        if call.coordinate_space == "local_refinement_1000":
+            return {
+                "status": "confirmed",
+                "reason": "local_refinement_correction",
+                "signatures": signatures,
+                "pending_signatures": pending_signatures,
+            }
+        if signatures == pending_signatures:
+            return {
+                "status": "confirmed",
+                "reason": "same_click_repeated_after_local_preview",
+                "signatures": signatures,
+                "pending_signatures": pending_signatures,
+            }
+    threshold = max(1, int(trusted_success_threshold))
+    if all(trusted_click_counts.get(signature, 0) >= threshold for signature in signatures):
+        return {
+            "status": "trusted",
+            "reason": "repeated_successful_click_coordinate",
+            "signatures": signatures,
+        }
+    return {
+        "status": "guard",
+        "reason": "new_or_untrusted_click_coordinate",
+        "signatures": signatures,
+    }
+
+
+def _click_guard_signatures(
+    call: ComputerCall,
+    screen: Any,
+) -> tuple[str, ...]:
+    signatures: list[str] = []
+    for item in _click_logical_points(call, screen):
+        point = item["point"]
+        signatures.append(f"{item['action_type']}:{point[0]}:{point[1]}")
+    return tuple(signatures)
+
+
+def _pre_click_refinement_messages(
     *,
     computer_loop: ComputerLoop,
     call: Any,
-    verification_status: str,
     image_detail: str | None,
+    radius: int = 120,
+    upscale: bool = True,
+    max_size: int = 1080,
+    resample: str = "nearest",
+    image_format: str = "PNG",
+    draw_center_marker: bool = False,
 ) -> list[dict[str, Any]]:
     screen = computer_loop.screen
     screenshot_region_around = getattr(screen, "screenshot_region_around", None)
@@ -1515,23 +1705,208 @@ def _local_click_refinement_messages(
     total_clicks = len(click_points)
     for local_index, item in enumerate(click_points, start=1):
         point = item["point"]
-        local_box = _local_refinement_logical_box(point, screen, radius=520)
+        intent = str(item.get("intent") or "").strip()
+        local_box = _local_refinement_logical_box(point, screen, radius=radius)
         try:
-            crop = screenshot_region_around(x=point[0], y=point[1], radius=520)
+            crop = _capture_local_refinement_crop(
+                screenshot_region_around,
+                x=point[0],
+                y=point[1],
+                radius=radius,
+                upscale=upscale,
+                max_size=max_size,
+                resample=resample,
+                image_format=image_format,
+                draw_center_marker=draw_center_marker,
+            )
+        except Exception:
+            continue
+        is_last = local_index == total_clicks
+        text = (
+            "点击保护：本次 click 尚未执行。"
+            "这是本次操作意图附近的局部高清截图。"
+            "请不要围绕上一次拟点击中心做判断，也不要默认使用 x=500,y=500。"
+            "请把这张局部图当作新的完整图，重新选择操作意图对应目标的中心点。"
+        )
+        if draw_center_marker:
+            text += "图中如有品红色定位框，它只是辅助参考，不代表必须点击框中心。"
+        else:
+            text += "本轮不绘制中心定位框，避免诱导模型机械点击中心。"
+        if intent:
+            text += f"本次 click 的操作意图是：{intent}。"
+        text += "本轮不提供机器推荐点；请只根据局部高清图重新判断目标中心。"
+        if is_last:
+            text += (
+                "下一轮只看这张局部图，使用 "
+                'coordinate_space="local_refinement_1000" 给出局部图 0..1000 坐标。'
+                "不要复制任何完整截图坐标；局部图左上角是 x=0,y=0，右下角是 x=1000,y=1000。"
+                "harness 只有在你确认或修正后才会真实执行点击并返回完整屏幕观察。"
+            )
+        else:
+            text += "这是复合动作中的前序点击候选，当前动作整体也尚未执行。"
+        metadata = {
+            "click_index": local_index,
+            "action_index": item["action_index"],
+            "action_type": item["action_type"],
+            "intent": intent or None,
+            "proposed_click": {"x": point[0], "y": point[1]},
+            "local_refinement_box": list(local_box),
+            "coordinate_space": "local_refinement_1000",
+            "image_ref": crop.image_url,
+            "crop_width": crop.width,
+            "crop_height": crop.height,
+            "draw_cursor": False,
+            "draw_center_marker": bool(draw_center_marker),
+            "upscale": bool(upscale),
+            "resample": str(resample),
+            "image_format": str(image_format),
+            "precision_mode": "pre_click_refinement",
+            "executed": False,
+            "is_active_local_refinement": is_last,
+        }
+        structured_data = {
+            "mode": "pre_click_refinement",
+            "executed": False,
+            "click_index": local_index,
+            "action_index": item["action_index"],
+            "action_type": item["action_type"],
+            "intent": intent or None,
+            "next_coordinate_space": "local_refinement_1000",
+            "local_image_coordinate_range": [0, 1000],
+            "local_image_task": "choose_target_center_again",
+            "draw_cursor": False,
+            "draw_center_marker": bool(draw_center_marker),
+            "upscale": bool(upscale),
+            "resample": str(resample),
+            "image_format": str(image_format),
+            "do_not_copy_screen_coordinates": True,
+        }
+        output_payload = {
+            "type": "computer_screenshot",
+            "image_url": crop.image_url,
+            "detail": _local_refinement_image_detail(image_detail),
+            "summary": "Click requires local confirmation before execution.",
+            "observation_text": text,
+            "structured_data": structured_data,
+            "click_index": local_index,
+            "action_index": item["action_index"],
+            "intent": intent or None,
+            "coordinate_space": "local_refinement_1000",
+            "draw_cursor": False,
+            "draw_center_marker": bool(draw_center_marker),
+            "upscale": bool(upscale),
+            "resample": str(resample),
+            "image_format": str(image_format),
+            "precision_mode": "pre_click_refinement",
+            "executed": False,
+            "is_active_local_refinement": is_last,
+        }
+        refinements.append({"output": output_payload, "metadata": metadata})
+
+    if refinements:
+        active_box = refinements[-1]["metadata"]["local_refinement_box"]
+        set_local_refinement_box = getattr(computer_loop, "set_local_refinement_box", None)
+        if callable(set_local_refinement_box):
+            set_local_refinement_box(tuple(int(value) for value in active_box))
+    return refinements
+
+
+def _pre_click_guard_context_item(
+    *,
+    call: ComputerCall,
+    refinements: list[dict[str, Any]],
+    image_detail: str | None,
+) -> dict[str, Any]:
+    active = refinements[-1]["output"]
+    output_payload = {
+        "type": "computer_screenshot",
+        "image_url": active.get("image_url"),
+        "detail": image_detail or active.get("detail") or "auto",
+        "summary": "Click guard returned a local screenshot; no click was executed.",
+        "observation_text": (
+            "点击保护：computer_use 尚未执行。"
+            "当前只返回拟点击点局部截图，确认无误后才执行真实点击。"
+        ),
+        "structured_data": active.get("structured_data"),
+        "precision_mode": "pre_click_refinement",
+        "executed": False,
+        "coordinate_space": "local_refinement_1000",
+    }
+    if len(refinements) > 1:
+        output_payload["local_refinements"] = [
+            dict(item["output"])
+            for item in refinements
+            if isinstance(item, dict) and isinstance(item.get("output"), dict)
+        ]
+    return {
+        "type": "computer_call_output",
+        "call_id": call.call_id,
+        "output": output_payload,
+    }
+
+
+def _local_click_refinement_messages(
+    *,
+    computer_loop: ComputerLoop,
+    call: Any,
+    verification_status: str,
+    image_detail: str | None,
+    radius: int = 120,
+    upscale: bool = True,
+    max_size: int = 1080,
+    resample: str = "nearest",
+    image_format: str = "PNG",
+    draw_center_marker: bool = False,
+) -> list[dict[str, Any]]:
+    screen = computer_loop.screen
+    screenshot_region_around = getattr(screen, "screenshot_region_around", None)
+    if not callable(screenshot_region_around):
+        return []
+    click_points = _click_logical_points(call, screen)
+    if not click_points:
+        return []
+
+    refinements: list[dict[str, Any]] = []
+    total_clicks = len(click_points)
+    for local_index, item in enumerate(click_points, start=1):
+        point = item["point"]
+        intent = str(item.get("intent") or "").strip()
+        local_box = _local_refinement_logical_box(point, screen, radius=radius)
+        try:
+            crop = _capture_local_refinement_crop(
+                screenshot_region_around,
+                x=point[0],
+                y=point[1],
+                radius=radius,
+                upscale=upscale,
+                max_size=max_size,
+                resample=resample,
+                image_format=image_format,
+                draw_center_marker=draw_center_marker,
+            )
         except Exception:
             continue
         is_last = local_index == total_clicks
         text = (
             "点击局部截图：这是刚才 computer_use 中"
             f"第 {local_index}/{total_clicks} 个点击动作后的局部高清截图，"
-            f"以该点击点 x={point[0]}, y={point[1]} 为中心。请用这张图确认"
-            "点击是否落在目标控件上。"
+            "用于重新查看操作意图附近的目标。"
+            "请不要围绕上一次点击中心做判断，也不要默认使用 x=500,y=500。"
+            "请把这张局部图当作新的完整图，重新选择操作意图对应目标的中心点。"
         )
+        if draw_center_marker:
+            text += "图中如有品红色定位框，它只是辅助参考，不代表必须点击框中心。"
+        else:
+            text += "本轮不绘制中心定位框，避免诱导模型机械点击中心。"
+        if intent:
+            text += f"本次 click 的操作意图是：{intent}。"
+        text += "本轮不提供机器推荐点；请只根据局部高清图重新判断目标中心。"
         if is_last:
             text += (
                 "如果下一步需要基于这张局部图修正点击，必须设置 "
                 'coordinate_space="local_refinement_1000"；harness 会把局部 '
-                "0..1000 坐标转换回完整截图坐标。"
+                "0..1000 坐标转换回完整截图坐标。请在思考中只判断目标中心在局部图中的位置，"
+                "不要重复完整截图坐标。"
             )
         else:
             text += (
@@ -1542,25 +1917,55 @@ def _local_click_refinement_messages(
             "click_index": local_index,
             "action_index": item["action_index"],
             "action_type": item["action_type"],
+            "intent": intent or None,
             "attempted_click": {"x": point[0], "y": point[1]},
             "local_refinement_box": list(local_box),
             "coordinate_space": "local_refinement_1000",
             "image_ref": crop.image_url,
             "crop_width": crop.width,
             "crop_height": crop.height,
+            "draw_cursor": False,
+            "draw_center_marker": bool(draw_center_marker),
+            "upscale": bool(upscale),
+            "resample": str(resample),
+            "image_format": str(image_format),
             "reason": verification_status,
             "is_active_local_refinement": is_last,
+        }
+        structured_data = {
+            "mode": "post_click_refinement",
+            "executed": True,
+            "click_index": local_index,
+            "action_index": item["action_index"],
+            "action_type": item["action_type"],
+            "intent": intent or None,
+            "next_coordinate_space": "local_refinement_1000",
+            "local_image_coordinate_range": [0, 1000],
+            "local_image_task": "choose_target_center_again",
+            "draw_cursor": False,
+            "draw_center_marker": bool(draw_center_marker),
+            "upscale": bool(upscale),
+            "resample": str(resample),
+            "image_format": str(image_format),
+            "verification_status": verification_status,
+            "do_not_copy_screen_coordinates": True,
         }
         output_payload = {
             "type": "computer_screenshot",
             "image_url": crop.image_url,
-            "detail": image_detail or "auto",
-            "summary": text,
+            "detail": _local_refinement_image_detail(image_detail),
+            "summary": "Click-local refinement screenshot after execution.",
+            "observation_text": text,
+            "structured_data": structured_data,
             "click_index": local_index,
             "action_index": item["action_index"],
-            "attempted_click": {"x": point[0], "y": point[1]},
-            "local_refinement_box": list(local_box),
+            "intent": intent or None,
             "coordinate_space": "local_refinement_1000",
+            "draw_cursor": False,
+            "draw_center_marker": bool(draw_center_marker),
+            "upscale": bool(upscale),
+            "resample": str(resample),
+            "image_format": str(image_format),
             "is_active_local_refinement": is_last,
         }
         refinements.append(
@@ -1578,6 +1983,49 @@ def _local_click_refinement_messages(
     return refinements
 
 
+def _capture_local_refinement_crop(
+    screenshot_region_around: Any,
+    *,
+    x: int,
+    y: int,
+    radius: int,
+    upscale: bool = True,
+    max_size: int = 1080,
+    resample: str = "nearest",
+    image_format: str = "PNG",
+    draw_center_marker: bool = False,
+) -> Any:
+    try:
+        return screenshot_region_around(
+            x=x,
+            y=y,
+            radius=radius,
+            max_width=max(1, int(max_size)),
+            max_height=max(1, int(max_size)),
+            draw_cursor=False,
+            draw_center_marker=draw_center_marker,
+            upscale=upscale,
+            resample=resample,
+            image_format=image_format,
+        )
+    except TypeError:
+        try:
+            return screenshot_region_around(
+                x=x,
+                y=y,
+                radius=radius,
+                draw_cursor=False,
+            )
+        except TypeError:
+            return screenshot_region_around(x=x, y=y, radius=radius)
+
+
+def _local_refinement_image_detail(image_detail: str | None) -> str:
+    if image_detail == "original":
+        return "original"
+    return "high"
+
+
 def _click_logical_points(call: Any, screen: Any) -> list[dict[str, Any]]:
     points: list[dict[str, Any]] = []
     actions = list(getattr(call, "actions", ()) or ())
@@ -1589,10 +2037,20 @@ def _click_logical_points(call: Any, screen: Any) -> list[dict[str, Any]]:
         y = getattr(action, "y", None)
         if x is None or y is None:
             continue
+        intent = str(getattr(action, "intent", "") or "").strip()
+        raw = getattr(action, "raw", None)
+        if not intent and isinstance(raw, dict):
+            intent = str(
+                raw.get("intent")
+                or raw.get("operation_intent")
+                or raw.get("purpose")
+                or ""
+            ).strip()
         points.append(
             {
                 "action_index": action_index,
                 "action_type": action_type,
+                "intent": intent,
                 "point": _map_model_point_to_logical_screen(
                     int(x),
                     int(y),
@@ -1604,85 +2062,6 @@ def _click_logical_points(call: Any, screen: Any) -> list[dict[str, Any]]:
             }
         )
     return points
-
-
-def _local_click_refinement_message(
-    *,
-    computer_loop: ComputerLoop,
-    call: Any,
-    verification_status: str,
-    image_detail: str | None,
-) -> dict[str, Any] | None:
-    if verification_status not in {
-        VERIFICATION_NO_SCREEN_CHANGE,
-        VERIFICATION_REPEATED_ACTION,
-    }:
-        return None
-    if not _is_click_only_call(call):
-        return None
-    screen = computer_loop.screen
-    point = _last_click_logical_point(call, screen)
-    if point is None:
-        return None
-    local_box = _local_refinement_logical_box(point, screen, radius=520)
-    screenshot_region_around = getattr(screen, "screenshot_region_around", None)
-    if not callable(screenshot_region_around):
-        return None
-    try:
-        crop = screenshot_region_around(x=point[0], y=point[1], radius=520)
-    except Exception:
-        return None
-    set_local_refinement_box = getattr(computer_loop, "set_local_refinement_box", None)
-    if callable(set_local_refinement_box):
-        set_local_refinement_box(local_box)
-    text = (
-        "局部定位兜底：上一次点击可能有轻微偏差。下一张图是以上次尝试点击点"
-        f" x={point[0]}, y={point[1]} 为中心的高清局部截图，坐标仍来自当前"
-        "截图坐标系。请先在这个局部图中重新确认目标位置，再决定下一次"
-        " computer_use。若下一次鼠标操作基于局部图定位，必须设置 "
-        'coordinate_space="local_refinement_1000"；harness 会把局部 0..1000 '
-        "坐标转换回完整截图坐标。"
-    )
-    return {
-        "message": _screen_observation_message(
-            text=text,
-            image_url=crop.image_url,
-            image_detail=image_detail,
-        ),
-        "metadata": {
-            "attempted_click": {"x": point[0], "y": point[1]},
-            "local_refinement_box": list(local_box),
-            "coordinate_space": "local_refinement_1000",
-            "crop_width": crop.width,
-            "crop_height": crop.height,
-            "reason": verification_status,
-        },
-    }
-
-
-def _is_click_only_call(call: Any) -> bool:
-    actions = getattr(call, "actions", ())
-    if not actions:
-        return False
-    return all(getattr(action, "type", "") in {"click", "double_click"} for action in actions)
-
-
-def _last_click_logical_point(call: Any, screen: Any) -> tuple[int, int] | None:
-    actions = list(getattr(call, "actions", ()) or ())
-    for action in reversed(actions):
-        if getattr(action, "type", "") not in {"click", "double_click", "move"}:
-            continue
-        x = getattr(action, "x", None)
-        y = getattr(action, "y", None)
-        if x is None or y is None:
-            continue
-        return _map_model_point_to_logical_screen(
-            int(x),
-            int(y),
-            coordinate_space=str(getattr(call, "coordinate_space", "") or "screenshot"),
-            screen=screen,
-        )
-    return None
 
 
 def _map_model_point_to_logical_screen(
@@ -1823,6 +2202,70 @@ def _order_tool_turn(
     return ordered_calls
 
 
+def _should_inject_macro_proposal_reminder(
+    step_records: list[StepRecord],
+    tool_registry: ModelToolRegistry,
+) -> bool:
+    if not tool_registry.is_model_callable("propose_action_macro"):
+        return False
+    if any(_step_agent_tool_name(record) == "propose_action_macro" for record in step_records):
+        return False
+    submit_count = sum(
+        1
+        for record in step_records
+        if record.result == "computer_call_output"
+        and _step_contains_computer_action(record, "submit_text")
+    )
+    record_count = sum(
+        1
+        for record in step_records
+        if record.result == "accepted"
+        and _step_agent_tool_name(record)
+        in {"append_text_file", "write_text_file", "run_shell"}
+    )
+    return submit_count >= 2 and record_count >= 2
+
+
+def _macro_proposal_reminder_message() -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": (
+                    "宏提醒：你已经连续成功完成至少两次同类 GUI 流程。"
+                    "下一轮必须先调用 propose_action_macro 建议一个可复用宏；"
+                    "宏应把输入文本、记录字段或其他变化项设计成动态参数。"
+                    "宏步骤只能包含 computer_use 的键鼠/等待/输入动作，"
+                    "只覆盖界面操作部分；读写文件、shell、记忆或轨迹记录"
+                    "仍然作为宏外的普通工具调用完成，不要写进宏步骤。"
+                    "这是非阻塞建议，不要等待批准，提交宏建议后继续当前任务。"
+                ),
+            }
+        ],
+    }
+
+
+def _step_agent_tool_name(record: StepRecord) -> str:
+    action = record.action if isinstance(record.action, dict) else {}
+    if action.get("type") != "agent_tool":
+        return ""
+    return str(action.get("name") or "")
+
+
+def _step_contains_computer_action(record: StepRecord, action_type: str) -> bool:
+    action = record.action if isinstance(record.action, dict) else {}
+    if action.get("type") != "computer_call":
+        return False
+    actions = action.get("actions")
+    if not isinstance(actions, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") == action_type
+        for item in actions
+    )
+
+
 def _sort_tool_calls_across_kinds(
     calls: tuple[tuple[str, ComputerCall | AgentToolCall], ...],
 ) -> tuple[tuple[str, ComputerCall | AgentToolCall], ...]:
@@ -1917,6 +2360,16 @@ def _computer_action_summary(call: ComputerCall) -> str:
             if len(text) > 80:
                 text = text[:77] + "..."
             parts.append(f"type({text!r})")
+        elif action_type == "submit_text":
+            text = (action.text or "").replace("\n", " ")
+            if len(text) > 80:
+                text = text[:77] + "..."
+            target = (
+                f"@({action.x},{action.y}) "
+                if action.x is not None and action.y is not None
+                else ""
+            )
+            parts.append(f"submit_text({target}{text!r})")
         elif action_type == "keypress":
             parts.append("keypress(" + "+".join(action.keys) + ")")
         elif action_type == "wait":

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -18,7 +20,7 @@ from cfie_client import (
     Qwen35ComputerAdapter,
     ScreenshotResult,
 )
-from cfie_client.executor import ComputerBackend
+from cfie_client.executor import ComputerBackend, ComputerExecutor
 from cfie_client.protocol import ComputerAction, ComputerCall
 from cfie_gui_agent import (
     ActionMacro,
@@ -29,7 +31,9 @@ from cfie_gui_agent import (
     WorkspaceProfile,
 )
 from cfie_gui_agent.context import ContextManager, VisionContextPolicy
-from cfie_gui_agent.runner import _normalize_agent_tool_arguments
+from cfie_gui_agent.runner import (
+    _normalize_agent_tool_arguments,
+)
 
 
 @dataclass
@@ -89,6 +93,28 @@ def test_keyboard_type_text_uses_clipboard_paste(monkeypatch):
         ("set", "请只回答数字：71 + 27 等于几？"),
         ("press", ("ctrl", "v")),
         ("set", "old"),
+    ]
+
+
+def test_submit_text_action_focuses_replaces_and_submits():
+    backend = FakeBackend()
+    executor = ComputerExecutor(backend=backend, action_delay_seconds=0)
+    action = ComputerAction.from_openai(
+        {
+            "type": "submit_text",
+            "x": 500,
+            "y": 900,
+            "text": "question",
+        }
+    )
+
+    executor.execute(action)
+
+    assert backend.calls == [
+        ("click", (500, 900, "left")),
+        ("press_keys", (("ctrl", "a"),)),
+        ("type_text", ("question",)),
+        ("press_keys", (("enter",),)),
     ]
 
 
@@ -237,6 +263,20 @@ def test_protocol_sorts_fully_indexed_computer_actions_and_preserves_index():
     assert call.to_openai_dict()["actions"][0]["index"] == 1
 
 
+def test_protocol_preserves_computer_action_intent_aliases():
+    action = ComputerAction.from_openai(
+        {
+            "type": "click",
+            "x": 500,
+            "y": 900,
+            "operation_intent": "点击蓝色发送按钮",
+        }
+    )
+
+    assert action.intent == "点击蓝色发送按钮"
+    assert action.to_openai_dict()["intent"] == "点击蓝色发送按钮"
+
+
 def test_protocol_keeps_original_action_order_when_index_is_partial():
     call = ComputerCall.from_openai(
         {
@@ -352,6 +392,39 @@ def test_computer_loop_can_map_qwen_normalized_coordinates_to_screenshot_pixels(
     assert backend.calls == [("click", (560, 570, "left"))]
 
 
+def test_computer_loop_maps_submit_text_focus_coordinates():
+    backend = FakeBackend()
+    screen = FakeScreen()
+    loop = ComputerLoop(
+        backend=backend,
+        screen=screen,
+        model_coordinate_mode="qwen_normalized_1000",
+    )
+    call = ComputerCall.from_openai(
+        {
+            "type": "computer_call",
+            "call_id": "submit_text",
+            "actions": [
+                {
+                    "type": "submit_text",
+                    "x": 500,
+                    "y": 900,
+                    "text": "question",
+                }
+            ],
+        }
+    )
+
+    loop.handle_call(call)
+
+    assert backend.calls[:4] == [
+        ("click", (400, 540, "left")),
+        ("press_keys", (("ctrl", "a"),)),
+        ("type_text", ("question",)),
+        ("press_keys", (("enter",),)),
+    ]
+
+
 def test_computer_call_coordinate_space_overrides_loop_default():
     backend = FakeBackend()
     screen = FakeScreen()
@@ -432,6 +505,23 @@ def test_computer_loop_maps_local_refinement_coordinates_to_screen_box():
     loop.handle_call(call)
 
     assert backend.calls == [("click", (300, 350, "left"))]
+
+
+def test_computer_loop_rejects_out_of_range_local_refinement_coordinates():
+    backend = FakeBackend()
+    screen = FakeScreen()
+    loop = ComputerLoop(backend=backend, screen=screen)
+    loop.set_local_refinement_box((100, 200, 400, 300))
+    call = ComputerCall(
+        call_id="bad_local_refinement",
+        coordinate_space="local_refinement_1000",
+        actions=(ComputerAction(type="click", x=1356, y=321, button="left"),),
+    )
+
+    with pytest.raises(ValueError, match="local_refinement_1000 coordinates"):
+        loop.handle_call(call)
+
+    assert backend.calls == []
 
 
 def test_scaled_screen_capture_can_emit_file_url(
@@ -727,12 +817,170 @@ def test_gui_agent_runner_adds_local_crop_after_click_only_action():
 
     assert result.status == "completed"
     assert saw_local_refinement is True
-    assert screen.local_requests == [(400, 300, 520)]
+    assert screen.local_requests == [(400, 300, 120)]
     local_refinement = result.metadata["step_records"][0]["metadata"][
         "local_refinement"
     ]
     assert local_refinement["coordinate_space"] == "local_refinement_1000"
-    assert local_refinement["local_refinement_box"] == [0, 0, 800, 600]
+    assert local_refinement["local_refinement_box"] == [280, 180, 240, 240]
+
+
+def test_gui_agent_runner_guards_untrusted_click_before_execution():
+    class LocalCropScreen(FakeScreen):
+        def __init__(self) -> None:
+            self.local_requests: list[tuple[int, int, int]] = []
+
+        def screenshot_region_around(
+            self,
+            *,
+            x: int,
+            y: int,
+            radius: int = 180,
+            max_width: int = 720,
+            max_height: int = 720,
+            draw_cursor: bool | None = None,
+        ) -> ScreenshotResult:
+            self.local_requests.append((x, y, radius))
+            return ScreenshotResult(
+                image_url="data:image/png;base64,LOCAL_PRECLICK",
+                width=320,
+                height=240,
+            )
+
+    backend = FakeBackend()
+    screen = LocalCropScreen()
+    loop = ComputerLoop(backend=backend, screen=screen)
+    runner = GuiAgentRunner(
+        computer_loop=loop,
+        max_steps=3,
+        guard_untrusted_clicks=True,
+    )
+    task = GuiAgentTaskSpec(task_id="task_guard_click", instruction="Click target.")
+    saw_preclick_guard = False
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal saw_preclick_guard
+        if len(conversation) == 2:
+            return {
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_guard_1",
+                        "coordinate_space": "qwen_normalized_1000",
+                        "actions": [{"type": "click", "x": 500, "y": 500}],
+                    }
+                ]
+            }
+        if not backend.calls:
+            guard_output = conversation[-1]["output"]
+            saw_preclick_guard = (
+                conversation[-1]["type"] == "computer_call_output"
+                and guard_output["image_url"] == "data:image/png;base64,LOCAL_PRECLICK"
+                and guard_output["precision_mode"] == "pre_click_refinement"
+                and guard_output["executed"] is False
+                and "observation_text" in guard_output
+                and guard_output["structured_data"]["mode"] == "pre_click_refinement"
+            )
+            assert "proposed_click" not in guard_output
+            assert "proposed_click" not in guard_output["structured_data"]
+            assert "attempted_click" not in guard_output["structured_data"]
+            return {
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_guard_2",
+                        "coordinate_space": "qwen_normalized_1000",
+                        "actions": [{"type": "click", "x": 500, "y": 500}],
+                    }
+                ]
+            }
+        assert conversation[-1]["type"] == "computer_call_output"
+        assert conversation[-1]["output"]["image_url"] == "data:image/png;base64,AAAA"
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert saw_preclick_guard is True
+    assert backend.calls == [("click", (400, 300, "left"))]
+    assert screen.local_requests == [(400, 300, 120)]
+    assert result.metadata["step_records"][0]["result"] == "click_refinement_required"
+    assert result.metadata["step_records"][1]["result"] == "computer_call_output"
+
+
+def test_gui_agent_runner_default_click_refinement_is_model_only():
+    class LocalCropScreen(FakeScreen):
+        def screenshot_region_around(
+            self,
+            *,
+            x: int,
+            y: int,
+            radius: int = 180,
+            max_width: int = 720,
+            max_height: int = 720,
+            draw_cursor: bool | None = None,
+            draw_center_marker: bool | None = None,
+        ) -> ScreenshotResult:
+            image = Image.new("RGB", (100, 100), "white")
+            for px in range(60, 65):
+                image.putpixel((px, 30), (239, 68, 68))
+            buffer = BytesIO()
+            image.save(buffer, format="PNG")
+            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return ScreenshotResult(
+                image_url=f"data:image/png;base64,{encoded}",
+                width=100,
+                height=100,
+            )
+
+    loop = ComputerLoop(backend=FakeBackend(), screen=LocalCropScreen())
+    runner = GuiAgentRunner(
+        computer_loop=loop,
+        max_steps=2,
+        guard_untrusted_clicks=True,
+    )
+    task = GuiAgentTaskSpec(
+        task_id="task_guard_model_only",
+        instruction="Click the small red target.",
+    )
+    observed_structured_data: dict[str, Any] = {}
+
+    def agent(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal observed_structured_data
+        if len(conversation) == 2:
+            return {
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_guard_model_only",
+                        "coordinate_space": "qwen_normalized_1000",
+                        "actions": [{"type": "click", "x": 500, "y": 500}],
+                    }
+                ]
+            }
+        observed_structured_data = dict(conversation[-1]["output"]["structured_data"])
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }
+            ]
+        }
+
+    result = runner.run_task(task, agent)
+
+    assert result.status == "completed"
+    assert "recommended_click_1000" not in observed_structured_data
+    assert "local_visual_candidates" not in observed_structured_data
+    assert observed_structured_data["mode"] == "pre_click_refinement"
 
 
 def test_gui_agent_runner_adds_local_crop_for_every_click_in_compound_action():
@@ -803,7 +1051,7 @@ def test_gui_agent_runner_adds_local_crop_for_every_click_in_compound_action():
     result = runner.run_task(task, agent)
 
     assert result.status == "completed"
-    assert screen.local_requests == [(80, 120, 520), (720, 480, 520)]
+    assert screen.local_requests == [(80, 120, 120), (720, 480, 120)]
     assert observed_local_images == [
         "data:image/png;base64,LOCAL1",
         "data:image/png;base64,LOCAL2",
